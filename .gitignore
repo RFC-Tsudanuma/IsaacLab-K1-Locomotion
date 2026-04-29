@@ -1,4 +1,12 @@
-*logs/
-*outputs/
+# Python
 __pycache__/
+*.pyc
+*.pyo
 *.egg-info/
+
+# IsaacLab / Hydra
+outputs/
+logs/
+
+# Isaac Sim
+_isaac_sim/
