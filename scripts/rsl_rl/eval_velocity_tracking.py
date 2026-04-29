@@ -59,7 +59,7 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-import isaaclab_k1_soccer.tasks  # noqa: F401
+import isaaclab_k1_locomotion.tasks  # noqa: F401
 
 
 def build_commands(high_speed: float, low_speed: float, high_ang: float, low_ang: float):

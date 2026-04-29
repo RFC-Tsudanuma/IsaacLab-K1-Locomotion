@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Installation script for the 'isaaclab_k1_soccer' python package."""
+"""Installation script for the 'isaaclab_k1_locomotion' python package."""
 
 import os
 
@@ -23,8 +23,8 @@ INSTALL_REQUIRES = [
 
 # Installation operation
 setup(
-    name="isaaclab_k1_soccer",
-    packages=["isaaclab_k1_soccer"],
+    name="isaaclab_k1_locomotion",
+    packages=["isaaclab_k1_locomotion"],
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],

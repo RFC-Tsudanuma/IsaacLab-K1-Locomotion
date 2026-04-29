@@ -44,7 +44,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_tasks
-import isaaclab_k1_soccer.tasks
+import isaaclab_k1_locomotion.tasks
 
 
 class VelocityController:

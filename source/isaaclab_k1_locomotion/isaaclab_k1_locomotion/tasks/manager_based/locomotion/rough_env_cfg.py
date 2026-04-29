@@ -39,7 +39,7 @@ _STANCE_RATIO: float = 0.55 # 接地時間の割合
 
 _K1_USD_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "../../../../../../../../assets_soccer/booster_robotics_robots/K1/K1_22dof.usd",
+    "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_22dof.usd",
 )
 
 ##

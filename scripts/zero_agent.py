@@ -35,7 +35,7 @@ import torch
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import parse_env_cfg
 
-import isaaclab_k1_soccer.tasks  # noqa: F401
+import isaaclab_k1_locomotion.tasks  # noqa: F401
 
 
 def main():

@@ -23,7 +23,7 @@ keywords = ["extension", "template", "isaaclab"]
 # NOTE: Add additional dependencies here
 
 [[python.module]]
-name = "isaaclab_k1_soccer"
+name = "isaaclab_k1_locomotion"
 
 [isaac_lab_settings]
 # TODO: Uncomment and list any apt dependencies here.
