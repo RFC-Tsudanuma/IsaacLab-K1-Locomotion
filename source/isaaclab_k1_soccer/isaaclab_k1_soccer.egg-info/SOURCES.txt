@@ -1,0 +1,10 @@
+pyproject.toml
+setup.py
+isaaclab_k1_soccer/__init__.py
+isaaclab_k1_soccer/ui_extension_example.py
+isaaclab_k1_soccer.egg-info/PKG-INFO
+isaaclab_k1_soccer.egg-info/SOURCES.txt
+isaaclab_k1_soccer.egg-info/dependency_links.txt
+isaaclab_k1_soccer.egg-info/not-zip-safe
+isaaclab_k1_soccer.egg-info/requires.txt
+isaaclab_k1_soccer.egg-info/top_level.txt
