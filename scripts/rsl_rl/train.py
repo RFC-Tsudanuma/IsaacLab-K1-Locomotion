@@ -169,6 +169,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+    # print joint order
+    try:
+        print("[INFO] K1 joint order (USD native):")
+        robot = env.unwrapped.scene["robot"]
+        for i, name in enumerate(robot.joint_names):
+            print(f"  {i:2d}: {name}")
+        print("[INFO] K1 joint order (action space):")
+        action_term = env.unwrapped.action_manager._terms["joint_pos"]
+        for i, name in enumerate(action_term._joint_names):
+            print(f"  {i:2d}: {name}")
+    except Exception as e:
+        print(f"[WARNING] Could not retrieve joint names: {e}")
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)

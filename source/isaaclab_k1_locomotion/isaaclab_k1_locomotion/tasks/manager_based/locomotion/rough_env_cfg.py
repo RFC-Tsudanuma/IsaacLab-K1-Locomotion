@@ -17,7 +17,7 @@ from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
-from isaaclab_tasks.manager_based.locomotion.velocity.velocity_env_cfg import (
+from .velocity_env_cfg import (
     LocomotionVelocityRoughEnvCfg,
     ObservationsCfg,
     RewardsCfg,
