@@ -97,19 +97,19 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     actuators={
         "legs": ImplicitActuatorCfg(
             joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
-            effort_limit_sim={".*_Hip_Pitch": 30.0, ".*_Hip_Roll": 35.0, ".*_Hip_Yaw": 20.0, ".*_Knee_Pitch": 40.0},
-            velocity_limit={".*_Hip_Pitch": 7.1, ".*_Hip_Roll": 12.9, ".*_Hip_Yaw": 18.1, ".*_Knee_Pitch": 12.5},
+            effort_limit_sim={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
             stiffness={".*_Hip_Pitch": 30.0, ".*_Hip_Roll": 35.0, ".*_Hip_Yaw": 20.0, ".*_Knee_Pitch": 40.0},
             damping={".*_Hip_Pitch": 2.5, ".*_Hip_Roll": 2.5, ".*_Hip_Yaw": 2.5, ".*_Knee_Pitch": 4.0},
-            armature={".*_Hip_.*": 0.01, ".*_Knee_Pitch": 0.01},
+            armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
         ),
         "feet": ImplicitActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
-            effort_limit_sim=20.0,
-            velocity_limit=18.1,
+            effort_limit_sim=38.3,
+            velocity_limit=17.59,
             stiffness=20.0,
             damping=2.0,
-            armature=0.01,
+            armature=0.0282528,
         ),
         "arms": ImplicitActuatorCfg(
             joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
