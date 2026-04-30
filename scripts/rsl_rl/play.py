@@ -34,6 +34,17 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--viser", action="store_true", default=False, help="Enable viser-based visualization.")
+parser.add_argument("--viser_port", type=int, default=8080, help="Port for the viser server.")
+parser.add_argument(
+    "--viser_urdf",
+    type=str,
+    default=None,
+    help="Path to the URDF used for viser visualization. Defaults to the K1 locomotion URDF.",
+)
+parser.add_argument(
+    "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -55,8 +66,10 @@ simulation_app = app_launcher.app
 
 import os
 import time
+from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -77,7 +90,71 @@ import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
-import isaaclab_k1_soccer.tasks  # noqa: F401
+import isaaclab_k1_locomotion.tasks  # noqa: F401
+
+
+DEFAULT_VISER_URDF = str(
+    Path(__file__).resolve().parent
+    / "../../assets_soccer/booster_robotics_robots/K1/K1_22dof.urdf"
+)
+
+
+def setup_viser(env, urdf_path: str, port: int):
+    """Spin up a viser server and load the given URDF for visualization.
+
+    Returns a tuple ``(server, base_frame, viser_urdf, joint_indices)`` where
+    ``joint_indices[k]`` is the index in Isaac Lab's joint state for the k-th
+    actuated joint reported by ``viser_urdf.get_actuated_joint_names()``. An
+    entry is ``None`` when no matching joint exists.
+    """
+    import viser
+    from viser.extras import ViserUrdf
+
+    server = viser.ViserServer(port=port)
+    server.scene.add_grid(
+        "/ground",
+        width=20.0,
+        height=20.0,
+        cell_size=0.5,
+        section_size=2.0,
+        plane="xy",
+        plane_color=(0.85, 0.85, 0.85),
+        plane_opacity=1.0,
+        shadow_opacity=0.3,
+        infinite_grid=True,
+    )
+    server.scene.add_frame("/world", show_axes=True, axes_length=0.3, axes_radius=0.01)
+    base_frame = server.scene.add_frame("/base", show_axes=False)
+    viser_urdf = ViserUrdf(server, urdf_or_path=Path(urdf_path), root_node_name="/base")
+
+    urdf_joint_names = viser_urdf.get_actuated_joint_names()
+    isaac_joint_names = list(env.unwrapped.scene["robot"].joint_names)
+    joint_indices = []
+    for name in urdf_joint_names:
+        if name in isaac_joint_names:
+            joint_indices.append(isaac_joint_names.index(name))
+        else:
+            print(f"[WARNING] Viser: joint '{name}' not found in Isaac robot; will use 0.0.")
+            joint_indices.append(None)
+    print(f"[INFO] Viser visualization available at http://localhost:{port}")
+    return server, base_frame, viser_urdf, joint_indices
+
+
+def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
+    """Push the current robot state from Isaac Lab into the viser scene."""
+    robot = env.unwrapped.scene["robot"]
+    root_state = robot.data.root_state_w[env_idx]
+    pos = root_state[0:3].detach().cpu().numpy()
+    quat_wxyz = root_state[3:7].detach().cpu().numpy()
+    joint_pos = robot.data.joint_pos[env_idx].detach().cpu().numpy()
+
+    cfg = np.array(
+        [joint_pos[i] if i is not None else 0.0 for i in joint_indices], dtype=np.float32
+    )
+
+    base_frame.position = pos.astype(np.float32)
+    base_frame.wxyz = quat_wxyz.astype(np.float32)
+    viser_urdf.update_cfg(cfg)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -189,6 +266,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    # set up viser visualization (optional)
+    viser_state = None
+    if args_cli.viser:
+        urdf_path = args_cli.viser_urdf or DEFAULT_VISER_URDF
+        viser_state = setup_viser(env, urdf_path, args_cli.viser_port)
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
@@ -205,6 +288,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             obs, _, dones, _ = env.step(actions)
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
+        if viser_state is not None:
+            try:
+                _, base_frame, viser_urdf, joint_indices = viser_state
+                update_viser(env, base_frame, viser_urdf, joint_indices, env_idx=args_cli.viser_env_idx)
+            except Exception as e:
+                print(f"[WARNING] Viser update failed: {e}")
         if args_cli.video:
             # Manually capture frame as fallback in case RecordVideo fails
             try:
