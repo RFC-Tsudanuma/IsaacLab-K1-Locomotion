@@ -42,6 +42,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
 
+@configclass
 class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
