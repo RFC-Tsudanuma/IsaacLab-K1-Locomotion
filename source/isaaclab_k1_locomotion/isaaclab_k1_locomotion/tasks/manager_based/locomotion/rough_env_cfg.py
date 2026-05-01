@@ -7,7 +7,7 @@ import os
 import torch
 
 from isaaclab.assets import ArticulationCfg
-from isaaclab.actuators import ImplicitActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -95,26 +95,30 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "legs": ImplicitActuatorCfg(
+        "legs": IdealPDActuatorCfg(
             joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
-            effort_limit_sim={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
             velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
-            stiffness={".*_Hip_Pitch": 30.0, ".*_Hip_Roll": 35.0, ".*_Hip_Yaw": 20.0, ".*_Knee_Pitch": 40.0},
-            damping={".*_Hip_Pitch": 2.5, ".*_Hip_Roll": 2.5, ".*_Hip_Yaw": 2.5, ".*_Knee_Pitch": 4.0},
+            # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
+            # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
+            stiffness={".*_Hip_.*": 200.0, ".*_Knee_Pitch": 200.0},
+            damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
         ),
-        "feet": ImplicitActuatorCfg(
+        "feet": IdealPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
-            effort_limit_sim=38.3,
+            effort_limit=38.3,
             velocity_limit=17.59,
-            stiffness=20.0,
-            damping=2.0,
+            # stiffness=17.84601339,
+            # damping=53.53804017,
+            stiffness=50.84601339,
+            damping=3.0,
             armature=0.0282528,
         ),
-        "arms": ImplicitActuatorCfg(
+        "arms": IdealPDActuatorCfg(
             joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
-            effort_limit_sim=100.0,
-            velocity_limit_sim=50.0,
+            effort_limit=100.0,
+            velocity_limit=50.0,
             stiffness=40.0,
             damping=10.0,
         ),
