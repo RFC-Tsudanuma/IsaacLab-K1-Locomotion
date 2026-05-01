@@ -216,11 +216,41 @@ def joint_mirror_symmetry(
 
         return torch.exp(-error / 0.1)
 
+def get_feet_offset(env: ManagerBasedRLEnv, feet_distance_ref = 0.3) -> torch.Tensor:
+    """Get the offset between left and right foot in the robot frame.
+
+    This function computes the offset between the left and right foot positions in the robot frame.
+    """
+    asset = env.scene["robot"]
+    _,_,base_yaw = euler_xyz_from_quat(asset.data.root_quat_w)
+    feet_x_offset = (
+        torch.cos(base_yaw) * (asset.data.body_pos_w[:, asset.find_bodies("left_foot_link")[0][0], 0] - asset.data.body_pos_w[:, asset.find_bodies("right_foot_link")[0][0], 0])
+         - torch.sin(base_yaw) * (asset.data.body_pos_w[:, asset.find_bodies("left_foot_link")[0][0], 1] - asset.data.body_pos_w[:, asset.find_bodies("right_foot_link")[0][0], 1])
+    )
+    feet_y_offset = (
+        -torch.sin(base_yaw) * (asset.data.body_pos_w[:, asset.find_bodies("left_foot_link")[0][0], 0] - asset.data.body_pos_w[:, asset.find_bodies("right_foot_link")[0][0], 0])
+         + torch.cos(base_yaw) * (asset.data.body_pos_w[:, asset.find_bodies("left_foot_link")[0][0], 1] - asset.data.body_pos_w[:, asset.find_bodies("right_foot_link")[0][0], 1])
+    )
+
+    feet_y_offset = feet_y_offset - feet_distance_ref
+    return feet_x_offset, feet_y_offset
+
+def feet_close_penalty(env: ManagerBasedRLEnv, feet_distance_threshold = 0.15) -> torch.Tensor:
+    """Penalize feet being too close.
+
+    This function penalizes the agent for having its feet too close together. The reward is computed as the
+    distance between the feet positions.
+    """
+    _, feet_y_offset = get_feet_offset(env, 0.0) # そのままの値が欲しいのでrefは0にする
+
+    return (feet_y_offset < feet_distance_threshold).float()
+
 __all__ = [
     "minimum_height",
     "track_lin_vel_xy_discrete_exp",
     "track_ang_vel_z_discrete_exp",
     "feet_distance",
     "feet_phase",
+    "feet_close_penalty",
     "joint_mirror_symmetry",
 ]
