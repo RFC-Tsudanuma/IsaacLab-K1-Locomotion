@@ -192,6 +192,18 @@ class EventCfg:
         },
     )
 
+    # randomize_actuator_gains = EventTerm(
+    #     func=mdp.randomize_actuator_gains,
+    #     mode="startup",
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
+    #         "stiffness_distribution_params": (0.8, 1.2),
+    #         "damping_distribution_params": (0.8, 1.2),
+    #         "operation": "scale",
+    #         "distribution": "uniform",
+    #     },
+    # )
+
     # reset
     base_external_force_torque = EventTerm(
         func=mdp.apply_external_force_torque,
