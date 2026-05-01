@@ -258,6 +258,13 @@ class K1Rewards(RewardsCfg):
             "sensor_cfg": None, 
         },
     )
+    feet_close_penalty = RewTerm(
+        func=feet_close_penalty,
+        weight=-15.0,
+        params={
+            "feet_distance_threshold": 0.09,
+        },
+    )
 
 # ---------------------------------------------------------------------------
 # Environment configs
