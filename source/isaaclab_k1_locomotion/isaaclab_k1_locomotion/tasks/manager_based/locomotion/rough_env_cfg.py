@@ -196,7 +196,7 @@ class K1Rewards(RewardsCfg):
         params={"command_name": "base_velocity", "std": 0.5},
     )
 
-    """
+    
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
@@ -209,10 +209,10 @@ class K1Rewards(RewardsCfg):
             "stance_ratio": _STANCE_RATIO,
         },
     )
-    """
+    
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_positive_biped,
-        weight=1.0, # 位相報酬を使う場合は通常0にするか微量にする
+        weight=0.0, # 位相報酬を使う場合は通常0にするか微量にする
         params={
             "command_name": "base_velocity",
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
