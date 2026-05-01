@@ -250,13 +250,6 @@ class K1Rewards(RewardsCfg):
         weight=-0.5,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
     )
-    joint_deviation_lower_pitch = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.3,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Pitch", ".*_Knee_Pitch", ".*_Ankle_Pitch"])
-        },
-    )
 
     """
     base_height_penalty = RewTerm(
