@@ -196,6 +196,7 @@ class K1Rewards(RewardsCfg):
         params={"command_name": "base_velocity", "std": 0.5},
     )
 
+    """
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
@@ -208,9 +209,10 @@ class K1Rewards(RewardsCfg):
             "stance_ratio": _STANCE_RATIO,
         },
     )
+    """
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_positive_biped,
-        weight=0.0, # 位相報酬を使う場合は通常0にするか微量にする
+        weight=1.0, # 位相報酬を使う場合は通常0にするか微量にする
         params={
             "command_name": "base_velocity",
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
@@ -249,6 +251,7 @@ class K1Rewards(RewardsCfg):
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
     )
 
+    """
     base_height_penalty = RewTerm(
         func=minimum_height,
         weight=-1.0,
@@ -258,6 +261,7 @@ class K1Rewards(RewardsCfg):
             "sensor_cfg": None, 
         },
     )
+    """
 
 # ---------------------------------------------------------------------------
 # Environment configs
@@ -298,18 +302,18 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         )
         self.rewards.flat_orientation_l2.weight = -1.0
         self.rewards.action_rate_l2.weight = -0.005
-        self.rewards.dof_acc_l2.weight = -1.0e-7
+        self.rewards.dof_acc_l2.weight = -1.25e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        self.rewards.dof_torques_l2.weight = -1.0e-7
+        self.rewards.dof_torques_l2.weight = -1.5e-7
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
 
         # Commands
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # Terminations
