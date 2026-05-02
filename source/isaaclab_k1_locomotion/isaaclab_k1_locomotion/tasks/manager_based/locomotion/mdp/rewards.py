@@ -245,6 +245,68 @@ def feet_close_penalty(env: ManagerBasedRLEnv, feet_distance_threshold = 0.15) -
 
     return (feet_y_offset < feet_distance_threshold).float()
 
+
+def feet_parallel_to_ground(env: ManagerBasedRLEnv, 
+                            sigma: float = 0.3,
+                            enable_potential: bool = True, 
+                            discount_factor: float = 0.99) -> torch.Tensor:
+    """Reward feet being parallel to the ground.
+
+    This function rewards the agent for keeping its feet parallel to the ground.
+    The reward is computed based on the pitch and roll angles of the feet.
+    When the feet are perfectly parallel to the ground, pitch and roll should be close to zero.
+
+    Args:
+        env: Environment instance
+        sigma: Exponential kernel width parameter (default: 0.3)
+
+    Returns:
+        torch.Tensor: Reward value for each environment
+    """
+    asset = env.scene["robot"]
+
+    # Get foot body indices
+    left_foot_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_foot_idx = asset.find_bodies("right_foot_link")[0][0]
+
+    # Get foot orientations (quaternions) in world frame
+    left_foot_quat = asset.data.body_quat_w[:, left_foot_idx, :]
+    right_foot_quat = asset.data.body_quat_w[:, right_foot_idx, :]
+
+    # Convert quaternions to euler angles (roll, pitch, yaw)
+    left_roll, left_pitch, _ = euler_xyz_from_quat(left_foot_quat)
+    right_roll, right_pitch, _ = euler_xyz_from_quat(right_foot_quat)
+    left_roll = wrap_to_pi(left_roll)
+    right_roll = wrap_to_pi(right_roll)
+    left_pitch = wrap_to_pi(left_pitch)
+    right_pitch = wrap_to_pi(right_pitch)
+
+    # Compute squared errors for pitch and roll
+    # When feet are parallel to ground, both pitch and roll should be ~0
+    left_foot_error = torch.square(left_pitch) + torch.square(left_roll)
+    right_foot_error = torch.square(right_pitch) + torch.square(right_roll)
+
+    # Total error for both feet
+    total_error = left_foot_error + right_foot_error
+
+    current_potential = torch.exp(-total_error / sigma)
+
+    if enable_potential:
+        buffer_key = "feet_parallel_to_ground_potential_prev"
+        if not hasattr(env, "_custom_buffers"):
+            env._custom_buffers = {}
+        if buffer_key not in env._custom_buffers:
+            env._custom_buffers[buffer_key] = current_potential.clone()
+        prev_potential = env._custom_buffers[buffer_key]
+        shaped_reward = discount_factor * current_potential - prev_potential
+        reset_mask = env.reset_buf > 0
+        shaped_reward = torch.where(reset_mask, torch.zeros_like(shaped_reward), shaped_reward)
+        env._custom_buffers[buffer_key] = current_potential.clone()
+    else:
+        shaped_reward = current_potential
+
+    return shaped_reward
+
 __all__ = [
     "minimum_height",
     "track_lin_vel_xy_discrete_exp",
@@ -253,4 +315,5 @@ __all__ = [
     "feet_phase",
     "feet_close_penalty",
     "joint_mirror_symmetry",
+    "feet_parallel_to_ground",
 ]

@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import minimum_height
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height
 from .mdp.rewards import track_lin_vel_xy_discrete_exp, track_ang_vel_z_discrete_exp, joint_mirror_symmetry
 from .mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
 
@@ -269,6 +269,14 @@ class K1Rewards(RewardsCfg):
         weight=-15.0,
         params={
             "feet_distance_threshold": 0.09,
+        },
+    )
+
+    feet_parallel_to_ground = RewTerm(
+        func=feet_parallel_to_ground,
+        weight=0.5,
+        params={
+            "sigma": 0.15
         },
     )
 
