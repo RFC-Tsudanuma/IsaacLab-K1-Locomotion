@@ -95,7 +95,7 @@ import isaaclab_k1_locomotion.tasks  # noqa: F401
 
 DEFAULT_VISER_URDF = str(
     Path(__file__).resolve().parent
-    / "../../assets_soccer/booster_robotics_robots/K1/K1_22dof.urdf"
+    / "../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf"
 )
 
 

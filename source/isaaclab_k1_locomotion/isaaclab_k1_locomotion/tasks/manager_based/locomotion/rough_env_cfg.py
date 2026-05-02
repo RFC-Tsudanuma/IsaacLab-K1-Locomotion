@@ -43,9 +43,9 @@ from .mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
 _PHASE_FREQ: float = 2.0  # Hz (歩行周期)
 _STANCE_RATIO: float = 0.55 # 接地時間の割合
 
-_K1_USD_PATH = os.path.join(
+_K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_22dof.usd",
+    "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf",
 )
 
 ##
@@ -53,9 +53,15 @@ _K1_USD_PATH = os.path.join(
 ##
 
 K1_LOCOMOTION_CFG = ArticulationCfg(
-    spawn=sim_utils.UsdFileCfg(
-        usd_path=_K1_USD_PATH,
+    spawn=sim_utils.UrdfFileCfg(
+        asset_path=_K1_URDF_PATH,
+        fix_base=False,
+        merge_fixed_joints=True,
+        force_usd_conversion=True,
         activate_contact_sensors=True,
+        joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+            gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=None, damping=None),
+        ),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
             retain_accelerations=False,
@@ -80,16 +86,16 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             ".*_Knee_Pitch": 0.52,
             ".*_Ankle_Pitch": -0.26,
             ".*_Ankle_Roll": 0.0,   
-            "AAHead_yaw" : 0.0,
-            "Head_pitch" : 0.0,
-            "ALeft_Shoulder_Pitch": 0.0,
-            "ARight_Shoulder_Pitch": 0.0,
-            "Left_Shoulder_Roll": -0.7853981634 * 1.75,
-            "Left_Elbow_Pitch": 0.0,
-            "Left_Elbow_Yaw": 0.0,
-            "Right_Shoulder_Roll": 0.7853981634 * 1.75,
-            "Right_Elbow_Pitch": 0.0,
-            "Right_Elbow_Yaw": 0.0,       
+            # "AAHead_yaw" : 0.0,
+            # "Head_pitch" : 0.0,
+            # "ALeft_Shoulder_Pitch": 0.0,
+            # "ARight_Shoulder_Pitch": 0.0,
+            # "Left_Shoulder_Roll": -0.7853981634 * 1.75,
+            # "Left_Elbow_Pitch": 0.0,
+            # "Left_Elbow_Yaw": 0.0,
+            # "Right_Shoulder_Roll": 0.7853981634 * 1.75,
+            # "Right_Elbow_Pitch": 0.0,
+            # "Right_Elbow_Yaw": 0.0,       
         },
         joint_vel={".*": 0.0},
     ),
@@ -115,13 +121,13 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             damping=3.0,
             armature=0.0282528,
         ),
-        "arms": IdealPDActuatorCfg(
-            joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
-            effort_limit=100.0,
-            velocity_limit=50.0,
-            stiffness=40.0,
-            damping=10.0,
-        ),
+        # "arms": IdealPDActuatorCfg(
+        #     joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
+        #     effort_limit=100.0,
+        #     velocity_limit=50.0,
+        #     stiffness=40.0,
+        #     damping=10.0,
+        # ),
     },
 )
 
@@ -232,22 +238,22 @@ class K1Rewards(RewardsCfg):
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Ankle_Pitch", ".*_Ankle_Roll"])},
     )
-    dof_pos_limits_arm = RewTerm(
-        func=mdp.joint_pos_limits,
-        weight=-0.5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
-    )
+    # dof_pos_limits_arm = RewTerm(
+    #     func=mdp.joint_pos_limits,
+    #     weight=-0.5,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
+    # )
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.1,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
-    joint_deviation_arm = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
-    )
+    # joint_deviation_arm = RewTerm(
+    #     func=mdp.joint_deviation_l1,
+    #     weight=-0.5,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
+    # )
 
     base_height_penalty = RewTerm(
         func=minimum_height,

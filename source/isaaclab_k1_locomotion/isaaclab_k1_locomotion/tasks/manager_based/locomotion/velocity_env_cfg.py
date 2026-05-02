@@ -32,9 +32,9 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
 
 # K1の関節名リスト、この順番に合わせるためobsのjoint_posやvel、アクションなどはこれで指定する必要がある
 JOINT_NAMES_K1 = [
-    "AAHead_yaw", "Head_pitch",
-    "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch", "Left_Elbow_Yaw",
-    "ARight_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw",
+    # "AAHead_yaw", "Head_pitch",
+    # "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch", "Left_Elbow_Yaw",
+    # "ARight_Shoulder_Pitch", "Right_Shoulder_Roll","Right_Elbow_Pitch", "Right_Elbow_Yaw",
     "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
     "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
     "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
