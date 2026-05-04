@@ -28,6 +28,10 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--load_pretrained", type=str, default=None,
+    help="Path to a pretrained checkpoint (.pt) to initialize weights (strict=False, for transfer learning)."
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -221,6 +225,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+    # transfer learning: load pretrained weights with strict=False (observation dim may differ)
+    elif args_cli.load_pretrained is not None:
+        pretrained_path = os.path.abspath(args_cli.load_pretrained)
+        print(f"[INFO]: Loading pretrained weights (strict=False) from: {pretrained_path}")
+        loaded = torch.load(pretrained_path, map_location=agent_cfg.device)
+        state_dict = loaded.get("model_state_dict", loaded)
+
+        # 入力層・normalizerはobs次元が違うので除外してロード
+        filtered = {k: v for k, v in state_dict.items()
+                    if not any(k.startswith(p) for p in [
+                        "actor.0.weight",
+                        "actor_obs_normalizer",
+                    ])}
+        policy = getattr(runner.alg, 'actor_critic', None) or getattr(runner.alg, 'policy', None)
+        result = policy.load_state_dict(filtered, strict=False)
+        if isinstance(result, tuple):
+            missing, unexpected = result
+            if missing:
+                print(f"[INFO]: Missing keys: {missing}")
+            if unexpected:
+                print(f"[INFO]: Unexpected keys: {unexpected}")
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
