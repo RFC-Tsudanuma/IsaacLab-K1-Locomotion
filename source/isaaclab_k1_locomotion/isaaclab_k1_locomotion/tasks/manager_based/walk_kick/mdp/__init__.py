@@ -5,4 +5,4 @@
 
 from .observations import *
 from .rewards import *
-from .commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
+from .commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg, KickDirectionCommand, KickDirectionCommandCfg

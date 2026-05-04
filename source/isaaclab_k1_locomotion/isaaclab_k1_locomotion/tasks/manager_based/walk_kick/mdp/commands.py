@@ -4,8 +4,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from __future__ import annotations
+
+import math
 import torch
 from typing import TYPE_CHECKING
+
 from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
 from isaaclab.utils import configclass
@@ -46,3 +49,33 @@ class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
     high_ang_vel: float = 1.0
     low_ang_vel_max: float = 0.2
     high_prob: float = 0.5
+
+
+class KickDirectionCommand(UniformVelocityCommand):
+    """蹴り方向コマンド。
+
+    エピソードごとにランダムな角度 θ をサンプリングし、
+    command = [sin θ, cos θ, 0] を返す。
+    kick_ball_velocity 報酬は command[:, :2] を方向ベクトルとして使用する。
+    """
+
+    cfg: "KickDirectionCommandCfg"
+
+    def _resample(self, env_ids: torch.Tensor):
+        n = len(env_ids)
+        low, high = self.cfg.ranges.heading
+        theta = torch.empty(n, device=self.device).uniform_(low, high)
+        self.command[env_ids, 0] = torch.sin(theta)
+        self.command[env_ids, 1] = torch.cos(theta)
+        self.command[env_ids, 2] = 0.0
+
+
+@configclass
+class KickDirectionCommandCfg(UniformVelocityCommandCfg):
+    """蹴り方向コマンドの設定クラス。
+
+    ranges.heading でサンプリング範囲を指定する。
+    ranges.lin_vel_x/y, ang_vel_z は使用しない（0 に設定すること）。
+    """
+
+    class_type: type = KickDirectionCommand

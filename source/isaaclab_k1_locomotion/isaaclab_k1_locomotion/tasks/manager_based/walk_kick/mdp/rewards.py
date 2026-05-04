@@ -61,3 +61,23 @@ def kick_ball_velocity(
 
     ball_speed_in_cmd_dir = (ball_vel * cmd_dir_normalized).sum(dim=-1)
     return torch.clamp(ball_speed_in_cmd_dir, min=0.0)
+
+
+def kick_ball_forward(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ボールがロボットの前方に動いているときの報酬（コマンドマネージャー不要）。shape: (N,)"""
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene["robot"]
+
+    ball_vel_w = ball.data.root_lin_vel_w[:, :2]
+
+    # ロボットのヨー角から前方ベクトルを計算
+    quat = robot.data.root_quat_w  # (N, 4) [w, x, y, z]
+    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    forward = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)  # (N, 2)
+
+    speed_forward = (ball_vel_w * forward).sum(dim=-1)
+    return torch.clamp(speed_forward, min=0.0)
