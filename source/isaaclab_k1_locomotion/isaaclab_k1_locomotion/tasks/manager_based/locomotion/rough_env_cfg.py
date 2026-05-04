@@ -278,9 +278,17 @@ class K1Rewards(RewardsCfg):
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=0.5,
+        weight=20.0,
         params={
-            "sigma": 0.15
+            "sigma": 0.08
+        },
+    )
+
+    foot_clearance_ji = RewTerm(
+        func=foot_clearance_ji,
+        weight=-200.0,
+        params={
+            "target_clearance": 0.09,
         },
     )
 
