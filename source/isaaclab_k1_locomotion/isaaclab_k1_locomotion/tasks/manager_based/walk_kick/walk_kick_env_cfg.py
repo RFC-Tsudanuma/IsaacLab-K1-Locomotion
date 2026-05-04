@@ -14,11 +14,6 @@ K1FlatEnvCfg を継承し、ボール蹴りタスク向けの観測・報酬・�
 
 追加コマンド:
   kick_direction: エピソードごとにランダムな蹴り方向 θ ∈ [-π, π] をサンプリング
-
-報酬:
-  + touch_ball         : 足がボールに触れたとき
-  + ball_distance      : ボールへの接近
-  + kick_ball_velocity : ボールが蹴り方向コマンドに沿って動いているとき
 """
 
 import math
@@ -38,7 +33,6 @@ from ..locomotion.flat_env_cfg import K1FlatEnvCfg
 from . import mdp
 
 _BALL_RADIUS = 0.11
-
 
 @configclass
 class K1WalkKickEnvCfg(K1FlatEnvCfg):
@@ -108,19 +102,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             params={"command_name": "kick_direction"},
         )
 
-        # ------------------------------------------------------------------ #
-        # Rewards: ボール接触・接近・方向蹴り
-        # ------------------------------------------------------------------ #
-        self.rewards.touch_ball = RewTerm(func=mdp.touch_ball, weight=50.0)
-        self.rewards.ball_distance = RewTerm(func=mdp.ball_distance, weight=1.0)
-        self.rewards.kick_ball_velocity = RewTerm(
-            func=mdp.kick_ball_velocity,
-            weight=5.0,
-            params={
-                "ball_cfg": SceneEntityCfg("soccer_ball"),
-                "command_name": "kick_direction",
-            },
-        )
+
 
         # ------------------------------------------------------------------ #
         # Events: ボール位置リセット
@@ -140,17 +122,39 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
 
         # ------------------------------------------------------------------ #
-        # Commands: キックタスク向けに歩行速度指令の範囲を調整
+        # Rewards: track_lin_vel_xy を無効化し，ボール保持と前進速度に置き換え
         # ------------------------------------------------------------------ #
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.3, 0.3)
-        self.commands.base_velocity.ranges.ang_vel_z = (-0.5, 0.5)
-        self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
+        self.rewards.track_lin_vel_xy_exp.weight = 0.0
+
+        # ボールをロボット前方軸付近に保つ報酬（横ずれにガウスペナルティ）
+        self.rewards.ball_in_front = RewTerm(
+            func=mdp.ball_in_front,
+            weight=1.0,
+            params={"sigma_y": 0.3},
+        )
+        # ロボットの水平移動速度ノルムを最大化する報酬
+        self.rewards.robot_xy_speed = RewTerm(
+            func=mdp.robot_xy_speed,
+            weight=1.0,
+        )
+        # ボールに近づく報酬（蹴り位置への接近）
+        self.rewards.approach_ball = RewTerm(
+            func=mdp.approach_ball,
+            weight=1.0,
+            params={"sigma": 1.0},
+        )
+        # kick_direction の向きに体を向けているときの報酬
+        self.rewards.align_to_kick_direction = RewTerm(
+            func=mdp.align_to_kick_direction,
+            weight=1.0,
+            params={"command_name": "kick_direction"},
+        )
 
         # ------------------------------------------------------------------ #
         # その他
         # ------------------------------------------------------------------ #
         self.episode_length_s = 12.0
+        self.scene.env_spacing = 10.0
 
 
 @configclass
