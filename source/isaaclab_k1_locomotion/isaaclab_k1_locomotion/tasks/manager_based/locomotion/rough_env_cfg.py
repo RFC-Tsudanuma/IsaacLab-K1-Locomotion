@@ -7,7 +7,7 @@ import os
 import torch
 
 from isaaclab.assets import ArticulationCfg
-from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.actuators import IdealPDActuatorCfg, DelayedPDActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -101,7 +101,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "legs": IdealPDActuatorCfg(
+        "legs": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
             effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
             velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
@@ -110,8 +110,10 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             stiffness={".*_Hip_.*": 200.0, ".*_Knee_Pitch": 200.0},
             damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
+            min_delay=1,
+            max_delay=3,
         ),
-        "feet": IdealPDActuatorCfg(
+        "feet": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
             effort_limit=38.3,
             velocity_limit=17.59,
@@ -120,6 +122,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             stiffness=50.84601339,
             damping=3.0,
             armature=0.0282528,
+            min_delay=1,
+            max_delay=3,
         ),
         # "arms": IdealPDActuatorCfg(
         #     joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
