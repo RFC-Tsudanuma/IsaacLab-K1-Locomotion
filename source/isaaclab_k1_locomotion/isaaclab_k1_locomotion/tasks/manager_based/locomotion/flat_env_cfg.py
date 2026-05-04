@@ -3,16 +3,35 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from .rough_env_cfg import K1RoughEnvCfg
+from .velocity_env_cfg import CurriculumCfg
 import math
-from .mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
+from .mdp.curriculums import modify_command_resampling_time_range
+
+
+@configclass
+class K1FlatCurriculumCfg(CurriculumCfg):
+    """K1 Flat 環境用のカリキュラム設定。"""
+
+    # ステップ数が5000を超えたら、コマンドのリサンプリング時間分布の範囲を (1.0, 5.0) に変更
+    command_resampling_time_range = CurrTerm(
+        func=modify_command_resampling_time_range,
+        params={
+            "command_name": "base_velocity",
+            "resampling_time_range": (1.0, 5.0),
+            "num_steps": 5000,
+        },
+    )
 
 
 @configclass
 class K1FlatEnvCfg(K1RoughEnvCfg):
+    curriculum: K1FlatCurriculumCfg = K1FlatCurriculumCfg()
+
     def __post_init__(self):
         super().__post_init__()
 
