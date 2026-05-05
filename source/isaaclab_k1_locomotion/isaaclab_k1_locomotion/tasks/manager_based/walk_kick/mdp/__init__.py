@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+from .curriculums import *
 from .observations import *
 from .rewards import *
+from .terminations import *
 from .commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg, KickDirectionCommand, KickDirectionCommandCfg

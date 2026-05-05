@@ -87,12 +87,12 @@ def kick_ball_forward(
 def ball_in_front(
     env: ManagerBasedRLEnv,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    sigma_y: float = 0.3,
+    fov_half_angle: float = 0.524,
 ) -> torch.Tensor:
-    """ボールがロボットフレームの前方軸付近にあるときの報酬。shape: (N,)
+    """ボールがロボットのカメラ視野内にあるときの報酬。shape: (N,)
 
-    x_rel > 0（前方）かつ |y_rel| が小さいほど高い報酬。
-    sigma_y: 横方向のガウス幅 [m]（小さいほど厳しく前方を要求）。
+    ロボット前方を基準に水平角が fov_half_angle [rad] 以内なら 1.0，
+    それ以外は指数的に減衰。デフォルト 0.524 rad ≈ 30°（片側）。
     """
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
@@ -103,9 +103,13 @@ def ball_in_front(
     x_rel = rel_pos_b[:, 0]
     y_rel = rel_pos_b[:, 1]
 
+    # ロボット前方からボールへの水平角（絶対値）
+    horiz_angle = torch.atan2(torch.abs(y_rel), x_rel.clamp(min=1e-6))
+
     in_front = (x_rel > 0.0).float()
-    lateral_score = torch.exp(-y_rel**2 / (2.0 * sigma_y**2))
-    return in_front * lateral_score
+    # FOV 内は 1.0，外側は指数減衰
+    in_fov_score = torch.exp(-((horiz_angle - fov_half_angle).clamp(min=0.0) ** 2) / (fov_half_angle ** 2))
+    return in_front * in_fov_score
 
 
 def robot_xy_speed(
@@ -114,6 +118,22 @@ def robot_xy_speed(
     """ロボットの水平面（XY）移動速度ノルム。shape: (N,)"""
     robot = env.scene["robot"]
     return robot.data.root_lin_vel_w[:, :2].norm(dim=-1)
+
+
+def reach_ball_bonus(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    threshold: float = 0.3,
+) -> torch.Tensor:
+    """ボールに到達したとき（かつ time_out でないとき）に 1 を返す成功ボーナス。shape: (N,)"""
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene["robot"]
+    dist = torch.norm(
+        ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
+    )
+    reached = dist < threshold
+    not_timeout = ~env.termination_manager.time_outs
+    return (reached & not_timeout).float()
 
 
 def approach_ball(
@@ -156,3 +176,70 @@ def align_to_kick_direction(
 
     cos_sim = forward_x * kick_x + forward_y * kick_y
     return torch.clamp(cos_sim, min=0.0)
+
+
+def kick_direction_exp(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    command_name: str = "kick_direction",
+    sigma: float = 0.5,
+) -> torch.Tensor:
+    """ボール速度方向が kick_direction コマンドと一致しているときの指数報酬。shape: (N,)
+
+    ボールが動いていないときは報酬なし。
+    sigma: 方向誤差の許容幅（小さいほど厳密な方向一致を要求）。
+    """
+    ball = env.scene[ball_cfg.name]
+    ball_vel = ball.data.root_lin_vel_w[:, :2]  # (N, 2)
+    ball_speed = ball_vel.norm(dim=-1)
+
+    moving = (ball_speed > 0.01).float()
+    ball_dir = ball_vel / (ball_speed.unsqueeze(-1) + 1e-6)
+
+    command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
+    kick_dir = torch.stack([command[:, 1], command[:, 0]], dim=-1)  # (cos θ, sin θ)
+
+    cos_sim = (ball_dir * kick_dir).sum(dim=-1)
+    return moving * torch.exp(-(1.0 - cos_sim) / sigma)
+
+
+def kick_velocity_exp(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    command_name: str = "kick_direction",
+    sigma: float = 1.0,
+) -> torch.Tensor:
+    """kick_direction 方向のボール速度が大きいときの指数報酬。shape: (N,)
+
+    1 - exp(-v / sigma) の形式で，速度が増すほど 1 に近づく。
+    sigma: 報酬が飽和する速度スケール [m/s]。
+    """
+    ball = env.scene[ball_cfg.name]
+    ball_vel = ball.data.root_lin_vel_w[:, :2]  # (N, 2)
+
+    command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
+    kick_dir = torch.stack([command[:, 1], command[:, 0]], dim=-1)  # (cos θ, sin θ)
+
+    speed_in_kick_dir = (ball_vel * kick_dir).sum(dim=-1)
+    return 1.0 - torch.exp(-torch.clamp(speed_in_kick_dir, min=0.0) / sigma)
+
+
+def single_foot_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
+    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
+    threshold: float = 0.5,
+) -> torch.Tensor:
+    """両足同時接触ペナルティ（片足接触を推奨）。負の重みで使用。shape: (N,)
+
+    両足が同時にボールに接触しているとき 1.0 を返す。
+    負の重みを設定することで同時接触を抑制し，片足キックを促す。
+    """
+    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
+    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
+
+    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
+    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
+
+    both_contact = (force_right > threshold) & (force_left > threshold)
+    return both_contact.float()
