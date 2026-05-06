@@ -173,50 +173,54 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         #   Phase 3 (1500-2000): さらにキック関連報酬を追加
         # ------------------------------------------------------------------ #
 
+        # steps_per_iteration = num_steps_per_env (PPO config) = 24
+        # start_step / end_step はiteration数で指定する
+        _spi = 24
+
         # Phase 1→2: 速度追従報酬をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.0,
-                    "start_step": 1000, "end_step": 1500},
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.0,
-                    "start_step": 1000, "end_step": 1500},
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
         # Phase 2: ボール接近報酬をフェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1000, "end_step": 1500},
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.approach_ball_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "approach_ball", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1000, "end_step": 1500},
+            params={"term_name": "approach_ball", "start_weight": 0.0, "end_weight": 5.0,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.align_to_kick_direction_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1000, "end_step": 1500},
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
         # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
-                    "start_step": 1500, "end_step": 2000},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
-                    "start_step": 1500, "end_step": 2000},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
-                    "start_step": 1500, "end_step": 2000},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
         # # ボールに到達したときの成功ボーナス（タイムアウト終了は除外）
@@ -236,7 +240,6 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # ------------------------------------------------------------------ #
         # その他
         # ------------------------------------------------------------------ #
-        self.episode_length_s = 5.0
         self.scene.env_spacing = 100.0
 
 
@@ -246,7 +249,7 @@ class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
         super().__post_init__()
 
         self.scene.num_envs = 20
-        self.scene.env_spacing = 2.5
+        self.scene.env_spacing = 10
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None

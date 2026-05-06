@@ -51,13 +51,17 @@ def linear_reward_weight(
     end_weight: float,
     start_step: int,
     end_step: int,
+    steps_per_iteration: int = 0,
 ) -> None:
-    """ステップ数に応じて報酬重みを start_weight から end_weight へ線形補間するカリキュラム。
+    """ステップ数（またはiteration数）に応じて報酬重みを線形補間するカリキュラム。
 
-    step < start_step なら start_weight，step >= end_step なら end_weight を維持。
-    増加・減少どちらにも使用可能。
+    steps_per_iteration > 0 の場合、start_step/end_step をiteration単位として解釈する。
+    steps_per_iteration = 0（デフォルト）の場合、common_step_counter（物理ステップ数）を使う。
     """
-    step = env.common_step_counter
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
     if step <= start_step:
         new_weight = start_weight
     elif step >= end_step:
