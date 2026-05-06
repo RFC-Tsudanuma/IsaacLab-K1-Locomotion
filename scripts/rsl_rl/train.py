@@ -225,6 +225,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         # load previously trained model
         runner.load(resume_path)
+        # sync common_step_counter so curriculum resumes from the correct phase
+        if agent_cfg.resume:
+            synced_steps = runner.current_learning_iteration * runner.cfg["num_steps_per_env"]
+            env.unwrapped.common_step_counter = synced_steps
+            print(f"[INFO]: Set common_step_counter to {synced_steps} (iteration {runner.current_learning_iteration})")
     # transfer learning: load pretrained weights with strict=False (observation dim may differ)
     elif args_cli.load_pretrained is not None:
         pretrained_path = os.path.abspath(args_cli.load_pretrained)
