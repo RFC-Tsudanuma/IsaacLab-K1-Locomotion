@@ -32,7 +32,7 @@ from .velocity_env_cfg import (
 
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
-from .mdp import feet_phase, phase_obs
+from .mdp import feet_phase, phase_obs, feet_height_bezier
 from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji
 
 ##
@@ -206,16 +206,28 @@ class K1Rewards(RewardsCfg):
 
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
-    feet_phase = RewTerm(
-        func=feet_phase,
-        weight=2.2, # 位相に合わせて足を動かすことへの報酬
+    # feet_phase = RewTerm(
+    #     func=feet_phase,
+    #     weight=2.2, # 位相に合わせて足を動かすことへの報酬
+    #     params={
+    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+    #         "command_name": "base_velocity",
+    #         "phase_freq": 1.5,
+    #         "stance_ratio": _STANCE_RATIO,
+    #     },
+    # )
+
+    feet_height_bezier = RewTerm(
+        func=feet_height_bezier,
+        weight=1.5, # 足の高さが理想的なベジェ曲線に近い場合の報酬
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-            "command_name": "base_velocity",
-            "phase_freq": 1.5,
+            "swing_height": 0.12,
+            "sigma": 0.005,
+            "phase_freq": 1.7,
             "stance_ratio": _STANCE_RATIO,
         },
     )
+
 
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_positive_biped,
@@ -226,6 +238,7 @@ class K1Rewards(RewardsCfg):
             "threshold": 0.4,
         },
     )
+
     feet_slide = RewTerm(
         func=mdp.feet_slide,
         weight=-1.0,
@@ -277,19 +290,19 @@ class K1Rewards(RewardsCfg):
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=20.0,
+        weight=30.0,
         params={
             "sigma": 0.08
         },
     )
 
-    foot_clearance_ji = RewTerm(
-        func=foot_clearance_ji,
-        weight=-200.0,
-        params={
-            "target_clearance": 0.09,
-        },
-    )
+    # foot_clearance_ji = RewTerm(
+    #     func=foot_clearance_ji,
+    #     weight=-30.0,
+    #     params={
+    #         "target_clearance": 0.10,
+    #     },
+    # )
 
 # ---------------------------------------------------------------------------
 # Environment configs
@@ -328,7 +341,7 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "threshold": 1.0,
             },
         )
-        self.rewards.flat_orientation_l2.weight = -1.0
+        self.rewards.flat_orientation_l2.weight = -20.0
         self.rewards.action_rate_l2.weight = -0.005
         self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(

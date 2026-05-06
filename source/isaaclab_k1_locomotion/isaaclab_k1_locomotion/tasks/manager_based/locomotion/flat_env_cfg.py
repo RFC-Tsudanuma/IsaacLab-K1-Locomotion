@@ -22,7 +22,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=modify_command_resampling_time_range,
         params={
             "command_name": "base_velocity",
-            "resampling_time_range": (1.0, 5.0),
+            "resampling_time_range": (2.0, 7.0),
             "num_steps": 5000,
         },
     )
@@ -46,6 +46,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
 
         # Rewards
         self.rewards.track_ang_vel_z_exp.weight = 2.0
+        self.rewards.ang_vel_xy_l2.weight = -0.07
         self.rewards.lin_vel_z_l2.weight = -0.2
         self.rewards.action_rate_l2.weight = -0.005
         self.rewards.dof_acc_l2.weight = -1.0e-7
@@ -55,8 +56,8 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.6, 0.6)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.6, 0.6)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
@@ -67,7 +68,7 @@ class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
         super().__post_init__()
 
         self.scene.num_envs = 50
-        self.scene.env_spacing = 2.5
+        self.scene.env_spacing = 0.1
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
