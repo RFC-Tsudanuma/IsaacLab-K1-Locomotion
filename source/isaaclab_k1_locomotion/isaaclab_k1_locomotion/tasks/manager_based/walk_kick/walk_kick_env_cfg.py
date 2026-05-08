@@ -209,7 +209,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 2: ボール接近報酬をフェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 10.0,
+            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 5.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         # self.curriculum.approach_ball_weight = CurrTerm(
@@ -226,7 +226,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 30.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 100.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
@@ -246,13 +246,13 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         #     weight=10.0,
         # )
 
-        # # ------------------------------------------------------------------ #
-        # # Terminations: ボールに到達したらエピソード終了
-        # # ------------------------------------------------------------------ #
-        # self.terminations.reached_ball = DoneTerm(
-        #     func=mdp.reached_ball,
-        #     params={"threshold": 0.3},
-        # )
+        # ------------------------------------------------------------------ #
+        # Terminations: 足がボールに触れてから delay_steps 後にエピソード終了
+        # ------------------------------------------------------------------ #
+        self.terminations.ball_kicked = DoneTerm(
+            func=mdp.ball_kicked_after_contact,
+            params={"delay_steps": 100},  # 制御周波数 50Hz で約 2秒に相当
+        )
 
         # ------------------------------------------------------------------ #
         # その他
