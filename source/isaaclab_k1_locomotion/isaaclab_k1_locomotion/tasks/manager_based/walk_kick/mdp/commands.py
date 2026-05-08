@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING
 from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
 from isaaclab.utils import configclass
+from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -79,3 +80,40 @@ class KickDirectionCommandCfg(UniformVelocityCommandCfg):
     """
 
     class_type: type = KickDirectionCommand
+
+
+class BallFollowVelocityCommand(UniformVelocityCommand):
+    """ボール追従速度コマンド。
+
+    毎ステップ、速度コマンド (vx, vy, wz) をロボットフレームでの
+    ボール相対位置 (x, y) と wz=0 に更新する。
+    velocity tracking 報酬と組み合わせることでボール追従を実現する。
+    """
+
+    cfg: "BallFollowVelocityCommandCfg"
+
+    def _resample_command(self, _env_ids):
+        # 毎ステップ _update_command で上書きするためリサンプルは不要
+        pass
+
+    def _update_command(self):
+        ball = self._env.scene["soccer_ball"]
+        robot = self._env.scene["robot"]
+
+        rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
+        rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
+
+        max_vel = self.cfg.max_vel
+        self.vel_command_b[:, 0] = torch.clamp(rel_pos_b[:, 0], -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(rel_pos_b[:, 1], -max_vel, max_vel)
+        self.vel_command_b[:, 2] = 0.0
+
+
+@configclass
+class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
+    """ボール追従速度コマンドの設定クラス。"""
+
+    class_type: type = BallFollowVelocityCommand
+
+    max_vel: float = 1.0
+    """速度コマンドの上限 [m/s]。ボール相対位置をこの値でクランプする。"""

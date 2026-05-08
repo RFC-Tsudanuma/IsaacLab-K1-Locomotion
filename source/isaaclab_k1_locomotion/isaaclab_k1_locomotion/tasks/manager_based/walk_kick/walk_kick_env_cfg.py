@@ -76,8 +76,26 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
 
         # ------------------------------------------------------------------ #
-        # Commands: 蹴り方向コマンドを追加（既存の base_velocity はそのまま維持）
+        # Commands: base_velocity をボール追従コマンドに置き換え
+        #   vx = ロボットフレームでのボール相対 x 位置（クランプ済み）
+        #   vy = ロボットフレームでのボール相対 y 位置（クランプ済み）
+        #   wz = 0
         # ------------------------------------------------------------------ #
+        self.commands.base_velocity = mdp.BallFollowVelocityCommandCfg(
+            asset_name="robot",
+            resampling_time_range=(10.0, 10.0),
+            heading_command=False,
+            debug_vis=False,
+            max_vel=1.0,
+            ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
+                lin_vel_x=(-1.0, 1.0),
+                lin_vel_y=(-1.0, 1.0),
+                ang_vel_z=(0.0, 0.0),
+                heading=(0.0, 0.0),
+            ),
+        )
+
+        # 蹴り方向コマンドを追加
         self.commands.kick_direction = mdp.KickDirectionCommandCfg(
             asset_name="robot",
             resampling_time_range=(10.0, 10.0),
@@ -176,17 +194,17 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # start_step / end_step はiteration数で指定する
         _spi = 24
 
-        # Phase 1→2: 速度追従報酬をフェードアウト
-        self.curriculum.track_lin_vel_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
-        self.curriculum.track_ang_vel_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
+        # # Phase 1→2: 速度追従報酬をフェードアウト
+        # self.curriculum.track_lin_vel_weight = CurrTerm(
+        #     func=mdp.linear_reward_weight,
+        #     params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.0,
+        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        # )
+        # self.curriculum.track_ang_vel_weight = CurrTerm(
+        #     func=mdp.linear_reward_weight,
+        #     params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.0,
+        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        # )
 
         # Phase 2: ボール接近報酬をフェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
@@ -194,16 +212,16 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 10.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
-        self.curriculum.approach_ball_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "approach_ball", "start_weight": 0.0, "end_weight": 50.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
-        self.curriculum.align_to_kick_direction_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 10.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
+        # self.curriculum.approach_ball_weight = CurrTerm(
+        #     func=mdp.linear_reward_weight,
+        #     params={"term_name": "approach_ball", "start_weight": 0.0, "end_weight": 50.0,
+        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        # )
+        # self.curriculum.align_to_kick_direction_weight = CurrTerm(
+        #     func=mdp.linear_reward_weight,
+        #     params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 10.0,
+        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        # )
 
         # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(

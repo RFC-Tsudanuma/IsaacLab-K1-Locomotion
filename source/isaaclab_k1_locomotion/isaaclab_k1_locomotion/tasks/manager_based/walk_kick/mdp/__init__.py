@@ -7,4 +7,11 @@ from .curriculums import *
 from .observations import *
 from .rewards import *
 from .terminations import *
-from .commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg, KickDirectionCommand, KickDirectionCommandCfg
+from .commands import (
+    BallFollowVelocityCommand,
+    BallFollowVelocityCommandCfg,
+    DiscreteVelocityCommand,
+    DiscreteVelocityCommandCfg,
+    KickDirectionCommand,
+    KickDirectionCommandCfg,
+)
