@@ -139,15 +139,25 @@ def reach_ball_bonus(
 def approach_ball(
     env: ManagerBasedRLEnv,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    sigma: float = 1.0,
 ) -> torch.Tensor:
-    """ボールに近いほど高い報酬（蹴り位置への接近を促す）。shape: (N,)"""
+    """前ステップより近づいた分だけ報酬（ポテンシャル差分）。shape: (N,)"""
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
     dist = torch.norm(
         ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
     )
-    return torch.exp(-dist / sigma)
+
+    if not hasattr(env, "_approach_ball_prev_dist"):
+        env._approach_ball_prev_dist = dist.clone()
+        return torch.zeros(env.num_envs, device=env.device)
+
+    # エピソードリセット直後は差分をゼロにする
+    just_reset = env.episode_length_buf <= 1
+    env._approach_ball_prev_dist[just_reset] = dist[just_reset]
+
+    reward = env._approach_ball_prev_dist - dist
+    env._approach_ball_prev_dist = dist.clone()
+    return reward
 
 
 def align_to_kick_direction(
