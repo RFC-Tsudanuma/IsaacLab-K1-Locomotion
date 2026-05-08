@@ -192,7 +192,7 @@ def kick_direction_exp(
     env: ManagerBasedRLEnv,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     command_name: str = "kick_direction",
-    sigma: float = 0.5,
+    sigma: float = 0.25,
 ) -> torch.Tensor:
     """ボール速度方向が kick_direction コマンドと一致しているときの指数報酬。shape: (N,)
 
