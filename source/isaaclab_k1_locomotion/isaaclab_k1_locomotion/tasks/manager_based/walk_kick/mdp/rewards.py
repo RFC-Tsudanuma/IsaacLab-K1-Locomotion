@@ -234,6 +234,54 @@ def kick_velocity_exp(
     return 1.0 - torch.exp(-torch.clamp(speed_in_kick_dir, min=0.0) / sigma)
 
 
+def reset_ball_after_kick(
+    env: ManagerBasedRLEnv,
+    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
+    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    delay_steps: int = 20,
+    contact_threshold: float = 0.5,
+) -> torch.Tensor:
+    """足がボールに触れてから delay_steps 後にボールを初期位置へリセットする。
+
+    エピソードを終了せずボールだけをリセットすることで、ロボットが
+    連続してキック練習を行えるようにする。報酬は常に 0。
+    """
+    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
+    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
+
+    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
+    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
+    contacted = (force_right > contact_threshold) | (force_left > contact_threshold)
+
+    if not hasattr(env, "_ball_reset_counter"):
+        env._ball_reset_counter = torch.zeros(env.num_envs, dtype=torch.int32, device=env.device)
+
+    just_reset = env.episode_length_buf <= 1
+    env._ball_reset_counter[just_reset] = 0
+
+    counting = env._ball_reset_counter > 0
+    should_increment = (counting | contacted) & (env._ball_reset_counter < delay_steps)
+    env._ball_reset_counter[should_increment] += 1
+
+    triggered = (env._ball_reset_counter >= delay_steps).nonzero(as_tuple=False).squeeze(-1)
+    if triggered.numel() > 0:
+        ball = env.scene[ball_cfg.name]
+        ball_state = ball.data.default_root_state[triggered].clone()
+
+        noise_x = torch.empty(triggered.numel(), device=env.device).uniform_(-0.05, 0.10)
+        noise_y = torch.empty(triggered.numel(), device=env.device).uniform_(-0.10, 0.10)
+        ball_state[:, 0] += noise_x
+        ball_state[:, 1] += noise_y
+        ball_state[:, :3] += env.scene.env_origins[triggered]
+        ball_state[:, 7:] = 0.0
+
+        ball.write_root_state_to_sim(ball_state, env_ids=triggered)
+        env._ball_reset_counter[triggered] = 0
+
+    return torch.zeros(env.num_envs, device=env.device)
+
+
 def single_foot_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
