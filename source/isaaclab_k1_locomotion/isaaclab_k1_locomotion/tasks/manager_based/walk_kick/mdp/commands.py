@@ -136,7 +136,23 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         max_vel = self.cfg.max_vel
         self.vel_command_b[:, 0] = torch.clamp(rel_pos_b[:, 0], -max_vel, max_vel)
         self.vel_command_b[:, 1] = torch.clamp(rel_pos_b[:, 1], -max_vel, max_vel)
-        self.vel_command_b[:, 2] = 0.0
+
+        # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
+        if self.cfg.kick_direction_command_name:
+            kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
+            # kick_cmd = [sin θ, cos θ, 0] → world frame angle θ
+            kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
+
+            quat = robot.data.root_quat_w
+            w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+            robot_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+            ang_error = kick_theta - robot_yaw
+            # [-π, π] に正規化
+            ang_error = torch.atan2(torch.sin(ang_error), torch.cos(ang_error))
+            self.vel_command_b[:, 2] = torch.clamp(ang_error, -self.cfg.max_ang_vel, self.cfg.max_ang_vel)
+        else:
+            self.vel_command_b[:, 2] = 0.0
 
 
 @configclass
@@ -147,3 +163,9 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
 
     max_vel: float = 1.0
     """速度コマンドの上限 [m/s]。ボール相対位置をこの値でクランプする。"""
+
+    max_ang_vel: float = 1.0
+    """角速度コマンドの上限 [rad/s]。角度誤差をこの値でクランプする。"""
+
+    kick_direction_command_name: str | None = None
+    """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""

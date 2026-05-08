@@ -87,10 +87,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             heading_command=False,
             debug_vis=False,
             max_vel=1.0,
+            max_ang_vel=1.0,
+            kick_direction_command_name="kick_direction",
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
                 lin_vel_x=(-1.0, 1.0),
                 lin_vel_y=(-1.0, 1.0),
-                ang_vel_z=(0.0, 0.0),
+                ang_vel_z=(-1.0, 1.0),
                 heading=(0.0, 0.0),
             ),
         )
