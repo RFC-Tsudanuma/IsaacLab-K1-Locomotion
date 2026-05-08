@@ -209,7 +209,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 2: ボール接近報酬をフェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 5.0,
+            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         # self.curriculum.approach_ball_weight = CurrTerm(
@@ -226,17 +226,17 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 100.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 3,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 10.0,
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 0.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -5,
+            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": 0.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
