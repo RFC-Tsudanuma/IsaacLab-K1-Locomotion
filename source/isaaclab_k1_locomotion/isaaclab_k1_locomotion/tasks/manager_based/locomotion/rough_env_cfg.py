@@ -206,27 +206,27 @@ class K1Rewards(RewardsCfg):
 
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
-    # feet_phase = RewTerm(
-    #     func=feet_phase,
-    #     weight=2.2, # 位相に合わせて足を動かすことへの報酬
-    #     params={
-    #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-    #         "command_name": "base_velocity",
-    #         "phase_freq": 1.5,
-    #         "stance_ratio": _STANCE_RATIO,
-    #     },
-    # )
-
-    feet_height_bezier = RewTerm(
-        func=feet_height_bezier,
-        weight=1.5, # 足の高さが理想的なベジェ曲線に近い場合の報酬
+    feet_phase = RewTerm(
+        func=feet_phase,
+        weight=2.0, # 位相に合わせて足を動かすことへの報酬
         params={
-            "swing_height": 0.12,
-            "sigma": 0.005,
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+            "command_name": "base_velocity",
             "phase_freq": 1.7,
             "stance_ratio": _STANCE_RATIO,
         },
     )
+
+    # feet_height_bezier = RewTerm(
+    #     func=feet_height_bezier,
+    #     weight=1.5, # 足の高さが理想的なベジェ曲線に近い場合の報酬
+    #     params={
+    #         "swing_height": 0.12,
+    #         "sigma": 0.005,
+    #         "phase_freq": 1.7,
+    #         "stance_ratio": _STANCE_RATIO,
+    #     },
+    # )
 
 
     feet_air_time = RewTerm(
@@ -262,7 +262,7 @@ class K1Rewards(RewardsCfg):
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.15,
+        weight=-0.01,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*Knee.*" ,".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -296,13 +296,16 @@ class K1Rewards(RewardsCfg):
         },
     )
 
-    # foot_clearance_ji = RewTerm(
-    #     func=foot_clearance_ji,
-    #     weight=-30.0,
-    #     params={
-    #         "target_clearance": 0.10,
-    #     },
-    # )
+    foot_clearance_ji = RewTerm(
+        func=foot_clearance_ji,
+        weight=-100.0,
+        params={
+            "command_name": "base_velocity",
+            "target_clearance": 0.10,
+            "phase_freq": 1.7,
+            "stance_ratio": _STANCE_RATIO,
+        },
+    )
 
 # ---------------------------------------------------------------------------
 # Environment configs

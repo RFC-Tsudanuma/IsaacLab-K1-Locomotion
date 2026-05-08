@@ -330,21 +330,44 @@ def both_feet_not_in_contact(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg)
 
     return both_feet_not_in_contact.float() * -1.0  # Penalty of -1 when both feet are not in contact
 
-def foot_clearance_ji(env: ManagerBasedRLEnv, target_clearance: float = 0.06) -> torch.Tensor:
+def foot_clearance_ji(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    target_clearance: float = 0.10,
+    phase_freq: float = 1.5,
+    stance_ratio: float = 0.55,
+    cmd_threshold: float = 0.1,
+) -> torch.Tensor:
+    """遊脚にのみ高さ追従ペナルティを与える。
+
+    遊脚判定は ``feet_phase`` と同じ規約（位相オシレータの desired stance、
+    コマンド速度が ``cmd_threshold`` 以下の時は両足 stance 扱い）。
+    """
     asset = env.scene["robot"]
 
-    # Get foot body indices
     left_foot_idx = asset.find_bodies("left_foot_link")[0][0]
     right_foot_idx = asset.find_bodies("right_foot_link")[0][0]
-    right_foot_xy_vel_sq = torch.sqrt(torch.norm(asset.data.body_lin_vel_w[:, right_foot_idx, :2], dim=1))
-    left_foot_xy_vel_sq = torch.sqrt(torch.norm(asset.data.body_lin_vel_w[:, left_foot_idx, :2], dim=1))
 
     right_foot_height_err = torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2])
     left_foot_height_err = torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2])
 
-    right_reward = right_foot_height_err * right_foot_xy_vel_sq
-    left_reward = left_foot_height_err * left_foot_xy_vel_sq
-    return right_reward + left_reward
+    # feet_phase と同一の desired-stance 判定
+    t = env.episode_length_buf * env.step_dt
+    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    phase_right = (phase_left + math.pi) % (2.0 * math.pi)
+    stance_threshold = 2.0 * math.pi * stance_ratio
+    desired_stance_left = phase_left < stance_threshold
+    desired_stance_right = phase_right < stance_threshold
+
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    is_stopped = cmd_speed <= cmd_threshold
+    desired_stance_left = desired_stance_left | is_stopped
+    desired_stance_right = desired_stance_right | is_stopped
+
+    swing_left = (~desired_stance_left).float()
+    swing_right = (~desired_stance_right).float()
+
+    return right_foot_height_err * swing_right + left_foot_height_err * swing_left
 
 
 def _expected_foot_height_bezier(phi: torch.Tensor, swing_height: float, stance_ratio: float = 0.5) -> torch.Tensor:

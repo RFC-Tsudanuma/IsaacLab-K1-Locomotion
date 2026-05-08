@@ -10,7 +10,7 @@ from isaaclab.utils import configclass
 from .rough_env_cfg import K1RoughEnvCfg
 from .velocity_env_cfg import CurriculumCfg
 import math
-from .mdp.curriculums import modify_command_resampling_time_range
+from .mdp.curriculums import modify_command_resampling_time_range, lin_vel_command_curriculum
 
 
 @configclass
@@ -24,6 +24,20 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             "command_name": "base_velocity",
             "resampling_time_range": (2.0, 7.0),
             "num_steps": 5000,
+        },
+    )
+
+    # 線速度コマンド範囲を段階的に拡げるカリキュラム
+    # 追従誤差(EMA)が threshold を下回るとステージが進む: ±0.3 → ±0.6 → ±1.0
+    lin_vel_command = CurrTerm(
+        func=lin_vel_command_curriculum,
+        params={
+            "command_name": "base_velocity",
+            "stages": [(-0.3, 0.3), (-0.7, 0.7), (-1.0, 1.0)],
+            "error_threshold": 0.2,
+            "asset_name": "robot",
+            "ema_alpha": 0.02,
+            "min_updates": 50,
         },
     )
 
@@ -48,7 +62,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.07
         self.rewards.lin_vel_z_l2.weight = -0.2
-        self.rewards.action_rate_l2.weight = -0.005
+        self.rewards.action_rate_l2.weight = -0.01
         self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
@@ -56,8 +70,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.6, 0.6)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.6, 0.6)
+        # lin_vel_x / lin_vel_y は lin_vel_command カリキュラムが段階的に拡張する
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
