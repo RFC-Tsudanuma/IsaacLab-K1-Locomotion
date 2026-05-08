@@ -9,8 +9,10 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
+import isaaclab.utils.math as math_utils
 from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
+from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
@@ -62,13 +64,41 @@ class KickDirectionCommand(UniformVelocityCommand):
 
     cfg: "KickDirectionCommandCfg"
 
-    def _resample(self, env_ids: torch.Tensor):
+    def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
         low, high = self.cfg.ranges.heading
         theta = torch.empty(n, device=self.device).uniform_(low, high)
         self.command[env_ids, 0] = torch.sin(theta)
         self.command[env_ids, 1] = torch.cos(theta)
         self.command[env_ids, 2] = 0.0
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        if debug_vis:
+            if not hasattr(self, "kick_dir_visualizer"):
+                self.kick_dir_visualizer = VisualizationMarkers(self.cfg.goal_vel_visualizer_cfg)
+            self.kick_dir_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "kick_dir_visualizer"):
+                self.kick_dir_visualizer.set_visibility(False)
+
+    def _debug_vis_callback(self, _event):
+        if not self.robot.is_initialized:
+            return
+        base_pos_w = self.robot.data.root_pos_w.clone()
+        base_pos_w[:, 2] += 0.5
+
+        # command = [sin θ, cos θ, 0] → world frame angle θ
+        kick_x = self.command[:, 1]  # cos θ
+        kick_y = self.command[:, 0]  # sin θ
+        theta = torch.atan2(kick_y, kick_x)  # = θ (world frame)
+
+        zeros = torch.zeros_like(theta)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, theta)
+
+        default_scale = self.kick_dir_visualizer.cfg.markers["arrow"].scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(self.num_envs, 1)
+
+        self.kick_dir_visualizer.visualize(base_pos_w, arrow_quat, arrow_scale)
 
 
 @configclass
