@@ -201,40 +201,47 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 2: 速度追従をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.9,
+            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.9,
+            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
-        # Phase 2: ボール接近・キック関連報酬をフェードイン
+        # Phase 2: ボール接近関連報酬をフェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
+
+        # Phase 3: キック関連報酬をフェードイン
         self.curriculum.robot_xy_speed_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 1.5,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 0.2,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+        )
+        self.curriculum.touch_ball_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "touch_ball", "start_weight": 0.0, "end_weight": 0.2,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
         # # ボールに到達したときの成功ボーナス（タイムアウト終了は除外）
@@ -263,7 +270,7 @@ class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
         super().__post_init__()
 
         self.scene.num_envs = 20
-        self.scene.env_spacing = 10
+        self.scene.env_spacing = 4
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
