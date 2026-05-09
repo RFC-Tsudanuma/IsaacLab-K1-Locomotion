@@ -99,7 +99,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # 蹴り方向コマンドを追加
         self.commands.kick_direction = mdp.KickDirectionCommandCfg(
             asset_name="robot",
-            resampling_time_range=(10.0, 10.0),
+            resampling_time_range=(1000.0, 1000.0),  # タイマーリサンプル無効化（ボールリセット時のみ更新）
             heading_command=False,
             debug_vis=True,
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
