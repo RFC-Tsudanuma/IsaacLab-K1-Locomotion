@@ -159,6 +159,10 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             func=mdp.robot_xy_speed,
             weight=0.0,
         )
+        self.rewards.robot_ang_speed = RewTerm(
+            func=mdp.robot_ang_speed,
+            weight=0.0,
+        )
         self.rewards.approach_ball = RewTerm(
             func=mdp.approach_ball,
             weight=0.0,
@@ -176,12 +180,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.kick_direction_exp = RewTerm(
             func=mdp.kick_direction_exp,
             weight=0.0,
-            params={"command_name": "kick_direction", "sigma": 0.5},
+            params={"command_name": "kick_direction", "sigma": 0.25},
         )
         self.rewards.kick_velocity_exp = RewTerm(
             func=mdp.kick_velocity_exp,
             weight=0.0,
-            params={"command_name": "kick_direction", "sigma": 2.0},
+            params={"command_name": "kick_direction", "sigma": 1.0},
         )
         self.rewards.single_foot_contact = RewTerm(
             func=mdp.single_foot_contact,
@@ -206,7 +210,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.5,
+            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 1.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
@@ -223,19 +227,24 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 0.2,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
+        self.curriculum.robot_ang_speed_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "robot_ang_speed", "start_weight": 0.0, "end_weight": 0.2,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+        )
         self.curriculum.touch_ball_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "touch_ball", "start_weight": 0.0, "end_weight": 0.2,
+            params={"term_name": "touch_ball", "start_weight": 0.0, "end_weight": 1.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 8.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(

@@ -120,6 +120,14 @@ def robot_xy_speed(
     return robot.data.root_lin_vel_w[:, :2].norm(dim=-1)
 
 
+def robot_ang_speed(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """ロボットのヨー角速度の絶対値。shape: (N,)"""
+    robot = env.scene["robot"]
+    return robot.data.root_ang_vel_w[:, 2].abs()
+
+
 def reach_ball_bonus(
     env: ManagerBasedRLEnv,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
