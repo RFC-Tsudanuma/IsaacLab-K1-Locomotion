@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -171,29 +172,48 @@ def approach_ball(
 def align_to_kick_direction(
     env: ManagerBasedRLEnv,
     command_name: str = "kick_direction",
+    sigma: float = 0.5,
 ) -> torch.Tensor:
-    """ロボットのヨー方向が kick_direction コマンドと一致しているときの報酬。shape: (N,)
-
-    command = [sin θ, cos θ, 0]（KickDirectionCommand の形式）。
-    前方向ベクトルとの cos 類似度を [0, 1] にクリップして返す。
-    """
+    """ロボットのヨー方向と kick_direction の角度誤差に基づく指数報酬。shape: (N,)"""
     robot = env.scene["robot"]
     command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
 
-    quat = robot.data.root_quat_w  # (N, 4) [w, x, y, z]
+    quat = robot.data.root_quat_w
     w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
-    # ロボット前方ベクトル (cos yaw, sin yaw)
     forward_x = torch.cos(yaw)
     forward_y = torch.sin(yaw)
 
-    # kick_direction ベクトル: command[0]=sin θ, command[1]=cos θ → (cos θ, sin θ)
     kick_x = command[:, 1]  # cos θ
     kick_y = command[:, 0]  # sin θ
 
     cos_sim = forward_x * kick_x + forward_y * kick_y
-    return torch.clamp(cos_sim, min=0.0)
+    angle_error = torch.acos(torch.clamp(cos_sim, -1.0, 1.0))
+    return torch.exp(-angle_error ** 2 / sigma ** 2)
+
+
+def walk_speed_limit(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """最大歩行速度を超えた分のペナルティ（lin-function）。shape: (N,)
+
+    env._max_walking_speed [vx, vy, wz] を超えた成分の合計を返す。
+    負の重みで使用する。
+    """
+    robot = env.scene["robot"]
+    if not hasattr(env, "_max_walking_speed"):
+        return torch.zeros(env.num_envs, device=env.device)
+
+    vx = robot.data.root_lin_vel_b[:, 0].abs()
+    vy = robot.data.root_lin_vel_b[:, 1].abs()
+    wz = robot.data.root_ang_vel_b[:, 2].abs()
+
+    return (
+        torch.clamp(vx - env._max_walking_speed[:, 0], min=0.0)
+        + torch.clamp(vy - env._max_walking_speed[:, 1], min=0.0)
+        + torch.clamp(wz - env._max_walking_speed[:, 2], min=0.0)
+    )
 
 
 def kick_direction_exp(
@@ -219,6 +239,34 @@ def kick_direction_exp(
 
     cos_sim = (ball_dir * kick_dir).sum(dim=-1)
     return moving * torch.exp(-(1.0 - cos_sim) / sigma)
+
+
+def kick_velocity_accurate(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    command_name: str = "kick_direction",
+    sigma: float = 0.5,
+) -> torch.Tensor:
+    """ボール速度が kick_range 目標速度に一致しているときの指数報酬。shape: (N,)
+
+    kick_direction 方向の速度成分が env._kick_range に近いほど高い報酬。
+    ボールが動いていないときは報酬なし。
+    """
+    if not hasattr(env, "_kick_range"):
+        return torch.zeros(env.num_envs, device=env.device)
+
+    ball = env.scene[ball_cfg.name]
+    command = env.command_manager.get_command(command_name)
+    kick_dir = torch.stack([command[:, 1], command[:, 0]], dim=-1)  # (cos θ, sin θ)
+
+    ball_vel = ball.data.root_lin_vel_w[:, :2]
+    speed_in_kick_dir = (ball_vel * kick_dir).sum(dim=-1)
+
+    target_speed = env._kick_range[:, 0]
+    moving = (speed_in_kick_dir > 0.1).float()
+
+    error = speed_in_kick_dir - target_speed
+    return moving * torch.exp(-error ** 2 / sigma ** 2)
 
 
 def kick_velocity_exp(
@@ -249,12 +297,15 @@ def reset_ball_after_kick(
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     delay_steps: int = 20,
     contact_threshold: float = 0.5,
+    close_threshold: float = 0.25,
+    r_min: float = 0.5,
+    r_max: float = 1.0,
 ) -> torch.Tensor:
-    """足がボールに触れてから delay_steps 後にボールを初期位置へリセットする。
-
-    エピソードを終了せずボールだけをリセットすることで、ロボットが
-    連続してキック練習を行えるようにする。報酬は常に 0。
+    """足がボールに触れてから delay_steps 後、またはロボットがボールに近づきすぎた場合に
+    ボールをロボット周囲 [r_min, r_max] m のランダム位置へリセットする。報酬は常に 0。
     """
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene["robot"]
     sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
     sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
 
@@ -272,16 +323,21 @@ def reset_ball_after_kick(
     should_increment = (counting | contacted) & (env._ball_reset_counter < delay_steps)
     env._ball_reset_counter[should_increment] += 1
 
-    triggered = (env._ball_reset_counter >= delay_steps).nonzero(as_tuple=False).squeeze(-1)
-    if triggered.numel() > 0:
-        ball = env.scene[ball_cfg.name]
-        ball_state = ball.data.default_root_state[triggered].clone()
+    dist = (ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]).norm(dim=-1)
+    too_close = (dist < close_threshold) & ~counting
 
-        noise_x = torch.empty(triggered.numel(), device=env.device).uniform_(-0.05, 0.10)
-        noise_y = torch.empty(triggered.numel(), device=env.device).uniform_(-0.10, 0.10)
-        ball_state[:, 0] += noise_x
-        ball_state[:, 1] += noise_y
-        ball_state[:, :3] += env.scene.env_origins[triggered]
+    triggered = ((env._ball_reset_counter >= delay_steps) | too_close).nonzero(as_tuple=False).squeeze(-1)
+    if triggered.numel() > 0:
+        n = triggered.numel()
+        r = torch.empty(n, device=env.device).uniform_(r_min, r_max)
+        theta = torch.empty(n, device=env.device).uniform_(-math.pi, math.pi)
+
+        robot_pos = robot.data.root_pos_w[triggered]
+        default_z = ball.data.default_root_state[triggered, 2]
+        ball_state = ball.data.default_root_state[triggered].clone()
+        ball_state[:, 0] = robot_pos[:, 0] + r * torch.cos(theta)
+        ball_state[:, 1] = robot_pos[:, 1] + r * torch.sin(theta)
+        ball_state[:, 2] = env.scene.env_origins[triggered, 2] + default_z
         ball_state[:, 7:] = 0.0
 
         ball.write_root_state_to_sim(ball_state, env_ids=triggered)

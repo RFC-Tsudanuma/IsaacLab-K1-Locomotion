@@ -133,9 +133,17 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
         rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
 
+        # ロボットとボールの距離に応じてオフセットをスケール
+        # 遠い時はフルオフセット、近づくほどボール中心に収束
+        dist = rel_pos_b[:, :2].norm(dim=-1)
+        scale = torch.clamp(dist / self.cfg.kick_approach_radius, 0.0, 1.0)
+
+        kick_x = rel_pos_b[:, 0] - self.cfg.kick_offset_x * scale
+        kick_y = rel_pos_b[:, 1] - torch.sign(rel_pos_b[:, 1]) * self.cfg.kick_lateral_offset * scale
+
         max_vel = self.cfg.max_vel
-        self.vel_command_b[:, 0] = torch.clamp(rel_pos_b[:, 0], -max_vel, max_vel)
-        self.vel_command_b[:, 1] = torch.clamp(rel_pos_b[:, 1], -max_vel, max_vel)
+        self.vel_command_b[:, 0] = torch.clamp(kick_x, -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(kick_y, -max_vel, max_vel)
 
         # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
         if self.cfg.kick_direction_command_name:
@@ -166,6 +174,15 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
 
     max_ang_vel: float = 1.0
     """角速度コマンドの上限 [rad/s]。角度誤差をこの値でクランプする。"""
+
+    kick_offset_x: float = 0.1
+    """キック位置のx方向オフセット [m]。ボールより手前に止まる距離。"""
+
+    kick_lateral_offset: float = 0.15
+    """キック位置の横方向オフセット [m]。近い方の足でキックするようにずらす量。"""
+
+    kick_approach_radius: float = 0.4
+    """このボールまでの距離以下でオフセットが線形に縮小し始める [m]。0でボール中心に収束。"""
 
     kick_direction_command_name: str | None = None
     """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""

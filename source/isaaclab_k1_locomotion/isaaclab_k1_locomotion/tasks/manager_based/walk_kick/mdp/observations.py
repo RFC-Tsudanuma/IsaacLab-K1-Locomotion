@@ -41,6 +41,24 @@ def ball_vel_rel(
     return vel_b
 
 
+def max_walking_speed(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """エピソードごとにサンプリングされた最大歩行速度 [vx, vy, wz]。shape: (N, 3)"""
+    if not hasattr(env, "_max_walking_speed"):
+        return torch.zeros(env.num_envs, 3, device=env.device)
+    return env._max_walking_speed
+
+
+def kick_range(
+    env: ManagerBasedRLEnv,
+) -> torch.Tensor:
+    """エピソードごとにサンプリングされた目標ボール速度（kick range）。shape: (N, 1)"""
+    if not hasattr(env, "_kick_range"):
+        return torch.zeros(env.num_envs, 1, device=env.device)
+    return env._kick_range
+
+
 def kick_dir_sincos(
     env: ManagerBasedRLEnv,
     command_name: str = "kick_direction",

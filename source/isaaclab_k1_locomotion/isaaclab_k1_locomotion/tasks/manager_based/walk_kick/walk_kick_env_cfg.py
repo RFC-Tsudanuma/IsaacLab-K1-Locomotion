@@ -122,84 +122,99 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             func=mdp.kick_dir_sincos,
             params={"command_name": "kick_direction"},
         )
+        self.observations.policy.max_walking_speed = ObsTerm(func=mdp.max_walking_speed)
+        self.observations.policy.kick_range = ObsTerm(func=mdp.kick_range)
 
 
 
         # ------------------------------------------------------------------ #
-        # Events: ボール位置リセット
+        # Events: ボール位置リセット・最大歩行速度サンプリング
         # ------------------------------------------------------------------ #
         self.events.reset_ball = EventTerm(
-            func=loco_mdp.reset_root_state_uniform,
+            func=mdp.reset_ball_polar,
             mode="reset",
             params={
-                "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
-                "pose_range": {
-                    "x": (-0.05, 0.10),
-                    "y": (-0.10, 0.10),
-                    "z": (0.0, 0.0),
-                },
-                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "ball_cfg": SceneEntityCfg("soccer_ball"),
+                "r_min": 0.5,
+                "r_max": 1.0,
             },
+        )
+        self.events.sample_max_walking_speed = EventTerm(
+            func=mdp.sample_max_walking_speed,
+            mode="reset",
+            params={
+                "x_range": (0.5, 1.5),
+                "y_range": (0.5, 1.0),
+                "yaw_range": (1.0, 1.5),
+            },
+        )
+        self.events.sample_kick_range = EventTerm(
+            func=mdp.sample_kick_range,
+            mode="reset",
+            params={"speed_range": (1.0, 2.0)},
         )
 
         # ------------------------------------------------------------------ #
-        # Rewards: track_lin_vel_xy を無効化し，ボール保持と前進速度に置き換え
+        # Rewards
         # ------------------------------------------------------------------ #
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
         self.rewards.track_ang_vel_z_exp.weight = 1.0
-        #self.rewards.action_rate_l2.weight = 0.0
 
-        # Phase 2 以降で有効化（初期 weight=0、カリキュラムで増加）
+        # Walk Speed (固定 x1.5, lin-function)
+        self.rewards.robot_xy_speed = RewTerm(func=mdp.robot_xy_speed, weight=1.5)
+
+        # Walk Speed Limit (固定 x-0.1, lin-function)
+        self.rewards.walk_speed_limit = RewTerm(func=mdp.walk_speed_limit, weight=-0.1)
+
+        # Ball Vision (カリキュラム -0.15→0.15, e-function)
         self.rewards.ball_in_front = RewTerm(
             func=mdp.ball_in_front,
-            weight=0.0,
-            params={"fov_half_angle": 0.524},  # ±30°
+            weight=-0.15,
+            params={"fov_half_angle": 0.524},
         )
-        self.rewards.robot_xy_speed = RewTerm(
-            func=mdp.robot_xy_speed,
-            weight=0.0,
-        )
-        self.rewards.robot_ang_speed = RewTerm(
-            func=mdp.robot_ang_speed,
-            weight=0.0,
-        )
-        self.rewards.approach_ball = RewTerm(
-            func=mdp.approach_ball,
-            weight=0.0,
-        )
+
+        # Kick Direction Alignment (カリキュラム 0→0.15, e-function)
         self.rewards.align_to_kick_direction = RewTerm(
             func=mdp.align_to_kick_direction,
             weight=0.0,
-            params={"command_name": "kick_direction"},
+            params={"command_name": "kick_direction", "sigma": 0.5},
         )
-        # Phase 3 以降で有効化
-        self.rewards.touch_ball = RewTerm(
-            func=mdp.touch_ball,
-            weight=0.0,
-        )
+
+        # Kick Direction (カリキュラム 0→2.0, e-function)
         self.rewards.kick_direction_exp = RewTerm(
             func=mdp.kick_direction_exp,
             weight=0.0,
             params={"command_name": "kick_direction", "sigma": 0.25},
         )
+
+        # Kick Velocity (カリキュラム 0→4.0, e-function)
         self.rewards.kick_velocity_exp = RewTerm(
             func=mdp.kick_velocity_exp,
             weight=0.0,
             params={"command_name": "kick_direction", "sigma": 1.0},
         )
+
+        # Kick Velocity Accurate (カリキュラム 0→4.0, e-function)
+        self.rewards.kick_velocity_accurate = RewTerm(
+            func=mdp.kick_velocity_accurate,
+            weight=0.0,
+            params={"command_name": "kick_direction", "sigma": 0.5},
+        )
+
+        # Single Feet Avoidance (カリキュラム -0.15→0, e-function)
         self.rewards.single_foot_contact = RewTerm(
             func=mdp.single_foot_contact,
-            weight=0.0,
+            weight=-0.15,
         )
 
         # ------------------------------------------------------------------ #
-        # Curriculum: 2フェーズで報酬重みを段階的に切り替え
-        #   Phase 1 (    0-1000): 速度追従のみ
-        #   Phase 2 (1000-1500): 全報酬を最終値まで一斉にフェードイン/アウト
+        # Curriculum: 3フェーズで報酬重みを段階的に切り替え
+        #   Phase 1 (    0-1000): 速度追従 + Walk Speed + Walk Speed Limit
+        #   Phase 2 (1000-1500): Ball Vision, Kick Direction Alignment フェードイン
+        #   Phase 3 (1500-2000): Kick 関連報酬フェードイン, Single Feet フェードアウト
         # ------------------------------------------------------------------ #
 
         # steps_per_iteration = num_steps_per_env (PPO config) = 24
-        # start_step / end_step はiteration数で指定する
         _spi = 24
 
         # Phase 2: 速度追従をフェードアウト
@@ -210,46 +225,43 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 1.5,
+            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
-        # Phase 2: ボール接近関連報酬をフェードイン
+        # Phase 2: Ball Vision (-0.15→0.15), Kick Direction Alignment (0→0.15)
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
+            params={"term_name": "ball_in_front", "start_weight": -0.15, "end_weight": 0.15,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        )
+        self.curriculum.align_to_kick_direction_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 0.15,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
-        # Phase 3: キック関連報酬をフェードイン
-        self.curriculum.robot_xy_speed_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 0.2,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
-        )
-        self.curriculum.robot_ang_speed_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "robot_ang_speed", "start_weight": 0.0, "end_weight": 0.2,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
-        )
-        self.curriculum.touch_ball_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "touch_ball", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
-        )
+        # Phase 3: Kick 関連報酬フェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 8.0,
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
+        self.curriculum.kick_velocity_accurate_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "kick_velocity_accurate", "start_weight": 0.0, "end_weight": 4.0,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+        )
+
+        # Phase 3: Single Feet Avoidance フェードアウト (-0.15→0)
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
+            params={"term_name": "single_foot_contact", "start_weight": -0.15, "end_weight": 0.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
