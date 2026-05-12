@@ -160,16 +160,16 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
         self.rewards.track_ang_vel_z_exp.weight = 1.0
 
-        # Walk Speed (固定 x1.5, lin-function)
-        self.rewards.robot_xy_speed = RewTerm(func=mdp.robot_xy_speed, weight=1.5)
+        # Walk Speed (カリキュラム 0→1.5, lin-function, Phase 3から)
+        self.rewards.robot_xy_speed = RewTerm(func=mdp.robot_xy_speed, weight=0.0)
 
-        # Walk Speed Limit (固定 x-0.1, lin-function)
-        self.rewards.walk_speed_limit = RewTerm(func=mdp.walk_speed_limit, weight=-0.1)
+        # Walk Speed Limit (カリキュラム 0→-0.1, lin-function, Phase 3から)
+        self.rewards.walk_speed_limit = RewTerm(func=mdp.walk_speed_limit, weight=0.0)
 
-        # Ball Vision (カリキュラム -0.15→0.15, e-function)
+        # Ball Vision (カリキュラム 0→0.15, 報酬値 [-0.15, 0.15], Phase 2から)
         self.rewards.ball_in_front = RewTerm(
             func=mdp.ball_in_front,
-            weight=-0.15,
+            weight=0.0,
             params={"fov_half_angle": 0.524},
         )
 
@@ -204,7 +204,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Single Feet Avoidance (カリキュラム -0.15→0, e-function)
         self.rewards.single_foot_contact = RewTerm(
             func=mdp.single_foot_contact,
-            weight=-0.15,
+            weight=-0.0,
         )
 
         # ------------------------------------------------------------------ #
@@ -232,13 +232,25 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 2: Ball Vision (-0.15→0.15), Kick Direction Alignment (0→0.15)
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "ball_in_front", "start_weight": -0.15, "end_weight": 0.15,
+            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 0.15,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.align_to_kick_direction_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 0.15,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        )
+
+        # Phase 3: Walk Speed (0→1.5), Walk Speed Limit (0→-0.1)
+        self.curriculum.robot_xy_speed_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 1.5,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+        )
+        self.curriculum.walk_speed_limit_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "walk_speed_limit", "start_weight": 0.0, "end_weight": -0.1,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
         # Phase 3: Kick 関連報酬フェードイン
