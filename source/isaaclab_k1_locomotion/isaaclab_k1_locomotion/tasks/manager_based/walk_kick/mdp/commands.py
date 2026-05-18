@@ -9,13 +9,12 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
-import isaaclab.sim as sim_utils
 import isaaclab.utils.math as math_utils
 from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
-from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_rotate, quat_rotate_inverse, yaw_quat
+from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -123,17 +122,9 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
 
     cfg: "BallFollowVelocityCommandCfg"
 
-    def _is_random_phase(self) -> bool:
-        if self.cfg.ball_follow_start_iteration <= 0:
-            return False
-        step = self._env.common_step_counter // max(self.cfg.steps_per_iteration, 1)
-        return step < self.cfg.ball_follow_start_iteration
-
-    def _resample_command(self, env_ids: torch.Tensor):
-        if self._is_random_phase():
-            # Phase 1: 親クラスのランダムサンプリングを使用
-            super()._resample_command(env_ids)
-        # Phase 2+: _update_command が毎ステップ上書きするため不要
+    def _resample_command(self, _env_ids):
+        # 毎ステップ _update_command で上書きするためリサンプルは不要
+        pass
 
     def _update_command(self):
         ball = self._env.scene["soccer_ball"]
@@ -142,25 +133,14 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
         rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
 
-        dist = rel_pos_b[:, :2].norm(dim=-1)
-        scale = torch.clamp(dist / self.cfg.kick_approach_radius, 0.0, 1.0)
-
-        kick_x = rel_pos_b[:, 0] - self.cfg.kick_offset_x * scale
-        kick_y = rel_pos_b[:, 1] - torch.sign(rel_pos_b[:, 1]) * self.cfg.kick_lateral_offset * scale
-
-        # 可視化用に常に更新（Phase 1でも表示できるよう）
-        self._kick_pos_b = torch.stack([kick_x, kick_y, torch.zeros_like(kick_x)], dim=-1)
-
-        if self._is_random_phase():
-            return  # Phase 1: 速度コマンドはリサンプル時のランダム値をそのまま使用
-
         max_vel = self.cfg.max_vel
-        self.vel_command_b[:, 0] = torch.clamp(kick_x, -max_vel, max_vel)
-        self.vel_command_b[:, 1] = torch.clamp(kick_y, -max_vel, max_vel)
+        self.vel_command_b[:, 0] = torch.clamp(rel_pos_b[:, 0], -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(rel_pos_b[:, 1], -max_vel, max_vel)
 
         # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
         if self.cfg.kick_direction_command_name:
             kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
+            # kick_cmd = [sin θ, cos θ, 0] → world frame angle θ
             kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
 
             quat = robot.data.root_quat_w
@@ -168,48 +148,11 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
             robot_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
             ang_error = kick_theta - robot_yaw
+            # [-π, π] に正規化
             ang_error = torch.atan2(torch.sin(ang_error), torch.cos(ang_error))
             self.vel_command_b[:, 2] = torch.clamp(ang_error, -self.cfg.max_ang_vel, self.cfg.max_ang_vel)
         else:
             self.vel_command_b[:, 2] = 0.0
-
-    def _set_debug_vis_impl(self, debug_vis: bool):
-        if debug_vis:
-            if not hasattr(self, "kick_pos_visualizer"):
-                marker_cfg = VisualizationMarkersCfg(
-                    prim_path="/Visuals/KickPosition",
-                    markers={
-                        "sphere": sim_utils.SphereCfg(
-                            radius=0.05,
-                            visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(1.0, 0.5, 0.0),
-                            ),
-                        )
-                    },
-                )
-                self.kick_pos_visualizer = VisualizationMarkers(marker_cfg)
-            self.kick_pos_visualizer.set_visibility(True)
-        else:
-            if hasattr(self, "kick_pos_visualizer"):
-                self.kick_pos_visualizer.set_visibility(False)
-
-    def _debug_vis_callback(self, _event):
-        if not self.robot.is_initialized:
-            return
-        if not hasattr(self, "_kick_pos_b"):
-            return
-
-        robot = self._env.scene["robot"]
-        robot_pos_w = robot.data.root_pos_w[:, :3].clone()
-        robot_yaw_q = yaw_quat(robot.data.root_quat_w)
-
-        kick_pos_w = robot_pos_w + quat_rotate(robot_yaw_q, self._kick_pos_b)
-        kick_pos_w[:, 2] = robot_pos_w[:, 2]
-
-        identity_quat = torch.zeros(self.num_envs, 4, device=self.device)
-        identity_quat[:, 0] = 1.0
-
-        self.kick_pos_visualizer.visualize(kick_pos_w, identity_quat)
 
 
 @configclass
@@ -221,23 +164,8 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     max_vel: float = 1.0
     """速度コマンドの上限 [m/s]。ボール相対位置をこの値でクランプする。"""
 
-    ball_follow_start_iteration: int = 1000
-    """このiteration数からボール追従に切り替える。0以下で常にボール追従。"""
-
-    steps_per_iteration: int = 24
-    """1 iteration あたりのステップ数（PPO config の num_steps_per_env）。"""
-
     max_ang_vel: float = 1.0
     """角速度コマンドの上限 [rad/s]。角度誤差をこの値でクランプする。"""
-
-    kick_offset_x: float = 0.1
-    """キック位置のx方向オフセット [m]。ボールより手前に止まる距離。"""
-
-    kick_lateral_offset: float = 0.15
-    """キック位置の横方向オフセット [m]。近い方の足でキックするようにずらす量。"""
-
-    kick_approach_radius: float = 0.4
-    """このボールまでの距離以下でオフセットが線形に縮小し始める [m]。0でボール中心に収束。"""
 
     kick_direction_command_name: str | None = None
     """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""
