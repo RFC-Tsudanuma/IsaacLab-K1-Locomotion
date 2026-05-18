@@ -84,7 +84,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             asset_name="robot",
             resampling_time_range=(10.0, 10.0),
             heading_command=False,
-            debug_vis=False,
+            debug_vis=True,
             max_vel=1.0,
             max_ang_vel=1.0,
             kick_direction_command_name="kick_direction",
@@ -220,31 +220,27 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 2: 速度追従をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.5,
+            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.9,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.5,
+            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.9,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
-        # Phase 2: Ball Vision (-0.15→0.15), Kick Direction Alignment (0→0.15)
+        # Phase 2: Ball Vision (-0.15→0.15), 
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 0.15,
+            params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
-        self.curriculum.align_to_kick_direction_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 0.15,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
+
 
         # Phase 3: Walk Speed (0→1.5), Walk Speed Limit (0→-0.1)
         self.curriculum.robot_xy_speed_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 1.5,
+            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 0.5,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.walk_speed_limit_weight = CurrTerm(
@@ -253,27 +249,34 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
+        # Phase 3:Kick Direction Alignment (0→0.15)
+        self.curriculum.align_to_kick_direction_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 1.0,
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+        )
+
         # Phase 3: Kick 関連報酬フェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 0.5,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_accurate_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_accurate", "start_weight": 0.0, "end_weight": 4.0,
+            params={"term_name": "kick_velocity_accurate", "start_weight": 0.0, "end_weight": 0.5,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
         # Phase 3: Single Feet Avoidance フェードアウト (-0.15→0)
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "single_foot_contact", "start_weight": -0.15, "end_weight": 0.0,
+            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": 0.15,
                     "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 

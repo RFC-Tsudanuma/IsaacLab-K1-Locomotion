@@ -110,7 +110,8 @@ def ball_in_front(
     in_front = (x_rel > 0.0).float()
     # FOV 内は 1.0，外側は指数減衰
     in_fov_score = torch.exp(-((horiz_angle - fov_half_angle).clamp(min=0.0) ** 2) / (fov_half_angle ** 2))
-    return in_front * in_fov_score
+    score = in_front * in_fov_score  # [0, 1]
+    return 2.0 * score - 1.0  # [-1, 1] に正規化: 視野内=+1, 視野外=-1
 
 
 def robot_xy_speed(
@@ -190,7 +191,7 @@ def align_to_kick_direction(
 
     cos_sim = forward_x * kick_x + forward_y * kick_y
     angle_error = torch.acos(torch.clamp(cos_sim, -1.0, 1.0))
-    return torch.exp(-angle_error ** 2 / sigma ** 2)
+    return torch.exp(-angle_error ** 2 / sigma ** 2).clamp(0.0, 1.0)  # [0, 1] に正規化
 
 
 def walk_speed_limit(
