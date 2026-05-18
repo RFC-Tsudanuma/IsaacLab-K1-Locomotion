@@ -26,6 +26,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.schemas import CollisionPropertiesCfg, MassPropertiesCfg
 from isaaclab.utils import configclass
@@ -217,18 +218,6 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # steps_per_iteration = num_steps_per_env (PPO config) = 24
         _spi = 24
 
-        # Phase 2: 速度追従をフェードアウト
-        self.curriculum.track_lin_vel_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.9,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
-        self.curriculum.track_ang_vel_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.9,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        )
-
         # Phase 2: Ball Vision (-0.15→0.15), 
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
@@ -286,18 +275,18 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         #     weight=10.0,
         # )
 
-        # ボールを蹴ってから delay_steps 後にボールだけをリセット（エピソード継続）
-        self.rewards.reset_ball_after_kick = RewTerm(
-            func=mdp.reset_ball_after_kick,
-            weight=1.0,  # 0だとRewardManagerにスキップされるため1.0を設定（関数は常に0を返す）
-            params={"delay_steps": 150},
+        # ------------------------------------------------------------------ #
+        # Terminations: 足がボールに触れてから delay_steps 後にエピソード終了
+        # ------------------------------------------------------------------ #
+        self.terminations.ball_kicked = DoneTerm(
+            func=mdp.ball_kicked_after_contact,
+            params={"delay_steps": 100},  # 制御周波数 50Hz で約 2秒に相当
         )
 
         # ------------------------------------------------------------------ #
         # その他
         # ------------------------------------------------------------------ #
         self.scene.env_spacing = 100.0
-        self.episode_length_s = 60.0
 
 
 @configclass

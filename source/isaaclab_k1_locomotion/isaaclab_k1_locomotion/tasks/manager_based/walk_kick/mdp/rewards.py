@@ -291,6 +291,7 @@ def kick_velocity_exp(
     return 1.0 - torch.exp(-torch.clamp(speed_in_kick_dir, min=0.0) / sigma)
 
 
+<<<<<<< HEAD
 def reset_ball_after_kick(
     env: ManagerBasedRLEnv,
     sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
@@ -348,6 +349,8 @@ def reset_ball_after_kick(
     return torch.zeros(env.num_envs, device=env.device)
 
 
+=======
+>>>>>>> parent of 00dc5dc... ロボットではなくボールがリセットされるように
 def single_foot_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
