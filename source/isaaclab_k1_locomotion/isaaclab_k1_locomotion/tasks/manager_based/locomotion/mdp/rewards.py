@@ -90,7 +90,8 @@ def feet_phase(
     and 0 otherwise (partial matches give no reward).  When the velocity command is below
     ``cmd_threshold`` (standing still), the desired pattern switches to *both feet in contact*
     so that the agent is actively rewarded for keeping both feet planted instead of lifting
-    one to follow the oscillator.
+    one to follow the oscillator.  Additionally, while stopped, every lifted foot incurs a
+    -1 penalty (片足浮き → -1, 両足浮き → -2) to actively suppress in-place stepping.
 
     Args:
         env: The learning environment.
@@ -123,7 +124,7 @@ def feet_phase(
     desired_stance = torch.stack([desired_stance_left, desired_stance_right], dim=1)
 
     # When command speed is small, override desired pattern to "both feet in contact"
-    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
     is_stopped = (cmd_speed <= cmd_threshold).unsqueeze(1)  # [N, 1]
     desired_stance = torch.where(is_stopped, torch.ones_like(desired_stance), desired_stance)
 
@@ -138,6 +139,15 @@ def feet_phase(
 
     # +1 only when both feet match their desired contact state simultaneously
     reward = torch.all(actual_contact == desired_stance, dim=1).float()  # [N]
+
+    # 停止時に足が浮いていたら、浮いている足の数に比例した負報酬を加える
+    # (両足接地: 0, 片足浮き: -1, 両足浮き: -2 が reward に加算される)
+    is_stopped_flat = is_stopped.squeeze(1)
+    num_lifted = (~actual_contact).sum(dim=1).float()  # [N], in {0, 1, 2}
+    stopped_penalty = torch.where(
+        is_stopped_flat, -num_lifted, torch.zeros_like(num_lifted)
+    )
+    reward = reward + stopped_penalty
 
     return reward
 
@@ -337,8 +347,9 @@ def foot_clearance_ji(
     phase_freq: float = 1.5,
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
+    sigma: float = 0.03,
 ) -> torch.Tensor:
-    """遊脚にのみ高さ追従ペナルティを与える。
+    """遊脚にのみ高さ追従報酬を与える関数
 
     遊脚判定は ``feet_phase`` と同じ規約（位相オシレータの desired stance、
     コマンド速度が ``cmd_threshold`` 以下の時は両足 stance 扱い）。
@@ -348,8 +359,8 @@ def foot_clearance_ji(
     left_foot_idx = asset.find_bodies("left_foot_link")[0][0]
     right_foot_idx = asset.find_bodies("right_foot_link")[0][0]
 
-    right_foot_height_err = torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2])
-    left_foot_height_err = torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2])
+    right_foot_height_err = torch.exp(-torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2]) / (sigma **2))
+    left_foot_height_err = torch.exp(-torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2]) / (sigma **2))
 
     # feet_phase と同一の desired-stance 判定
     t = env.episode_length_buf * env.step_dt
@@ -359,7 +370,7 @@ def foot_clearance_ji(
     desired_stance_left = phase_left < stance_threshold
     desired_stance_right = phase_right < stance_threshold
 
-    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
     is_stopped = cmd_speed <= cmd_threshold
     desired_stance_left = desired_stance_left | is_stopped
     desired_stance_right = desired_stance_right | is_stopped
@@ -369,6 +380,47 @@ def foot_clearance_ji(
 
     return right_foot_height_err * swing_right + left_foot_height_err * swing_left
 
+def foot_clearance_ji_pen(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    target_clearance: float = 0.10,
+    phase_freq: float = 1.5,
+    stance_ratio: float = 0.55,
+    cmd_threshold: float = 0.1,
+    sigma: float = 0.03,
+) -> torch.Tensor:
+    """遊脚にのみ高さ追従報酬を与える関数
+
+    遊脚判定は ``feet_phase`` と同じ規約（位相オシレータの desired stance、
+    コマンド速度が ``cmd_threshold`` 以下の時は両足 stance 扱い）。
+    """
+    asset = env.scene["robot"]
+
+    left_foot_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_foot_idx = asset.find_bodies("right_foot_link")[0][0]
+
+    right_foot_vel = torch.norm(asset.data.body_lin_vel_w[:, right_foot_idx, :2], dim=1)    # xy速度が速いほどペナルティを大きくする
+    left_foot_vel =  torch.norm(asset.data.body_lin_vel_w[:, left_foot_idx, :2], dim=1)
+    right_foot_height_err = right_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2]) 
+    left_foot_height_err = left_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2])
+
+    # feet_phase と同一の desired-stance 判定
+    t = env.episode_length_buf * env.step_dt
+    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    phase_right = (phase_left + math.pi) % (2.0 * math.pi)
+    stance_threshold = 2.0 * math.pi * stance_ratio
+    desired_stance_left = phase_left < stance_threshold
+    desired_stance_right = phase_right < stance_threshold
+
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    is_stopped = cmd_speed < cmd_threshold
+    desired_stance_left = desired_stance_left | is_stopped
+    desired_stance_right = desired_stance_right | is_stopped
+
+    swing_left = (~desired_stance_left).float()
+    swing_right = (~desired_stance_right).float()
+
+    return -(right_foot_height_err * swing_right + left_foot_height_err * swing_left)
 
 def _expected_foot_height_bezier(phi: torch.Tensor, swing_height: float, stance_ratio: float = 0.5) -> torch.Tensor:
     """Expected foot height from gait phase using a cubic Bézier profile.
@@ -424,8 +476,8 @@ def feet_height_bezier(env: ManagerBasedRLEnv,
     rz_right = _expected_foot_height_bezier(phase_right, swing_height, stance_ratio)
 
     # 歩行コマンドが非常に小さい時は目標高さは0にする（足を上げない歩行も許容する）
-    command_lin_vel = env.command_manager.get_command("base_velocity")[:, :2]
-    command_speed = torch.norm(command_lin_vel, dim=1)
+    command_vel = env.command_manager.get_command("base_velocity")[:, :3]
+    command_speed = torch.norm(command_vel, dim=1)
     rz_left = torch.where(command_speed > 0.1, rz_left, torch.zeros_like(rz_left))
     rz_right = torch.where(command_speed > 0.1, rz_right, torch.zeros_like(rz_right))
     rz_left = torch.clamp(rz_left, min=ground_height)
@@ -439,6 +491,63 @@ def feet_height_bezier(env: ManagerBasedRLEnv,
     total_error = error_left + error_right
     return torch.exp(-total_error / sigma)
 
+def feet_stride_length(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    phase_freq: float = 1.5,
+    stance_ratio: float = 0.55,
+    sigma: float = 0.04,
+    cmd_threshold: float = 0.1,
+) -> torch.Tensor:
+    """コマンド速度に応じた目標歩幅に追従するほど高い報酬。
+
+    目標歩幅
+        L = v_cmd_x * stance_ratio / phase_freq
+    （1サイクル中に遊脚が前進する距離 = 接地中に後退する距離）
+
+    左右足の前後方向距離 (x_L - x_R, base yaw frame) を位相に応じた目標値
+        target_gap(φ_L) = L * cos(φ_L)
+    と比較し、 exp(-error² / σ²) で報酬化する。
+    （各足が ±L/2 の振幅で逆位相に振動する単純な正弦近似モデル。
+      接地/遊脚比は左右ともに対称で、x方向のオフセットは0近傍と仮定。）
+
+    Args:
+        env: 学習環境
+        command_name: 速度コマンド名
+        phase_freq: 歩行周期の周波数 [Hz] (feet_phase と揃えること)
+        stance_ratio: 接地時間の割合 (feet_phase と揃えること)
+        sigma: 指数報酬のスケール [m]
+        cmd_threshold: コマンドがこれ以下の時は目標歩幅を0にする
+    """
+    asset = env.scene["robot"]
+
+    left_foot_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_foot_idx = asset.find_bodies("right_foot_link")[0][0]
+
+    base_pos_w = asset.data.root_pos_w[:, :3]
+    base_quat_yaw = yaw_quat(asset.data.root_quat_w)
+
+    foot_rel_left = quat_apply_inverse(
+        base_quat_yaw, asset.data.body_pos_w[:, left_foot_idx, :3] - base_pos_w
+    )
+    foot_rel_right = quat_apply_inverse(
+        base_quat_yaw, asset.data.body_pos_w[:, right_foot_idx, :3] - base_pos_w
+    )
+    fwd_gap = foot_rel_left[:, 0] - foot_rel_right[:, 0]
+
+    t = env.episode_length_buf * env.step_dt
+    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+
+    cmd = env.command_manager.get_command(command_name)
+    L = cmd[:, 0] * stance_ratio / phase_freq
+
+    cmd_speed = torch.norm(cmd[:, :3], dim=1)
+    L = torch.where(cmd_speed < cmd_threshold, torch.zeros_like(L), L)
+
+    target_gap = L * torch.cos(phase_left)
+    error = torch.square(fwd_gap - target_gap)
+    return torch.exp(-error / (sigma ** 2))
+
 __all__ = [
     "minimum_height",
     "track_lin_vel_xy_discrete_exp",
@@ -451,4 +560,5 @@ __all__ = [
     "both_feet_not_in_contact",
     "foot_clearance_ji",
     "feet_height_bezier",
+    "feet_stride_length",
 ]
