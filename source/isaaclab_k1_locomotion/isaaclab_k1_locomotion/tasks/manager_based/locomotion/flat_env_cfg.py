@@ -6,11 +6,36 @@
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
+import isaaclab.terrains as terrain_gen
+from isaaclab.terrains import TerrainGeneratorCfg
 
 from .rough_env_cfg import K1RoughEnvCfg
 from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.curriculums import modify_command_resampling_time_range, lin_vel_command_curriculum
+
+
+# 段差・坂道なし、ランダムノイズのみの軽く凹凸した地面
+NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=5.0,
+    num_rows=5,
+    num_cols=5,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    curriculum=False,
+    sub_terrains={
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.9,
+            noise_range=(0.01, 0.04),
+            noise_step=0.01,
+            border_width=0.25,
+        ),
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.1),
+    },
+)
 
 
 @configclass
@@ -22,8 +47,18 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=modify_command_resampling_time_range,
         params={
             "command_name": "base_velocity",
-            "resampling_time_range": (2.0, 7.0),
-            "num_steps": 5000,
+            "resampling_time_range": (1.0, 7.0),
+            "num_steps": 8000,
+        },
+    )
+
+    # より細かいコマンド変動に対応
+    command_resampling_time_range = CurrTerm(
+        func=modify_command_resampling_time_range,
+        params={
+            "command_name": "base_velocity",
+            "resampling_time_range": (0.1, 3.0),
+            "num_steps": 12000,
         },
     )
 
@@ -34,9 +69,9 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         params={
             "command_name": "base_velocity",
             "stages": [(-0.3, 0.3), (-0.7, 0.7), (-1.0, 1.0)],
-            "error_threshold": 0.2,
+            "error_threshold": 0.25,
             "asset_name": "robot",
-            "ema_alpha": 0.02,
+            "ema_alpha": 0.026,
             "min_updates": 50,
         },
     )
@@ -52,6 +87,10 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # Flat terrain
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
+        # 軽い凹凸のみの地面 (段差・坂道なし)
+        # self.scene.terrain.terrain_type = "generator"
+        # self.scene.terrain.terrain_generator = NOISY_FLAT_TERRAIN_CFG
+        # self.scene.terrain.max_init_terrain_level = None
         # No height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
@@ -61,8 +100,8 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # Rewards
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.07
-        self.rewards.lin_vel_z_l2.weight = -0.2
-        self.rewards.action_rate_l2.weight = -0.01
+        self.rewards.lin_vel_z_l2.weight = -0.4
+        self.rewards.action_rate_l2.weight = -0.03
         self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4

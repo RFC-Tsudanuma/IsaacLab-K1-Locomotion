@@ -33,12 +33,12 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs, feet_height_bezier
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji, foot_clearance_ji_pen, feet_stride_length
 
 ##
 # 基本設定
 ##
-_PHASE_FREQ: float = 2.0  # Hz (歩行周期)
+_PHASE_FREQ: float = 1.4  # Hz (歩行周期)
 _STANCE_RATIO: float = 0.55 # 接地時間の割合
 
 _K1_URDF_PATH = os.path.join(
@@ -155,7 +155,7 @@ class K1PolicyCfg(ObsGroup):
     actions = ObsTerm(func=mdp.last_action)
     
     # 整理した位相観測
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": 2.0}) # 頻度は適宜調整
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ}) # 頻度は適宜調整
 
     def __post_init__(self):
         self.enable_corruption = True
@@ -172,7 +172,7 @@ class K1CriticCfg(ObsGroup):
     joint_pos = ObsTerm(func=mdp.joint_pos_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": 2.0})
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ})
 
     def __post_init__(self):
         self.enable_corruption = False # Criticにノイズは不要
@@ -195,7 +195,7 @@ class K1Rewards(RewardsCfg):
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=1.0,
+        weight=1.2,
         params={"command_name": "base_velocity", "std": 0.5},
     )
     track_ang_vel_z_exp = RewTerm(
@@ -212,7 +212,7 @@ class K1Rewards(RewardsCfg):
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "command_name": "base_velocity",
-            "phase_freq": 1.7,
+            "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
         },
     )
@@ -223,7 +223,7 @@ class K1Rewards(RewardsCfg):
     #     params={
     #         "swing_height": 0.12,
     #         "sigma": 0.005,
-    #         "phase_freq": 1.7,
+    #         "phase_freq": _PHASE_FREQ,
     #         "stance_ratio": _STANCE_RATIO,
     #     },
     # )
@@ -263,7 +263,7 @@ class K1Rewards(RewardsCfg):
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.01,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*Knee.*" ,".*_Hip_Yaw", ".*_Hip_Roll"])},
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
     #     func=mdp.joint_deviation_l1,
@@ -296,13 +296,13 @@ class K1Rewards(RewardsCfg):
         },
     )
 
-    foot_clearance_ji = RewTerm(
-        func=foot_clearance_ji,
-        weight=-100.0,
+    foot_clearance_ji_pen = RewTerm(
+        func=foot_clearance_ji_pen,
+        weight=150.0,
         params={
             "command_name": "base_velocity",
-            "target_clearance": 0.10,
-            "phase_freq": 1.7,
+            "target_clearance": 0.08,
+            "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
         },
     )
