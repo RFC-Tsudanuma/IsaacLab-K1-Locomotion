@@ -9,4 +9,5 @@ outputs/
 logs/
 
 # Isaac Sim
-_isaac_sim/
+_isaac_sim/logs/
+outputs/

@@ -33,13 +33,16 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji
+from .mdp.rewards import minimum_height
+from .mdp.rewards import track_lin_vel_xy_discrete_exp, track_ang_vel_z_discrete_exp, joint_mirror_symmetry, feet_close_penalty, feet_parallel_to_ground, foot_clearance_ji, feet_height_bezier, feet_swing, stand_still_joint_deviation_l1
+from .mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
 
 ##
 # 基本設定
 ##
-_PHASE_FREQ: float = 2.0  # Hz (歩行周期)
+_PHASE_FREQ: float = 1.3  # Hz (歩行周期)
 _STANCE_RATIO: float = 0.55 # 接地時間の割合
+
 
 _K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -155,7 +158,7 @@ class K1PolicyCfg(ObsGroup):
     actions = ObsTerm(func=mdp.last_action)
     
     # 整理した位相観測
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": 2.0}) # 頻度は適宜調整
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ}) # 頻度は適宜調整
 
     def __post_init__(self):
         self.enable_corruption = True
@@ -172,7 +175,7 @@ class K1CriticCfg(ObsGroup):
     joint_pos = ObsTerm(func=mdp.joint_pos_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": 2.0})
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ})
 
     def __post_init__(self):
         self.enable_corruption = False # Criticにノイズは不要
@@ -204,19 +207,20 @@ class K1Rewards(RewardsCfg):
         params={"command_name": "base_velocity", "std": 0.5},
     )
 
+    
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
         func=feet_phase,
-        weight=2.2, # 位相に合わせて足を動かすことへの報酬
+        weight=2.0, # 位相に合わせて足を動かすことへの報酬
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"), #body_names=".*_foot_link"
             "command_name": "base_velocity",
-            "phase_freq": 1.5,
+            "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
         },
     )
-
+    
     feet_air_time = RewTerm(
         func=mdp.feet_air_time_positive_biped,
         weight=0.0, # 位相報酬を使う場合は通常0にするか微量にする
@@ -241,23 +245,78 @@ class K1Rewards(RewardsCfg):
         weight=-1.0,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Ankle_Pitch", ".*_Ankle_Roll"])},
     )
-    # dof_pos_limits_arm = RewTerm(
-    #     func=mdp.joint_pos_limits,
-    #     weight=-0.5,
-    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
-    # )
+    """
+    dof_pos_limits_arm = RewTerm(
+        func=mdp.joint_pos_limits,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
+    )
+    """
+    """
+    joint_deviation_hip_yaw = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.01,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_Hip_Yaw"],
+            )
+        },
+    )
+    """
+    """
+    joint_deviation_hip_pitch = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.05,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_Hip_Pitch"],
+            )
+        },
+    )
+    """
+
+    """
+    joint_deviation_hip_yaw = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.45,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_Hip_Yaw"],
+            )
+        },
+    )
+
+    joint_deviation_hip_roll = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.30,
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[".*_Hip_Roll"],
+            )
+        },
+    )
+    """
+    
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.15,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*Knee.*" ,".*_Hip_Yaw", ".*_Hip_Roll"])},
+        weight=-0.33,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
-    # joint_deviation_arm = RewTerm(
-    #     func=mdp.joint_deviation_l1,
-    #     weight=-0.5,
-    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
-    # )
+    
 
+    """
+    joint_deviation_arm = RewTerm(
+        func=mdp.joint_deviation_l1,
+        weight=-0.5,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
+    )
+    """
+    
     base_height_penalty = RewTerm(
         func=minimum_height,
         weight=-1.0,
@@ -267,9 +326,11 @@ class K1Rewards(RewardsCfg):
             "sensor_cfg": None, 
         },
     )
+    
+
     feet_close_penalty = RewTerm(
         func=feet_close_penalty,
-        weight=-15.0,
+        weight=-14.0, #-17.0,
         params={
             "feet_distance_threshold": 0.09,
         },
@@ -277,19 +338,68 @@ class K1Rewards(RewardsCfg):
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=20.0,
+        weight=10.0,
         params={
             "sigma": 0.08
         },
     )
 
-    foot_clearance_ji = RewTerm(
-        func=foot_clearance_ji,
-        weight=-200.0,
+    """
+    feet_height_bezier = RewTerm(
+        func=feet_height_bezier,
+        weight=8.0,
         params={
-            "target_clearance": 0.09,
+            "swing_height": 0.09,
+            "sigma": 0.008,
+            "phase_freq": _PHASE_FREQ,
+            "stance_ratio": _STANCE_RATIO,
+            "ground_height": 0.02,
         },
     )
+    """
+    
+    feet_swing = RewTerm(
+        func=feet_swing,
+        weight=3.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+            "phase_freq": _PHASE_FREQ,
+            "stance_ratio": _STANCE_RATIO,
+            "swing_period": 0.3,
+            "cmd_threshold": 0.1,
+            "command_name": "base_velocity",
+        },
+    )
+    
+    
+    foot_clearance_ji = RewTerm(
+        func=foot_clearance_ji,
+        weight=-75.0,
+        params={
+            "target_clearance": 0.11,
+        },
+    )
+
+    stand_still_joint_deviation = RewTerm(
+        func=stand_still_joint_deviation_l1,
+        weight=-0.5,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": 0.05,
+            "asset_cfg": SceneEntityCfg(
+                "robot",
+                joint_names=[
+                    ".*_Hip_Pitch",
+                    ".*_Knee_Pitch",
+                    ".*_Ankle_Pitch",
+                    ".*_Hip_Roll",
+                    ".*_Hip_Yaw",
+                ],
+            ),
+        },
+    )
+    
+    
 
 # ---------------------------------------------------------------------------
 # Environment configs
@@ -328,20 +438,20 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "threshold": 1.0,
             },
         )
-        self.rewards.flat_orientation_l2.weight = -1.0
+        self.rewards.flat_orientation_l2.weight = -3.5#-1.0
         self.rewards.action_rate_l2.weight = -0.005
-        self.rewards.dof_acc_l2.weight = -1.0e-7
+        self.rewards.dof_acc_l2.weight = -1.25e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        self.rewards.dof_torques_l2.weight = -1.0e-7
+        self.rewards.dof_torques_l2.weight = -1.5e-7
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
 
         # Commands
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # Terminations

@@ -416,6 +416,79 @@ def feet_height_bezier(env: ManagerBasedRLEnv,
     total_error = error_left + error_right
     return torch.exp(-total_error / sigma)
 
+def feet_swing(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    phase_freq: float = 1.3,
+    stance_ratio: float = 0.55,
+    swing_period: float = 0.30,
+    cmd_threshold: float = 0.1,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # gait_process: 0.0〜1.0
+    t = env.episode_length_buf * env.step_dt
+    gait_process = torch.remainder(phase_freq * t, 1.0)
+
+    # feet_phase と同じ考え方:
+    # stance_ratio までが接地期、その後がスイング期
+    swing_center_left = stance_ratio + 0.5 * (1.0 - stance_ratio)
+    swing_center_right = (swing_center_left + 0.5) % 1.0
+
+    def phase_dist(a, b):
+        d = torch.abs(a - b)
+        return torch.minimum(d, 1.0 - d)
+
+    left_swing = phase_dist(gait_process, swing_center_left) < 0.5 * swing_period
+    right_swing = phase_dist(gait_process, swing_center_right) < 0.5 * swing_period
+
+    actual_contact = (
+        contact_sensor.data.net_forces_w_history[:, -1, sensor_cfg.body_ids, :]
+        .norm(dim=-1)
+        > 1.0
+    )  # [N, 2]
+
+    left_not_contact = ~actual_contact[:, 0]
+    right_not_contact = ~actual_contact[:, 1]
+
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :2], dim=1)
+    is_moving = cmd_speed > cmd_threshold
+
+    # 移動時：スイング位相で足が非接地なら報酬
+    swing_reward = (
+        (left_swing & left_not_contact).float()
+        + (right_swing & right_not_contact).float()
+    )
+
+    # 停止時：両足が接地していたら報酬
+    both_feet_contact = actual_contact[:, 0] & actual_contact[:, 1]
+    stop_reward = both_feet_contact.float()
+
+    # 移動時は swing_reward、停止時は stop_reward
+    reward = torch.where(is_moving, swing_reward, stop_reward)
+
+    return reward
+
+#追加
+def stand_still_joint_deviation_l1(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Penalize joint deviation from default pose only when command is near zero."""
+    asset = env.scene[asset_cfg.name]
+
+    command = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(command[:, :2], dim=1) + torch.abs(command[:, 2])
+    is_stopped = cmd_speed < cmd_threshold
+
+    joint_error = torch.abs(asset.data.joint_pos[:, asset_cfg.joint_ids] - asset.data.default_joint_pos[:, asset_cfg.joint_ids])
+    penalty = torch.sum(joint_error, dim=1)
+
+    return penalty * is_stopped.float()
+
 __all__ = [
     "minimum_height",
     "track_lin_vel_xy_discrete_exp",
@@ -428,4 +501,6 @@ __all__ = [
     "both_feet_not_in_contact",
     "foot_clearance_ji",
     "feet_height_bezier",
+    "feet_swing",
+    "stand_still_joint_deviation_l1",
 ]
