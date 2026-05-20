@@ -125,7 +125,7 @@ def feet_phase(
 
     # When command speed is small, override desired pattern to "both feet in contact"
     cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
-    is_stopped = (cmd_speed <= cmd_threshold).unsqueeze(1)  # [N, 1]
+    is_stopped = (cmd_speed < cmd_threshold).unsqueeze(1)  # [N, 1]
     desired_stance = torch.where(is_stopped, torch.ones_like(desired_stance), desired_stance)
 
     # Actual contact: True when net contact force exceeds 1 N
@@ -352,7 +352,7 @@ def foot_clearance_ji(
     """遊脚にのみ高さ追従報酬を与える関数
 
     遊脚判定は ``feet_phase`` と同じ規約（位相オシレータの desired stance、
-    コマンド速度が ``cmd_threshold`` 以下の時は両足 stance 扱い）。
+    コマンド速度が ``cmd_threshold`` 未満の時は両足 stance 扱い）。
     """
     asset = env.scene["robot"]
 
@@ -371,7 +371,7 @@ def foot_clearance_ji(
     desired_stance_right = phase_right < stance_threshold
 
     cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
-    is_stopped = cmd_speed <= cmd_threshold
+    is_stopped = cmd_speed < cmd_threshold
     desired_stance_left = desired_stance_left | is_stopped
     desired_stance_right = desired_stance_right | is_stopped
 
@@ -392,7 +392,7 @@ def foot_clearance_ji_pen(
     """遊脚にのみ高さ追従報酬を与える関数
 
     遊脚判定は ``feet_phase`` と同じ規約（位相オシレータの desired stance、
-    コマンド速度が ``cmd_threshold`` 以下の時は両足 stance 扱い）。
+    コマンド速度が ``cmd_threshold`` 未満の時は両足 stance 扱い）。
     """
     asset = env.scene["robot"]
 
@@ -517,7 +517,7 @@ def feet_stride_length(
         phase_freq: 歩行周期の周波数 [Hz] (feet_phase と揃えること)
         stance_ratio: 接地時間の割合 (feet_phase と揃えること)
         sigma: 指数報酬のスケール [m]
-        cmd_threshold: コマンドがこれ以下の時は目標歩幅を0にする
+        cmd_threshold: コマンドがこれ未満の時は目標歩幅を0にする
     """
     asset = env.scene["robot"]
 

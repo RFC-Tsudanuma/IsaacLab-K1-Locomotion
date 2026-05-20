@@ -27,7 +27,7 @@ def phase_obs(
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
-    コマンド速度が ``cmd_threshold`` 以下のときは位相をゼロで埋め、
+    コマンド速度が ``cmd_threshold`` 未満のときは位相をゼロで埋め、
     停止すべき状況であることをポリシーに明示する。
     """
     t = env.episode_length_buf * env.step_dt
@@ -41,7 +41,7 @@ def phase_obs(
 
     cmd = env.command_manager.get_command(command_name)
     cmd_speed = torch.norm(cmd[:, :3], dim=1, keepdim=True)
-    is_stopped = cmd_speed <= cmd_threshold
+    is_stopped = cmd_speed < cmd_threshold
     phase = torch.where(is_stopped, torch.zeros_like(phase), phase)
 
     return phase

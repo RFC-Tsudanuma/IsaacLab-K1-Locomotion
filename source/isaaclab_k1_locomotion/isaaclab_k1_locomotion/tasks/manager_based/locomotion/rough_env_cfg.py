@@ -39,6 +39,7 @@ from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_he
 # 基本設定
 ##
 _PHASE_FREQ: float = 1.4  # Hz (歩行周期)
+_COMMAND_THRESHOLD: float = 0.05 # コマンド速度がこれ未満のときは停止とみなす
 _STANCE_RATIO: float = 0.55 # 接地時間の割合
 
 _K1_URDF_PATH = os.path.join(
@@ -155,7 +156,7 @@ class K1PolicyCfg(ObsGroup):
     actions = ObsTerm(func=mdp.last_action)
     
     # 整理した位相観測
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ}) # 頻度は適宜調整
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ, "cmd_threshold": _COMMAND_THRESHOLD}) # 頻度は適宜調整
 
     def __post_init__(self):
         self.enable_corruption = True
@@ -172,7 +173,7 @@ class K1CriticCfg(ObsGroup):
     joint_pos = ObsTerm(func=mdp.joint_pos_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ})
+    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ, "cmd_threshold": _COMMAND_THRESHOLD})
 
     def __post_init__(self):
         self.enable_corruption = False # Criticにノイズは不要
@@ -214,6 +215,7 @@ class K1Rewards(RewardsCfg):
             "command_name": "base_velocity",
             "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
+            "cmd_threshold": _COMMAND_THRESHOLD,
         },
     )
 
@@ -304,6 +306,7 @@ class K1Rewards(RewardsCfg):
             "target_clearance": 0.08,
             "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
+            "cmd_threshold": _COMMAND_THRESHOLD,
         },
     )
 
