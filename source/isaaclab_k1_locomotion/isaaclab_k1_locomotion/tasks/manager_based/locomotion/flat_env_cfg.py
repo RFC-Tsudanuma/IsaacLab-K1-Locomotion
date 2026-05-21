@@ -57,8 +57,8 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=modify_command_resampling_time_range,
         params={
             "command_name": "base_velocity",
-            "resampling_time_range": (0.1, 3.0),
-            "num_steps": 12000,
+            "resampling_time_range": (0.1, 7.0),
+            "num_steps": 14000,
         },
     )
 
@@ -99,13 +99,13 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
 
         # Rewards
         self.rewards.track_ang_vel_z_exp.weight = 2.0
-        self.rewards.ang_vel_xy_l2.weight = -0.07
-        self.rewards.lin_vel_z_l2.weight = -0.4
-        self.rewards.action_rate_l2.weight = -0.03
-        self.rewards.dof_acc_l2.weight = -1.0e-7
+        self.rewards.ang_vel_xy_l2.weight = -0.14
+        self.rewards.lin_vel_z_l2.weight = -0.8
+        self.rewards.action_rate_l2.weight = -0.2
+        self.rewards.dof_acc_l2.weight = -1.2e-7
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
-        self.rewards.dof_torques_l2.weight = -1.0e-7
+        self.rewards.dof_torques_l2.weight = -5.0e-6
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
@@ -113,6 +113,14 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
+@configclass
+class K1FlatEnvLearnStandingCfg(K1FlatEnvCfg):
+    """追加学習で立ち姿勢を覚えるための環境設定。これは予め普通のFlatで学習したポリシーに追加学習する用途"""
+    def __post_init__(self):
+        super().__post_init__()
+        # Rewards
+        self.commands.base_velocity.resampling_time_range = (1.0, 5.0)  # コマンドのリサンプリング時間の範囲を変更
+        self.commands.base_velocity.rel_standing_envs = 0.3
 
 @configclass
 class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):

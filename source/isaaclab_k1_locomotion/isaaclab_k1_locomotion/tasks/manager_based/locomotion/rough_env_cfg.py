@@ -264,7 +264,7 @@ class K1Rewards(RewardsCfg):
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.01,
+        weight=-0.09,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -286,7 +286,7 @@ class K1Rewards(RewardsCfg):
         func=feet_close_penalty,
         weight=-15.0,
         params={
-            "feet_distance_threshold": 0.09,
+            "feet_distance_threshold": 0.06,
         },
     )
 
@@ -300,10 +300,10 @@ class K1Rewards(RewardsCfg):
 
     foot_clearance_ji_pen = RewTerm(
         func=foot_clearance_ji_pen,
-        weight=150.0,
+        weight=4.0,
         params={
             "command_name": "base_velocity",
-            "target_clearance": 0.08,
+            "target_clearance": 0.09,
             "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
             "cmd_threshold": _COMMAND_THRESHOLD,
