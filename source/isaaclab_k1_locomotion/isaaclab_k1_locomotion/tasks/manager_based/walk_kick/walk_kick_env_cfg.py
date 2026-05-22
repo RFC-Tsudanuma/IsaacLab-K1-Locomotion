@@ -128,12 +128,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # ------------------------------------------------------------------ #
         # Events: ボール位置リセット・定期ずれ
         # ------------------------------------------------------------------ #
-        self.events.perturb_ball = EventTerm(
-            func=mdp.perturb_ball_position,
-            mode="interval",
-            interval_range_s=(1.0, 1.0),
-            params={"distance_range": (0.01, 0.05)},
-        )
+        # self.events.perturb_ball = EventTerm(
+        #     func=mdp.perturb_ball_position,
+        #     mode="interval",
+        #     interval_range_s=(1.0, 1.0),
+        #     params={"distance_range": (0.01, 0.05)},
+        # )
         self.events.reset_ball = EventTerm(
             func=loco_mdp.reset_root_state_uniform,
             mode="reset",

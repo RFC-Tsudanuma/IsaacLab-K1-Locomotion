@@ -141,9 +141,6 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
             kick_dir_w[:, 0] = kick_cmd[:, 1]  # cos θ (world x)
             kick_dir_w[:, 1] = kick_cmd[:, 0]  # sin θ (world y)
 
-        # ターゲット: ボール位置から蹴る向きの反対側 approach_offset m
-        target_pos_w = ball_pos_w - self.cfg.approach_offset * kick_dir_w
-
         # robot → ball ベクトル
         to_ball = ball_pos_w[:, :2] - robot_pos_w[:, :2]
         dist = to_ball.norm(dim=-1).clamp(min=1e-6)
@@ -152,23 +149,22 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         # キック方向との角度一致度 [0, 1]
         alignment = (to_ball_dir * kick_dir_w[:, :2]).sum(dim=-1).clamp(min=0.0)
 
-        # キックモード条件:
-        #   1. ロボット→ボールの向きがキック方向とほぼ一致
-        #   2. ロボット→ボールの距離がオフセットとほぼ同じ
-        dir_ok = alignment > self.cfg.kick_align_threshold
-        dist_ok = (dist - self.cfg.approach_offset).abs() < self.cfg.kick_dist_tolerance
-        at_kick_pos = dir_ok & dist_ok
+        # ボールまでの距離に応じて動的オフセットを変化させる
+        # dist >= decay_start_dist → approach_offset（後方ターゲット）
+        # dist = 0               → -overshoot_offset（向こう側ターゲット）
+        t = (dist / self.cfg.decay_start_dist).clamp(0.0, 1.0)
+        tp = t.pow(self.cfg.decay_exponent)
+        dynamic_offset = tp * self.cfg.approach_offset + (1.0 - tp) * (-self.cfg.overshoot_offset)
 
-        # 引力: キックモードならキック方向へ、それ以外はターゲットへ
-        to_target = target_pos_w[:, :2] - robot_pos_w[:, :2]
-        att_kick = kick_dir_w[:, :2] * self.cfg.max_vel
-        att_vec = torch.where(at_kick_pos.unsqueeze(-1), att_kick, to_target)
+        # 動的ターゲット
+        dynamic_target = ball_pos_w[:, :2] - dynamic_offset.unsqueeze(-1) * kick_dir_w[:, :2]
+        att_vec = dynamic_target - robot_pos_w[:, :2]
 
         # 斥力: アプローチ方向にだけ穴をあける
         hole_factor = 1.0 - alignment.pow(self.cfg.hole_sharpness)  # (N,)
 
         in_range = dist < self.cfg.repulsion_radius
-        rep_mag = hole_factor * torch.where(
+        rep_mag = hole_factor * t * torch.where(
             in_range,
             self.cfg.repulsion_gain * (1.0 / dist - 1.0 / self.cfg.repulsion_radius) / dist.pow(2),
             torch.zeros_like(dist),
@@ -223,11 +219,14 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     repulsion_gain: float = 0.5
     """斥力の強さ。大きいほど強くボールを避ける。"""
 
-    hole_sharpness: float = 4.0
-    """アプローチ方向の穴の鋭さ。大きいほど穴が狭く（アプローチ方向にのみ）なる。"""
+    hole_sharpness: float = 2.0
+    """アプローチ方向の穴の鋭さ。大きいほど穴が狭くなる。"""
 
-    kick_align_threshold: float = 0.85
-    """キックモード切り替えの方向一致度閾値（cos類似度）。1に近いほど厳密。"""
+    decay_start_dist: float = 0.5 * math.sqrt(2)
+    """ボールまでの距離がこれ以下になったら動的オフセット変化を開始する [m]。"""
 
-    kick_dist_tolerance: float = 0.2
-    """キックモード切り替えの距離許容誤差 [m]。approach_offsetとの差がこれ以内で切り替え。"""
+    overshoot_offset: float = 0.2
+    """ボール到達時のオーバーシュート距離 [m]。ターゲットがボールの向こう側へ移る。"""
+
+    decay_exponent: float = 2.0
+    """動的オフセット縮小の冪乗。1=線形、2以上で近距離側が急峻になる。"""
