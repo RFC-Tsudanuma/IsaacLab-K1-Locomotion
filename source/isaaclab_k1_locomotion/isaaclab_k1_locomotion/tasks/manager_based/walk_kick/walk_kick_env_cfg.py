@@ -99,7 +99,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # 蹴り方向コマンドを追加
         self.commands.kick_direction = mdp.KickDirectionCommandCfg(
             asset_name="robot",
-            resampling_time_range=(5.0, 5.0),
+            resampling_time_range=(10.0, 10.0),
             heading_command=False,
             debug_vis=True,
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
@@ -234,18 +234,18 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 3,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 0.0,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 1.0,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": 0.0,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+            params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
         # # ボールに到達したときの成功ボーナス（タイムアウト終了は除外）
