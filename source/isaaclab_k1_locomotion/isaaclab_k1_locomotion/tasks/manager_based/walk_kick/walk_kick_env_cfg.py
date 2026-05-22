@@ -235,17 +235,17 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
-                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
         )
 
         # # ボールに到達したときの成功ボーナス（タイムアウト終了は除外）

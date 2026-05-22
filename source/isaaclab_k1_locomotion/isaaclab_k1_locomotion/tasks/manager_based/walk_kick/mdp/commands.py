@@ -158,7 +158,11 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
 
         # 動的ターゲット
         dynamic_target = ball_pos_w[:, :2] - dynamic_offset.unsqueeze(-1) * kick_dir_w[:, :2]
-        att_vec = dynamic_target - robot_pos_w[:, :2]
+        att_raw = dynamic_target - robot_pos_w[:, :2]
+        att_dist = att_raw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        att_dir = att_raw / att_dist
+        att_speed = att_dist.squeeze(-1).clamp(min=self.cfg.min_att_speed, max=self.cfg.max_vel)
+        att_vec = att_dir * att_speed.unsqueeze(-1)
 
         # 斥力: アプローチ方向にだけ穴をあける
         hole_factor = 1.0 - alignment.pow(self.cfg.hole_sharpness)  # (N,)
@@ -204,6 +208,9 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     max_vel: float = 1.0
     """速度コマンドの上限 [m/s]。ボール相対位置をこの値でクランプする。"""
 
+    min_att_speed: float = 0.6
+    """引力の最小速度 [m/s]。ターゲットに近づいても最低限この速度で引き付ける。"""
+
     max_ang_vel: float = 1.0
     """角速度コマンドの上限 [rad/s]。角度誤差をこの値でクランプする。"""
 
@@ -225,7 +232,7 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     decay_start_dist: float = 0.5 * math.sqrt(2)
     """ボールまでの距離がこれ以下になったら動的オフセット変化を開始する [m]。"""
 
-    overshoot_offset: float = 0.2
+    overshoot_offset: float = 0.0
     """ボール到達時のオーバーシュート距離 [m]。ターゲットがボールの向こう側へ移る。"""
 
     decay_exponent: float = 2.0
