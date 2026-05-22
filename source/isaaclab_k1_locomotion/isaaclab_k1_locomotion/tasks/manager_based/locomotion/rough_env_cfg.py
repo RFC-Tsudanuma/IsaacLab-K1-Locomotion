@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs, feet_height_bezier
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji, foot_clearance_ji_pen, feet_stride_length
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
 
 ##
 # 基本設定
@@ -110,7 +110,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
             min_delay=1,
-            max_delay=3,
+            max_delay=6,
         ),
         "feet": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
@@ -122,7 +122,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             damping=3.0,
             armature=0.0282528,
             min_delay=1,
-            max_delay=3,
+            max_delay=6,
         ),
         # "arms": IdealPDActuatorCfg(
         #     joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
@@ -284,9 +284,9 @@ class K1Rewards(RewardsCfg):
     )
     feet_close_penalty = RewTerm(
         func=feet_close_penalty,
-        weight=-15.0,
+        weight=-20.0,
         params={
-            "feet_distance_threshold": 0.06,
+            "feet_distance_threshold": 0.10,
         },
     )
 
@@ -308,6 +308,11 @@ class K1Rewards(RewardsCfg):
             "stance_ratio": _STANCE_RATIO,
             "cmd_threshold": _COMMAND_THRESHOLD,
         },
+    )
+
+    action_smoothness_l2 = RewTerm(
+        func=action_smoothness_l2,
+        weight=-0.01,
     )
 
 # ---------------------------------------------------------------------------
@@ -351,11 +356,11 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
         self.rewards.action_rate_l2.weight = -0.005
         self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(
-            "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
+            "robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]
         )
         self.rewards.dof_torques_l2.weight = -1.0e-7
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
-            "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
+            "robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]
         )
 
         # Commands

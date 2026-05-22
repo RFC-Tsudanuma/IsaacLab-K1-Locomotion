@@ -102,10 +102,10 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.ang_vel_xy_l2.weight = -0.14
         self.rewards.lin_vel_z_l2.weight = -0.8
         self.rewards.action_rate_l2.weight = -0.2
-        self.rewards.dof_acc_l2.weight = -1.2e-7
+        self.rewards.dof_acc_l2.weight = -9.0e-7
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
-        self.rewards.dof_torques_l2.weight = -5.0e-6
+        self.rewards.dof_torques_l2.weight = -8.0e-5
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
