@@ -12,15 +12,15 @@ specify the reward function and its parameters.
 from __future__ import annotations
 
 import math
-import re
 import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_rotate_inverse, yaw_quat, euler_xyz_from_quat, wrap_to_pi
+from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
+from .observations import ball_vel as get_ball_vel
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -547,6 +547,151 @@ def feet_stride_length(
     target_gap = L * torch.cos(phase_left)
     error = torch.square(fwd_gap - target_gap)
     return torch.exp(-error / (sigma ** 2))
+
+# ボールの速度方向がコマンド(目標位置)へ向く方向とどの程度一致するかを [0,1] で返す。
+# ボールが (ほぼ) 停止している間は 0 になるよう速度でゲートする。
+def ball_command_tracking(env: ManagerBasedRLEnv, command_name: str = "target_pos",
+                          speed_gate: float = 0.3,
+                          asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball")) -> torch.Tensor:
+    # Why world-frame: get_command() の戻り値はロボット base frame の目標位置オフセットなので、
+    # world frame の ball_vel と直接コサイン類似度を取ると frame が合わない。
+    # ball の現在位置から目標位置への方向 (world) と ball_vel (world) を比較する。
+    ball = env.scene[asset_cfg.name]
+    ball_pos_w = ball.data.root_pos_w[:, :2]
+    ball_vel_w = ball.data.root_com_vel_w[:, :2]
+
+    target_pos_w = env.command_manager.get_term(command_name).pos_command_w[:, :2]
+    desired_dir_w = target_pos_w - ball_pos_w
+
+    cos_sim = torch.nn.functional.cosine_similarity(ball_vel_w, desired_dir_w, dim=1, eps=1e-6)
+    alignment = (cos_sim + 1.0) / 2.0  # [-1,1] -> [0,1]
+
+    # 速度ゲート: speed_gate [m/s] 未満では reward を線形に減衰させ、停止時は 0 にする
+    ball_speed = torch.norm(ball_vel_w, dim=1)
+    speed_factor = torch.clamp(ball_speed / speed_gate, 0.0, 1.0)
+    return alignment * speed_factor
+
+def ball_speed(env: ManagerBasedRLEnv, max_speed: float = 6.0, asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball")) -> torch.Tensor:
+    ball_vel = get_ball_vel(env)
+    speed = torch.norm(ball_vel, dim=1)
+    return torch.clamp(speed / max_speed, 0.0, 1.0)
+
+# ボール速度の目標方向成分 (内積) を [0, max_speed] -> [0,1] に正規化して返す。
+# Why: ball_speed と ball_command_tracking を別々に与えると「速いが方向無視」 or
+# 「方向は正しいが遅い」の局所解に陥るため、両者を一本化する。
+def ball_velocity_toward_target(
+    env: ManagerBasedRLEnv,
+    command_name: str = "target_pos",
+    max_speed: float = 6.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    ball = env.scene[asset_cfg.name]
+    ball_pos_w = ball.data.root_pos_w[:, :2]
+    ball_vel_w = ball.data.root_com_vel_w[:, :2]
+
+    target_pos_w = env.command_manager.get_term(command_name).pos_command_w[:, :2]
+    desired_dir_w = target_pos_w - ball_pos_w
+    desired_unit = desired_dir_w / (torch.norm(desired_dir_w, dim=1, keepdim=True) + 1e-6)
+
+    v_along = (ball_vel_w * desired_unit).sum(dim=1)
+    v_along = torch.clamp(v_along, min=0.0)
+    return torch.clamp(v_along / max_speed, 0.0, 1.0)
+
+# ボールの飛距離に応じて報酬を与える。14mで最大1.0
+def ball_distance(env: ManagerBasedRLEnv, max_distance: float = 14.0, asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball")) -> torch.Tensor:
+    ball_vel = get_ball_vel(env) # 積分してる事になったのでこちらの方が正しく距離である。
+    ball_distance = torch.norm(ball_vel,dim=1,p=2) #l2ノルム計算してボールの距離を出す
+    return torch.clamp(ball_distance / max_distance, 0.0, 1.0)
+
+# ボールに触っていると報酬を得る。これを最後までオンにしていると蹴るよりも触ってしまうため、
+# カリキュラムで途中で重みを途中で下げる等した方がよさそう。
+def touch_ball(env: ManagerBasedRLEnv) -> torch.Tensor:
+    contact_threshould = 0.1
+    sensor_right = env.scene.sensors["contact_balls_right"]
+    sensor_left = env.scene.sensors["contact_balls_left"]
+    force_right = torch.norm(sensor_right.data.force_matrix_w[:,0,0],p=2,dim=1)
+    force_left = torch.norm(sensor_left.data.force_matrix_w[:,0,0],p=2,dim=1)
+    has_contact = torch.where(force_right > contact_threshould,1.0,0.0) + torch.where(force_left > contact_threshould,1.0,0.0)
+    return torch.clip(has_contact,min=0.0,max=1.0)
+
+def base_lin_vel_xy_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ロボットの xy 平面の線速度の L2 二乗和をペナルティとして返す。"""
+    asset = env.scene[asset_cfg.name]
+    return torch.sum(torch.square(asset.data.root_lin_vel_w[:, :2]), dim=1)
+
+
+def base_ang_vel_z_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ロボットの z 軸 (yaw) 回転速度の L2 二乗をペナルティとして返す。"""
+    asset = env.scene[asset_cfg.name]
+    return torch.square(asset.data.root_ang_vel_b[:, 2])
+
+
+def force_touch_ball_downhalf(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    z_upper: float = 0.23,
+    z_lower: float = 0.06,
+    contact_threshold: float = 0.1,
+) -> torch.Tensor:
+    """足が望ましい高さ範囲 [z_lower, z_upper] の外でボールに触れたらペナルティ。
+
+    左右それぞれの足について「その足の高さが範囲外」かつ「その足がボールに接触」
+    の場合にペナルティを与える。両足同時の場合も最大 1.0 にクリップする。
+    """
+    robot = env.scene[asset_cfg.name]
+    left_foot_idx = robot.find_bodies("left_foot_link")[0][0]
+    right_foot_idx = robot.find_bodies("right_foot_link")[0][0]
+    left_z = robot.data.body_link_pos_w[:, left_foot_idx, 2]
+    right_z = robot.data.body_link_pos_w[:, right_foot_idx, 2]
+
+    out_range_left = (left_z > z_upper) | (left_z < z_lower)
+    out_range_right = (right_z > z_upper) | (right_z < z_lower)
+
+    sensor_right = env.scene.sensors["contact_balls_right"]
+    sensor_left = env.scene.sensors["contact_balls_left"]
+    force_right = torch.norm(sensor_right.data.force_matrix_w[:, 0, 0], p=2, dim=1)
+    force_left = torch.norm(sensor_left.data.force_matrix_w[:, 0, 0], p=2, dim=1)
+    touch_left = force_left > contact_threshold
+    touch_right = force_right > contact_threshold
+
+    penalty_left = (touch_left & out_range_left).float()
+    penalty_right = (touch_right & out_range_right).float()
+    return torch.clamp(penalty_left + penalty_right, max=1.0)
+
+def action_smoothness_l2(env):
+    a = env.action_manager.action
+    a_prev = env.action_manager.prev_action
+    if not hasattr(env, "_prev_prev_action"):
+        env._prev_prev_action = torch.zeros_like(a)
+    diff = a - 2.0 * a_prev + env._prev_prev_action
+    env._prev_prev_action = a_prev.clone()
+    return torch.sum(torch.square(diff), dim=1)
+
+def fix_stance_foot_pos(env: ManagerBasedRLEnv,asset_cfg: SceneEntityCfg ) -> torch.tensor:
+    robot = env.scene[asset_cfg.name]
+    stance_foot_vel = robot.data.body_com_vel_w[:,asset_cfg.body_ids,:2].squeeze(1) # x,y
+    stance_foot_vel_sum = torch.linalg.norm(stance_foot_vel,dim=1)
+    return stance_foot_vel_sum.squeeze()
+
+
+# 蹴り足の z 高さが threshold を超えた量の合計を返す (penalty 用 / weight を負にする)。
+# Why threshold: キック動作中の一時的な持ち上げは許容したいので、地面付近はペナルティ 0 にする。
+# 蹴った後に足を地面まで戻させるための報酬。
+def foot_height_penalty(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    threshold: float = 0.08,
+) -> torch.Tensor:
+    robot = env.scene[asset_cfg.name]
+    foot_z = robot.data.body_pos_w[:, asset_cfg.body_ids, 2]
+    excess = (foot_z - threshold).clamp(min=0.0)
+    return excess.sum(dim=1)
 
 __all__ = [
     "minimum_height",

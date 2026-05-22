@@ -11,7 +11,9 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
-
+from isaaclab.assets import Articulation
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -45,3 +47,19 @@ def phase_obs(
     phase = torch.where(is_stopped, torch.zeros_like(phase), phase)
 
     return phase
+
+def ball_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """ボールの線速度を、ロボットの base yaw frame で返す (x: 前後, y: 左右)。"""
+    ball: Articulation = env.scene["soccer_ball"]
+    robot: Articulation = env.scene[asset_cfg.name]
+    vel_w = ball.data.root_com_vel_w[:, :3]
+    vel_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), vel_w)
+    return vel_b[:, :2]
+
+def ball_pos_rel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """ボールとロボットの相対位置を、ロボットの base yaw frame で返す (x: 前後, y: 左右)。"""
+    ball: Articulation = env.scene["soccer_ball"]
+    robot: Articulation = env.scene[asset_cfg.name]
+    offset_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
+    offset_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), offset_w)
+    return offset_b[:, :2]
