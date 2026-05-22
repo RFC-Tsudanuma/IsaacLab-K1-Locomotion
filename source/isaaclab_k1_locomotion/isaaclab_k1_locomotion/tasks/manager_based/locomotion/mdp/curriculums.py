@@ -32,6 +32,28 @@ def modify_command_resampling_time_range(
         term.cfg.resampling_time_range = resampling_time_range
 
 
+def modify_push_robot(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    num_steps: int,
+    interval_range_s: tuple[float, float] | None = None,
+    velocity_range: dict[str, tuple[float, float]] | None = None,
+):
+    """指定ステップ数を超えたら、push_robot イベントの interval_range_s と velocity_range を更新する。
+
+    EventManager は次回のインターバルサンプリング時に ``term_cfg.interval_range_s`` を
+    再読込するため、cfg の書き換えだけで反映される。``velocity_range`` は ``params`` 経由で
+    イベント関数に渡されるので、こちらも cfg.params を上書きすれば次回呼び出しで反映される。
+    """
+    if env.common_step_counter > num_steps:
+        term_cfg = env.event_manager.get_term_cfg(term_name)
+        if interval_range_s is not None:
+            term_cfg.interval_range_s = interval_range_s
+        if velocity_range is not None:
+            term_cfg.params["velocity_range"] = velocity_range
+
+
 class lin_vel_command_curriculum(ManagerTermBase):
     """線速度コマンド範囲(lin_vel_x / lin_vel_y)を段階的に拡げるカリキュラム。
 

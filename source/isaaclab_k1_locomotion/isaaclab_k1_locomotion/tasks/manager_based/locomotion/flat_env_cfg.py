@@ -12,7 +12,11 @@ from isaaclab.terrains import TerrainGeneratorCfg
 from .rough_env_cfg import K1RoughEnvCfg
 from .velocity_env_cfg import CurriculumCfg
 import math
-from .mdp.curriculums import modify_command_resampling_time_range, lin_vel_command_curriculum
+from .mdp.curriculums import (
+    modify_command_resampling_time_range,
+    lin_vel_command_curriculum,
+    modify_push_robot,
+)
 
 
 # 段差・坂道なし、ランダムノイズのみの軽く凹凸した地面
@@ -73,6 +77,27 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
+        },
+    )
+
+    # push_robot を段階的に強くするカリキュラム
+    # 初期値 (EventCfg): interval 7-10s, vel ±0.5 → ±0.5
+    push_robot_stage1 = CurrTerm(
+        func=modify_push_robot,
+        params={
+            "term_name": "push_robot",
+            "num_steps": 8000,
+            "interval_range_s": (5.0, 8.0),
+            "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
+        },
+    )
+    push_robot_stage2 = CurrTerm(
+        func=modify_push_robot,
+        params={
+            "term_name": "push_robot",
+            "num_steps": 14000,
+            "interval_range_s": (3.0, 6.0),
+            "velocity_range": {"x": (-1.5, 1.5), "y": (-1.5, 1.5)},
         },
     )
 
