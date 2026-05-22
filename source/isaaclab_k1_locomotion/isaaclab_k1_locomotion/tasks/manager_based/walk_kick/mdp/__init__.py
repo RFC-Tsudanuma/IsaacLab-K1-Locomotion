@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 from .curriculums import *
+from .events import *
 from .observations import *
 from .rewards import *
 from .terminations import *

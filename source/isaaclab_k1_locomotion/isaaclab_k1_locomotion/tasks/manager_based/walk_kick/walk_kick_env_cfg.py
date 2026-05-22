@@ -99,7 +99,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # 蹴り方向コマンドを追加
         self.commands.kick_direction = mdp.KickDirectionCommandCfg(
             asset_name="robot",
-            resampling_time_range=(10.0, 10.0),
+            resampling_time_range=(5.0, 5.0),
             heading_command=False,
             debug_vis=True,
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
@@ -126,8 +126,14 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
 
 
         # ------------------------------------------------------------------ #
-        # Events: ボール位置リセット
+        # Events: ボール位置リセット・定期ずれ
         # ------------------------------------------------------------------ #
+        self.events.perturb_ball = EventTerm(
+            func=mdp.perturb_ball_position,
+            mode="interval",
+            interval_range_s=(1.0, 1.0),
+            params={"distance_range": (0.01, 0.05)},
+        )
         self.events.reset_ball = EventTerm(
             func=loco_mdp.reset_root_state_uniform,
             mode="reset",
@@ -147,6 +153,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # ------------------------------------------------------------------ #
         self.rewards.track_lin_vel_xy_exp.weight = 1.0
         self.rewards.track_ang_vel_z_exp.weight = 1.0
+
         #self.rewards.action_rate_l2.weight = 0.0
 
         # Phase 2 以降で有効化（初期 weight=0、カリキュラムで増加）

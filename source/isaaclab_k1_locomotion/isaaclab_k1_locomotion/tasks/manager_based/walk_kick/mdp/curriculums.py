@@ -43,6 +43,28 @@ def scale_feet_landing_penalty(
     return torch.tensor(combined)
 
 
+def window_reward_weight(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    term_name: str,
+    weight: float,
+    start_step: int,
+    end_step: int,
+    steps_per_iteration: int = 0,
+) -> None:
+    """start_step < step <= end_step の期間だけ weight を適用し、それ以外は 0 にする。"""
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
+
+    new_weight = weight if start_step < step <= end_step else 0.0
+
+    term = env.reward_manager.get_term_cfg(term_name)
+    if abs(term.weight - new_weight) > 1e-8:
+        term.weight = new_weight
+
+
 def linear_reward_weight(
     env: ManagerBasedRLEnv,
     _env_ids: torch.Tensor,

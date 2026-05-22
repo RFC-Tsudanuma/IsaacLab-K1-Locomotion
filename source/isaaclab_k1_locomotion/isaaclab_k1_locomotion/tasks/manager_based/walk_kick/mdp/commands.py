@@ -130,17 +130,52 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         ball = self._env.scene["soccer_ball"]
         robot = self._env.scene["robot"]
 
-        rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-        rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
+        ball_pos_w = ball.data.root_pos_w[:, :3]
+        robot_pos_w = robot.data.root_pos_w[:, :3]
 
-        max_vel = self.cfg.max_vel
-        self.vel_command_b[:, 0] = torch.clamp(rel_pos_b[:, 0], -max_vel, max_vel)
-        self.vel_command_b[:, 1] = torch.clamp(rel_pos_b[:, 1], -max_vel, max_vel)
-
-        # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
+        # キック方向ベクトル (world frame)
+        kick_dir_w = torch.zeros_like(ball_pos_w)
+        kick_cmd = None
         if self.cfg.kick_direction_command_name:
             kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
-            # kick_cmd = [sin θ, cos θ, 0] → world frame angle θ
+            kick_dir_w[:, 0] = kick_cmd[:, 1]  # cos θ (world x)
+            kick_dir_w[:, 1] = kick_cmd[:, 0]  # sin θ (world y)
+
+        # ターゲット: ボール位置から蹴る向きの反対側 approach_offset m
+        target_pos_w = ball_pos_w - self.cfg.approach_offset * kick_dir_w
+
+        # キック位置に着いたか判定
+        dist_to_target = (target_pos_w[:, :2] - robot_pos_w[:, :2]).norm(dim=-1)  # (N,)
+        at_kick_pos = dist_to_target < self.cfg.kick_switch_radius                 # (N,)
+
+        # 引力: 通常はターゲットへ、キック位置では蹴る向きへ
+        att_to_target = target_pos_w[:, :2] - robot_pos_w[:, :2]
+        att_kick = kick_dir_w[:, :2] * self.cfg.max_vel
+        att_vec = torch.where(at_kick_pos.unsqueeze(-1), att_kick, att_to_target)
+
+        # 斥力: ボール回避（キック位置では無効化）
+        to_ball = ball_pos_w[:, :2] - robot_pos_w[:, :2]
+        dist = to_ball.norm(dim=-1).clamp(min=1e-6)
+        in_range = dist < self.cfg.repulsion_radius
+        rep_mag = torch.where(
+            in_range,
+            self.cfg.repulsion_gain * (1.0 / dist - 1.0 / self.cfg.repulsion_radius) / dist.pow(2),
+            torch.zeros_like(dist),
+        )
+        rep_vec = -(to_ball / dist.unsqueeze(-1)) * rep_mag.unsqueeze(-1)
+        rep_vec = torch.where(at_kick_pos.unsqueeze(-1), torch.zeros_like(rep_vec), rep_vec)
+
+        F_total = att_vec + rep_vec
+        F_total_3d = torch.zeros_like(ball_pos_w)
+        F_total_3d[:, :2] = F_total
+        F_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), F_total_3d)
+
+        max_vel = self.cfg.max_vel
+        self.vel_command_b[:, 0] = torch.clamp(F_b[:, 0], -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(F_b[:, 1], -max_vel, max_vel)
+
+        # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
+        if kick_cmd is not None:
             kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
 
             quat = robot.data.root_quat_w
@@ -148,7 +183,6 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
             robot_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
             ang_error = kick_theta - robot_yaw
-            # [-π, π] に正規化
             ang_error = torch.atan2(torch.sin(ang_error), torch.cos(ang_error))
             self.vel_command_b[:, 2] = torch.clamp(ang_error, -self.cfg.max_ang_vel, self.cfg.max_ang_vel)
         else:
@@ -169,3 +203,15 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
 
     kick_direction_command_name: str | None = None
     """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""
+
+    approach_offset: float = 0.5
+    """ボールから蹴る向きの反対側へのオフセット距離 [m]。ロボットはこの位置を目標とする。"""
+
+    repulsion_radius: float = 0.3
+    """ボールからの斥力が発生する距離 [m]。ボール半径(0.11m)より大きく設定する。"""
+
+    repulsion_gain: float = 0.5
+    """斥力の強さ。大きいほど強くボールを避ける。"""
+
+    kick_switch_radius: float = 0.3
+    """ターゲット位置からこの距離以内に入ったらキックモードに切り替える距離 [m]。"""
