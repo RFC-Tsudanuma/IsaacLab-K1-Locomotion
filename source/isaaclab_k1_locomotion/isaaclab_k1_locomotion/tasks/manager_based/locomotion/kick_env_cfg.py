@@ -85,7 +85,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             max_depenetration_velocity=1.0,
         ),
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-            enabled_self_collisions=True,
+            enabled_self_collisions=False,
             solver_position_iteration_count=8,
             solver_velocity_iteration_count=4,
         ),
@@ -391,6 +391,8 @@ class EventCfg:
 class RewardsCfg:
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-500.0)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.1)
+    # 上半身の傾き (projected_gravity の xy 成分の L2 二乗) にペナルティ。0:完全直立, 1:横倒し。
+    flat_orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-7)
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-1.0e-6)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-4.0)
