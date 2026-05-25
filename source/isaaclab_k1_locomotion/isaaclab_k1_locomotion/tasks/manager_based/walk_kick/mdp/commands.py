@@ -168,7 +168,7 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         hole_factor = 1.0 - alignment.pow(self.cfg.hole_sharpness)  # (N,)
 
         in_range = dist < self.cfg.repulsion_radius
-        rep_mag = hole_factor * t * torch.where(
+        rep_mag = hole_factor * torch.where(
             in_range,
             self.cfg.repulsion_gain * (1.0 / dist - 1.0 / self.cfg.repulsion_radius) / dist.pow(2),
             torch.zeros_like(dist),

@@ -25,7 +25,6 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.schemas import CollisionPropertiesCfg, MassPropertiesCfg
 from isaaclab.utils import configclass
@@ -135,16 +134,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         #     params={"distance_range": (0.01, 0.05)},
         # )
         self.events.reset_ball = EventTerm(
-            func=loco_mdp.reset_root_state_uniform,
+            func=mdp.reset_ball_in_front_of_robot,
             mode="reset",
             params={
-                "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0)},
-                "pose_range": {
-                    "x": (-0.05, 0.10),
-                    "y": (-0.10, 0.10),
-                    "z": (0.0, 0.0),
-                },
-                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "forward_range": (0.3, 0.6),
+                "lateral_range": (-0.2, 0.2),
+                "ball_radius": _BALL_RADIUS,
             },
         )
 
@@ -274,7 +269,7 @@ class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
         super().__post_init__()
 
         self.scene.num_envs = 20
-        self.scene.env_spacing = 10
+        self.scene.env_spacing = 4
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
