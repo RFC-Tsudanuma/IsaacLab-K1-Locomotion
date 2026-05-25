@@ -40,6 +40,7 @@ def minimum_height(env: ManagerBasedRLEnv, min_height: float = 0.47,
         # Use the provided target height directly for flat terrain
         adjusted_min_height = min_height
     # Compute the L2 squared penalty
+    # send_data_stream({"current_height": asset.data.root_pos_w[:, 2][0], "rewards": torch.square(asset.data.root_pos_w[:, 2][0] - adjusted_min_height)})
     return torch.where(asset.data.root_pos_w[:, 2] < adjusted_min_height, torch.square(asset.data.root_pos_w[:, 2] - adjusted_min_height), torch.zeros_like(asset.data.root_pos_w[:, 2]))
 
 def feet_distance(
@@ -665,13 +666,15 @@ def force_touch_ball_downhalf(
     return torch.clamp(penalty_left + penalty_right, max=1.0)
 
 def action_smoothness_l2(env):
+    # これはcassieのcausal transformer論文から取ってきた
     a = env.action_manager.action
     a_prev = env.action_manager.prev_action
     if not hasattr(env, "_prev_prev_action"):
         env._prev_prev_action = torch.zeros_like(a)
-    diff = a - 2.0 * a_prev + env._prev_prev_action
+    diff1 = torch.square(a - a_prev)
+    diff2 = torch.square(a - 2.0 * a_prev + env._prev_prev_action)
     env._prev_prev_action = a_prev.clone()
-    return torch.sum(torch.square(diff), dim=1)
+    return torch.sum((diff1 + diff2), dim=1)
 
 def fix_stance_foot_pos(env: ManagerBasedRLEnv,asset_cfg: SceneEntityCfg ) -> torch.tensor:
     robot = env.scene[asset_cfg.name]

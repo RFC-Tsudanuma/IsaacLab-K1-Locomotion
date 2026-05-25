@@ -32,15 +32,15 @@ from .velocity_env_cfg import (
 
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
-from .mdp import feet_phase, phase_obs, feet_height_bezier
+from .mdp import feet_phase, phase_obs
 from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
 
 ##
 # 基本設定
 ##
-_PHASE_FREQ: float = 1.4  # Hz (歩行周期)
+_PHASE_FREQ: float = 1.6  # Hz (歩行周期)
 _COMMAND_THRESHOLD: float = 0.05 # コマンド速度がこれ未満のときは停止とみなす
-_STANCE_RATIO: float = 0.55 # 接地時間の割合
+_STANCE_RATIO: float = 0.50 # 接地時間の割合
 
 _K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -118,8 +118,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             velocity_limit=17.59,
             # stiffness=17.84601339,
             # damping=53.53804017,
-            stiffness=50.84601339,
-            damping=3.0,
+            stiffness=50.0,
+            damping=1.5,
             armature=0.0282528,
             min_delay=1,
             max_delay=6,
@@ -149,7 +149,7 @@ class K1PolicyCfg(ObsGroup):
     base_ang_vel = ObsTerm(func=mdp.base_ang_vel, noise=Unoise(n_min=-0.2, n_max=0.2))
     projected_gravity = ObsTerm(func=mdp.projected_gravity, noise=Unoise(n_min=-0.05, n_max=0.05))
     velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
-    joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01),
+    joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.03, n_max=0.03),
                         params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,noise=Unoise(n_min=-1.5, n_max=1.5),
                         params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
@@ -196,13 +196,13 @@ class K1Rewards(RewardsCfg):
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=1.2,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=3.5,
+        params={"command_name": "base_velocity", "std": 0.25},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
-        weight=2.0,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": 0.25},
     )
 
     # --- 位相ベースの歩行報酬 (重要) ---
@@ -243,7 +243,7 @@ class K1Rewards(RewardsCfg):
 
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-1.0,
+        weight=-0.2,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -264,7 +264,7 @@ class K1Rewards(RewardsCfg):
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.09,
+        weight=-0.16,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -275,9 +275,9 @@ class K1Rewards(RewardsCfg):
 
     base_height_penalty = RewTerm(
         func=minimum_height,
-        weight=-1.0,
+        weight=-100.0,
         params={
-            "min_height": 0.45,
+            "min_height": 0.52,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
@@ -286,13 +286,13 @@ class K1Rewards(RewardsCfg):
         func=feet_close_penalty,
         weight=-20.0,
         params={
-            "feet_distance_threshold": 0.10,
+            "feet_distance_threshold": 0.14,
         },
     )
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=30.0,
+        weight=3.5,
         params={
             "sigma": 0.08
         },
@@ -312,7 +312,7 @@ class K1Rewards(RewardsCfg):
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
-        weight=-0.01,
+        weight=-0.15,
     )
 
 # ---------------------------------------------------------------------------

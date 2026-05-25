@@ -12,6 +12,7 @@ from isaaclab.terrains import TerrainGeneratorCfg
 from .rough_env_cfg import K1RoughEnvCfg
 from .velocity_env_cfg import CurriculumCfg
 import math
+from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -72,8 +73,8 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages": [(-0.3, 0.3), (-0.7, 0.7), (-1.0, 1.0)],
-            "error_threshold": 0.25,
+            "stages": [(-0.5, 0.5), (-1.1, 1.1),(-1.4, 1.4)],
+            "error_threshold": 0.35,
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
@@ -87,20 +88,19 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         params={
             "term_name": "push_robot",
             "num_steps": 8000,
-            "interval_range_s": (5.0, 8.0),
-            "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0)},
+            "interval_range_s": (4.0, 8.0),
+            "velocity_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7), "roll": (-0.2, 0.2), "pitch": (-0.2, 0.2)},
         },
     )
     push_robot_stage2 = CurrTerm(
         func=modify_push_robot,
         params={
             "term_name": "push_robot",
-            "num_steps": 14000,
-            "interval_range_s": (3.0, 6.0),
-            "velocity_range": {"x": (-1.5, 1.5), "y": (-1.5, 1.5)},
+            "num_steps": 16000,
+            "interval_range_s": (4.0, 8.0),
+            "velocity_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0), "roll": (-0.3, 0.3), "pitch": (-0.3, 0.3)},
         },
     )
-
 
 @configclass
 class K1FlatEnvCfg(K1RoughEnvCfg):
@@ -124,19 +124,37 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
 
         # Rewards
         self.rewards.track_ang_vel_z_exp.weight = 2.0
-        self.rewards.ang_vel_xy_l2.weight = -0.14
+        self.rewards.ang_vel_xy_l2.weight = -0.30
         self.rewards.lin_vel_z_l2.weight = -0.8
-        self.rewards.action_rate_l2.weight = -0.2
-        self.rewards.dof_acc_l2.weight = -9.0e-7
+        self.rewards.action_rate_l2.weight = -0.6
+        self.rewards.dof_acc_l2.weight = -1.0e-6
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
-        self.rewards.dof_torques_l2.weight = -8.0e-5
+        self.rewards.dof_torques_l2.weight = -1.0e-5
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
+        # 速度コマンドを離散格子からサンプリングする版に差し替える
         # lin_vel_x / lin_vel_y は lin_vel_command カリキュラムが段階的に拡張する
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
+        prev = self.commands.base_velocity
+        self.commands.base_velocity = DiscreteVelocityCommandCfg(
+            asset_name=prev.asset_name,
+            resampling_time_range=prev.resampling_time_range,
+            rel_standing_envs=prev.rel_standing_envs,
+            rel_heading_envs=prev.rel_heading_envs,
+            heading_command=prev.heading_command,
+            heading_control_stiffness=prev.heading_control_stiffness,
+            debug_vis=prev.debug_vis,
+            ranges=DiscreteVelocityCommandCfg.Ranges(
+                lin_vel_x=prev.ranges.lin_vel_x,
+                lin_vel_y=prev.ranges.lin_vel_y,
+                ang_vel_z=(-1.0, 1.0),
+                heading=(-math.pi, math.pi),
+            ),
+            lin_vel_x_resolution=0.2,
+            lin_vel_y_resolution=0.1,
+            ang_vel_z_resolution=0.2,
+        )
 
 @configclass
 class K1FlatEnvLearnStandingCfg(K1FlatEnvCfg):

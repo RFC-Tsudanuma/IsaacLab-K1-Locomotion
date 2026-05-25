@@ -47,7 +47,7 @@ from .velocity_env_cfg import (
 
 # K1専用のMDP関数 (ローカル .mdp にのみ定義されているもの)
 from .mdp.observations import ball_pos_rel, ball_vel
-from .mdp.rewards import minimum_height, touch_ball, feet_close_penalty ,ball_velocity_toward_target, force_touch_ball_downhalf, fix_stance_foot_pos , base_lin_vel_xy_l2, base_ang_vel_z_l2, foot_height_penalty
+from .mdp.rewards import minimum_height, touch_ball, feet_close_penalty ,ball_velocity_toward_target, force_touch_ball_downhalf, fix_stance_foot_pos , base_lin_vel_xy_l2, base_ang_vel_z_l2, foot_height_penalty, ball_distance
 from .mdp.terminations import time_after_ball_contact
 from .mdp.curriculums import ball_max_speed_curriculum, kick_direction_command_curriculum
 
@@ -290,7 +290,7 @@ class TerminationsCfg:
     # (1) Time out
     time_out = DoneTerm(func=mdp.time_out, time_out=True)
     root_height_below_minimum = DoneTerm(mdp.root_height_below_minimum,params={"minimum_height": 0.40})
-    bad_orientation = DoneTerm(func=mdp.bad_orientation,params={"limit_angle": 0.7})
+    bad_orientation = DoneTerm(func=mdp.bad_orientation,params={"limit_angle": 0.4})
     # ボールに最初に触れてから3秒経過したらエピソード終了
     after_ball_contact_timeout = DoneTerm(
         func=time_after_ball_contact,
@@ -390,7 +390,7 @@ class EventCfg:
 @configclass
 class RewardsCfg:
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-500.0)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.1)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.5)
     # 上半身の傾き (projected_gravity の xy 成分の L2 二乗) にペナルティ。0:完全直立, 1:横倒し。
     flat_orientation = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
     dof_torques_l2 = RewTerm(func=mdp.joint_torques_l2, weight=-1.0e-7)
@@ -431,6 +431,7 @@ class RewardsCfg:
     )
     # タスク報酬
     touch_ball=RewTerm(func=touch_ball,weight=10.0)
+    ball_distance=RewTerm(func=ball_distance, weight=5.0)
     # ball_speed と ball_command_tracking の加算は局所解 (速いが方向無視 / 方向正解だが遅い) を生むため、
     # 目標方向への速度成分一本に統合した。
     # max_speed は学習初期にペナルティに負けないよう低めに設定 (デフォルト 6.0 → 2.0)。
@@ -453,7 +454,7 @@ class RewardsCfg:
     # subclass で body_names を上書きする。
     kick_foot_height = RewTerm(
         func=foot_height_penalty,
-        weight=-1.0,
+        weight=-10.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=["left_foot_link"]),
             "threshold": 0.08,

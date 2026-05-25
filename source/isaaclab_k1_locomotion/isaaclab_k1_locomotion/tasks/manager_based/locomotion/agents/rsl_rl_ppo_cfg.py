@@ -10,7 +10,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 
 @configclass
 class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
+    num_steps_per_env = 48
     max_iterations = 3000
     save_interval = 50
     experiment_name = "k1_rough"
@@ -46,5 +46,5 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
         self.max_iterations = 20000
         self.experiment_name = "k1_flat"
         self.policy.actor_hidden_dims = [256, 128, 128]
-        self.policy.critic_hidden_dims = [256, 128, 128]
+        self.policy.critic_hidden_dims = [256, 256, 128]
         self.save_interval = 100
