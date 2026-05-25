@@ -220,7 +220,7 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     approach_offset: float = 0.5
     """ボールから蹴る向きの反対側へのオフセット距離 [m]。ロボットはこの位置を目標とする。"""
 
-    repulsion_radius: float = 0.3
+    repulsion_radius: float = 0.5
     """ボールからの斥力が発生する距離 [m]。ボール半径(0.11m)より大きく設定する。"""
 
     repulsion_gain: float = 1.0
