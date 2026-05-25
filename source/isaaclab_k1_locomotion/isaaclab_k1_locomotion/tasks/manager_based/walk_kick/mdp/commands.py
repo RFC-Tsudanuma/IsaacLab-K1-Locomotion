@@ -232,8 +232,8 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     decay_start_dist: float = 0.5 * math.sqrt(2)
     """ボールまでの距離がこれ以下になったら動的オフセット変化を開始する [m]。"""
 
-    overshoot_offset: float = 0.0
+    overshoot_offset: float = 1.0
     """ボール到達時のオーバーシュート距離 [m]。ターゲットがボールの向こう側へ移る。"""
 
-    decay_exponent: float = 2.0
+    decay_exponent: float = 1.0
     """動的オフセット縮小の冪乗。1=線形、2以上で近距離側が急峻になる。"""

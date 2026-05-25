@@ -187,10 +187,9 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
 
         # ------------------------------------------------------------------ #
-        # Curriculum: 3フェーズで報酬重みを段階的に切り替え
+        # Curriculum: 2フェーズで報酬重みを段階的に切り替え
         #   Phase 1 (    0-1000): 速度追従のみ
-        #   Phase 2 (1000-1500): 速度追従を切り，ボール接近報酬を導入
-        #   Phase 3 (1500-2000): さらにキック関連報酬を追加
+        #   Phase 2 (1000-1500): 速度追従をフェードアウト，ボール・キック報酬を一斉フェードイン
         # ------------------------------------------------------------------ #
 
         # steps_per_iteration = num_steps_per_env (PPO config) = 24
@@ -209,38 +208,31 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
-        # Phase 2: ボール接近報酬をフェードイン
+        # Phase 2: ボール接近・キック関連報酬を一斉フェードイン
         self.curriculum.ball_in_front_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "ball_in_front", "start_weight": 0.0, "end_weight": 1.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
-        # self.curriculum.approach_ball_weight = CurrTerm(
-        #     func=mdp.linear_reward_weight,
-        #     params={"term_name": "approach_ball", "start_weight": 0.0, "end_weight": 50.0,
-        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        # )
-        # self.curriculum.align_to_kick_direction_weight = CurrTerm(
-        #     func=mdp.linear_reward_weight,
-        #     params={"term_name": "align_to_kick_direction", "start_weight": 0.0, "end_weight": 10.0,
-        #             "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
-        # )
-
-        # Phase 3: キック関連報酬をフェードイン
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 4.0,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 1.0,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+            params={"term_name": "kick_velocity_exp", "start_weight": 0.0, "end_weight": 4.0,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.single_foot_contact_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={"term_name": "single_foot_contact", "start_weight": 0.0, "end_weight": -0.15,
-                    "start_step": 1500, "end_step": 2000, "steps_per_iteration": _spi},
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
+        )
+        self.curriculum.robot_xy_speed_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={"term_name": "robot_xy_speed", "start_weight": 0.0, "end_weight": 0.5,
+                    "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
         # # ボールに到達したときの成功ボーナス（タイムアウト終了は除外）
