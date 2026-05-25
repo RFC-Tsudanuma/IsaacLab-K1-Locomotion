@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -267,13 +268,25 @@ def reset_ball_after_kick(
     triggered = (env._ball_reset_counter >= delay_steps).nonzero(as_tuple=False).squeeze(-1)
     if triggered.numel() > 0:
         ball = env.scene[ball_cfg.name]
-        ball_state = ball.data.default_root_state[triggered].clone()
+        robot = env.scene["robot"]
+        n = triggered.numel()
 
-        noise_x = torch.empty(triggered.numel(), device=env.device).uniform_(-0.05, 0.10)
-        noise_y = torch.empty(triggered.numel(), device=env.device).uniform_(-0.10, 0.10)
-        ball_state[:, 0] += noise_x
-        ball_state[:, 1] += noise_y
+        robot_pos_w = robot.data.root_pos_w[triggered]
+        robot_quat_w = robot.data.root_quat_w[triggered]
+        qw, qx, qy, qz = robot_quat_w[:, 0], robot_quat_w[:, 1], robot_quat_w[:, 2], robot_quat_w[:, 3]
+        yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+
+        dist = torch.empty(n, device=env.device).uniform_(0.3, 0.8)
+        angle_offset = torch.empty(n, device=env.device).uniform_(-math.pi / 3, math.pi / 3)
+        target_angle = yaw + angle_offset
+        dx = dist * torch.cos(target_angle)
+        dy = dist * torch.sin(target_angle)
+
+        ball_state = ball.data.default_root_state[triggered].clone()
         ball_state[:, :3] += env.scene.env_origins[triggered]
+        ball_state[:, 0] = robot_pos_w[:, 0] + dx
+        ball_state[:, 1] = robot_pos_w[:, 1] + dy
+        ball_state[:, 2] = 0.11
         ball_state[:, 7:] = 0.0
 
         ball.write_root_state_to_sim(ball_state, env_ids=triggered)

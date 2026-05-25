@@ -14,41 +14,38 @@ def reset_ball_in_front_of_robot(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    forward_range: tuple[float, float] = (0.3, 0.6),
-    lateral_range: tuple[float, float] = (-0.2, 0.2),
+    dist_range: tuple[float, float] = (0.3, 0.8),
+    half_angle: float = math.pi / 3,
     ball_radius: float = 0.11,
 ) -> None:
-    """ボールをロボットの前方にリセットする。
+    """ボールをロボット前方コーン内にリセットする。
 
-    ロボットのヨー角に基づいてロボット座標系で forward_range, lateral_range を
-    サンプリングし、ワールド座標に変換してボールを配置する。
+    ロボットの向きを基準に ±half_angle のコーン内、dist_range の距離でランダム配置する。
+    リセットイベント時は default_root_state のヨー角を使用する。
     """
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
     n = len(env_ids)
 
-    robot_pos_w = robot.data.root_pos_w[env_ids]
-    robot_quat_w = robot.data.root_quat_w[env_ids]
+    env_origins = env.scene.env_origins[env_ids]
 
-    # ロボットのヨー角を取得
-    w, x, y, z = robot_quat_w[:, 0], robot_quat_w[:, 1], robot_quat_w[:, 2], robot_quat_w[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    robot_default = robot.data.default_root_state[env_ids]
+    robot_reset_x = env_origins[:, 0] + robot_default[:, 0]
+    robot_reset_y = env_origins[:, 1] + robot_default[:, 1]
 
-    # ロボット座標系でサンプリング
-    fwd = torch.empty(n, device=env.device).uniform_(*forward_range)
-    lat = torch.empty(n, device=env.device).uniform_(*lateral_range)
+    qw, qx, qy, qz = robot_default[:, 3], robot_default[:, 4], robot_default[:, 5], robot_default[:, 6]
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
-    # ワールド座標に変換
-    cos_yaw = torch.cos(yaw)
-    sin_yaw = torch.sin(yaw)
-    dx = fwd * cos_yaw - lat * sin_yaw
-    dy = fwd * sin_yaw + lat * cos_yaw
+    dist = torch.empty(n, device=env.device).uniform_(*dist_range)
+    angle_offset = torch.empty(n, device=env.device).uniform_(-half_angle, half_angle)
+    target_angle = yaw + angle_offset
 
-    state = ball.data.root_state_w[env_ids].clone()
-    state[:, 0] = robot_pos_w[:, 0] + dx
-    state[:, 1] = robot_pos_w[:, 1] + dy
+    state = ball.data.default_root_state[env_ids].clone()
+    state[:, :3] += env_origins
+    state[:, 0] = robot_reset_x + dist * torch.cos(target_angle)
+    state[:, 1] = robot_reset_y + dist * torch.sin(target_angle)
     state[:, 2] = ball_radius
-    state[:, 7:] = 0.0  # 速度ゼロ
+    state[:, 7:] = 0.0
 
     ball.write_root_state_to_sim(state, env_ids=env_ids)
 
