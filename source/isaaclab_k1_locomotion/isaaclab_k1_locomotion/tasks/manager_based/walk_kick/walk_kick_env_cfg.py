@@ -127,12 +127,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # ------------------------------------------------------------------ #
         # Events: ボール位置リセット・定期ずれ
         # ------------------------------------------------------------------ #
-        # self.events.perturb_ball = EventTerm(
-        #     func=mdp.perturb_ball_position,
-        #     mode="interval",
-        #     interval_range_s=(1.0, 1.0),
-        #     params={"distance_range": (0.01, 0.05)},
-        # )
+        self.events.perturb_ball = EventTerm(
+            func=mdp.perturb_ball_position,
+            mode="interval",
+            interval_range_s=(1.0, 1.0),
+            params={"distance_range": (0.05, 0.3)},
+        )
         self.events.reset_ball = EventTerm(
             func=mdp.reset_ball_in_front_of_robot,
             mode="reset",
@@ -174,7 +174,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.kick_direction_exp = RewTerm(
             func=mdp.kick_direction_exp,
             weight=0.0,
-            params={"command_name": "kick_direction", "sigma": 0.5},
+            params={"command_name": "kick_direction", "sigma": 0.25},
         )
         self.rewards.kick_velocity_exp = RewTerm(
             func=mdp.kick_velocity_exp,
@@ -216,7 +216,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
         self.curriculum.kick_direction_exp_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 2.0,
+            params={"term_name": "kick_direction_exp", "start_weight": 0.0, "end_weight": 8.0,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.kick_velocity_exp_weight = CurrTerm(
@@ -245,7 +245,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.reset_ball_after_kick = RewTerm(
             func=mdp.reset_ball_after_kick,
             weight=1.0,  # 0だとRewardManagerにスキップされるため1.0を設定（関数は常に0を返す）
-            params={"delay_steps": 300},
+            params={"delay_steps": 150},
         )
 
         # ------------------------------------------------------------------ #
