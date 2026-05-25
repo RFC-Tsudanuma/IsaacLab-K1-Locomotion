@@ -292,6 +292,10 @@ def reset_ball_after_kick(
         ball.write_root_state_to_sim(ball_state, env_ids=triggered)
         env._ball_reset_counter[triggered] = 0
 
+        kick_cmd_term = env.command_manager._terms.get("kick_direction")
+        if kick_cmd_term is not None:
+            kick_cmd_term._resample(triggered)
+
     return torch.zeros(env.num_envs, device=env.device)
 
 

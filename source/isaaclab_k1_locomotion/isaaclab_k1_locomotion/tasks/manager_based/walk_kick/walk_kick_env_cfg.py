@@ -98,7 +98,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # 蹴り方向コマンドを追加
         self.commands.kick_direction = mdp.KickDirectionCommandCfg(
             asset_name="robot",
-            resampling_time_range=(10.0, 10.0),
+            resampling_time_range=(1e9, 1e9),
             heading_command=False,
             debug_vis=True,
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
@@ -137,8 +137,8 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             func=mdp.reset_ball_in_front_of_robot,
             mode="reset",
             params={
-                "forward_range": (0.3, 0.6),
-                "lateral_range": (-0.2, 0.2),
+                "dist_range": (0.3, 0.8),
+                "half_angle": 1.047,
                 "ball_radius": _BALL_RADIUS,
             },
         )
@@ -253,7 +253,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.reset_ball_after_kick = RewTerm(
             func=mdp.reset_ball_after_kick,
             weight=1.0,  # 0だとRewardManagerにスキップされるため1.0を設定（関数は常に0を返す）
-            params={"delay_steps": 150},
+            params={"delay_steps": 300},
         )
 
         # ------------------------------------------------------------------ #
