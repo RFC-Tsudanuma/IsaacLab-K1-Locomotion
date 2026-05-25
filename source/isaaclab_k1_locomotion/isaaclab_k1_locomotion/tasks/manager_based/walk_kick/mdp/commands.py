@@ -67,7 +67,15 @@ class KickDirectionCommand(UniformVelocityCommand):
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
         low, high = self.cfg.ranges.heading
-        theta = torch.empty(n, device=self.device).uniform_(low, high)
+
+        # ロボットの現在ヨー角を取得し、そこからの相対オフセットとしてサンプリング
+        robot_quat = self.robot.data.root_quat_w[env_ids]
+        w, x, y, z = robot_quat[:, 0], robot_quat[:, 1], robot_quat[:, 2], robot_quat[:, 3]
+        robot_yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+        offset = torch.empty(n, device=self.device).uniform_(low, high)
+        theta = robot_yaw + offset
+
         self.command[env_ids, 0] = torch.sin(theta)
         self.command[env_ids, 1] = torch.cos(theta)
         self.command[env_ids, 2] = 0.0
@@ -133,58 +141,20 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
         ball_pos_w = ball.data.root_pos_w[:, :3]
         robot_pos_w = robot.data.root_pos_w[:, :3]
 
-        # キック方向ベクトル (world frame)
-        kick_dir_w = torch.zeros_like(ball_pos_w)
         kick_cmd = None
         if self.cfg.kick_direction_command_name:
             kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
-            kick_dir_w[:, 0] = kick_cmd[:, 1]  # cos θ (world x)
-            kick_dir_w[:, 1] = kick_cmd[:, 0]  # sin θ (world y)
 
-        # robot → ball ベクトル
-        to_ball = ball_pos_w[:, :2] - robot_pos_w[:, :2]
-        dist = to_ball.norm(dim=-1).clamp(min=1e-6)
-        to_ball_dir = to_ball / dist.unsqueeze(-1)
-
-        # キック方向との角度一致度 [0, 1]
-        alignment = (to_ball_dir * kick_dir_w[:, :2]).sum(dim=-1).clamp(min=0.0)
-
-        # ボールまでの距離に応じて動的オフセットを変化させる
-        # dist >= decay_start_dist → approach_offset（後方ターゲット）
-        # dist = 0               → -overshoot_offset（向こう側ターゲット）
-        t = (dist / self.cfg.decay_start_dist).clamp(0.0, 1.0)
-        tp = t.pow(self.cfg.decay_exponent)
-        dynamic_offset = tp * self.cfg.approach_offset + (1.0 - tp) * (-self.cfg.overshoot_offset)
-
-        # 動的ターゲット
-        dynamic_target = ball_pos_w[:, :2] - dynamic_offset.unsqueeze(-1) * kick_dir_w[:, :2]
-        att_raw = dynamic_target - robot_pos_w[:, :2]
-        att_dist = att_raw.norm(dim=-1, keepdim=True).clamp(min=1e-6)
-        att_dir = att_raw / att_dist
-        att_speed = att_dist.squeeze(-1).clamp(min=self.cfg.min_att_speed, max=self.cfg.max_vel)
-        att_vec = att_dir * att_speed.unsqueeze(-1)
-
-        # 斥力: アプローチ方向にだけ穴をあける
-        hole_factor = 1.0 - alignment.pow(self.cfg.hole_sharpness)  # (N,)
-
-        in_range = dist < self.cfg.repulsion_radius
-        rep_mag = hole_factor * torch.where(
-            in_range,
-            self.cfg.repulsion_gain * (1.0 / dist - 1.0 / self.cfg.repulsion_radius) / dist.pow(2),
-            torch.zeros_like(dist),
-        )
-        rep_vec = -(to_ball_dir) * rep_mag.unsqueeze(-1)
-
-        F_total = att_vec + rep_vec
-        F_total_3d = torch.zeros_like(ball_pos_w)
-        F_total_3d[:, :2] = F_total
-        F_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), F_total_3d)
+        # ボール - ロボット のワールドフレームベクトルをロボットフレームに変換
+        to_ball_3d = torch.zeros_like(ball_pos_w)
+        to_ball_3d[:, :2] = ball_pos_w[:, :2] - robot_pos_w[:, :2]
+        to_ball_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), to_ball_3d)
 
         max_vel = self.cfg.max_vel
-        self.vel_command_b[:, 0] = torch.clamp(F_b[:, 0], -max_vel, max_vel)
-        self.vel_command_b[:, 1] = torch.clamp(F_b[:, 1], -max_vel, max_vel)
+        self.vel_command_b[:, 0] = torch.clamp(to_ball_b[:, 0], -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(to_ball_b[:, 1], -max_vel, max_vel)
 
-        # wz: ロボットの現在ヨー角と kick_direction の角度誤差（相対）
+        # wz: ロボットのヨー角と kick_direction の角度誤差
         if kick_cmd is not None:
             kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
 
@@ -206,34 +176,11 @@ class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
     class_type: type = BallFollowVelocityCommand
 
     max_vel: float = 1.0
-    """速度コマンドの上限 [m/s]。ボール相対位置をこの値でクランプする。"""
-
-    min_att_speed: float = 0.6
-    """引力の最小速度 [m/s]。ターゲットに近づいても最低限この速度で引き付ける。"""
+    """速度コマンドの上限 [m/s]。"""
 
     max_ang_vel: float = 1.0
-    """角速度コマンドの上限 [rad/s]。角度誤差をこの値でクランプする。"""
+    """角速度コマンドの上限 [rad/s]。"""
 
     kick_direction_command_name: str | None = None
     """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""
 
-    approach_offset: float = 0.5
-    """ボールから蹴る向きの反対側へのオフセット距離 [m]。ロボットはこの位置を目標とする。"""
-
-    repulsion_radius: float = 0.5
-    """ボールからの斥力が発生する距離 [m]。ボール半径(0.11m)より大きく設定する。"""
-
-    repulsion_gain: float = 1.0
-    """斥力の強さ。大きいほど強くボールを避ける。"""
-
-    hole_sharpness: float = 2.0
-    """アプローチ方向の穴の鋭さ。大きいほど穴が狭くなる。"""
-
-    decay_start_dist: float = 0.5 * math.sqrt(2)
-    """ボールまでの距離がこれ以下になったら動的オフセット変化を開始する [m]。"""
-
-    overshoot_offset: float = 1.0
-    """ボール到達時のオーバーシュート距離 [m]。ターゲットがボールの向こう側へ移る。"""
-
-    decay_exponent: float = 1.0
-    """動的オフセット縮小の冪乗。1=線形、2以上で近距離側が急峻になる。"""

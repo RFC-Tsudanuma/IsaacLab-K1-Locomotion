@@ -105,7 +105,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
                 lin_vel_x=(0.0, 0.0),
                 lin_vel_y=(0.0, 0.0),
                 ang_vel_z=(0.0, 0.0),
-                heading=(-math.pi, math.pi),  # 蹴り方向のサンプリング範囲
+                heading=(-math.pi / 4, math.pi / 4),  # ロボット正面から左右 45° のオフセット
             ),
         )
 
@@ -199,12 +199,12 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # Phase 1→2: 速度追従報酬をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.9,
+            params={"term_name": "track_lin_vel_xy_exp", "start_weight": 1.0, "end_weight": 0.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
         self.curriculum.track_ang_vel_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.9,
+            params={"term_name": "track_ang_vel_z_exp", "start_weight": 1.0, "end_weight": 0.5,
                     "start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi},
         )
 
