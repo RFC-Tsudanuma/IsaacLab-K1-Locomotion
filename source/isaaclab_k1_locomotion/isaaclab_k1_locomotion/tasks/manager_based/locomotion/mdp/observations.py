@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+from .events import get_phase_freq
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -33,7 +34,8 @@ def phase_obs(
     停止すべき状況であることをポリシーに明示する。
     """
     t = env.episode_length_buf * env.step_dt
-    phase_left = 2.0 * math.pi * phase_freq * t
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = 2.0 * math.pi * pf * t
     phase_right = phase_left + math.pi
 
     phase = torch.stack([
@@ -63,3 +65,18 @@ def ball_pos_rel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     offset_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
     offset_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), offset_w)
     return offset_b[:, :2]
+
+
+def kick_direction_b(
+    env: ManagerBasedRLEnv,
+    command_name: str = "kick_direction",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ワールド座標系のキック方向コマンドをロボットの base yaw frame に回転して返す (2D 単位ベクトル)。"""
+    robot: Articulation = env.scene[asset_cfg.name]
+    kick_dir_w_xy = env.command_manager.get_term(command_name).command  # (N, 2)
+    # 3D に拡張 (z=0) してから base yaw frame に回転
+    z = torch.zeros_like(kick_dir_w_xy[:, :1])
+    kick_dir_w = torch.cat([kick_dir_w_xy, z], dim=1)
+    kick_dir_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), kick_dir_w)
+    return kick_dir_b[:, :2]

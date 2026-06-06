@@ -106,8 +106,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
             # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
             # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
-            stiffness={".*_Hip_.*": 200.0, ".*_Knee_Pitch": 200.0},
-            damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
+            stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
+            damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
             min_delay=1,
             max_delay=6,
@@ -119,7 +119,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             # stiffness=17.84601339,
             # damping=53.53804017,
             stiffness=50.0,
-            damping=1.5,
+            damping=2.5,
             armature=0.0282528,
             min_delay=1,
             max_delay=6,
@@ -243,7 +243,7 @@ class K1Rewards(RewardsCfg):
 
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-0.2,
+        weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -264,7 +264,7 @@ class K1Rewards(RewardsCfg):
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.16,
+        weight=-0.13,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -277,7 +277,7 @@ class K1Rewards(RewardsCfg):
         func=minimum_height,
         weight=-100.0,
         params={
-            "min_height": 0.52,
+            "min_height": 0.53,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
@@ -312,7 +312,13 @@ class K1Rewards(RewardsCfg):
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
-        weight=-0.15,
+        weight=-0.15 * 1.8,
+    )
+
+    dof_vel_l2 = RewTerm(
+        func=mdp.joint_vel_l2,
+        weight=-5.0e-4,
+        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"])},
     )
 
 # ---------------------------------------------------------------------------

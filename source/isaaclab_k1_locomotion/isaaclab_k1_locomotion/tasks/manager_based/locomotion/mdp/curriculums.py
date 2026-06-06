@@ -61,7 +61,8 @@ class lin_vel_command_curriculum(ManagerTermBase):
     ``error_threshold`` を下回ったら次のステージに進む。最終ステージに到達したら以降は据え置く。
 
     Args:
-        stages: 各ステージで使用する ``(min, max)``。 ``lin_vel_x`` と ``lin_vel_y`` の両方に同じ範囲を適用する。
+        stages_x: 各ステージで ``lin_vel_x`` に適用する ``(min, max)`` のリスト。
+        stages_y: 各ステージで ``lin_vel_y`` に適用する ``(min, max)`` のリスト。 ``stages_x`` と同じ長さでなければならない。
         error_threshold: ステージを進めるためのEMA誤差(m/s)の上限。
         command_name: 対象コマンド名(例: ``"base_velocity"``)。
         asset_name: ロボットのアセット名。
@@ -72,7 +73,13 @@ class lin_vel_command_curriculum(ManagerTermBase):
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
         params = cfg.params
-        self._stages: list[tuple[float, float]] = [tuple(s) for s in params["stages"]]
+        self._stages_x: list[tuple[float, float]] = [tuple(s) for s in params["stages_x"]]
+        self._stages_y: list[tuple[float, float]] = [tuple(s) for s in params["stages_y"]]
+        if len(self._stages_x) != len(self._stages_y):
+            raise ValueError(
+                f"stages_x と stages_y は同じ長さでなければなりません: "
+                f"len(stages_x)={len(self._stages_x)}, len(stages_y)={len(self._stages_y)}"
+            )
         self._error_threshold: float = float(params["error_threshold"])
         self._command_name: str = params["command_name"]
         self._asset_name: str = params.get("asset_name", "robot")
@@ -82,13 +89,14 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._update_count: int = 0
 
         # 初期ステージの範囲を即時適用
-        self._apply_stage(self._stages[self._current_stage])
+        self._apply_stage(self._current_stage)
 
     def __call__(
         self,
         env: ManagerBasedRLEnv,
         env_ids: Sequence[int],
-        stages: Sequence[Sequence[float]],
+        stages_x: Sequence[Sequence[float]],
+        stages_y: Sequence[Sequence[float]],
         error_threshold: float,
         command_name: str,
         asset_name: str = "robot",
@@ -109,25 +117,26 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._update_count += 1
 
         if (
-            self._current_stage < len(self._stages) - 1
+            self._current_stage < len(self._stages_x) - 1
             and self._update_count >= min_updates
             and self._error_ema < error_threshold
         ):
             self._current_stage += 1
-            self._apply_stage(self._stages[self._current_stage])
+            self._apply_stage(self._current_stage)
             self._update_count = 0
             self._error_ema = None
 
         return {
             "stage": float(self._current_stage),
             "error_ema": float(self._error_ema if self._error_ema is not None else 0.0),
-            "lin_vel_max": float(self._stages[self._current_stage][1]),
+            "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
+            "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
         }
 
-    def _apply_stage(self, vel_range: tuple[float, float]) -> None:
+    def _apply_stage(self, stage_idx: int) -> None:
         cmd_term = self._env.command_manager.get_term(self._command_name)
-        cmd_term.cfg.ranges.lin_vel_x = tuple(vel_range)
-        cmd_term.cfg.ranges.lin_vel_y = tuple(vel_range)
+        cmd_term.cfg.ranges.lin_vel_x = tuple(self._stages_x[stage_idx])
+        cmd_term.cfg.ranges.lin_vel_y = tuple(self._stages_y[stage_idx])
 
 
 class ball_max_speed_curriculum(ManagerTermBase):

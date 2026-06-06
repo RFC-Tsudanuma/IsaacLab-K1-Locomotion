@@ -21,6 +21,7 @@ from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
 from .observations import ball_vel as get_ball_vel
+from .events import get_phase_freq
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -112,8 +113,9 @@ def feet_phase(
     # Current time within the episode for each environment  [N]
     t = env.episode_length_buf * env.step_dt
 
+    pf = get_phase_freq(env, phase_freq)
     # Phase angle in [0, 2*pi) for the LEFT foot
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)   # [N]
+    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 
@@ -402,12 +404,13 @@ def foot_clearance_ji_pen(
 
     right_foot_vel = torch.norm(asset.data.body_lin_vel_w[:, right_foot_idx, :2], dim=1)    # xy速度が速いほどペナルティを大きくする
     left_foot_vel =  torch.norm(asset.data.body_lin_vel_w[:, left_foot_idx, :2], dim=1)
-    right_foot_height_err = right_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2]) 
+    right_foot_height_err = right_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2])
     left_foot_height_err = left_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2])
 
     # feet_phase と同一の desired-stance 判定
     t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
@@ -604,6 +607,90 @@ def ball_distance(env: ManagerBasedRLEnv, max_distance: float = 14.0, asset_cfg:
     ball_distance = torch.norm(ball_vel,dim=1,p=2) #l2ノルム計算してボールの距離を出す
     return torch.clamp(ball_distance / max_distance, 0.0, 1.0)
 
+
+def ball_velocity_along_kick(
+    env: ManagerBasedRLEnv,
+    command_name: str = "kick_direction",
+    max_speed: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ボールのワールド座標 xy 速度を、コマンドのキック方向 (ワールド) に射影した量。
+
+    ``kick_direction`` コマンドは既に単位ベクトルを返すので追加正規化は不要。
+    正の成分のみを `max_speed` で割って [0, 1] にクランプする。
+    """
+    ball = env.scene[asset_cfg.name]
+    ball_vel_w = ball.data.root_com_vel_w[:, :2]
+    kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2)
+    v_along = (ball_vel_w * kick_dir_w).sum(dim=1)
+    v_along = torch.clamp(v_along, min=0.0)
+    return torch.clamp(v_along / max_speed, 0.0, 1.0)
+
+
+def ball_speed(
+    env: ManagerBasedRLEnv,
+    max_speed: float = 3.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ボールのワールド座標 xy 速度のノルムを `max_speed` で割って [0, 1] にクランプ。"""
+    ball = env.scene[asset_cfg.name]
+    ball_vel_w = ball.data.root_com_vel_w[:, :2]
+    speed = torch.norm(ball_vel_w, dim=1)
+    return torch.clamp(speed / max_speed, 0.0, 1.0)
+
+
+def com_jerk_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ロボットの root body COM の線加速度の jerk (時間微分) の L2 二乗をペナルティとして返す。
+
+    jerk_t ≈ (acc_t - acc_{t-1}) / dt
+    前ステップの加速度は `env._prev_com_lin_acc_w` に保持する
+    (`action_smoothness_l2` と同じパターン)。エピソードリセット直後は
+    勾配を 0 にしたいので、`episode_length_buf` が小さいときはペナルティを 0 にする。
+    """
+    robot = env.scene[asset_cfg.name]
+    # body_com_lin_acc_w: (N, num_bodies, 3) ; 0番目が root body
+    acc = robot.data.body_com_lin_acc_w[:, 0, :]  # (N, 3)
+    if not hasattr(env, "_prev_com_lin_acc_w") or env._prev_com_lin_acc_w.shape != acc.shape:
+        env._prev_com_lin_acc_w = acc.clone()
+    prev_acc = env._prev_com_lin_acc_w
+    dt = env.step_dt
+    jerk = (acc - prev_acc) / max(dt, 1e-6)
+    env._prev_com_lin_acc_w = acc.clone()
+    penalty = torch.sum(torch.square(jerk), dim=1)
+    # リセット直後 (前回 acc が前エピソードのもの) は無効化
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
+
+def robot_velocity_toward_ball(
+    env: ManagerBasedRLEnv,
+    max_speed: float = 1.0,
+    min_distance: float = 0.05,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ロボットがボールに向かって進んでいる成分を [0, 1] で返す shaping 報酬。
+
+    ワールド xy で、ロボット→ボール方向の単位ベクトルにロボットの線速度を射影する。
+    ボールに十分近づいたとき (`min_distance` 未満) は方向が定義しにくいので 0 を返す。
+    """
+    robot = env.scene[robot_cfg.name]
+    ball = env.scene[ball_cfg.name]
+    to_ball = ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
+    dist = torch.norm(to_ball, dim=1, keepdim=True)
+    direction = to_ball / (dist + 1e-6)
+    robot_vel_w = robot.data.root_lin_vel_w[:, :2]
+    v_along = (robot_vel_w * direction).sum(dim=1)
+    v_along = torch.clamp(v_along, min=0.0)
+    reward = torch.clamp(v_along / max_speed, 0.0, 1.0)
+    # ボールに十分近づいたら shaping 不要にする。
+    near = (dist.squeeze(-1) < min_distance)
+    reward = torch.where(near, torch.zeros_like(reward), reward)
+    return reward
+
 # ボールに触っていると報酬を得る。これを最後までオンにしていると蹴るよりも触ってしまうため、
 # カリキュラムで途中で重みを途中で下げる等した方がよさそう。
 def touch_ball(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -665,6 +752,40 @@ def force_touch_ball_downhalf(
     penalty_right = (touch_right & out_range_right).float()
     return torch.clamp(penalty_left + penalty_right, max=1.0)
 
+def feet_landing_impact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    contact_threshold: float = 1.0,
+) -> torch.Tensor:
+    """着地時の衝撃力に応じてペナルティを与える報酬関数 (weight < 0 で使う想定)。
+
+    前ステップで airborne (|F| < threshold) だった足が、現ステップで接地状態 (|F| >= threshold)
+    になった瞬間を「着地イベント」とみなし、その時の接地力ノルムをそのまま値として返す。
+    着地以外 (定常接地中 / 空中) は 0。
+
+    Args:
+        env: 学習環境。
+        sensor_cfg: 足の Contact sensor (両足の foot body を含める)。
+        contact_threshold: 接地判定の力ノルム閾値 [N]。
+
+    Returns:
+        環境ごとのペナルティ値 [N], 両足の衝撃力ノルム [N] の合計。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+
+    # net_forces_w_history: [N, history, num_bodies, 3]; index 0 = 最新, 1 = 前ステップ
+    forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    force_mag = forces.norm(dim=-1)  # [N, history, num_bodies]
+
+    current = force_mag[:, 0]
+    previous = force_mag[:, 1]
+
+    landing = (current >= contact_threshold) & (previous < contact_threshold)
+    impact_force = torch.where(landing, current, torch.zeros_like(current))
+
+    return impact_force.sum(dim=1)
+
+
 def action_smoothness_l2(env):
     # これはcassieのcausal transformer論文から取ってきた
     a = env.action_manager.action
@@ -709,4 +830,5 @@ __all__ = [
     "foot_clearance_ji",
     "feet_height_bezier",
     "feet_stride_length",
+    "feet_landing_impact",
 ]
