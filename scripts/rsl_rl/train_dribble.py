@@ -129,16 +129,13 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 """Rest everything follows."""
 
 import logging
-import math
 import os
 import time
 from datetime import datetime
 
 import gymnasium as gym
 import torch
-from rsl_rl.modules import ActorCritic, ActorCriticRecurrent
 from rsl_rl.runners import OnPolicyRunner
-from rsl_rl.utils import resolve_obs_groups
 
 from isaaclab.envs import (
     DirectMARLEnv,
@@ -159,235 +156,12 @@ logger = logging.getLogger(__name__)
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
 
+from dribble_helpers import HierarchicalVecEnvWrapper, _build_frozen_policy  # noqa: F401
+
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
-
-
-def _term_slot(observation_manager, group: str, term_name: str) -> tuple[int, int]:
-    """Return (start, end) column indices of ``term_name`` within the concatenated tensor of ``group``."""
-    if group not in observation_manager.active_terms:
-        raise ValueError(
-            f"Observation group '{group}' not found. Available: {list(observation_manager.active_terms.keys())}"
-        )
-    term_names = list(observation_manager.active_terms[group])
-    term_dims = list(observation_manager.group_obs_term_dim[group])
-    if term_name not in term_names:
-        raise ValueError(
-            f"Term '{term_name}' not found in group '{group}'. Available terms: {term_names}"
-        )
-    idx = term_names.index(term_name)
-    start = sum(int(math.prod(d)) for d in term_dims[:idx])
-    end = start + int(math.prod(term_dims[idx]))
-    return start, end
-
-
-class HierarchicalVecEnvWrapper:
-    """rsl_rl VecEnv-compatible wrapper exposing a high-level (walking command) action space.
-
-    Each step:
-        1. Read the current env observation.
-        2. Build a copy of the chosen ``low_level_obs_group`` tensor with the
-           ``low_level_cmd_term_name`` slice overwritten by the high-level action.
-        3. Run the frozen low-level policy on the modified observation → joint targets.
-        4. Step the inner env with those joint targets.
-
-    The env's ``command_manager`` is not touched.
-    """
-
-    def __init__(
-        self,
-        inner_env: RslRlVecEnvWrapper,
-        low_level_policy: torch.nn.Module,
-        low_level_obs_group: str = "policy",
-        low_level_cmd_term_name: str = "velocity_commands",
-        action_clip: float = 1.0,
-        high_action_dim: int = 3,
-    ):
-        self.env = inner_env
-        self.low_level_policy = low_level_policy
-        self.low_level_obs_group = low_level_obs_group
-        self.action_clip = float(action_clip)
-        # rsl_rl VecEnv-required attrs
-        self.num_envs = inner_env.num_envs
-        self.device = inner_env.device
-        self.max_episode_length = inner_env.max_episode_length
-        self.num_actions = int(high_action_dim)
-        # Resolve the slice of the walking-command observation term inside the chosen group.
-        om = inner_env.unwrapped.observation_manager
-        self._cmd_slot = _term_slot(om, low_level_obs_group, low_level_cmd_term_name)
-        slot_dim = self._cmd_slot[1] - self._cmd_slot[0]
-        if slot_dim != self.num_actions:
-            raise ValueError(
-                f"Slot dim of obs term '{low_level_cmd_term_name}' in group '{low_level_obs_group}' is"
-                f" {slot_dim}, but high_action_dim is {self.num_actions}."
-            )
-
-    # -- pass-through properties expected by rsl_rl / IsaacLab utilities --
-    @property
-    def cfg(self):
-        return self.env.cfg
-
-    @property
-    def unwrapped(self):
-        return self.env.unwrapped
-
-    @property
-    def observation_space(self):
-        return self.env.observation_space
-
-    @property
-    def action_space(self):
-        return self.env.action_space
-
-    @property
-    def render_mode(self):
-        return self.env.render_mode
-
-    @property
-    def episode_length_buf(self) -> torch.Tensor:
-        return self.env.episode_length_buf
-
-    @episode_length_buf.setter
-    def episode_length_buf(self, value: torch.Tensor):
-        self.env.episode_length_buf = value
-
-    # -- VecEnv API --
-    def reset(self):
-        return self.env.reset()
-
-    def get_observations(self):
-        return self.env.get_observations()
-
-    def step(self, action: torch.Tensor):
-        cmd = action.to(self.device).clamp(-self.action_clip, self.action_clip)
-
-        # Snapshot of the current env observation (used as the *base* for both policies).
-        env_obs = self.env.get_observations()
-
-        # Build a modified low-level obs without mutating env_obs.
-        low_group_tensor = env_obs[self.low_level_obs_group].clone()
-        s, e = self._cmd_slot
-        low_group_tensor[:, s:e] = cmd
-        low_obs = {k: env_obs[k] for k in env_obs.keys()}
-        low_obs[self.low_level_obs_group] = low_group_tensor
-
-        # Frozen low-level policy → joint targets.
-        joint_action = self.low_level_policy.act_inference(low_obs)
-
-        # Step the inner env with joint targets; return its outputs to the runner.
-        return self.env.step(joint_action)
-
-    def close(self):
-        return self.env.close()
-
-
-class _JitFrozenPolicy:
-    """TorchScript wrapper exposing the same ``act_inference`` API as RSL-RL policies.
-
-    Used when the frozen-checkpoint ``.pt`` is a TorchScript archive produced by
-    ``export_policy_as_jit`` (i.e. its ``forward(obs) -> action`` already bakes
-    in the normalizer).
-    """
-
-    def __init__(self, jit_module: torch.jit.ScriptModule, low_level_obs_group: str, device: str):
-        self._module = jit_module.to(device).eval()
-        for p in self._module.parameters():
-            p.requires_grad_(False)
-        self._low_level_obs_group = low_level_obs_group
-        self._device = device
-
-    @torch.inference_mode()
-    def act_inference(self, obs: dict) -> torch.Tensor:
-        return self._module(obs[self._low_level_obs_group].to(self._device))
-
-
-class _OnnxFrozenPolicy:
-    """ONNX-runtime wrapper exposing the same ``act_inference`` API as RSL-RL policies.
-
-    Reads the concatenated tensor of ``low_level_obs_group`` from the obs dict,
-    runs ONNX inference, and returns the resulting action tensor on ``device``.
-    Recurrent policies (LSTM/GRU with extra ``h_in`` / ``c_in`` inputs) are not
-    supported.
-    """
-
-    def __init__(self, onnx_path: str, low_level_obs_group: str, device: str):
-        import onnxruntime as ort  # local import: only needed for the ONNX branch
-
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "cuda" in device else ["CPUExecutionProvider"]
-        self._session = ort.InferenceSession(onnx_path, providers=providers)
-        input_names = [i.name for i in self._session.get_inputs()]
-        if input_names != ["obs"]:
-            raise ValueError(
-                f"ONNX frozen policy expects a single input named 'obs' (non-recurrent export),"
-                f" got inputs={input_names}. Recurrent ONNX frozen policies are not supported."
-            )
-        self._output_name = self._session.get_outputs()[0].name
-        self._low_level_obs_group = low_level_obs_group
-        self._device = device
-
-    def act_inference(self, obs: dict) -> torch.Tensor:
-        x = obs[self._low_level_obs_group]
-        x_np = x.detach().cpu().numpy().astype("float32", copy=False)
-        out = self._session.run([self._output_name], {"obs": x_np})[0]
-        return torch.from_numpy(out).to(self._device)
-
-
-def _build_frozen_policy(
-    env: RslRlVecEnvWrapper,
-    agent_cfg: RslRlBaseRunnerCfg,
-    checkpoint_path: str,
-    device: str,
-    low_level_obs_group: str,
-):
-    """Construct a low-level policy and load weights from a ``.pt`` or ``.onnx`` checkpoint.
-
-    For ``.pt`` checkpoints (raw state_dict), an ``ActorCritic`` mirroring
-    ``agent_cfg.policy`` is built and weights are loaded. For ``.onnx``
-    checkpoints (e.g. produced by ``export_policy.py``), an ONNX-runtime
-    wrapper is returned.
-
-    The policy is configured to read its input from ``low_level_obs_group`` so
-    that its concatenated input matches its training structure regardless of
-    how the high-level "policy" group is shaped.
-    """
-    ext = os.path.splitext(checkpoint_path)[1].lower()
-    if ext == ".onnx":
-        return _OnnxFrozenPolicy(checkpoint_path, low_level_obs_group, device)
-
-    # ``.pt`` can be either a TorchScript archive (export_policy_as_jit) or a
-    # raw state_dict (rsl_rl ``model_*.pt``). Try TorchScript first.
-    try:
-        jit_module = torch.jit.load(checkpoint_path, map_location=device)
-        return _JitFrozenPolicy(jit_module, low_level_obs_group, device)
-    except RuntimeError:
-        pass
-
-    agent_dict = agent_cfg.to_dict()
-    policy_cfg = dict(agent_dict["policy"])
-    policy_class_name = policy_cfg.pop("class_name", "ActorCritic")
-    policy_class = {"ActorCritic": ActorCritic, "ActorCriticRecurrent": ActorCriticRecurrent}[policy_class_name]
-
-    obs = env.get_observations()
-    forced_groups = {"policy": [low_level_obs_group], "critic": [low_level_obs_group]}
-    obs_groups = resolve_obs_groups(obs, forced_groups, ["critic"])
-
-    frozen = policy_class(obs, obs_groups, env.num_actions, **policy_cfg).to(device)
-
-    ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
-    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    # Frozen policy is only used for inference; critic_* tensors may have a
-    # different shape (privileged obs) and would fail the size check even with
-    # strict=False, so drop them entirely.
-    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(("critic", "critic_obs_normalizer"))}
-    # rsl_rl's ActorCritic.load_state_dict overrides the base method and returns a bool.
-    frozen.load_state_dict(state_dict, strict=False)
-
-    frozen.eval()
-    for p in frozen.parameters():
-        p.requires_grad_(False)
-    return frozen
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)

@@ -103,9 +103,10 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
 
-# Reuse the wrapper + frozen-policy builder from train_dribble.py so the play
-# inference path is byte-for-byte identical to training.
-from train_dribble import HierarchicalVecEnvWrapper, _build_frozen_policy
+# Reuse the wrapper + frozen-policy builder so the play inference path is
+# byte-for-byte identical to training. Imported from a side-effect-free helper
+# module (not train_dribble.py, which would re-run its top-level argparse).
+from dribble_helpers import HierarchicalVecEnvWrapper, _build_frozen_policy
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
