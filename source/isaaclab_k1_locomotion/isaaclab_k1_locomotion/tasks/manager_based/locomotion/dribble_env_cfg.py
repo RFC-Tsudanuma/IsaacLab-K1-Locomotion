@@ -50,6 +50,7 @@ from .velocity_env_cfg import CommandsCfg, MySceneCfg
 from .mdp.commands import KickDirectionCommandCfg
 from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b
 from .mdp.rewards import (
+    action_smoothness_l2,
     ball_speed,
     ball_velocity_along_kick,
     com_jerk_l2,
@@ -155,6 +156,32 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
         self.observations.policy.velocity_commands = None
         self.observations.critic.velocity_commands = None
 
+        # FlatEnv 由来のカリキュラム (base_velocity 追従/push_robot 強化) は
+        # 高レベルタスクには不要なので全て無効化。
+        self.curriculum.command_resampling_time_range = None
+        self.curriculum.lin_vel_command = None
+        self.curriculum.push_robot_stage1 = None
+
+        # FlatEnv/RoughEnv 由来の報酬項は全て無効化し、dribble 側で定義する項のみ残す。
+        self.rewards.track_lin_vel_xy_exp = None
+        self.rewards.track_ang_vel_z_exp = None
+        self.rewards.feet_phase = None
+        self.rewards.feet_air_time = None
+        self.rewards.feet_slide = None
+        self.rewards.dof_pos_limits_ankle = None
+        self.rewards.joint_deviation_hip = None
+        self.rewards.base_height_penalty = None
+        self.rewards.feet_close_penalty = None
+        self.rewards.feet_parallel_to_ground = None
+        self.rewards.foot_clearance_ji_pen = None
+        self.rewards.dof_vel_l2 = None
+        self.rewards.dof_torques_l2 = None
+        self.rewards.dof_acc_l2 = None
+        self.rewards.action_rate_l2 = None
+        self.rewards.undesired_contacts = None
+        self.rewards.dof_pos_limits = None
+        self.rewards.feet_landing_impact = None
+
         # Spawn the ball in a random position around the robot on reset.
         self.events.reset_ball = EventTerm(
             func=mdp.reset_root_state_uniform,
@@ -197,7 +224,7 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
         self.rewards.lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
         self.rewards.flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
         self.rewards.action_smoothness_l2 = RewTerm(
-            func=mdp.action_smoothness_l2,
+            func=action_smoothness_l2,
             weight=-0.2,
         )
         self.rewards.ang_vel_xy_l2 = RewTerm(

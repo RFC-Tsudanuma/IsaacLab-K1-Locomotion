@@ -283,19 +283,87 @@ class HierarchicalVecEnvWrapper:
         return self.env.close()
 
 
+class _JitFrozenPolicy:
+    """TorchScript wrapper exposing the same ``act_inference`` API as RSL-RL policies.
+
+    Used when the frozen-checkpoint ``.pt`` is a TorchScript archive produced by
+    ``export_policy_as_jit`` (i.e. its ``forward(obs) -> action`` already bakes
+    in the normalizer).
+    """
+
+    def __init__(self, jit_module: torch.jit.ScriptModule, low_level_obs_group: str, device: str):
+        self._module = jit_module.to(device).eval()
+        for p in self._module.parameters():
+            p.requires_grad_(False)
+        self._low_level_obs_group = low_level_obs_group
+        self._device = device
+
+    @torch.inference_mode()
+    def act_inference(self, obs: dict) -> torch.Tensor:
+        return self._module(obs[self._low_level_obs_group].to(self._device))
+
+
+class _OnnxFrozenPolicy:
+    """ONNX-runtime wrapper exposing the same ``act_inference`` API as RSL-RL policies.
+
+    Reads the concatenated tensor of ``low_level_obs_group`` from the obs dict,
+    runs ONNX inference, and returns the resulting action tensor on ``device``.
+    Recurrent policies (LSTM/GRU with extra ``h_in`` / ``c_in`` inputs) are not
+    supported.
+    """
+
+    def __init__(self, onnx_path: str, low_level_obs_group: str, device: str):
+        import onnxruntime as ort  # local import: only needed for the ONNX branch
+
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "cuda" in device else ["CPUExecutionProvider"]
+        self._session = ort.InferenceSession(onnx_path, providers=providers)
+        input_names = [i.name for i in self._session.get_inputs()]
+        if input_names != ["obs"]:
+            raise ValueError(
+                f"ONNX frozen policy expects a single input named 'obs' (non-recurrent export),"
+                f" got inputs={input_names}. Recurrent ONNX frozen policies are not supported."
+            )
+        self._output_name = self._session.get_outputs()[0].name
+        self._low_level_obs_group = low_level_obs_group
+        self._device = device
+
+    def act_inference(self, obs: dict) -> torch.Tensor:
+        x = obs[self._low_level_obs_group]
+        x_np = x.detach().cpu().numpy().astype("float32", copy=False)
+        out = self._session.run([self._output_name], {"obs": x_np})[0]
+        return torch.from_numpy(out).to(self._device)
+
+
 def _build_frozen_policy(
     env: RslRlVecEnvWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
     checkpoint_path: str,
     device: str,
     low_level_obs_group: str,
-) -> torch.nn.Module:
-    """Construct a low-level ActorCritic mirroring ``agent_cfg.policy`` and load weights.
+):
+    """Construct a low-level policy and load weights from a ``.pt`` or ``.onnx`` checkpoint.
 
-    The frozen policy is configured to read its actor/critic input from
-    ``low_level_obs_group`` so that its concatenated input matches its training
-    structure regardless of how the high-level "policy" group is shaped.
+    For ``.pt`` checkpoints (raw state_dict), an ``ActorCritic`` mirroring
+    ``agent_cfg.policy`` is built and weights are loaded. For ``.onnx``
+    checkpoints (e.g. produced by ``export_policy.py``), an ONNX-runtime
+    wrapper is returned.
+
+    The policy is configured to read its input from ``low_level_obs_group`` so
+    that its concatenated input matches its training structure regardless of
+    how the high-level "policy" group is shaped.
     """
+    ext = os.path.splitext(checkpoint_path)[1].lower()
+    if ext == ".onnx":
+        return _OnnxFrozenPolicy(checkpoint_path, low_level_obs_group, device)
+
+    # ``.pt`` can be either a TorchScript archive (export_policy_as_jit) or a
+    # raw state_dict (rsl_rl ``model_*.pt``). Try TorchScript first.
+    try:
+        jit_module = torch.jit.load(checkpoint_path, map_location=device)
+        return _JitFrozenPolicy(jit_module, low_level_obs_group, device)
+    except RuntimeError:
+        pass
+
     agent_dict = agent_cfg.to_dict()
     policy_cfg = dict(agent_dict["policy"])
     policy_class_name = policy_cfg.pop("class_name", "ActorCritic")
@@ -309,13 +377,12 @@ def _build_frozen_policy(
 
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
-    missing, unexpected = frozen.load_state_dict(state_dict, strict=False)
-    if missing or unexpected:
-        print(
-            f"[WARN] Frozen policy load: missing={len(missing)} unexpected={len(unexpected)} keys."
-            " Verify the frozen checkpoint matches --agent's policy architecture and the env's"
-            f" --low_level_obs_group ({low_level_obs_group}) structure."
-        )
+    # Frozen policy is only used for inference; critic_* tensors may have a
+    # different shape (privileged obs) and would fail the size check even with
+    # strict=False, so drop them entirely.
+    state_dict = {k: v for k, v in state_dict.items() if not k.startswith(("critic", "critic_obs_normalizer"))}
+    # rsl_rl's ActorCritic.load_state_dict overrides the base method and returns a bool.
+    frozen.load_state_dict(state_dict, strict=False)
 
     frozen.eval()
     for p in frozen.parameters():
