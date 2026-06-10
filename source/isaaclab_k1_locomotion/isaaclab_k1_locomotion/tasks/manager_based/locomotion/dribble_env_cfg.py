@@ -51,7 +51,7 @@ from .velocity_env_cfg import CommandsCfg, MySceneCfg
 from .mdp.commands import KickDirectionCommandCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
-from .mdp.curriculums import randomize_ball_init_velocity
+from .mdp.curriculums import randomize_ball_init_velocity, randomize_ball_init_pose
 from .mdp.events import reset_prev_high_action
 from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b, last_high_action
 from .mdp.terminations import time_after_ball_contact
@@ -170,7 +170,7 @@ class K1DribbleRewardsCfg:
     # ボール速度の大きさ (方向問わず)。max_speed で正規化、上限 1.0。
     ball_speed = RewTerm(
         func=ball_speed,
-        weight=1.0,
+        weight=0.7,
         params={"max_speed": 3.0},
     )
 
@@ -179,7 +179,7 @@ class K1DribbleRewardsCfg:
     robot_velocity_toward_ball = RewTerm(
         func=robot_velocity_toward_ball,
         weight=0.5,
-        params={"max_speed": 1.3, "min_distance": 0.15},
+        params={"max_speed": 0.8, "min_distance": 0.15},
     )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
     robot_facing_ball = RewTerm(
@@ -215,6 +215,7 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+        self.episode_length_s = 7.0
 
         # 報酬は dribble 用に丸ごと置き換える。
         # ※ K1FlatEnvCfg.__post_init__ が K1Rewards の各項を弄っている分は捨てて構わない。
@@ -262,7 +263,7 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
             params={
                 "velocity_range": {"x": (0.0, 0.0), "y": (0.0, 0.0), "yaw": (0.0, 0.0)},
                 "pose_range": {
-                    "x": (0.15, 1.5),
+                    "x": (0.10, 1.5),
                     "y": (-1.5, 1.5),
                     "z": (0.0, 0.0),
                     "roll": (0.0, 0.0),
@@ -273,21 +274,36 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
             },
         )
 
-        # self.curriculum.randomize_ball_init_velocity = CurrTerm(
-        #     func=randomize_ball_init_velocity,
-        #     params={
-        #         "term_name": "reset_ball",
-        #         "num_steps": 3000,
-        #         "velocity_range": {
-        #             "x": (-0.2, 0.2),
-        #             "y": (-0.2, 0.2),
-        #             "z": (0.0, 0.0),
-        #             "roll": (0.0, 0.0),
-        #             "pitch": (0.0, 0.0),
-        #             "yaw": (0.0, 0.0),
-        #         },
-        #     },
-        # )
+        self.curriculum.randomize_ball_init_velocity = CurrTerm(
+            func=randomize_ball_init_velocity,
+            params={
+                "term_name": "reset_ball",
+                "num_steps": 5000,
+                "velocity_range": {
+                    "x": (-0.5, 0.5),
+                    "y": (-0.5, 0.5),
+                    "z": (0.0, 0.0),
+                    "roll": (0.0, 0.0),
+                    "pitch": (0.0, 0.0),
+                    "yaw": (0.0, 0.0),
+                },
+            },
+        )
+        self.curriculum.randomize_ball_init_pose = CurrTerm(
+            func=randomize_ball_init_pose,
+            params={
+                "term_name": "reset_ball",
+                "num_steps": 5000,
+                "pose_range": {
+                    "x": (0.10, 3.0),
+                    "y": (-2.5, 2.5),
+                    "z": (0.0, 0.0),
+                    "roll": (0.0, 0.0),
+                    "pitch": (0.0, 0.0),
+                    "yaw": (0.0, 0.0),
+                },
+            },
+        )
 
 
 @configclass
