@@ -54,6 +54,29 @@ def modify_push_robot(
             term_cfg.params["velocity_range"] = velocity_range
 
 
+def randomize_ball_init_velocity(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    num_steps: int,
+    velocity_range: dict[str, tuple[float, float]],
+):
+    """指定ステップ数を超えたら、reset イベントの ``velocity_range`` を差し替えてボールに初速を与える。
+
+    ``term_name`` は ``mdp.reset_root_state_uniform`` を使ったイベント (例: ``reset_ball``)
+    を指す。EventManager は reset 呼び出し時に ``term_cfg.params`` を再読込するため、
+    ``params["velocity_range"]`` を上書きするだけで次回 reset から反映される。
+
+    Note:
+        ``num_steps`` は ``env.common_step_counter`` (env.step 呼び出し回数 ≒ num_steps_per_env *
+        iteration 数) と比較するので、「総学習ステップ数の半分」を狙うなら
+        ``num_steps_per_env * max_iterations // 2`` を渡せばよい。
+    """
+    if env.common_step_counter > num_steps:
+        term_cfg = env.event_manager.get_term_cfg(term_name)
+        term_cfg.params["velocity_range"] = velocity_range
+
+
 class lin_vel_command_curriculum(ManagerTermBase):
     """線速度コマンド範囲(lin_vel_x / lin_vel_y)を段階的に拡げるカリキュラム。
 

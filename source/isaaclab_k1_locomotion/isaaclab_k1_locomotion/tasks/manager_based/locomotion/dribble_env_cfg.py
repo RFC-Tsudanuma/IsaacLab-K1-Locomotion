@@ -38,6 +38,7 @@ from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.schemas import CollisionPropertiesCfg, MassPropertiesCfg
 from isaaclab.utils import configclass
@@ -48,12 +49,19 @@ from .flat_env_cfg import K1FlatEnvCfg
 from .rough_env_cfg import K1CriticCfg, K1ObservationsCfg, K1PolicyCfg
 from .velocity_env_cfg import CommandsCfg, MySceneCfg
 from .mdp.commands import KickDirectionCommandCfg
-from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+
+from .mdp.curriculums import randomize_ball_init_velocity
+from .mdp.events import reset_prev_high_action
+from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b, last_high_action
+from .mdp.terminations import time_after_ball_contact
 from .mdp.rewards import (
-    action_smoothness_l2,
     ball_speed,
     ball_velocity_along_kick,
     com_jerk_l2,
+    high_action_rate_l2,
+    high_action_smoothness_l2,
+    robot_facing_ball,
     robot_velocity_toward_ball,
 )
 
@@ -99,8 +107,14 @@ class K1DribbleSceneCfg(MySceneCfg):
 
 @configclass
 class K1DribblePolicyCfg(K1PolicyCfg):
-    """High-level policy obs: FlatEnv K1PolicyCfg + ball position + kick direction (in base frame)."""
+    """High-level policy obs: FlatEnv K1PolicyCfg + ball position + kick direction (in base frame).
 
+    ``velocity_commands`` の代わりに **前回の高レベル action (= 歩行コマンド)** を
+    観測する。位置 (term の並び順) は親の ``velocity_commands`` と同じ。
+    """
+
+    # K1PolicyCfg.velocity_commands を同名の項で上書き → 並び順は親と同じ。
+    velocity_commands = ObsTerm(func=last_high_action, params={"action_dim": 3})
     ball_pos_rel = ObsTerm(func=ball_pos_rel, noise=Unoise(n_min=-0.05, n_max=0.05))
     kick_direction_b = ObsTerm(func=kick_direction_b, params={"command_name": "kick_direction"})
 
@@ -109,6 +123,8 @@ class K1DribblePolicyCfg(K1PolicyCfg):
 class K1DribbleCriticCfg(K1CriticCfg):
     """High-level critic obs: FlatEnv K1CriticCfg + ball pos/vel (privileged) + kick direction."""
 
+    # 上位 policy と同様に velocity_commands を前回 high-level action に差し替え。
+    velocity_commands = ObsTerm(func=last_high_action, params={"action_dim": 3})
     ball_pos_rel = ObsTerm(func=ball_pos_rel)
     ball_vel = ObsTerm(func=ball_vel)
     kick_direction_b = ObsTerm(func=kick_direction_b, params={"command_name": "kick_direction"})
@@ -141,6 +157,55 @@ class K1DribbleCommandsCfg(CommandsCfg):
 
 
 @configclass
+class K1DribbleRewardsCfg:
+    """Dribble 専用の報酬。K1Rewards (歩行用) は継承せずに丸ごと置き換える。"""
+
+    # --- ボール関連の主報酬 ---
+    # キック方向 (ワールド座標) に沿ったボール速度成分が大きいほど高い報酬。
+    ball_velocity_along_kick = RewTerm(
+        func=ball_velocity_along_kick,
+        weight=5.0,
+        params={"command_name": "kick_direction", "max_speed": 3.0},
+    )
+    # ボール速度の大きさ (方向問わず)。max_speed で正規化、上限 1.0。
+    ball_speed = RewTerm(
+        func=ball_speed,
+        weight=1.0,
+        params={"max_speed": 3.0},
+    )
+
+    # --- Shaping ---
+    # ロボットがボールに向かって進んでいる成分。
+    robot_velocity_toward_ball = RewTerm(
+        func=robot_velocity_toward_ball,
+        weight=0.5,
+        params={"max_speed": 1.3, "min_distance": 0.15},
+    )
+    # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
+    robot_facing_ball = RewTerm(
+        func=robot_facing_ball,
+        weight=0.5,
+        params={"min_distance": 0.15},
+    )
+
+    # --- ペナルティ ---
+    termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-1.5)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.3)
+    # 上位ポリシーが出力する 3D 歩行コマンドに対する平滑性ペナルティ。
+    # 元の action_smoothness_l2 は env.action_manager.action (= frozen の 22D 関節指令)
+    # を見ており上位ポリシーが直接制御できないので、上位 action 用に差し替え。
+    action_smoothness_l2 = RewTerm(func=high_action_smoothness_l2, weight=-0.08)
+    # 上位ポリシー action の 1 ステップ差分 (action rate) ペナルティ。
+    # コマンドが急変するとロボットが追従しきれず歩行が乱れるので軽く抑える。
+    action_rate_l2 = RewTerm(func=high_action_rate_l2, weight=-0.3)
+    # ロボット root body COM の jerk (加速度の時間微分) ペナルティ。
+    # 値域が大きくなりやすいので重みは非常に小さめから始める。
+    com_jerk_l2 = RewTerm(func=com_jerk_l2, weight=-1e-6)
+
+
+@configclass
 class K1DribbleEnvCfg(K1FlatEnvCfg):
     """K1FlatEnv + a soccer ball, used as the dribble training env."""
 
@@ -151,10 +216,27 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # 高レベルの観測には FlatEnv の ``velocity_commands`` 項は不要なので外す。
-        # ※ ``low_level`` 観測グループには元のまま残しておく (frozen の入力スロットが必要)。
-        self.observations.policy.velocity_commands = None
-        self.observations.critic.velocity_commands = None
+        # 報酬は dribble 用に丸ごと置き換える。
+        # ※ K1FlatEnvCfg.__post_init__ が K1Rewards の各項を弄っている分は捨てて構わない。
+        self.rewards = K1DribbleRewardsCfg()
+
+        # ※ 上位 policy / critic の ``velocity_commands`` 項は K1DribblePolicyCfg /
+        # K1DribbleCriticCfg 側で ``last_high_action`` に上書き済み (位置はそのまま)。
+        # ``low_level`` 観測グループは K1PolicyCfg のまま残してあるので、wrapper が
+        # 入力時に同スロットを現ステップの高レベル action で塗り潰す。
+
+        # ロボットの初期 yaw を固定。ボールの reset 範囲 (x=(0.15, 1.5)) は
+        # env-frame で評価されるため、yaw をランダム化するとロボットの真後ろにも
+        # スポーンしうる。dribble では「ボールは常に正面 (x > 0)」を保ちたいので yaw=0 に固定する。
+        self.events.reset_base.params["pose_range"]["yaw"] = (0.0, 0.0)
+
+        # リセット時に ``_prev_high_action`` バッファ (HierarchicalVecEnvWrapper が
+        # 用意) を 0 にする。これがないと新エピソード最初の観測が前エピソードの
+        # 高レベル action を引きずる。
+        self.events.reset_prev_high_action = EventTerm(
+            func=reset_prev_high_action,
+            mode="reset",
+        )
 
         # FlatEnv 由来のカリキュラム (base_velocity 追従/push_robot 強化) は
         # 高レベルタスクには不要なので全て無効化。
@@ -162,27 +244,18 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
         self.curriculum.lin_vel_command = None
         self.curriculum.push_robot_stage1 = None
 
-        # FlatEnv/RoughEnv 由来の報酬項は全て無効化し、dribble 側で定義する項のみ残す。
-        self.rewards.track_lin_vel_xy_exp = None
-        self.rewards.track_ang_vel_z_exp = None
-        self.rewards.feet_phase = None
-        self.rewards.feet_air_time = None
-        self.rewards.feet_slide = None
-        self.rewards.dof_pos_limits_ankle = None
-        self.rewards.joint_deviation_hip = None
-        self.rewards.base_height_penalty = None
-        self.rewards.feet_close_penalty = None
-        self.rewards.feet_parallel_to_ground = None
-        self.rewards.foot_clearance_ji_pen = None
-        self.rewards.dof_vel_l2 = None
-        self.rewards.dof_torques_l2 = None
-        self.rewards.dof_acc_l2 = None
-        self.rewards.action_rate_l2 = None
-        self.rewards.undesired_contacts = None
-        self.rewards.dof_pos_limits = None
-        self.rewards.feet_landing_impact = None
+        # # DEBUG: 学習不調の切り分けのため一旦無効化。
+        # # ボールに初めて接触してから 4 秒後にエピソード終了。
+        # # time_out=True としているので termination_penalty の対象外 (時間切れ扱い)。
+        # self.terminations.after_ball_contact_timeout = DoneTerm(
+        #     func=time_after_ball_contact,
+        #     time_out=True,
+        #     params={"time_after_contact": 3.0},
+        # )
 
         # Spawn the ball in a random position around the robot on reset.
+        # 初期は静止 (velocity_range は全て 0)。総ステップ数の半分を超えたら
+        # 下の randomize_ball_init_velocity カリキュラムでランダム初速に切り替わる。
         self.events.reset_ball = EventTerm(
             func=mdp.reset_root_state_uniform,
             mode="reset",
@@ -200,43 +273,21 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
             },
         )
 
-        # キック方向 (ワールド座標) に沿ったボール速度成分が大きいほど高い報酬。
-        self.rewards.ball_velocity_along_kick = RewTerm(
-            func=ball_velocity_along_kick,
-            weight=5.0,
-            params={"command_name": "kick_direction", "max_speed": 3.0},
-        )
-        # ボール速度の大きさ (方向問わず)。max_speed で正規化、上限 1.0。
-        self.rewards.ball_speed = RewTerm(
-            func=ball_speed,
-            weight=1.5,
-            params={"max_speed": 3.0},
-        )
-        # Shaping: ロボットがボールに向かって進んでいる成分。重みは小さめ。
-        self.rewards.robot_velocity_toward_ball = RewTerm(
-            func=robot_velocity_toward_ball,
-            weight=0.5,
-            params={"max_speed": 1.0, "min_distance": 0.25},
-        )
-        
-        # -----------------------ペナルティ-----------------------
-        self.rewards.termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
-        self.rewards.lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-2.0)
-        self.rewards.flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-5.0)
-        self.rewards.action_smoothness_l2 = RewTerm(
-            func=action_smoothness_l2,
-            weight=-0.2,
-        )
-        self.rewards.ang_vel_xy_l2 = RewTerm(
-            func=mdp.ang_vel_xy_l2,
-            weight=-0.2,
-        )
-        # ロボット root body COM の jerk (加速度の時間微分) ペナルティ。
-        # 値域が大きくなりやすいので重みは非常に小さめから始める。
-        self.rewards.com_jerk_l2 = RewTerm(
-            func=com_jerk_l2,
-            weight=-1.0e-6,
-        )
+        # self.curriculum.randomize_ball_init_velocity = CurrTerm(
+        #     func=randomize_ball_init_velocity,
+        #     params={
+        #         "term_name": "reset_ball",
+        #         "num_steps": 3000,
+        #         "velocity_range": {
+        #             "x": (-0.2, 0.2),
+        #             "y": (-0.2, 0.2),
+        #             "z": (0.0, 0.0),
+        #             "roll": (0.0, 0.0),
+        #             "pitch": (0.0, 0.0),
+        #             "yaw": (0.0, 0.0),
+        #         },
+        #     },
+        # )
 
 
 @configclass

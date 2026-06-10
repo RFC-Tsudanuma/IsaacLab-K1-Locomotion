@@ -67,6 +67,23 @@ def ball_pos_rel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntity
     return offset_b[:, :2]
 
 
+def last_high_action(
+    env: ManagerBasedRLEnv,
+    action_dim: int = 3,
+) -> torch.Tensor:
+    """前回ステップで上位ポリシーが出力した行動 (歩行コマンド) を返す。
+
+    ``HierarchicalVecEnvWrapper`` が毎ステップ ``env._prev_high_action``
+    (shape ``(num_envs, action_dim)``) を更新する。リセット時は
+    :func:`mdp.events.reset_prev_high_action` で対象 env のスロットが 0 にされる。
+    未初期化のときは 0 を返す (起動時など)。
+    """
+    buf = getattr(env, "_prev_high_action", None)
+    if buf is None or buf.shape != (env.num_envs, action_dim):
+        return torch.zeros((env.num_envs, action_dim), device=env.device)
+    return buf
+
+
 def kick_direction_b(
     env: ManagerBasedRLEnv,
     command_name: str = "kick_direction",

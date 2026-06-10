@@ -52,4 +52,23 @@ def get_phase_freq(env: "ManagerBasedEnv", default: float) -> "float | torch.Ten
     return val
 
 
-__all__ = ["randomize_phase_freq", "get_phase_freq"]
+def reset_prev_high_action(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+):
+    """リセットされた env の ``_prev_high_action`` バッファを 0 にする。
+
+    バッファ実体は ``HierarchicalVecEnvWrapper`` が用意するので、本関数は無ければ
+    no-op で返す。Observation 計算は ``_reset_idx`` の後に走るので、ここで 0 化
+    しておけば新エピソード最初の観測 ``last_high_action`` も 0 になる。
+    """
+    buf = getattr(env, "_prev_high_action", None)
+    if buf is None:
+        return
+    if env_ids is None:
+        buf.zero_()
+        return
+    buf[env_ids] = 0.0
+
+
+__all__ = ["randomize_phase_freq", "get_phase_freq", "reset_prev_high_action"]

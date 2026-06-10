@@ -691,6 +691,31 @@ def robot_velocity_toward_ball(
     reward = torch.where(near, torch.zeros_like(reward), reward)
     return reward
 
+
+def robot_facing_ball(
+    env: ManagerBasedRLEnv,
+    min_distance: float = 0.05,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ロボットの Trunk 正面 (base +x) がボール方向を向いているほど大きい [0, 1] の報酬。
+
+    ボール位置をロボットの base yaw frame に変換し、xy 単位ベクトルの x 成分
+    (= cos(θ), θ は Trunk 正面とボール方向の角度) を返す。
+    cos が負 (ボールが背後) のときは 0 にクランプ。
+    `min_distance` 未満では方向が不安定になるので 0 を返す。
+    """
+    robot = env.scene[robot_cfg.name]
+    ball = env.scene[ball_cfg.name]
+    offset_w = ball.data.root_pos_w - robot.data.root_pos_w
+    offset_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), offset_w)
+    dist_xy = torch.norm(offset_b[:, :2], dim=1)
+    cos_theta = offset_b[:, 0] / (dist_xy + 1e-6)
+    reward = torch.clamp(cos_theta, min=0.0, max=1.0)
+    near = dist_xy < min_distance
+    return torch.where(near, torch.zeros_like(reward), reward)
+
+
 # ボールに触っていると報酬を得る。これを最後までオンにしていると蹴るよりも触ってしまうため、
 # カリキュラムで途中で重みを途中で下げる等した方がよさそう。
 def touch_ball(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -786,6 +811,53 @@ def feet_landing_impact(
     return impact_force.sum(dim=1)
 
 
+def feet_landing_vel(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot_link"),
+    contact_threshold: float = 1.0,
+    vertical_only: bool = True,
+) -> torch.Tensor:
+    """着地瞬間の足の速度に応じてペナルティを与える報酬関数 (weight < 0 で使う想定)。
+
+    `feet_landing_impact` が「着地時の接地力」を罰するのに対し、本関数は「着地時の足の速度」
+    を罰する。前ステップで airborne (|F| < threshold) だった足が、現ステップで接地状態
+    (|F| >= threshold) になった瞬間を「着地イベント」とみなし、その時の足の速度を値として返す。
+    速度が大きいほど地面を強く踏みつけている (=硬い着地) ことを意味するため、これを抑制すると
+    柔らかく接地する歩容を促せる。着地以外 (定常接地中 / 空中) は 0。
+
+    Args:
+        env: 学習環境。
+        sensor_cfg: 足の Contact sensor (両足の foot body を含める)。着地イベント判定に使う。
+        asset_cfg: 足の速度を取る Articulation。sensor_cfg と同じ足 body を同じ順序で指す必要がある。
+        contact_threshold: 接地判定の力ノルム閾値 [N]。
+        vertical_only: True のとき鉛直方向の下向き速度 |v_z| のみを対象にする (踏みつけの直接原因)。
+            False のときは足速度の 3D ノルムを使う (水平方向の擦り・滑りも抑制)。
+
+    Returns:
+        環境ごとのペナルティ値 [m/s], 着地した足の速度の合計。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+
+    # net_forces_w_history: [N, history, num_bodies, 3]; index 0 = 最新, 1 = 前ステップ
+    forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    force_mag = forces.norm(dim=-1)  # [N, history, num_feet]
+    current = force_mag[:, 0]
+    previous = force_mag[:, 1]
+    landing = (current >= contact_threshold) & (previous < contact_threshold)  # [N, num_feet]
+
+    # 足の速度 (world frame)。body_lin_vel_w は現ステップ値のみ取得可能なため着地直前を最新値で近似。
+    foot_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :]  # [N, num_feet, 3]
+    if vertical_only:
+        vel_mag = foot_vel[:, :, 2].abs()  # |v_z|
+    else:
+        vel_mag = foot_vel.norm(dim=-1)
+
+    impact_vel = torch.where(landing, vel_mag, torch.zeros_like(vel_mag))
+    return impact_vel.sum(dim=1)
+
+
 def action_smoothness_l2(env):
     # これはcassieのcausal transformer論文から取ってきた
     a = env.action_manager.action
@@ -796,6 +868,61 @@ def action_smoothness_l2(env):
     diff2 = torch.square(a - 2.0 * a_prev + env._prev_prev_action)
     env._prev_prev_action = a_prev.clone()
     return torch.sum((diff1 + diff2), dim=1)
+
+
+def high_action_smoothness_l2(env):
+    """上位ポリシーの高レベル action (歩行コマンド 3D) の平滑性ペナルティ。
+
+    既存の :func:`action_smoothness_l2` と同じ式
+    ``||a - a_prev||² + ||a - 2*a_prev + a_prev_prev||²`` を上位 action に対して計算する。
+    対象は ``env.action_manager.action`` (= frozen の 22D 関節指令) ではなく、
+    ``HierarchicalVecEnvWrapper`` が毎ステップ ``env._prev_high_action`` (clipped 3D) に
+    書き込む値。
+
+    リセット直後はペナルティを 0 にする (``episode_length_buf < 2``)。
+    """
+    a = getattr(env, "_prev_high_action", None)
+    if a is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    # 履歴バッファ。初回呼び出し or 形状不整合なら 0 で再初期化。
+    if (not hasattr(env, "_high_action_prev")) or env._high_action_prev.shape != a.shape:
+        env._high_action_prev = torch.zeros_like(a)
+        env._high_action_prev_prev = torch.zeros_like(a)
+    a_prev = env._high_action_prev
+    a_prev_prev = env._high_action_prev_prev
+    diff1 = torch.square(a - a_prev)
+    diff2 = torch.square(a - 2.0 * a_prev + a_prev_prev)
+    penalty = torch.sum(diff1 + diff2, dim=1)
+    # 履歴更新 (次ステップで使う)
+    env._high_action_prev_prev = a_prev.clone()
+    env._high_action_prev = a.clone()
+    # リセット直後は履歴が前エピソードのものなのでペナルティを無効化
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
+
+def high_action_rate_l2(env):
+    """上位ポリシーの高レベル action (歩行コマンド 3D) の action rate ペナルティ。
+
+    1 ステップ差分の L2 二乗: ``||a_t - a_{t-1}||²``。
+    対象は ``env.action_manager.action`` (= frozen の 22D 関節指令) ではなく、
+    ``HierarchicalVecEnvWrapper`` が ``env._prev_high_action`` に書き込む 3D 歩行コマンド。
+
+    バッファは ``high_action_smoothness_l2`` とは独立 (``_high_action_prev_for_rate``)。
+    呼び出し順序に依存しないようにするための分離。
+    リセット直後 (``episode_length_buf < 2``) は 0 を返す。
+    """
+    a = getattr(env, "_prev_high_action", None)
+    if a is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    if (not hasattr(env, "_high_action_prev_for_rate")) or env._high_action_prev_for_rate.shape != a.shape:
+        env._high_action_prev_for_rate = torch.zeros_like(a)
+    a_prev = env._high_action_prev_for_rate
+    penalty = torch.sum(torch.square(a - a_prev), dim=1)
+    env._high_action_prev_for_rate = a.clone()
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
 
 def fix_stance_foot_pos(env: ManagerBasedRLEnv,asset_cfg: SceneEntityCfg ) -> torch.tensor:
     robot = env.scene[asset_cfg.name]
@@ -831,4 +958,5 @@ __all__ = [
     "feet_height_bezier",
     "feet_stride_length",
     "feet_landing_impact",
+    "feet_landing_vel",
 ]

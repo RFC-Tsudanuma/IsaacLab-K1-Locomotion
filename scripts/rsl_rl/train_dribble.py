@@ -72,8 +72,12 @@ parser.add_argument(
 parser.add_argument(
     "--high_action_clip",
     type=float,
-    default=1.0,
-    help="Clipping range for the high-level action (interpreted as the walking command for the frozen policy).",
+    nargs=3,
+    default=[1.0, 0.8, 1.0],
+    metavar=("VX", "VY", "WZ"),
+    help="Per-axis clipping range for the high-level action (vx, vy, wz) — should match the frozen"
+    " walking policy's training-time velocity command range. Default mirrors lin_vel_command's"
+    " final stage: vx=±1.0, vy=±0.8, wz=±1.0.",
 )
 parser.add_argument(
     "--low_level_obs_group",
@@ -130,6 +134,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 import logging
 import os
+import shutil
 import time
 from datetime import datetime
 
@@ -258,9 +263,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
     with open(os.path.join(log_dir, "params", "dribble_meta.txt"), "w") as f:
         f.write(f"frozen_checkpoint: {os.path.abspath(args_cli.frozen_checkpoint)}\n")
-        f.write(f"high_action_clip: {args_cli.high_action_clip}\n")
+        f.write(f"high_action_clip (vx, vy, wz): {tuple(args_cli.high_action_clip)}\n")
         f.write(f"low_level_obs_group: {args_cli.low_level_obs_group}\n")
         f.write(f"low_level_cmd_term_name: {args_cli.low_level_cmd_term_name}\n")
+
+    # 学習時の frozen checkpoint をログに保存。後で play / 再学習する際に「どの歩行ポリシーで
+    # 学習したか」を取り違えないようにするための保険。
+    frozen_src = os.path.abspath(args_cli.frozen_checkpoint)
+    frozen_dst = os.path.join(log_dir, "params", "frozen_low_level.pt")
+    try:
+        shutil.copy(frozen_src, frozen_dst)
+        print(f"[INFO] Copied frozen checkpoint to: {frozen_dst}")
+    except OSError as e:
+        print(f"[WARN] Failed to copy frozen checkpoint ({frozen_src} -> {frozen_dst}): {e}")
 
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
