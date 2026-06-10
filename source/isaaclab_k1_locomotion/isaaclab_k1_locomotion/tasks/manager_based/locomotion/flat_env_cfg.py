@@ -16,7 +16,7 @@ from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.events import randomize_phase_freq
-from .mdp.rewards import feet_landing_impact
+from .mdp.rewards import feet_landing_impact, feet_landing_vel
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -154,10 +154,23 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
         self.rewards.feet_landing_impact = RewTerm(
             func=feet_landing_impact,
-            weight=-9.0e-3,
+            weight=-1.5e-2,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
+            },
+        )
+        # 着地時の速度ペナルティ: 接地した瞬間の足の(鉛直)速度が大きいほどペナルティを与える。
+        # 硬い踏みつけ(下向き速度が大きい着地)を抑制し、柔らかい接地を促す。
+        # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
+        self.rewards.feet_landing_vel = RewTerm(
+            func=feet_landing_vel,
+            weight=-2.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "contact_threshold": 1.0,
+                "vertical_only": False,
             },
         )
         # 速度コマンドを離散格子からサンプリングする版に差し替える

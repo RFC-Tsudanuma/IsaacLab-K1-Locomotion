@@ -109,8 +109,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
             damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
-            min_delay=1,
-            max_delay=6,
+            min_delay=2,
+            max_delay=10,
         ),
         "feet": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
@@ -121,8 +121,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             stiffness=50.0,
             damping=2.5,
             armature=0.0282528,
-            min_delay=1,
-            max_delay=6,
+            min_delay=2,
+            max_delay=10,
         ),
         # "arms": IdealPDActuatorCfg(
         #     joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
@@ -292,23 +292,23 @@ class K1Rewards(RewardsCfg):
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=3.5,
+        weight=3.0,
         params={
             "sigma": 0.08
         },
     )
 
-    foot_clearance_ji_pen = RewTerm(
-        func=foot_clearance_ji_pen,
-        weight=4.0,
-        params={
-            "command_name": "base_velocity",
-            "target_clearance": 0.09,
-            "phase_freq": _PHASE_FREQ,
-            "stance_ratio": _STANCE_RATIO,
-            "cmd_threshold": _COMMAND_THRESHOLD,
-        },
-    )
+    # foot_clearance_ji_pen = RewTerm(
+    #     func=foot_clearance_ji_pen,
+    #     weight=4.0,
+    #     params={
+    #         "command_name": "base_velocity",
+    #         "target_clearance": 0.09,
+    #         "phase_freq": _PHASE_FREQ,
+    #         "stance_ratio": _STANCE_RATIO,
+    #         "cmd_threshold": _COMMAND_THRESHOLD,
+    #     },
+    # )
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
