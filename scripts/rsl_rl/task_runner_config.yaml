@@ -1,0 +1,37 @@
+# Task runner configuration for IsaacLab-K1-Locomotion (RSL-RL)
+
+base:
+  # Command to invoke Python (can be "python", "isaaclab.bat -p", "./isaaclab.sh -p", etc.)
+  python_command: "auto"
+  train_script: "scripts/rsl_rl/train.py"
+  task: "Isaac-Velocity-Flat-K1-v0"
+  num_envs: 4096
+  headless: true
+  experiment_name: "k1_flat_knee_sweep"
+  run_name_format: "knee_eff{effort}_vel{velocity}"
+  extra_args: []
+  override_mode: "patched_register"
+  patch_sim_limits: true
+  task_runner_log_dir: "logs/task_runner"
+  skip_completed: true
+
+  # Optional resume settings for all runs
+  resume: false
+  load_run: null
+  checkpoint: null
+
+sweep:
+  # Target regex keys in actuator dict (Knee_Pitch only)
+  joint_keys:
+    - ".*_Knee_Pitch"
+
+  # If end is "default", the value is taken from the env config
+  effort_limit:
+    start: 10
+    step: 10
+    end: default
+
+  velocity_limit:
+    start: 5
+    step: 5
+    end: default
