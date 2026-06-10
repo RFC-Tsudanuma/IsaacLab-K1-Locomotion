@@ -290,13 +290,13 @@ class K1Rewards(RewardsCfg):
         },
     )
 
-    feet_parallel_to_ground = RewTerm(
-        func=feet_parallel_to_ground,
-        weight=3.0,
-        params={
-            "sigma": 0.08
-        },
-    )
+    # feet_parallel_to_ground = RewTerm(
+    #     func=feet_parallel_to_ground,
+    #     weight=3.0,
+    #     params={
+    #         "sigma": 0.08
+    #     },
+    # )
 
     # foot_clearance_ji_pen = RewTerm(
     #     func=foot_clearance_ji_pen,
