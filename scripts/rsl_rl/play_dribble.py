@@ -39,6 +39,12 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument(
+    "--export_only",
+    action="store_true",
+    default=False,
+    help="Export the high-level policy to TorchScript/ONNX and exit (skip the play loop).",
+)
 # -- hierarchical-specific arguments
 parser.add_argument(
     "--frozen_checkpoint",
@@ -49,8 +55,11 @@ parser.add_argument(
 parser.add_argument(
     "--high_action_clip",
     type=float,
-    default=1.0,
-    help="Clipping range for the high-level action (walking command).",
+    nargs=3,
+    default=[1.2, 0.8, 1.0],
+    metavar=("VX", "VY", "WZ"),
+    help="Per-axis clipping range for the high-level action (vx, vy, wz). Use the same values as"
+    " were used at training time.",
 )
 parser.add_argument(
     "--low_level_obs_group",
@@ -95,7 +104,12 @@ from isaaclab.envs import (
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import (
+    RslRlBaseRunnerCfg,
+    RslRlVecEnvWrapper,
+    export_policy_as_jit,
+    export_policy_as_onnx,
+)
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -194,6 +208,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy_nn = runner.alg.policy
     except AttributeError:
         policy_nn = runner.alg.actor_critic
+
+    # 上位ポリシーを TorchScript / ONNX にエクスポート (play.py と同じ流儀)。
+    # 出力先: <checkpoint dir>/exported/policy.{pt,onnx}
+    if hasattr(policy_nn, "actor_obs_normalizer"):
+        normalizer = policy_nn.actor_obs_normalizer
+    elif hasattr(policy_nn, "student_obs_normalizer"):
+        normalizer = policy_nn.student_obs_normalizer
+    else:
+        normalizer = None
+    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    print(f"[INFO] Exported high-level policy to: {export_model_dir}/policy.{{pt,onnx}}")
+
+    if args_cli.export_only:
+        hier_env.close()
+        return
 
     dt = inner_env.unwrapped.step_dt
 

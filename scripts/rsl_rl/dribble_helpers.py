@@ -58,18 +58,27 @@ class HierarchicalVecEnvWrapper:
         low_level_policy,
         low_level_obs_group: str = "policy",
         low_level_cmd_term_name: str = "velocity_commands",
-        action_clip: float = 1.0,
+        action_clip=(1.0, 1.0, 1.0),
         high_action_dim: int = 3,
     ):
         self.env = inner_env
         self.low_level_policy = low_level_policy
         self.low_level_obs_group = low_level_obs_group
-        self.action_clip = float(action_clip)
         # rsl_rl VecEnv-required attrs
         self.num_envs = inner_env.num_envs
         self.device = inner_env.device
         self.max_episode_length = inner_env.max_episode_length
         self.num_actions = int(high_action_dim)
+        # Per-axis clipping: accept a single float (uniform) or a per-axis sequence.
+        if isinstance(action_clip, (int, float)):
+            clip_vals = [float(action_clip)] * self.num_actions
+        else:
+            clip_vals = [float(v) for v in action_clip]
+            if len(clip_vals) != self.num_actions:
+                raise ValueError(
+                    f"action_clip must be a scalar or length-{self.num_actions} sequence, got {clip_vals}"
+                )
+        self.action_clip = torch.tensor(clip_vals, device=self.device)  # (num_actions,)
         # Resolve the slice of the walking-command observation term inside the chosen group.
         om = inner_env.unwrapped.observation_manager
         self._cmd_slot = _term_slot(om, low_level_obs_group, low_level_cmd_term_name)
@@ -79,6 +88,13 @@ class HierarchicalVecEnvWrapper:
                 f"Slot dim of obs term '{low_level_cmd_term_name}' in group '{low_level_obs_group}' is"
                 f" {slot_dim}, but high_action_dim is {self.num_actions}."
             )
+
+        # Buffer holding the previous high-level (clipped) action. The env's
+        # ``last_high_action`` observation reads this; ``reset_prev_high_action``
+        # event zeroes per-env slots at reset time.
+        inner_env.unwrapped._prev_high_action = torch.zeros(
+            self.num_envs, self.num_actions, device=self.device
+        )
 
     # -- pass-through properties expected by rsl_rl / IsaacLab utilities --
     @property
@@ -117,7 +133,8 @@ class HierarchicalVecEnvWrapper:
         return self.env.get_observations()
 
     def step(self, action: torch.Tensor):
-        cmd = action.to(self.device).clamp(-self.action_clip, self.action_clip)
+        # Per-axis clip: self.action_clip is (num_actions,); broadcast over batch.
+        cmd = torch.clamp(action.to(self.device), -self.action_clip, self.action_clip)
 
         env_obs = self.env.get_observations()
 
@@ -128,6 +145,11 @@ class HierarchicalVecEnvWrapper:
         low_obs[self.low_level_obs_group] = low_group_tensor
 
         joint_action = self.low_level_policy.act_inference(low_obs)
+
+        # Stash *before* env.step so that the post-step obs (incl. any auto-reset
+        # branches) observes the correct prev high action. For envs that get
+        # auto-reset inside env.step, the reset event clears this slot.
+        self.env.unwrapped._prev_high_action.copy_(cmd)
 
         return self.env.step(joint_action)
 
