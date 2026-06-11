@@ -136,20 +136,26 @@ class HierarchicalVecEnvWrapper:
         # Per-axis clip: self.action_clip is (num_actions,); broadcast over batch.
         cmd = torch.clamp(action.to(self.device), -self.action_clip, self.action_clip)
 
-        env_obs = self.env.get_observations()
+        # Frozen policy is fixed: never need autograd for it. Wrap the whole
+        # low-level inference in inference_mode so that we don't build a
+        # computation graph even if the outer caller (rsl_rl rollout) forgets to.
+        with torch.inference_mode():
+            env_obs = self.env.get_observations()
 
-        low_group_tensor = env_obs[self.low_level_obs_group].clone()
-        s, e = self._cmd_slot
-        low_group_tensor[:, s:e] = cmd
-        low_obs = {k: env_obs[k] for k in env_obs.keys()}
-        low_obs[self.low_level_obs_group] = low_group_tensor
+            low_group_tensor = env_obs[self.low_level_obs_group].clone()
+            s, e = self._cmd_slot
+            # cmd may carry grad info from the high-level sampler; detach defensively
+            # before stuffing into the frozen policy's input slot.
+            low_group_tensor[:, s:e] = cmd.detach()
+            low_obs = {k: env_obs[k] for k in env_obs.keys()}
+            low_obs[self.low_level_obs_group] = low_group_tensor
 
-        joint_action = self.low_level_policy.act_inference(low_obs)
+            joint_action = self.low_level_policy.act_inference(low_obs)
 
         # Stash *before* env.step so that the post-step obs (incl. any auto-reset
         # branches) observes the correct prev high action. For envs that get
         # auto-reset inside env.step, the reset event clears this slot.
-        self.env.unwrapped._prev_high_action.copy_(cmd)
+        self.env.unwrapped._prev_high_action.copy_(cmd.detach())
 
         return self.env.step(joint_action)
 
