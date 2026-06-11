@@ -7,7 +7,7 @@ import os
 import torch
 
 from isaaclab.assets import ArticulationCfg
-from isaaclab.actuators import IdealPDActuatorCfg, DelayedPDActuatorCfg
+from isaaclab.actuators import ActuatorNetMLPCfg, DelayedPDActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -47,9 +47,47 @@ _K1_URDF_PATH = os.path.join(
     "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf",
 )
 
+_LEG_NET_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "../../../../../../actuator_net_leg.pt",
+)
+
 ##
 # K1 robot asset configuration
 ##
+
+actuatornet_leg = ActuatorNetMLPCfg(
+    joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
+    effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+    velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+    # ActuatorNetMLPCfg は DCMotorCfg を継承しており、ピーク(ストール)トルク saturation_effort が必須。
+    # トルク-速度カーブの clipping にのみ使われるスカラ値 (グループ全関節に共通)。
+    # 各関節の上限は effort_limit が別途キャップするため、ここでは最大の effort_limit (Knee=112) を
+    # 上回る値にして低速域での不要なトルク制限を避ける。実機のモータ仕様が分かれば置き換えること。
+    saturation_effort=120.0,
+    stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
+    damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
+    armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
+    network_file=_LEG_NET_PATH,
+    pos_scale=1.0,
+    vel_scale=1.0,
+    torque_scale=1.0,
+    input_order="vel_pos",
+    input_idx=[2,1,0]
+)
+
+delayed_pd_leg = DelayedPDActuatorCfg(
+            joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
+            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+            # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
+            # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
+            stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
+            damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
+            armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
+            min_delay=2,
+            max_delay=10,
+        )
 
 K1_LOCOMOTION_CFG = ArticulationCfg(
     spawn=sim_utils.UrdfFileCfg(
@@ -100,18 +138,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "legs": DelayedPDActuatorCfg(
-            joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
-            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
-            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
-            # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
-            # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
-            stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
-            damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
-            armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
-            min_delay=2,
-            max_delay=10,
-        ),
+        "legs": actuatornet_leg,
         "feet": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
             effort_limit=38.3,
