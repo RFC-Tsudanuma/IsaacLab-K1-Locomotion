@@ -16,7 +16,7 @@ from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.events import randomize_phase_freq
-from .mdp.rewards import feet_landing_impact, feet_landing_vel
+from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -171,6 +171,22 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
                 "vertical_only": False,
+            },
+        )
+        # 着地時のかかと接地報酬: 着地の瞬間に足がつま先上げ(かかと下がり)姿勢ほど報酬を与える。
+        # 足裏ベタ着き/つま先着地ではなく、かかとから接地する歩容を促す。
+        # 着地イベント時のみ非0・両足合計 (0〜2 程度) なので重みは中程度にとる。
+        # NOTE: 学習しても逆 (つま先着地) が促進される場合は pitch_sign を -1.0 に反転する。
+        self.rewards.feet_heel_strike = RewTerm(
+            func=feet_heel_strike,
+            weight=0.5,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "contact_threshold": 1.0,
+                "target_pitch": 0.13,
+                "std": 0.15,
+                "pitch_sign": 1.0,
             },
         )
         # 速度コマンドを離散格子からサンプリングする版に差し替える
