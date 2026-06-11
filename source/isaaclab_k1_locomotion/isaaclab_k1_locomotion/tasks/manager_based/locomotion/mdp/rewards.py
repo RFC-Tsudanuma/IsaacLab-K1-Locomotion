@@ -858,6 +858,62 @@ def feet_landing_vel(
     return impact_vel.sum(dim=1)
 
 
+def feet_heel_strike(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot_link"),
+    contact_threshold: float = 1.0,
+    target_pitch: float = 0.2,
+    std: float = 0.15,
+    pitch_sign: float = 1.0,
+) -> torch.Tensor:
+    """着地の瞬間に「かかとから接地する」姿勢 (つま先上げ=背屈) を促す報酬関数 (weight > 0 で使う想定)。
+
+    前ステップで airborne (|F| < threshold) だった足が、現ステップで接地状態 (|F| >= threshold) に
+    なった瞬間を「着地イベント」とみなす。その瞬間の足のピッチ角が、かかと側が下がった姿勢
+    (``target_pitch``) に近いほど大きい報酬を与える。これにより、足裏ベタ着き/つま先着地ではなく、
+    かかとから接地する歩容を促す。着地以外 (定常接地中 / 空中) は 0。
+
+    Note:
+        足リンクのローカル座標系の取り方によってピッチの符号は変わりうる。学習しても逆 (つま先着地)
+        が促進されてしまう場合は ``pitch_sign`` を ``-1.0`` に反転すること。デバッグ時は
+        ``send_data_stream`` で着地時の ``pitch`` 値を確認すると符号を特定しやすい。
+
+    Args:
+        env: 学習環境。
+        sensor_cfg: 足の Contact sensor (両足の foot body を含める)。着地イベント判定に使う。
+        asset_cfg: 足の姿勢を取る Articulation。sensor_cfg と同じ足 body を同じ順序で指すこと。
+        contact_threshold: 接地判定の力ノルム閾値 [N]。
+        target_pitch: 着地時に狙うかかと下がりピッチ角 [rad] (toe-up / 背屈方向を正とする)。
+        std: 報酬カーネル幅。``target_pitch`` からの許容ズレの広さ。小さいほどシビアになる。
+        pitch_sign: 計測ピッチの符号補正 (+1.0 / -1.0)。toe-up が正になるよう合わせる。
+
+    Returns:
+        環境ごとの報酬値 (着地イベント時のみ非0、両足合計)。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    asset = env.scene[asset_cfg.name]
+
+    # net_forces_w_history: [N, history, num_bodies, 3]; index 0 = 最新, 1 = 前ステップ
+    forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :]
+    force_mag = forces.norm(dim=-1)  # [N, history, num_feet]
+    current = force_mag[:, 0]
+    previous = force_mag[:, 1]
+    landing = (current >= contact_threshold) & (previous < contact_threshold)  # [N, num_feet]
+
+    # 足のピッチ角 (world frame)。euler_xyz_from_quat は [*, 4] を想定するため平坦化して処理。
+    foot_quat = asset.data.body_quat_w[:, asset_cfg.body_ids, :]  # [N, num_feet, 4]
+    num_envs, num_feet = foot_quat.shape[0], foot_quat.shape[1]
+    _, pitch, _ = euler_xyz_from_quat(foot_quat.reshape(-1, 4))
+    pitch = wrap_to_pi(pitch).reshape(num_envs, num_feet)  # [N, num_feet]
+    pitch = pitch_sign * pitch
+
+    # かかと下がり (target_pitch) に近い着地ほど高報酬
+    heel_reward = torch.exp(-torch.square(pitch - target_pitch) / (std ** 2))
+    heel_reward = torch.where(landing, heel_reward, torch.zeros_like(heel_reward))
+    return heel_reward.sum(dim=1)
+
+
 def action_smoothness_l2(env):
     # これはcassieのcausal transformer論文から取ってきた
     a = env.action_manager.action
