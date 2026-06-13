@@ -611,20 +611,29 @@ def ball_distance(env: ManagerBasedRLEnv, max_distance: float = 14.0, asset_cfg:
 def ball_velocity_along_kick(
     env: ManagerBasedRLEnv,
     command_name: str = "kick_direction",
-    max_speed: float = 3.0,
+    speed_gate: float = 0.1,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
-    """ボールのワールド座標 xy 速度を、コマンドのキック方向 (ワールド) に射影した量。
+    """ボールのワールド座標 xy 速度の「方向」がコマンドのキック方向 (ワールド) と
+    どれだけ揃っているかだけを評価する。速度の大きさは見ない。
 
-    ``kick_direction`` コマンドは既に単位ベクトルを返すので追加正規化は不要。
-    正の成分のみを `max_speed` で割って [0, 1] にクランプする。
+    ``kick_direction`` コマンドは既に単位ベクトルを返す。ボール速度方向との
+    コサイン類似度 [-1, 1] を [0, 1] にマップして返す。速度の大きさ自体は
+    別途 ``ball_speed`` 報酬で評価する。
+
+    ただし停止時 (速度 ~0) に報酬が残ると悪影響なので、`speed_gate` [m/s] 未満では
+    線形に減衰させて停止時は 0 にする。`speed_gate` を小さく取ることで、動き出せば
+    すぐにゲートが 1 に飽和し「方向のみ」の評価という性質は保たれる。
     """
     ball = env.scene[asset_cfg.name]
     ball_vel_w = ball.data.root_com_vel_w[:, :2]
     kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2)
-    v_along = (ball_vel_w * kick_dir_w).sum(dim=1)
-    v_along = torch.clamp(v_along, min=0.0)
-    return torch.clamp(v_along / max_speed, 0.0, 1.0)
+    cos_sim = torch.nn.functional.cosine_similarity(ball_vel_w, kick_dir_w, dim=1, eps=1e-6)
+    alignment = (cos_sim + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+
+    ball_speed = torch.norm(ball_vel_w, dim=1)
+    speed_factor = torch.clamp(ball_speed / speed_gate, 0.0, 1.0)
+    return alignment * speed_factor
 
 
 def ball_speed(
