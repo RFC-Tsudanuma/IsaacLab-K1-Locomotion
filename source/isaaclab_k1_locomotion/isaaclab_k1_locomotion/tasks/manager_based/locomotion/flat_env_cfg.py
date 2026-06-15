@@ -37,9 +37,9 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
         self.commands.base_velocity.rel_standing_envs = 0.02
-        self.commands.base_velocity.ranges.lin_vel_x = (-0.6, 0.6)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.6, 0.6)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (0.4, 0.4)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
         self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
 
 

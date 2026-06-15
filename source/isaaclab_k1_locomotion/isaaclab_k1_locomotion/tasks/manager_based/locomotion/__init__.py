@@ -5,7 +5,7 @@
 
 import gymnasium as gym
 
-from . import agents
+from . import agents, kick
 
 ##
 # Register Gym environments.

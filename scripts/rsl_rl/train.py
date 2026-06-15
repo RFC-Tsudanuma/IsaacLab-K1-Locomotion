@@ -91,6 +91,7 @@ from isaaclab.envs import (
     ManagerBasedRLEnvCfg,
     multi_agent_to_single_agent,
 )
+from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
@@ -109,6 +110,34 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
+
+
+def resolve_resume_path(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace) -> str:
+    """Resolve a checkpoint path for resume/fine-tuning.
+
+    Supports:
+    - direct checkpoint paths
+    - explicit experiment override via ``--experiment_name``
+    - task-specific default resume roots (e.g. kick <- k1_flat)
+    """
+
+    checkpoint_arg = agent_cfg.load_checkpoint
+    if checkpoint_arg:
+        if os.path.isfile(checkpoint_arg):
+            return os.path.abspath(checkpoint_arg)
+        try:
+            resolved_checkpoint = retrieve_file_path(checkpoint_arg)
+        except Exception:
+            resolved_checkpoint = None
+        if resolved_checkpoint and os.path.isfile(resolved_checkpoint):
+            return os.path.abspath(resolved_checkpoint)
+
+    resume_experiment_name = agent_cfg.experiment_name
+    if args_cli.experiment_name is None:
+        resume_experiment_name = getattr(agent_cfg, "resume_experiment_name", agent_cfg.experiment_name)
+
+    resume_log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", resume_experiment_name))
+    return get_checkpoint_path(resume_log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -190,7 +219,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        resume_path = resolve_resume_path(agent_cfg, args_cli)
 
     # wrap for video recording
     if args_cli.video:
