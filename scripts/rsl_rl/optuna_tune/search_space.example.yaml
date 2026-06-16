@@ -1,0 +1,61 @@
+# Optuna search space for K1 Flat locomotion (rsl_rl PPO).
+#
+# Copy this file (e.g. to search_space.yaml) and edit freely. Only paths under
+# `space:` are sampled — anything you do not list keeps the project default.
+#
+# Usage:
+#   ./scripts/rsl_rl/optuna_tune/tune.sh --config scripts/rsl_rl/optuna_tune/search_space.yaml
+#
+# Resume support: re-running with the same study_name + storage continues
+# adding trials to the same SQLite study.
+
+study_name: k1_flat_v1
+storage: sqlite:///scripts/rsl_rl/optuna_tune/studies/k1_flat_v1.db
+direction: maximize
+sampler: tpe                    # tpe | random | cmaes
+n_trials: 30
+seed: 42
+
+train:
+  task: Isaac-Velocity-Flat-K1-v0
+  experiment_name: k1_flat      # must match the env_cfg default so logs land in logs/rsl_rl/k1_flat/
+  num_envs: 4096
+  max_iterations: 4000           # short per-trial budget; bump for final tuning
+  trial_seed_offset: 1000
+  extra_args: ["--headless"]    # forwarded verbatim to train.py
+
+metric:
+  # REQUIRED. Pick a TensorBoard scalar tag that already appears in your
+  # logs/rsl_rl/k1_flat/<run>/events.* files (open the run in TensorBoard
+  # to confirm the exact name). Common choices for rsl-rl runs:
+  #   "Train/mean_reward"
+  #   "Train/mean_episode_length"
+  #   "Train/Episode_Reward/track_lin_vel_xy_exp"
+  tag: "Train/mean_reward"
+  reduce: mean_last_n           # last | final | mean_last_n | max
+  last_n: 30
+  fail_value: -1.0e9            # returned when train.py crashes or tag is missing
+
+# Each entry is "<scope>.<dot.path>: {type, ...}"
+# scope must be either "agent" (for RslRlOnPolicyRunnerCfg) or "env" (for the env cfg).
+space:
+  # ---- PPO algorithm ----
+  agent.algorithm.learning_rate:        {type: loguniform, low: 1.0e-4, high: 5.0e-3}
+  agent.algorithm.entropy_coef:         {type: loguniform, low: 1.0e-4, high: 1.0e-2}
+  agent.algorithm.clip_param:           {type: float,      low: 0.10,   high: 0.30}
+  agent.algorithm.gamma:                {type: float,      low: 0.95,   high: 0.999}
+  agent.algorithm.lam:                  {type: float,      low: 0.90,   high: 0.99}
+  agent.algorithm.num_learning_epochs:  {type: int,        low: 3,      high: 10}
+  agent.algorithm.num_mini_batches:     {type: categorical, choices: [2, 4, 8]}
+  agent.algorithm.desired_kl:           {type: loguniform, low: 5.0e-3, high: 5.0e-2}
+  agent.policy.init_noise_std:          {type: float,      low: 0.3,    high: 1.0}
+
+  # ---- reward weights (Flat overrides; see flat_env_cfg.py / rough_env_cfg.py) ----
+  # env.rewards.track_lin_vel_xy_exp.weight:    {type: float, low: 0.5,  high: 3.0}
+  # env.rewards.track_ang_vel_z_exp.weight:     {type: float, low: 0.5,  high: 3.0}
+  # env.rewards.feet_phase.weight:              {type: float, low: 0.5,  high: 5.0}
+  # env.rewards.feet_parallel_to_ground.weight: {type: float, low: 5.0,  high: 50.0}
+  # env.rewards.feet_close_penalty.weight:      {type: float, low: -30.0, high: -1.0}
+  # env.rewards.action_rate_l2.weight:          {type: float, low: -0.05, high: -0.001}
+  # env.rewards.flat_orientation_l2.weight:     {type: float, low: -40.0, high: -5.0}
+  # env.rewards.feet_air_time.weight:           {type: float, low: 0.0,   high: 0.5}
