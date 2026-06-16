@@ -875,6 +875,8 @@ def feet_heel_strike(
     target_pitch: float = 0.2,
     std: float = 0.15,
     pitch_sign: float = 1.0,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.1,
 ) -> torch.Tensor:
     """着地の瞬間に「かかとから接地する」姿勢 (つま先上げ=背屈) を促す報酬関数 (weight > 0 で使う想定)。
 
@@ -882,6 +884,10 @@ def feet_heel_strike(
     なった瞬間を「着地イベント」とみなす。その瞬間の足のピッチ角が、かかと側が下がった姿勢
     (``target_pitch``) に近いほど大きい報酬を与える。これにより、足裏ベタ着き/つま先着地ではなく、
     かかとから接地する歩容を促す。着地以外 (定常接地中 / 空中) は 0。
+
+    立ち止まり時 (コマンド速度 < ``cmd_threshold``) は、接地閾値付近のノイズで擬似的な着地イベントが
+    頻発し、足を ``target_pitch`` 方向に傾ける勾配が効いてしまう (足の傾き/微振動の原因)。これを防ぐため、
+    停止時は報酬を 0 にゲートする (``feet_phase`` と同じ停止判定規約)。
 
     Note:
         足リンクのローカル座標系の取り方によってピッチの符号は変わりうる。学習しても逆 (つま先着地)
@@ -896,6 +902,8 @@ def feet_heel_strike(
         target_pitch: 着地時に狙うかかと下がりピッチ角 [rad] (toe-up / 背屈方向を正とする)。
         std: 報酬カーネル幅。``target_pitch`` からの許容ズレの広さ。小さいほどシビアになる。
         pitch_sign: 計測ピッチの符号補正 (+1.0 / -1.0)。toe-up が正になるよう合わせる。
+        command_name: 速度コマンド名。停止判定に使う。
+        cmd_threshold: 停止判定の速度ノルム閾値 [m/s]。これ未満は立ち止まりとみなし報酬を 0 にする。
 
     Returns:
         環境ごとの報酬値 (着地イベント時のみ非0、両足合計)。
@@ -920,7 +928,12 @@ def feet_heel_strike(
     # かかと下がり (target_pitch) に近い着地ほど高報酬
     heel_reward = torch.exp(-torch.square(pitch - target_pitch) / (std ** 2))
     heel_reward = torch.where(landing, heel_reward, torch.zeros_like(heel_reward))
-    return heel_reward.sum(dim=1)
+    reward = heel_reward.sum(dim=1)  # [N]
+
+    # 立ち止まり時 (cmd 速度 < cmd_threshold) は接地ノイズによる擬似着地で足が傾くのを防ぐため 0 にする
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)  # [N]
+    is_moving = (cmd_speed >= cmd_threshold).float()
+    return reward * is_moving
 
 
 def action_smoothness_l2(env):

@@ -11,7 +11,7 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains import TerrainGeneratorCfg
 
-from .rough_env_cfg import K1RoughEnvCfg, _PHASE_FREQ
+from .rough_env_cfg import K1RoughEnvCfg, _PHASE_FREQ, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.commands import DiscreteVelocityCommandCfg
@@ -142,7 +142,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.32
         self.rewards.lin_vel_z_l2.weight = -0.8
-        self.rewards.action_rate_l2.weight = -0.6
+        self.rewards.action_rate_l2.weight = -0.4
         self.rewards.dof_acc_l2.weight = -1.0e-6
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
@@ -165,7 +165,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
         self.rewards.feet_landing_vel = RewTerm(
             func=feet_landing_vel,
-            weight=-2.0,
+            weight=-5.0,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -179,14 +179,16 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # NOTE: 学習しても逆 (つま先着地) が促進される場合は pitch_sign を -1.0 に反転する。
         self.rewards.feet_heel_strike = RewTerm(
             func=feet_heel_strike,
-            weight=0.5,
+            weight=5.0,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
-                "target_pitch": 0.13,
+                "target_pitch": 0.2,
                 "std": 0.15,
-                "pitch_sign": 1.0,
+                "pitch_sign": -1.0,
+                "command_name": "base_velocity",
+                "cmd_threshold": _COMMAND_THRESHOLD,
             },
         )
         # 速度コマンドを離散格子からサンプリングする版に差し替える

@@ -138,7 +138,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "legs": actuatornet_leg,
+        "legs": delayed_pd_leg,
         "feet": DelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
             effort_limit=38.3,
@@ -288,7 +288,15 @@ class K1Rewards(RewardsCfg):
     #     weight=-0.5,
     #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
     # )
-    
+    dof_vel_limits = RewTerm(
+        func=mdp.joint_vel_limits,
+        weight=-1.0,
+        params={
+            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]),
+            "soft_ratio": 0.9
+        },
+    )
+
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
         weight=-0.13,
