@@ -30,17 +30,17 @@ class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         critic_hidden_dims=[512, 256, 128],
         activation="elu",
     )
-    policy = RslRlPpoActorCriticRecurrentCfg(
-        init_noise_std=0.6,
-        actor_obs_normalization=True,
-        critic_obs_normalization=True,
-        actor_hidden_dims=[128, 128],
-        critic_hidden_dims=[128, 128],
-        activation="elu",
-        rnn_type="gru",
-        rnn_hidden_dim=256,
-        rnn_num_layers=1,
-    )
+    # policy = RslRlPpoActorCriticRecurrentCfg(
+    #     init_noise_std=0.6,
+    #     actor_obs_normalization=True,
+    #     critic_obs_normalization=True,
+    #     actor_hidden_dims=[128, 128],
+    #     critic_hidden_dims=[128, 128],
+    #     activation="elu",
+    #     rnn_type="gru",
+    #     rnn_hidden_dim=256,
+    #     rnn_num_layers=1,
+    # )
     # actor = RslRlRNNModelCfg(
     #     init_noise_std=0.6,
     #     obs_normalization=True,
@@ -91,9 +91,9 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
         #       実装されており、recurrent (GRU) 方策ではミニバッチが [時間T, 軌跡数N] の
         #       2 次元になるため正しく動作しない (compute_symmetric_states の obs.repeat も失敗)。
         #       GRU を使う間は無効化する。MLP 方策に戻す場合は復活させてよい。
-        # self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
-        #     use_data_augmentation=False,
-        #     use_mirror_loss=True,
-        #     data_augmentation_func=compute_symmetric_states,
-        #     mirror_loss_coeff=0.5,
-        # )
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_symmetric_states,
+            mirror_loss_coeff=0.5,
+        )
