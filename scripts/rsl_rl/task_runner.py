@@ -274,6 +274,81 @@ def _state_run(state: dict[str, Any], index: int) -> dict[str, Any]:
     raise RuntimeError(f"Missing index {index} in task_runner state.")
 
 
+def _completed_indexes_path(base: dict[str, Any]) -> Path:
+    configured = base.get("completed_indexes_file")
+    if configured:
+        path = Path(str(configured))
+        if not path.is_absolute():
+            path = (_repo_root() / path).resolve()
+        return path
+    return _train_log_root(base) / "completed_indexes.json"
+
+
+def _load_completed_indexes(path: Path) -> set[int]:
+    if not path.exists():
+        return set()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return set()
+    raw = data.get("completed", []) if isinstance(data, dict) else []
+    completed: set[int] = set()
+    for value in raw:
+        try:
+            completed.add(int(value))
+        except Exception:
+            continue
+    return completed
+
+
+def _save_completed_indexes(path: Path, completed: set[int]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"completed": sorted(completed)}
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+        f.write("\n")
+
+
+def _parse_index_ranges(raw: Any, max_index: int) -> set[int]:
+    if raw is None:
+        return set(range(max_index + 1))
+    if isinstance(raw, str):
+        tokens = [raw]
+    elif isinstance(raw, list):
+        tokens = [str(item) for item in raw]
+    else:
+        raise RuntimeError("index_ranges must be a string, list, or null.")
+
+    merged = ",".join(token.strip() for token in tokens if token and str(token).strip())
+    if not merged:
+        return set(range(max_index + 1))
+
+    indexes: set[int] = set()
+    for part in merged.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            start = int(left.strip())
+            end = int(right.strip())
+            if start > end:
+                raise RuntimeError(f"Invalid index range: '{token}' (start > end)")
+            for idx in range(start, end + 1):
+                if 0 <= idx <= max_index:
+                    indexes.add(idx)
+        else:
+            idx = int(token)
+            if 0 <= idx <= max_index:
+                indexes.add(idx)
+    return indexes
+
+
+def _ordered_from_set(values: set[int], ordered: list[int]) -> list[int]:
+    return [value for value in ordered if value in values]
+
+
 def _sync_state_with_existing_logs(
     state: dict[str, Any],
     base: dict[str, Any],
@@ -307,10 +382,6 @@ def _resume_spec_for_index(
 ) -> dict[str, str] | None:
     if explicit_resume is not None and (explicit_resume_index is None or explicit_resume_index == index):
         return explicit_resume
-    run = _state_run(state, index)
-    checkpoint = run.get("latest_checkpoint")
-    if checkpoint and Path(checkpoint).exists() and run.get("status") != "completed":
-        return _infer_resume_spec_from_checkpoint(base, Path(checkpoint))
     return None
 
 
@@ -640,6 +711,24 @@ def main() -> int:
     parser.add_argument("--num-envs", type=int, default=None, help="Override num_envs for this run.")
     parser.add_argument("--max-iterations", type=int, default=None, help="Override max_iterations for this run.")
     parser.add_argument(
+        "--index-ranges",
+        type=str,
+        default=None,
+        help="Index ranges override (examples: 0-10 or 0-10,20-30).",
+    )
+    parser.add_argument(
+        "--ignore-completed",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Ignore completed_indexes and rerun target indexes.",
+    )
+    parser.add_argument(
+        "--completed-indexes-file",
+        type=str,
+        default=None,
+        help="Path override for completed indexes JSON file.",
+    )
+    parser.add_argument(
         "--resume-checkpoint",
         type=str,
         default=None,
@@ -668,12 +757,21 @@ def main() -> int:
     cfg_path = Path(args.config)
     cfg = _load_yaml(cfg_path)
     base = cfg.get("base") or {}
+    config_index_ranges = base.get("index_ranges")
+    config_ignore_completed = bool(base.get("ignore_completed", False))
+    config_completed_indexes_file = base.get("completed_indexes_file")
     if args.num_envs is not None:
         base["num_envs"] = args.num_envs
     if args.max_iterations is not None:
         extra_args = list(base.get("extra_args") or [])
         extra_args += ["--max_iterations", str(args.max_iterations)]
         base["extra_args"] = extra_args
+    if args.index_ranges is not None:
+        base["index_ranges"] = args.index_ranges
+    if args.ignore_completed is not None:
+        base["ignore_completed"] = bool(args.ignore_completed)
+    if args.completed_indexes_file is not None:
+        base["completed_indexes_file"] = args.completed_indexes_file
     sweep = cfg.get("sweep") or {}
 
     if "task" not in base:
@@ -701,6 +799,10 @@ def main() -> int:
         for index, effort, velocity in _iter_sweep(effort_axis, velocity_axis)
     ]
     skip_completed = bool(base.get("skip_completed", True)) if args.skip_completed is None else bool(args.skip_completed)
+    ignore_completed = bool(base.get("ignore_completed", False))
+    all_indexes = [entry[0] for entry in sweep_entries]
+    max_index = max(all_indexes) if all_indexes else -1
+    target_indexes = _parse_index_ranges(base.get("index_ranges"), max_index) if max_index >= 0 else set()
 
     explicit_resume: dict[str, str] | None = None
     explicit_resume_index: int | None = None
@@ -752,22 +854,57 @@ def main() -> int:
         )
         state = _state_template(cfg_path, base, sweep_entries, runner_log_root)
 
-    _sync_state_with_existing_logs(
-        state,
-        base,
-        sweep_entries,
-        skip_completed=skip_completed,
-        keep_pending_index=explicit_resume_index,
-    )
+    completed_indexes_path = _completed_indexes_path(base)
+    completed_indexes = _load_completed_indexes(completed_indexes_path)
+    completed_from_state = {
+        int(run["index"]) for run in state.get("runs", []) if str(run.get("status", "")).lower() == "completed"
+    }
+    completed_indexes.update(completed_from_state)
 
     effective_start_index = args.start_index
     if explicit_resume_index is not None:
         effective_start_index = max(effective_start_index, explicit_resume_index)
+        completed_indexes.discard(explicit_resume_index)
+
+    target_indexes = {idx for idx in target_indexes if idx >= effective_start_index}
+    if explicit_resume_index is not None:
+        target_indexes.add(explicit_resume_index)
+    if ignore_completed:
+        remaining_indexes = set(target_indexes)
+    else:
+        remaining_indexes = set(target_indexes - completed_indexes)
+    if explicit_resume_index is not None and explicit_resume_index in target_indexes:
+        remaining_indexes.add(explicit_resume_index)
+    if skip_completed:
+        for idx in target_indexes:
+            if idx in completed_indexes and idx != explicit_resume_index:
+                run = _state_run(state, idx)
+                run["status"] = "completed"
     print(f"Task runner logs: {runner_log_root}")
     print(f"Task runner state: {state_path}")
     print(f"Effective start index: {effective_start_index}")
+    print(f"Completed indexes file: {completed_indexes_path}")
+    print(f"Config completed_indexes_file: {config_completed_indexes_file}")
+    print(f"CLI completed_indexes_file: {args.completed_indexes_file}")
+    print(f"Effective completed_indexes_file: {base.get('completed_indexes_file')}")
+    print(f"Config index_ranges: {config_index_ranges}")
+    print(f"CLI index_ranges: {args.index_ranges}")
+    print(f"Effective index_ranges: {base.get('index_ranges')}")
+    print(f"Config ignore_completed: {config_ignore_completed}")
+    print(f"CLI ignore_completed: {args.ignore_completed}")
+    print(f"Effective ignore_completed: {ignore_completed}")
+    resume_enabled = bool(explicit_resume is not None or base.get("resume", False))
+    resume_source = explicit_resume["checkpoint_path"] if explicit_resume is not None else (
+        str(base.get("checkpoint")) if base.get("resume") and base.get("checkpoint") else None
+    )
+    print(f"Resume enabled: {resume_enabled}")
+    print(f"Resume source: {resume_source}")
     print(f"Patch mode: ConfigStore-before patch, patch_sim_limits={bool(base.get('patch_sim_limits', True))}")
     print(f"Skip completed: {skip_completed}")
+    print(f"Ignore completed: {ignore_completed}")
+    print(f"Target indexes: {_ordered_from_set(target_indexes, all_indexes)}")
+    print(f"Completed: {_ordered_from_set(completed_indexes, all_indexes)}")
+    print(f"Remaining: {_ordered_from_set(remaining_indexes, all_indexes)}")
     if explicit_resume is not None:
         if explicit_resume_index is None:
             for candidate_index, _, _, candidate_run_name in sweep_entries:
@@ -790,16 +927,20 @@ def main() -> int:
 
     executed = 0
     if not args.dry_run:
+        _save_completed_indexes(completed_indexes_path, completed_indexes)
         _save_state(state, state_path)
 
     for index, effort, velocity, run_name in sweep_entries:
-        if index < effective_start_index:
+        if index not in target_indexes:
             continue
         if args.limit is not None and executed >= args.limit:
             break
 
         state_run = _state_run(state, index)
-        if skip_completed and state_run.get("status") == "completed":
+        if index not in remaining_indexes:
+            print(f"\n[{index}] skipping (not remaining) run_name={run_name}")
+            continue
+        if skip_completed and not ignore_completed and state_run.get("status") == "completed" and index != explicit_resume_index:
             print(f"\n[{index}] skipping completed run_name={run_name}")
             continue
 
@@ -860,6 +1001,9 @@ def main() -> int:
             print(f"Run failed (index={index}, code={return_code}). Continuing.")
             continue
         state_run["status"] = "completed"
+        completed_indexes.add(index)
+        remaining_indexes.discard(index)
+        _save_completed_indexes(completed_indexes_path, completed_indexes)
         _save_state(state, state_path)
 
     print("\nSweep finished.")

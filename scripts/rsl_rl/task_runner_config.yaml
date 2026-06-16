@@ -14,6 +14,20 @@ base:
   patch_sim_limits: true
   task_runner_log_dir: "logs/task_runner"
   skip_completed: true
+  ignore_completed: false
+  # Optional path for persistent completed index registry.
+  # If omitted, defaults to logs/rsl_rl/<experiment_name>/completed_indexes.json
+  # CLI override: --completed-indexes-file <path>
+  completed_indexes_file: null
+  # Optional target index ranges for sweep.
+  # Examples:
+  #   index_ranges: ["0-10", "20-30"]
+  #   index_ranges: ["0-10,20-30"]
+  # Empty/null means all indexes in the generated sweep.
+  # CLI override: --index-ranges 0-10,20-30
+  index_ranges: null
+  # CLI override: --ignore-completed
+  # CLI takes priority over YAML.
 
   # Optional resume settings for all runs
   resume: false
