@@ -16,7 +16,7 @@ from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.events import randomize_phase_freq
-from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike
+from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -202,6 +202,15 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "command_name": "base_velocity",
                 "cmd_threshold": _COMMAND_THRESHOLD,
             },
+        )
+        # 重心(全身CoM)位置の jerk ペナルティ: CoM 速度の二階差分 (≒躍度) の二乗ノルムを罰する。
+        # 体重移動の急変(カクつき)を抑え、滑らかな重心移動を促す。
+        # jerk は dt² で割るため値が大きくなりやすい。重みは dof_acc_l2 (-1e-6) と同程度の桁から開始し、
+        # reward logger で他項と桁を合わせて要チューニング。
+        self.rewards.com_jerk_l2 = RewTerm(
+            func=com_jerk_l2,
+            weight=-1.0e-6,
+            params={"asset_cfg": SceneEntityCfg("robot")},
         )
         # 速度コマンドを離散格子からサンプリングする版に差し替える
         # lin_vel_x / lin_vel_y は lin_vel_command カリキュラムが段階的に拡張する
