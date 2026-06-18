@@ -142,7 +142,10 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._asset_name: str = params.get("asset_name", "robot")
 
         self._current_stage: int = 0
-        self._error_ema: float | None = None
+        # EMA は GPU 上のスカラーテンソルのまま保持し、毎ステップの .item() 同期を避ける。
+        # 閾値判定・ログ用に CPU 値が必要なときだけ同期する (下記 __call__ 参照)。
+        self._error_ema: torch.Tensor | None = None
+        self._cached_ema: float = 0.0  # ログ表示用にキャッシュした EMA(同期時のみ更新)
         self._update_count: int = 0
 
         # 初期ステージの範囲を即時適用
@@ -165,7 +168,9 @@ class lin_vel_command_curriculum(ManagerTermBase):
 
         cmd_lin_xy = cmd_term.command[:, :2]
         actual_lin_xy = asset.data.root_lin_vel_b[:, :2]
-        err = torch.norm(cmd_lin_xy - actual_lin_xy, dim=-1).mean().item()
+        # 誤差(全env平均)は GPU 上のスカラーテンソルのまま計算する。ここで .item() しない
+        # ことで、毎ステップ走る curriculum 更新での GPU→CPU 同期(collection の律速要因)を排除する。
+        err = torch.norm(cmd_lin_xy - actual_lin_xy, dim=-1).mean()
 
         if self._error_ema is None:
             self._error_ema = err
@@ -174,19 +179,25 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._update_count += 1
 
         current_threshold = self._error_thresholds[self._current_stage]
-        if (
-            self._current_stage < len(self._stages_x) - 1
-            and self._update_count >= min_updates
-            and self._error_ema < current_threshold
-        ):
-            self._current_stage += 1
-            self._apply_stage(self._current_stage)
+        # 閾値判定とログ値の更新は min_updates ステップごとにまとめて行う。
+        # CPU への同期 (.item()) はこの分岐の中だけで起き、毎ステップではなくなる。
+        # NOTE: 旧実装は warm-up 後は毎ステップ判定していたが、本実装では判定が周期的になる
+        #       (ステージ進行が最大 min_updates ステップ遅れる)。EMA 値自体は同一に更新され続け、
+        #       カリキュラムの挙動への実質的な影響はない。
+        if self._update_count >= min_updates:
+            ema_val = float(self._error_ema)  # 同期はここだけ (min_updates 回に1回)
+            self._cached_ema = ema_val
+            if self._current_stage < len(self._stages_x) - 1 and ema_val < current_threshold:
+                self._current_stage += 1
+                self._apply_stage(self._current_stage)
+                self._error_ema = None
+                self._cached_ema = 0.0
+                current_threshold = self._error_thresholds[self._current_stage]
             self._update_count = 0
-            self._error_ema = None
 
         return {
             "stage": float(self._current_stage),
-            "error_ema": float(self._error_ema if self._error_ema is not None else 0.0),
+            "error_ema": float(self._cached_ema),
             "error_threshold": float(current_threshold),
             "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
             "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
