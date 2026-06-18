@@ -23,7 +23,7 @@ class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 50
     experiment_name = "k1_rough"
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.6,
+        init_noise_std=0.7207805082202461,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[512, 256, 128],
@@ -61,10 +61,10 @@ class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.004,
+        entropy_coef=0.005399484409787433,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=0.00012551115172973836,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
@@ -80,8 +80,8 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
 
         self.max_iterations = 20000
         self.experiment_name = "k1_flat"
-        # self.policy.actor_hidden_dims = [256, 128, 128]
-        # self.policy.critic_hidden_dims = [256, 256, 128]
+        self.policy.actor_hidden_dims = [256, 128, 128]
+        self.policy.critic_hidden_dims = [256, 256, 128]
         self.save_interval = 100
 
         # 左右対称性を mirror loss として学習に加える (data augmentation は使わない)。
