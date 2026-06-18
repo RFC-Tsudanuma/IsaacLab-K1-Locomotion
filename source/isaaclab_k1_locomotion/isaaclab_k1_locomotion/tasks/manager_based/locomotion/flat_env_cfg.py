@@ -77,9 +77,11 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages_x": [(-0.6, 0.6), (-1.2, 1.2)],
-            "stages_y": [(-0.5, 0.5), (-0.8, 0.8)],
-            "error_threshold": 0.35,
+            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
+            "stages_y": [(-0.5, 0.5), (-0.8, 0.8), (-0.9, 0.9)],
+            # 速度範囲が広いステージほど絶対誤差が出やすいので閾値を緩めて難易度を均す
+            # (最終ステージの値は据え置きなのでログ表示用)
+            "error_threshold": [0.30, 0.45, 0.55],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
@@ -154,7 +156,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
         self.rewards.feet_landing_impact = RewTerm(
             func=feet_landing_impact,
-            weight=-1.5e-2,
+            weight=-0.5e-2,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
@@ -165,7 +167,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
         self.rewards.feet_landing_vel = RewTerm(
             func=feet_landing_vel,
-            weight=-5.0,
+            weight=-1.5,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -184,7 +186,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
-                "target_pitch": 0.2,
+                "target_pitch": 0.13,
                 "std": 0.15,
                 "pitch_sign": -1.0,
                 "command_name": "base_velocity",

@@ -299,7 +299,7 @@ class K1Rewards(RewardsCfg):
 
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.13,
+        weight=-0.05,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -312,7 +312,7 @@ class K1Rewards(RewardsCfg):
         func=minimum_height,
         weight=-100.0,
         params={
-            "min_height": 0.53,
+            "min_height": 0.45,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
@@ -347,7 +347,7 @@ class K1Rewards(RewardsCfg):
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
-        weight=-0.15 * 1.8,
+        weight=-0.15,
     )
 
     dof_vel_l2 = RewTerm(

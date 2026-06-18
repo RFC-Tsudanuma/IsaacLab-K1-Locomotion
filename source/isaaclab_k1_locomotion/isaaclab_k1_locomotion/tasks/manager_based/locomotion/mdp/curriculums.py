@@ -108,6 +108,9 @@ class lin_vel_command_curriculum(ManagerTermBase):
         stages_x: 各ステージで ``lin_vel_x`` に適用する ``(min, max)`` のリスト。
         stages_y: 各ステージで ``lin_vel_y`` に適用する ``(min, max)`` のリスト。 ``stages_x`` と同じ長さでなければならない。
         error_threshold: ステージを進めるためのEMA誤差(m/s)の上限。
+            単一の float を渡すと全ステージ共通の閾値になる。
+            ``stages_x`` と同じ長さのリストを渡すとステージごとに閾値を設定でき、
+            広い速度範囲のステージほど緩い(大きい)閾値にして難易度を均せる。
         command_name: 対象コマンド名(例: ``"base_velocity"``)。
         asset_name: ロボットのアセット名。
         ema_alpha: EMA の更新係数 (0,1]。大きいほど直近の誤差を強く反映する。
@@ -124,7 +127,17 @@ class lin_vel_command_curriculum(ManagerTermBase):
                 f"stages_x と stages_y は同じ長さでなければなりません: "
                 f"len(stages_x)={len(self._stages_x)}, len(stages_y)={len(self._stages_y)}"
             )
-        self._error_threshold: float = float(params["error_threshold"])
+        # error_threshold は float(全ステージ共通)または stages と同じ長さのリスト(ステージ毎)
+        raw_threshold = params["error_threshold"]
+        if isinstance(raw_threshold, (list, tuple)):
+            self._error_thresholds: list[float] = [float(t) for t in raw_threshold]
+            if len(self._error_thresholds) != len(self._stages_x):
+                raise ValueError(
+                    f"error_threshold をリストで渡す場合は stages と同じ長さでなければなりません: "
+                    f"len(error_threshold)={len(self._error_thresholds)}, len(stages_x)={len(self._stages_x)}"
+                )
+        else:
+            self._error_thresholds = [float(raw_threshold)] * len(self._stages_x)
         self._command_name: str = params["command_name"]
         self._asset_name: str = params.get("asset_name", "robot")
 
@@ -141,7 +154,7 @@ class lin_vel_command_curriculum(ManagerTermBase):
         env_ids: Sequence[int],
         stages_x: Sequence[Sequence[float]],
         stages_y: Sequence[Sequence[float]],
-        error_threshold: float,
+        error_threshold: float | Sequence[float],
         command_name: str,
         asset_name: str = "robot",
         ema_alpha: float = 0.02,
@@ -160,10 +173,11 @@ class lin_vel_command_curriculum(ManagerTermBase):
             self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
         self._update_count += 1
 
+        current_threshold = self._error_thresholds[self._current_stage]
         if (
             self._current_stage < len(self._stages_x) - 1
             and self._update_count >= min_updates
-            and self._error_ema < error_threshold
+            and self._error_ema < current_threshold
         ):
             self._current_stage += 1
             self._apply_stage(self._current_stage)
@@ -173,6 +187,7 @@ class lin_vel_command_curriculum(ManagerTermBase):
         return {
             "stage": float(self._current_stage),
             "error_ema": float(self._error_ema if self._error_ema is not None else 0.0),
+            "error_threshold": float(current_threshold),
             "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
             "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
         }
