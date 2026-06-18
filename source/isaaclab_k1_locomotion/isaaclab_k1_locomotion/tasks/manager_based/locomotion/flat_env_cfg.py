@@ -140,6 +140,16 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # No terrain curriculum
         self.curriculum.terrain_levels = None
 
+        # Flat では脚部の接触ペナルティ (undesired_contacts) は不要なので削除する。
+        # これにより接触センサで読む必要があるのは足 (.*_foot_link: 着地系報酬/air_time) と
+        # 胴体 (Trunk: base_contact 終了判定) だけになるので、センサも 2 部位に絞り収集を更に軽くする。
+        # NOTE: rough は undesired_contacts (股関節/すね) を使うため velocity_env_cfg 側のセンサ
+        #       (足+股関節+すね+胴体) は据え置き、ここ (flat) でのみ上書きする。
+        # NOTE: dribble の足-ボール接触は専用センサ (contact_balls_left/right, SoccerBall フィルタ)
+        #       を使っており、この contact_forces とは独立なので影響しない。
+        self.rewards.undesired_contacts = None
+        self.scene.contact_forces.prim_path = "{ENV_REGEX_NS}/Robot/(Trunk|.*_foot_link)"
+
         # Rewards
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.32
