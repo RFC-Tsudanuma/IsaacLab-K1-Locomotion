@@ -1009,6 +1009,58 @@ def fix_stance_foot_pos(env: ManagerBasedRLEnv,asset_cfg: SceneEntityCfg ) -> to
     return stance_foot_vel_sum.squeeze()
 
 
+def com_jerk_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """全身重心 (CoM) 位置の jerk の二乗ノルムを罰する報酬関数 (weight < 0 で使う想定)。
+
+    jerk (躍度) は加速度の時間微分。CoM 速度 v の二階差分で近似する::
+
+        jerk_t ≈ (v_t - 2 v_{t-1} + v_{t-2}) / dt²        [m/s³]
+
+    重心の動きの急変 (カクつき) を罰することで、滑らかな体重移動を促す。
+    全身 CoM 速度は各 body の CoM 速度を質量で加重平均して求める::
+
+        v_com = Σ_i m_i v_i / Σ_i m_i        (world frame)
+
+    履歴 (v_{t-1}, v_{t-2}) は env 上のバッファに保持する。リセット直後は前エピソードの
+    履歴が混ざるため、エピソード開始 2 ステップ (``episode_length_buf < 2``) は 0 を返す
+    (``action_smoothness_l2`` / ``high_action_smoothness_l2`` と同じ規約)。
+
+    Args:
+        env: 学習環境。
+        asset_cfg: CoM を計算する Articulation。全身を対象にするため body は絞らない。
+
+    Returns:
+        環境ごとのペナルティ値 [(m/s³)²], shape (N,)。
+    """
+    asset = env.scene[asset_cfg.name]
+
+    # 全身 CoM 速度 (world frame) = Σ m_i v_i / Σ m_i
+    masses = asset.data.default_mass.to(env.device)  # [N, num_bodies]
+    body_com_vel = asset.data.body_com_vel_w[:, :, :3]  # [N, num_bodies, 3]
+    total_mass = masses.sum(dim=1, keepdim=True).clamp(min=1e-6)  # [N, 1]
+    com_vel = (masses.unsqueeze(-1) * body_com_vel).sum(dim=1) / total_mass  # [N, 3]
+
+    # 履歴バッファ (初回 or 形状不整合なら現在値で初期化)
+    if (not hasattr(env, "_com_vel_prev")) or env._com_vel_prev.shape != com_vel.shape:
+        env._com_vel_prev = com_vel.clone()
+        env._com_vel_prev_prev = com_vel.clone()
+
+    dt = env.step_dt
+    jerk = (com_vel - 2.0 * env._com_vel_prev + env._com_vel_prev_prev) / (dt ** 2)  # [N, 3]
+    penalty = torch.sum(torch.square(jerk), dim=1)  # [N]
+
+    # 履歴更新 (次ステップで使う)
+    env._com_vel_prev_prev = env._com_vel_prev.clone()
+    env._com_vel_prev = com_vel.clone()
+
+    # リセット直後は前エピソードの速度が二階差分に混ざるのでペナルティを無効化
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
+
 # 蹴り足の z 高さが threshold を超えた量の合計を返す (penalty 用 / weight を負にする)。
 # Why threshold: キック動作中の一時的な持ち上げは許容したいので、地面付近はペナルティ 0 にする。
 # 蹴った後に足を地面まで戻させるための報酬。
