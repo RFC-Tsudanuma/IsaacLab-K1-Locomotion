@@ -69,6 +69,28 @@ _POLICY_OBS_DIM = 49
 _GAIT_PHASE_SWAP = [47, 48, 45, 46]
 
 
+# 反転に使う符号定数を (device, dtype) ごとに一度だけ生成してキャッシュする。
+# 旧実装は呼び出しのたびに torch.tensor([...], device=...) で Python リストから
+# テンソルを生成し host→device コピーを発生させていた (mirror loss は学習の
+# epoch×mini_batch 回呼ばれるため無視できない)。プロファイルでも
+# internal_new_from_data → to(device) → copy_kernel_cuda として観測された。
+_CONST_CACHE: dict = {}
+
+
+def _mirror_consts(device: torch.device, dtype: torch.dtype) -> dict:
+    key = (device, dtype)
+    consts = _CONST_CACHE.get(key)
+    if consts is None:
+        consts = {
+            "joint_sign": torch.tensor(_JOINT_MIRROR_SIGN, device=device, dtype=dtype),
+            "ang_vel": torch.tensor([-1.0, 1.0, -1.0], device=device, dtype=dtype),
+            "proj_gravity": torch.tensor([1.0, -1.0, 1.0], device=device, dtype=dtype),
+            "vel_cmd": torch.tensor([1.0, -1.0, -1.0], device=device, dtype=dtype),
+        }
+        _CONST_CACHE[key] = consts
+    return consts
+
+
 def _mirror_joints(joint_data: torch.Tensor) -> torch.Tensor:
     """関節ごとの量 (..., 12) を左右反転する。
 
@@ -78,7 +100,7 @@ def _mirror_joints(joint_data: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(joint_data)
     out[..., _LEFT_JOINT_IDX] = joint_data[..., _RIGHT_JOINT_IDX]
     out[..., _RIGHT_JOINT_IDX] = joint_data[..., _LEFT_JOINT_IDX]
-    sign = torch.tensor(_JOINT_MIRROR_SIGN, device=joint_data.device, dtype=joint_data.dtype)
+    sign = _mirror_consts(joint_data.device, joint_data.dtype)["joint_sign"]
     return out * sign
 
 
@@ -91,14 +113,14 @@ def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
         )
 
     out = obs.clone()
-    device, dtype = out.device, out.dtype
+    consts = _mirror_consts(out.device, out.dtype)
 
     # base_ang_vel: roll(x), yaw(z) を反転
-    out[:, _ANG_VEL_SLICE] *= torch.tensor([-1.0, 1.0, -1.0], device=device, dtype=dtype)
+    out[:, _ANG_VEL_SLICE] *= consts["ang_vel"]
     # projected_gravity: 横方向(y) を反転
-    out[:, _PROJ_GRAVITY_SLICE] *= torch.tensor([1.0, -1.0, 1.0], device=device, dtype=dtype)
+    out[:, _PROJ_GRAVITY_SLICE] *= consts["proj_gravity"]
     # velocity_commands: lin_vel_y, ang_vel_z を反転
-    out[:, _VEL_CMD_SLICE] *= torch.tensor([1.0, -1.0, -1.0], device=device, dtype=dtype)
+    out[:, _VEL_CMD_SLICE] *= consts["vel_cmd"]
     # 関節量
     out[:, _JOINT_POS_SLICE] = _mirror_joints(obs[:, _JOINT_POS_SLICE])
     out[:, _JOINT_VEL_SLICE] = _mirror_joints(obs[:, _JOINT_VEL_SLICE])
