@@ -81,7 +81,16 @@ class MySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    # 接触センサは実際に query される body だけに絞る (収集フェーズの CPU 律速対策)。
+    # 報酬/終了判定が参照するのは足・股関節・すね・胴体のみ:
+    #   .*_foot_link (着地系報酬/air_time), .*_Hip_(Pitch|Roll|Yaw)/.*_Shank (undesired_contacts),
+    #   Trunk (base_contact 終了判定)。
+    # 全 23 body → 11 body に減らしても観測・報酬・終了はビット一致 (純粋な高速化)。
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(Trunk|.*_foot_link|.*_Hip_(Pitch|Roll|Yaw)|.*_Shank)",
+        history_length=3,
+        track_air_time=True,
+    )
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
