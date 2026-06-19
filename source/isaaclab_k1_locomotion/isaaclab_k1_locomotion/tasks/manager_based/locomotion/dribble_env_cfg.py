@@ -169,13 +169,13 @@ class K1DribbleRewardsCfg:
     # ボール速度の「方向」がキック方向 (ワールド座標) と揃っているほど高い報酬 (速度の大きさは見ない)。
     ball_velocity_along_kick = RewTerm(
         func=ball_velocity_along_kick,
-        weight=5.0,
+        weight=4.5,
         params={"command_name": "kick_direction"},
     )
     # ボール速度の大きさ (方向問わず)。max_speed で正規化、上限 1.0。
     ball_speed = RewTerm(
         func=ball_speed,
-        weight=0.4,
+        weight=0.8,
         params={"max_speed": 2.0},
     )
 
@@ -183,8 +183,8 @@ class K1DribbleRewardsCfg:
     # ロボットがボールに向かって進んでいる成分。
     robot_velocity_toward_ball = RewTerm(
         func=robot_velocity_toward_ball,
-        weight=0.2,
-        params={"max_speed": 0.7, "min_distance": 0.15},
+        weight=1.0,
+        params={"max_speed": 0.9, "min_distance": 0.15},
     )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
     robot_facing_ball = RewTerm(
@@ -239,7 +239,9 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
         # ロボットの初期 yaw を固定。ボールの reset 範囲 (x=(0.15, 1.5)) は
         # env-frame で評価されるため、yaw をランダム化するとロボットの真後ろにも
         # スポーンしうる。dribble では「ボールは常に正面 (x > 0)」を保ちたいので yaw=0 に固定する。
-        self.events.reset_base.params["pose_range"]["yaw"] = (0.0, 0.0)
+        self.events.reset_base.params["pose_range"]["yaw"] = (-0.7, 0.7)
+        self.events.reset_base.params["pose_range"]["x"] = (0.0, 0.0)
+        self.events.reset_base.params["pose_range"]["y"] = (0.0, 0.0)
 
         # リセット時に ``_prev_high_action`` バッファ (HierarchicalVecEnvWrapper が
         # 用意) を 0 にする。これがないと新エピソード最初の観測が前エピソードの

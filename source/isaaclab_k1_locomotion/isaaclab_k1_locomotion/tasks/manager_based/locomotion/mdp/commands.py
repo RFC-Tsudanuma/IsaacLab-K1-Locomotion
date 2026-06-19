@@ -12,10 +12,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
+import isaaclab.utils.math as math_utils
 from isaaclab.assets import Articulation
 from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
 from isaaclab.managers import CommandTerm, CommandTermCfg
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from isaaclab.markers.config import GREEN_ARROW_X_MARKER_CFG
 from isaaclab.utils import configclass
 
 if TYPE_CHECKING:
@@ -81,6 +84,8 @@ class KickDirectionCommand(CommandTerm):
         super().__init__(cfg, env)
         # ロボットの参照 (メトリック計算用)
         self.robot: Articulation = env.scene[cfg.asset_name]
+        # ボールの参照 (矢印の可視化起点用)
+        self.ball = env.scene[cfg.ball_name]
         # ワールド座標系の単位ベクトル (num_envs, 2)
         self.kick_dir_w = torch.zeros(self.num_envs, 2, device=self.device)
         self.kick_dir_w[:, 0] = 1.0  # 初期は +x
@@ -116,6 +121,44 @@ class KickDirectionCommand(CommandTerm):
         # ワールド座標系定義なので、毎ステップの再計算は不要。
         pass
 
+    """
+    可視化 (debug_vis=True のとき、ロボット頭上にキック方向の矢印を表示)。
+    """
+
+    def _set_debug_vis_impl(self, debug_vis: bool):
+        # マーカーの表示/非表示を切り替える。
+        if debug_vis:
+            # 初回のみマーカーを生成。
+            if not hasattr(self, "kick_dir_visualizer"):
+                self.kick_dir_visualizer = VisualizationMarkers(self.cfg.goal_dir_visualizer_cfg)
+            self.kick_dir_visualizer.set_visibility(True)
+        else:
+            if hasattr(self, "kick_dir_visualizer"):
+                self.kick_dir_visualizer.set_visibility(False)
+
+    def _debug_vis_callback(self, event):
+        # ボールが未初期化なら何もしない (de-init 時に data へアクセスできないため)。
+        if not self.ball.is_initialized:
+            return
+        # 矢印の起点: ボールの少し上。
+        arrow_pos_w = self.ball.data.root_pos_w.clone()
+        arrow_pos_w[:, 2] += 0.3
+        # ワールド座標 xy 単位ベクトルを矢印の scale / quaternion に変換。
+        arrow_scale, arrow_quat = self._resolve_xy_dir_to_arrow(self.kick_dir_w)
+        self.kick_dir_visualizer.visualize(arrow_pos_w, arrow_quat, arrow_scale)
+
+    def _resolve_xy_dir_to_arrow(self, xy_dir: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """ワールド座標系の xy 方向ベクトルを矢印の (scale, quaternion) に変換する。"""
+        # マーカーのデフォルト scale。
+        default_scale = self.kick_dir_visualizer.cfg.markers["arrow"].scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(xy_dir.shape[0], 1)
+        # 方位角 (ワールド x 軸から) を計算。kick_dir_w は単位ベクトルなので向きのみ使う。
+        heading_angle = torch.atan2(xy_dir[:, 1], xy_dir[:, 0])
+        zeros = torch.zeros_like(heading_angle)
+        # kick_dir_w はワールド座標系なので base quaternion を掛ける必要はない。
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_angle)
+        return arrow_scale, arrow_quat
+
 
 @configclass
 class KickDirectionCommandCfg(CommandTermCfg):
@@ -126,5 +169,15 @@ class KickDirectionCommandCfg(CommandTermCfg):
     asset_name: str = MISSING
     """メトリック計算に使うロボット asset の名前。"""
 
+    ball_name: str = "soccer_ball"
+    """矢印の可視化起点に使うボール asset の名前。"""
+
     angle_range: tuple[float, float] = (-math.pi, math.pi)
     """サンプリングされる角度 θ (rad) のレンジ。ワールド座標 x 軸からの方位角。"""
+
+    goal_dir_visualizer_cfg: VisualizationMarkersCfg = GREEN_ARROW_X_MARKER_CFG.replace(
+        prim_path="/Visuals/Command/kick_direction"
+    )
+    """キック方向を示す矢印マーカーの設定 (デフォルトは緑の矢印)。"""
+
+    goal_dir_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)

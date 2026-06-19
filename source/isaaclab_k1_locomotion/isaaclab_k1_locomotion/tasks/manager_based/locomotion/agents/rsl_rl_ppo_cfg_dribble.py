@@ -15,10 +15,10 @@ class K1DribblePPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = "k1_dribble"
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=0.6,
+        init_noise_std=0.7,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[256, 128, 128],
+        actor_hidden_dims=[256, 256, 128],
         critic_hidden_dims=[256, 256, 128],
         activation="elu",
     )
@@ -29,7 +29,7 @@ class K1DribblePPORunnerCfg(RslRlOnPolicyRunnerCfg):
         entropy_coef=0.004,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=1.0e-3,
+        learning_rate=1.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,
