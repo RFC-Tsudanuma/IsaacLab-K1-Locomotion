@@ -60,6 +60,7 @@ from .mdp.events import reset_prev_high_action
 from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b, last_high_action
 from .mdp.terminations import time_after_ball_contact
 from .mdp.rewards import (
+    approach_ball_progress,
     ball_speed,
     ball_velocity_along_kick,
     com_jerk_l2,
@@ -67,7 +68,6 @@ from .mdp.rewards import (
     high_action_smoothness_l2,
     high_action_xy_coactivation,
     robot_facing_ball,
-    robot_velocity_toward_ball,
 )
 
 
@@ -180,11 +180,14 @@ class K1DribbleRewardsCfg:
     )
 
     # --- Shaping ---
-    # ロボットがボールに向かって進んでいる成分。
-    robot_velocity_toward_ball = RewTerm(
-        func=robot_velocity_toward_ball,
-        weight=1.0,
-        params={"max_speed": 0.9, "min_distance": 0.15},
+    # ロボット→ボール距離の減少量 (ポテンシャル形式) で接近を誘引する。
+    # 速度射影 (robot_velocity_toward_ball) と違い上限クランプ・近接ゼロが無く、
+    # 常時密な勾配がかかるので「動かない」局所解に陥りにくい。
+    # weight の目安: 制御ステップ dt=0.02s・接近速度~0.9m/s → 約0.018m/step なので、
+    # 旧 shaping ([0,1]×1.0) と同オーダーにするには ~40。
+    approach_ball_progress = RewTerm(
+        func=approach_ball_progress,
+        weight=40.0,
     )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
     robot_facing_ball = RewTerm(

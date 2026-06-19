@@ -701,6 +701,34 @@ def robot_velocity_toward_ball(
     return reward
 
 
+def approach_ball_progress(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ロボット→ボール距離の 1 ステップ減少量 (m) を返すポテンシャル形式の接近報酬。
+
+    ``progress = dist_{t-1} - dist_t``。近づくと正、離れると負、止まると 0。
+    速度を直接見る :func:`robot_velocity_toward_ball` (上限クランプ・近接で 0) と違い、
+    上限がなく常時密な勾配がかかるため「動かない」局所解に陥りにくい。
+    ポテンシャル差なのでエピソード総和は ``dist_0 - dist_final`` に telescope する。
+
+    リセット直後 (``episode_length_buf < 2``) は距離が不連続に飛ぶので 0 を返す。
+    """
+    robot = env.scene[robot_cfg.name]
+    ball = env.scene[ball_cfg.name]
+    to_ball = ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
+    dist = torch.norm(to_ball, dim=1)
+    prev = getattr(env, "_prev_ball_distance", None)
+    if prev is None or prev.shape != dist.shape:
+        env._prev_ball_distance = dist.clone()
+        return torch.zeros_like(dist)
+    progress = prev - dist
+    env._prev_ball_distance = dist.clone()
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(progress), progress)
+
+
 def robot_facing_ball(
     env: ManagerBasedRLEnv,
     min_distance: float = 0.05,
