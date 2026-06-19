@@ -228,18 +228,38 @@ def _build_frozen_policy(
     policy_class_name = policy_cfg.pop("class_name", "ActorCritic")
     policy_class = {"ActorCritic": ActorCritic, "ActorCriticRecurrent": ActorCriticRecurrent}[policy_class_name]
 
-    obs = env.get_observations()
-    forced_groups = {"policy": [low_level_obs_group], "critic": [low_level_obs_group]}
-    obs_groups = resolve_obs_groups(obs, forced_groups, ["critic"])
-
-    frozen = policy_class(obs, obs_groups, env.num_actions, **policy_cfg).to(device)
-
     ckpt = torch.load(checkpoint_path, weights_only=False, map_location=device)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
     # Frozen policy is only used for inference; critic_* tensors may have a
     # different shape (privileged obs) and would fail the size check even with
     # strict=False, so drop them entirely.
     state_dict = {k: v for k, v in state_dict.items() if not k.startswith(("critic", "critic_obs_normalizer"))}
+
+    # The frozen low-level policy is a *different* network than the high-level
+    # dribble policy, so its architecture comes from its own checkpoint, not from
+    # ``agent_cfg.policy`` (which describes the high-level net). Infer the actor's
+    # hidden-layer sizes from the checkpoint so any flat/rough model loads cleanly
+    # regardless of the dribble agent cfg's ``actor_hidden_dims``.
+    actor_layer_idxs = sorted(
+        int(k.split(".")[1]) for k in state_dict if k.startswith("actor.") and k.endswith(".weight")
+    )
+    if actor_layer_idxs:
+        actor_weights = [state_dict[f"actor.{i}.weight"] for i in actor_layer_idxs]
+        # out_features of every linear except the last (= action head) are hidden dims.
+        inferred_hidden = [int(w.shape[0]) for w in actor_weights[:-1]]
+        if inferred_hidden and inferred_hidden != list(policy_cfg.get("actor_hidden_dims", [])):
+            print(
+                f"[dribble] frozen policy actor_hidden_dims {policy_cfg.get('actor_hidden_dims')} "
+                f"-> {inferred_hidden} (inferred from checkpoint)"
+            )
+            policy_cfg["actor_hidden_dims"] = inferred_hidden
+            policy_cfg["critic_hidden_dims"] = inferred_hidden
+
+    obs = env.get_observations()
+    forced_groups = {"policy": [low_level_obs_group], "critic": [low_level_obs_group]}
+    obs_groups = resolve_obs_groups(obs, forced_groups, ["critic"])
+
+    frozen = policy_class(obs, obs_groups, env.num_actions, **policy_cfg).to(device)
     frozen.load_state_dict(state_dict, strict=False)
 
     frozen.eval()
