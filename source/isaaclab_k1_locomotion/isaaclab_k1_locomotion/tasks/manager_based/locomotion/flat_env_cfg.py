@@ -77,14 +77,19 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
+            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.8, 1.8)],
             "stages_y": [(-0.5, 0.5), (-0.8, 0.8), (-0.9, 0.9)],
             # 速度範囲が広いステージほど絶対誤差が出やすいので閾値を緩めて難易度を均す
             # (最終ステージの値は据え置きなのでログ表示用)
-            "error_threshold": [0.30, 0.45, 0.55],
+            "error_threshold": [0.30, 0.60, 0.55],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
+            # ステージを進めた直後、新しい(広い)コマンド範囲が全 env に行き渡るまで
+            # 誤差計測を止めて次の遷移判定を待つ。これが無いと、各 env がまだ旧範囲の
+            # コマンドを保持したまま EMA が低いため、緩い次ステージ閾値を即満たして
+            # 0→1→2 と一気に遷移してしまう。resampling_time_range の最大値の倍数で指定。
+            "stage_cooldown_resamples": 1.5,
         },
     )
 

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
@@ -146,6 +147,14 @@ class lin_vel_command_curriculum(ManagerTermBase):
         asset_name: ロボットのアセット名。
         ema_alpha: EMA の更新係数 (0,1]。大きいほど直近の誤差を強く反映する。
         min_updates: ステージ進行を許可する前に必要な呼び出し回数(EMAを温めるため)。
+        stage_cooldown_resamples: ステージを進めた直後、誤差計測(EMA)を再開するまで待つ
+            「コマンド再サンプリング周期」の倍数。ステージを進めると ``cfg.ranges`` は即座に
+            広がるが、各 env が新しい範囲のコマンドを実際に引くのは次回の再サンプリング時
+            (最大 ``resampling_time_range[1]`` 秒後)である。この待機を入れないと、ステージ変更
+            直後の EMA は依然として古い狭い範囲の誤差を映しており、緩い次ステージ閾値を即座に
+            満たして 0→1→2 と一気に遷移してしまう。再サンプリング周期 (= ``resampling_time_range``
+            の最大値) と env.step_dt から待機ステップ数を算出する。1.0 で「全 env が最低 1 回は
+            新範囲を引く」のを保証し、EMA 収束の余裕を見て既定 1.5。
     """
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
@@ -178,6 +187,9 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._error_ema: torch.Tensor | None = None
         self._cached_ema: float = 0.0  # ログ表示用にキャッシュした EMA(同期時のみ更新)
         self._update_count: int = 0
+        # ステージ変更直後の待機ステップ数。残っている間は EMA 計測・判定を停止し、
+        # 全 env が新しい範囲のコマンドを引くのを待つ (チェーン遷移を防ぐ)。
+        self._cooldown_remaining: int = 0
 
         # 初期ステージの範囲を即時適用
         self._apply_stage(self._current_stage)
@@ -193,9 +205,28 @@ class lin_vel_command_curriculum(ManagerTermBase):
         asset_name: str = "robot",
         ema_alpha: float = 0.02,
         min_updates: int = 50,
+        stage_cooldown_resamples: float = 1.5,
     ) -> dict[str, float]:
         asset: Articulation = env.scene[asset_name]
         cmd_term = env.command_manager.get_term(command_name)
+
+        current_threshold = self._error_thresholds[self._current_stage]
+
+        # --- ステージ変更直後のクールダウン ---
+        # ステージを進めると cfg.ranges は即座に広がるが、各 env が新しい範囲のコマンドを
+        # 実際に引くのは次回の再サンプリング時 (最大 resampling_time_range[1] 秒後)。
+        # この間に EMA を更新・判定すると、依然として古い狭い範囲の誤差を見て次の
+        # (より緩い) 閾値を即満たし、0→1→2 と一気に遷移してしまう。クールダウン中は
+        # 計測を完全に止め、全 env が新範囲を引き終えるのを待ってから EMA を seed し直す。
+        if self._cooldown_remaining > 0:
+            self._cooldown_remaining -= 1
+            return {
+                "stage": float(self._current_stage),
+                "error_ema": float(self._cached_ema),
+                "error_threshold": float(current_threshold),
+                "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
+                "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
+            }
 
         cmd_lin_xy = cmd_term.command[:, :2]
         actual_lin_xy = asset.data.root_lin_vel_b[:, :2]
@@ -209,7 +240,6 @@ class lin_vel_command_curriculum(ManagerTermBase):
             self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
         self._update_count += 1
 
-        current_threshold = self._error_thresholds[self._current_stage]
         # 閾値判定とログ値の更新は min_updates ステップごとにまとめて行う。
         # CPU への同期 (.item()) はこの分岐の中だけで起き、毎ステップではなくなる。
         # NOTE: 旧実装は warm-up 後は毎ステップ判定していたが、本実装では判定が周期的になる
@@ -224,6 +254,12 @@ class lin_vel_command_curriculum(ManagerTermBase):
                 self._error_ema = None
                 self._cached_ema = 0.0
                 current_threshold = self._error_thresholds[self._current_stage]
+                # 新範囲が全 env に行き渡るまでのクールダウンを設定。
+                # resampling_time_range の最大値 (秒) を step_dt (秒) で割って必要ステップ数に換算。
+                max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                self._cooldown_remaining = int(
+                    math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt)
+                )
             self._update_count = 0
 
         return {
