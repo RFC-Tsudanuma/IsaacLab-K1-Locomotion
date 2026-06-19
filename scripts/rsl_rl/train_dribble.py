@@ -73,11 +73,11 @@ parser.add_argument(
     "--high_action_clip",
     type=float,
     nargs=3,
-    default=[1.0, 0.8, 1.0],
+    default=[1.0, 0.5, 1.0],
     metavar=("VX", "VY", "WZ"),
     help="Per-axis clipping range for the high-level action (vx, vy, wz) — should match the frozen"
     " walking policy's training-time velocity command range. Default mirrors lin_vel_command's"
-    " final stage: vx=±1.0, vy=±0.8, wz=±1.0.",
+    " final stage: vx=±1.0, vy=±0.5, wz=±1.0.",
 )
 parser.add_argument(
     "--low_level_obs_group",
