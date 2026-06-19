@@ -312,7 +312,7 @@ class K1Rewards(RewardsCfg):
         func=minimum_height,
         weight=-100.0,
         params={
-            "min_height": 0.45,
+            "min_height": 0.51,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
