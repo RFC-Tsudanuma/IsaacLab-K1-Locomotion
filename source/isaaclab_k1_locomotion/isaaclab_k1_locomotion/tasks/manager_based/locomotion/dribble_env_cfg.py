@@ -195,16 +195,16 @@ class K1DribbleRewardsCfg:
 
     # --- ペナルティ ---
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-500.0)
-    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-4.5)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-15.0)
-    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.6)
+    lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-4.5 * 0.5)
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-15.0 * 0.5)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.6 * 0.5)
     # 上位ポリシーが出力する 3D 歩行コマンドに対する平滑性ペナルティ。
     # 元の action_smoothness_l2 は env.action_manager.action (= frozen の 22D 関節指令)
     # を見ており上位ポリシーが直接制御できないので、上位 action 用に差し替え。
     action_smoothness_l2 = RewTerm(func=high_action_smoothness_l2, weight=-0.12)
     # 上位ポリシー action の 1 ステップ差分 (action rate) ペナルティ。
     # コマンドが急変するとロボットが追従しきれず歩行が乱れるので軽く抑える。
-    action_rate_l2 = RewTerm(func=high_action_rate_l2, weight=-0.4)
+    action_rate_l2 = RewTerm(func=high_action_rate_l2, weight=-0.4 * 0.8)
     # 上位 action の並進 vx・vy 共活性ペナルティ (|vx|*|vy|)。
     # x+theta / y+theta のどちらかのモードに寄せ、xy 同時入力による不安定を抑える。
     # weight はカリキュラム (high_action_xy_coactivation_curriculum) で 0 → -3.0 に
@@ -212,7 +212,7 @@ class K1DribbleRewardsCfg:
     high_action_xy_coactivation = RewTerm(func=high_action_xy_coactivation, weight=-3.0)
     # ロボット root body COM の jerk (加速度の時間微分) ペナルティ。
     # 値域が大きくなりやすいので重みは非常に小さめから始める。
-    com_jerk_l2 = RewTerm(func=com_jerk_l2, weight=-2e-6)
+    com_jerk_l2 = RewTerm(func=com_jerk_l2, weight=-2e-6 * 0.5)
 
 
 @configclass
