@@ -101,7 +101,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             "term_name": "push_robot",
             "num_steps": 6000,
             "interval_range_s": (4.0, 8.0),
-            "velocity_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7), "roll": (-0.2, 0.2), "pitch": (-0.2, 0.2)},
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "roll": (-0.02, 0.02), "pitch": (-0.02, 0.02)},
         },
     )
     # push_robot_stage2 = CurrTerm(
@@ -171,7 +171,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
         self.rewards.feet_landing_impact = RewTerm(
             func=feet_landing_impact,
-            weight=-0.5e-2,
+            weight=-0.5e-2 * 0.3,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
@@ -182,7 +182,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
         self.rewards.feet_landing_vel = RewTerm(
             func=feet_landing_vel,
-            weight=-1.5,
+            weight=-1.5 * 0.2,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -201,7 +201,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
-                "target_pitch": 0.13,
+                "target_pitch": 0.10,
                 "std": 0.15,
                 "pitch_sign": -1.0,
                 "command_name": "base_velocity",
