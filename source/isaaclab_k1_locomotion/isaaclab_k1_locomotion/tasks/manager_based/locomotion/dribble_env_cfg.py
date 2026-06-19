@@ -51,7 +51,11 @@ from .velocity_env_cfg import CommandsCfg, MySceneCfg
 from .mdp.commands import KickDirectionCommandCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
-from .mdp.curriculums import randomize_ball_init_velocity, randomize_ball_init_pose
+from .mdp.curriculums import (
+    modify_reward_weight_linear,
+    randomize_ball_init_velocity,
+    randomize_ball_init_pose,
+)
 from .mdp.events import reset_prev_high_action
 from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b, last_high_action
 from .mdp.terminations import time_after_ball_contact
@@ -61,6 +65,7 @@ from .mdp.rewards import (
     com_jerk_l2,
     high_action_rate_l2,
     high_action_smoothness_l2,
+    high_action_xy_coactivation,
     robot_facing_ball,
     robot_velocity_toward_ball,
 )
@@ -200,6 +205,11 @@ class K1DribbleRewardsCfg:
     # 上位ポリシー action の 1 ステップ差分 (action rate) ペナルティ。
     # コマンドが急変するとロボットが追従しきれず歩行が乱れるので軽く抑える。
     action_rate_l2 = RewTerm(func=high_action_rate_l2, weight=-0.4)
+    # 上位 action の並進 vx・vy 共活性ペナルティ (|vx|*|vy|)。
+    # x+theta / y+theta のどちらかのモードに寄せ、xy 同時入力による不安定を抑える。
+    # weight はカリキュラム (high_action_xy_coactivation_curriculum) で 0 → -3.0 に
+    # 線形ランプするので、ここの値は据え置き時のフォールバック。
+    high_action_xy_coactivation = RewTerm(func=high_action_xy_coactivation, weight=-3.0)
     # ロボット root body COM の jerk (加速度の時間微分) ペナルティ。
     # 値域が大きくなりやすいので重みは非常に小さめから始める。
     com_jerk_l2 = RewTerm(func=com_jerk_l2, weight=-2e-6)
@@ -302,6 +312,21 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
                     "pitch": (0.0, 0.0),
                     "yaw": (0.0, 0.0),
                 },
+            },
+        )
+
+        # vx・vy 共活性ペナルティの weight を段階的に強める。
+        # 学習初期 (~3000 step) はペナルティ 0 で自由に探索させ、ドリブルの基礎を
+        # 学んでから 3000→8000 step で weight を 0 → -3.0 に線形ランプして
+        # x+theta / y+theta のモード分離を徐々に強制する。
+        self.curriculum.high_action_xy_coactivation_curriculum = CurrTerm(
+            func=modify_reward_weight_linear,
+            params={
+                "term_name": "high_action_xy_coactivation",
+                "start_weight": 0.0,
+                "end_weight": -3.0,
+                "start_step": 3000,
+                "end_step": 8000,
             },
         )
 

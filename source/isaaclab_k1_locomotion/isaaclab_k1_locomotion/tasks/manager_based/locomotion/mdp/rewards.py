@@ -1002,6 +1002,23 @@ def high_action_rate_l2(env):
     return torch.where(fresh, torch.zeros_like(penalty), penalty)
 
 
+def high_action_xy_coactivation(env):
+    """上位 action の並進成分 vx と vy が同時に大きいほど大きいペナルティ。
+
+    値は ``|vx| * |vy|``。片軸のみ (x+theta / y+theta) なら 0、小さい混合は
+    積なので二次的に小さく実質ノーペナルティ。vx・vy が両方大きい「全部盛り」
+    だけを狙い撃ちで抑えることで、x+theta か y+theta のどちらかのモードに寄せる。
+    theta(vyaw) は対象外で常に自由。
+
+    対象は ``HierarchicalVecEnvWrapper`` が ``env._prev_high_action`` に書き込む
+    clipped な 3D 歩行コマンド (vx, vy, vyaw)。
+    """
+    a = getattr(env, "_prev_high_action", None)
+    if a is None:
+        return torch.zeros(env.num_envs, device=env.device)
+    return torch.abs(a[:, 0]) * torch.abs(a[:, 1])
+
+
 def fix_stance_foot_pos(env: ManagerBasedRLEnv,asset_cfg: SceneEntityCfg ) -> torch.tensor:
     robot = env.scene[asset_cfg.name]
     stance_foot_vel = robot.data.body_com_vel_w[:,asset_cfg.body_ids,:2].squeeze(1) # x,y

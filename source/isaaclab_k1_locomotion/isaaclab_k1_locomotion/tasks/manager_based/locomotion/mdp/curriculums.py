@@ -76,6 +76,37 @@ def randomize_ball_init_velocity(
         term_cfg = env.event_manager.get_term_cfg(term_name)
         term_cfg.params["velocity_range"] = velocity_range
 
+def modify_reward_weight_linear(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    start_step: int,
+    end_step: int,
+):
+    """報酬項の weight を ``start_step`` → ``end_step`` で ``start_weight`` → ``end_weight`` に線形変化させる。
+
+    ``start_step`` 以前は ``start_weight``、``end_step`` 以降は ``end_weight`` で据え置く。
+    ペナルティを学習初期は弱く(または 0)、後半で強めたい場合に使う。
+
+    Note:
+        ``start_step`` / ``end_step`` は ``env.common_step_counter`` (env.step 呼び出し回数
+        ≒ num_steps_per_env * iteration 数) と比較する。
+    """
+    s = env.common_step_counter
+    if s <= start_step:
+        weight = start_weight
+    elif s >= end_step:
+        weight = end_weight
+    else:
+        alpha = (s - start_step) / float(end_step - start_step)
+        weight = start_weight + alpha * (end_weight - start_weight)
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    term_cfg.weight = weight
+    env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+
 def randomize_ball_init_pose(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
