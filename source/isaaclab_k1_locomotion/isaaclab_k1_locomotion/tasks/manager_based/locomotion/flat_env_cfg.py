@@ -90,6 +90,11 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # コマンドを保持したまま EMA が低いため、緩い次ステージ閾値を即満たして
             # 0→1→2 と一気に遷移してしまう。resampling_time_range の最大値の倍数で指定。
             "stage_cooldown_resamples": 1.5,
+            # 切替直後は EMA を「閾値 × post_switch_ema_scale」で固定し、この最小ステップ数の間は
+            # 計測・更新・判定を止める。hold 明けも高い値から減衰させることで、運良く低い誤差を
+            # 1 回引いただけで即次ステージへ進む(一気な遷移)のを確実に防ぐ。
+            "post_switch_hold_steps": 500,
+            "post_switch_ema_scale": 2.0,
         },
     )
 

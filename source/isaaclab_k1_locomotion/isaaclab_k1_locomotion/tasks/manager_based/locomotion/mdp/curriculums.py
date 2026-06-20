@@ -155,6 +155,13 @@ class lin_vel_command_curriculum(ManagerTermBase):
             満たして 0→1→2 と一気に遷移してしまう。再サンプリング周期 (= ``resampling_time_range``
             の最大値) と env.step_dt から待機ステップ数を算出する。1.0 で「全 env が最低 1 回は
             新範囲を引く」のを保証し、EMA 収束の余裕を見て既定 1.5。
+        post_switch_hold_steps: ステージを進めた直後に EMA を高い値で固定し、計測・更新・判定を
+            止める最小ステップ数 (既定 500)。実際の hold は ``stage_cooldown_resamples`` から
+            算出した再サンプリング待ちステップ数とこの値の大きい方になる。固定値で下限を
+            設けることで、再サンプリング周期が短い設定でも切替直後の一気な遷移を確実に防ぐ。
+        post_switch_ema_scale: 切替直後に EMA を固定する初期値の、新ステージ閾値に対する倍率
+            (既定 2.0)。hold 明けはこの高い値から実測値へ向けて減衰するため、運良く低い誤差を
+            引いただけで即遷移するのを防ぐ。大きいほど次遷移までの猶予が長くなる。
     """
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
@@ -187,9 +194,10 @@ class lin_vel_command_curriculum(ManagerTermBase):
         self._error_ema: torch.Tensor | None = None
         self._cached_ema: float = 0.0  # ログ表示用にキャッシュした EMA(同期時のみ更新)
         self._update_count: int = 0
-        # ステージ変更直後の待機ステップ数。残っている間は EMA 計測・判定を停止し、
-        # 全 env が新しい範囲のコマンドを引くのを待つ (チェーン遷移を防ぐ)。
-        self._cooldown_remaining: int = 0
+        # ステージ変更直後の hold ステップ数。残っている間は EMA 計測・更新・判定を
+        # 完全に停止し、EMA を高い値に固定したまま待つ。全 env が新しい範囲のコマンドを
+        # 引いてポリシーがある程度適応するのを待ってから計測を再開する (チェーン遷移を防ぐ)。
+        self._hold_remaining: int = 0
 
         # 初期ステージの範囲を即時適用
         self._apply_stage(self._current_stage)
@@ -206,20 +214,24 @@ class lin_vel_command_curriculum(ManagerTermBase):
         ema_alpha: float = 0.02,
         min_updates: int = 50,
         stage_cooldown_resamples: float = 1.5,
+        post_switch_hold_steps: int = 500,
+        post_switch_ema_scale: float = 2.0,
     ) -> dict[str, float]:
         asset: Articulation = env.scene[asset_name]
         cmd_term = env.command_manager.get_term(command_name)
 
         current_threshold = self._error_thresholds[self._current_stage]
 
-        # --- ステージ変更直後のクールダウン ---
+        # --- ステージ変更直後の hold ---
         # ステージを進めると cfg.ranges は即座に広がるが、各 env が新しい範囲のコマンドを
         # 実際に引くのは次回の再サンプリング時 (最大 resampling_time_range[1] 秒後)。
-        # この間に EMA を更新・判定すると、依然として古い狭い範囲の誤差を見て次の
-        # (より緩い) 閾値を即満たし、0→1→2 と一気に遷移してしまう。クールダウン中は
-        # 計測を完全に止め、全 env が新範囲を引き終えるのを待ってから EMA を seed し直す。
-        if self._cooldown_remaining > 0:
-            self._cooldown_remaining -= 1
+        # さらにポリシーが新範囲に適応するにも時間がかかる。この間に EMA を更新・判定すると、
+        # 依然として古い狭い範囲の誤差を見て次の (より緩い) 閾値を即満たし、0→1→2 と
+        # 一気に遷移してしまう。hold 中は EMA を高い値に固定したまま計測・更新・判定を
+        # 完全に止め、全 env が新範囲を引いて適応するのを待つ。hold 明けも EMA は高い値の
+        # ままなので、実測値へ向けて減衰しきる (= 本当に追従できる) まで次遷移は起きない。
+        if self._hold_remaining > 0:
+            self._hold_remaining -= 1
             return {
                 "stage": float(self._current_stage),
                 "error_ema": float(self._cached_ema),
@@ -251,15 +263,21 @@ class lin_vel_command_curriculum(ManagerTermBase):
             if self._current_stage < len(self._stages_x) - 1 and ema_val < current_threshold:
                 self._current_stage += 1
                 self._apply_stage(self._current_stage)
-                self._error_ema = None
-                self._cached_ema = 0.0
                 current_threshold = self._error_thresholds[self._current_stage]
-                # 新範囲が全 env に行き渡るまでのクールダウンを設定。
-                # resampling_time_range の最大値 (秒) を step_dt (秒) で割って必要ステップ数に換算。
+                # 切り替え直後は EMA を「新ステージ閾値より十分高い値」で固定する。
+                # こうすると hold 明けに実測値で seed し直す代わりに、この高い値から
+                # 実測値へ向けて徐々に減衰していくため、運良く低い誤差を 1 回引いただけで
+                # 即次ステージへ進む (一気に遷移する) ことを防げる。
+                high_ema = float(current_threshold) * post_switch_ema_scale
+                self._error_ema = self._error_ema.new_full((), high_ema)
+                self._cached_ema = high_ema
+                # hold は「新範囲が全 env に行き渡るまで」と「固定 500 ステップ」の
+                # 大きい方。前者は resampling_time_range の最大値 (秒) ÷ step_dt (秒)。
                 max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
-                self._cooldown_remaining = int(
+                resample_steps = int(
                     math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt)
                 )
+                self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
             self._update_count = 0
 
         return {
