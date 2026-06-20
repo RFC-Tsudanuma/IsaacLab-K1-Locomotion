@@ -618,8 +618,13 @@ def ball_velocity_along_kick(
     どれだけ揃っているかだけを評価する。速度の大きさは見ない。
 
     ``kick_direction`` コマンドは既に単位ベクトルを返す。ボール速度方向との
-    コサイン類似度 [-1, 1] を [0, 1] にマップして返す。速度の大きさ自体は
+    コサイン類似度 [-1, 1] を **そのまま** 返す (対称評価)。速度の大きさ自体は
     別途 ``ball_speed`` 報酬で評価する。
+
+    Why 対称: [0, 1] にマップすると逆方向 (cos=-1) が「報酬ゼロ」になり罰せられず、
+    無方向に報酬を出す ``ball_speed`` と組み合わさると「方向を無視してとにかく蹴る」
+    局所解に落ちる。生の cos を使えば逆方向は負の報酬となり、目標と反対に蹴る挙動を
+    積極的にペナルティ化できる。
 
     ただし停止時 (速度 ~0) に報酬が残ると悪影響なので、`speed_gate` [m/s] 未満では
     線形に減衰させて停止時は 0 にする。`speed_gate` を小さく取ることで、動き出せば
@@ -629,11 +634,10 @@ def ball_velocity_along_kick(
     ball_vel_w = ball.data.root_com_vel_w[:, :2]
     kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2)
     cos_sim = torch.nn.functional.cosine_similarity(ball_vel_w, kick_dir_w, dim=1, eps=1e-6)
-    alignment = (cos_sim + 1.0) / 2.0  # [-1, 1] -> [0, 1]
 
     ball_speed = torch.norm(ball_vel_w, dim=1)
     speed_factor = torch.clamp(ball_speed / speed_gate, 0.0, 1.0)
-    return alignment * speed_factor
+    return cos_sim * speed_factor
 
 
 def ball_speed(
@@ -750,6 +754,47 @@ def robot_facing_ball(
     cos_theta = offset_b[:, 0] / (dist_xy + 1e-6)
     reward = torch.clamp(cos_theta, min=0.0, max=1.0)
     near = dist_xy < min_distance
+    return torch.where(near, torch.zeros_like(reward), reward)
+
+
+def robot_behind_ball(
+    env: ManagerBasedRLEnv,
+    command_name: str = "kick_direction",
+    min_distance: float = 0.15,
+    engage_distance: float = 1.0,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ロボットが「キック方向から見てボールの後ろ側」かつ「ボールに近い」ほど大きい
+    [0, 1] の報酬。
+
+    ロボット→ボール方向の単位ベクトルと ``kick_direction`` (ワールド単位ベクトル) の
+    内積を取る。+1 ならロボットはボールの真後ろ (前進すればボールをキック方向へ押せる
+    理想配置)、-1 なら逆側 (前進するとボールを目標と反対に蹴ってしまう配置)。
+
+    Why 密な非ポテンシャル形式: 良い配置に早く着くほど報酬を受け取れるステップ数が
+    増えるので、累積報酬として「なるべく早く位置合わせする」挙動が自然に誘導される。
+
+    Why 近接ゲート (``engage_distance``): 距離に依存しない素の密報酬だと、ボールから
+    遠い後ろ側で「居座る」だけで永久に報酬を稼げてしまい (farmable)、接近してキック
+    する危険・労力を避ける局所最適に落ちる。``proximity = clamp(1 - dist/engage)`` を
+    掛けて、ボールに近いほど報酬が大きくなるようにすることで「後ろ側 かつ 接近」を
+    要求し、回り込んだ後そのまま接近 → 接触 → キックへ繋がるようにする。
+
+    逆側 (内積 < 0) は 0 にクランプして「ゼロ報酬」とする (積極的な罰はしない)。
+    ``min_distance`` 未満では方向が不安定になるので 0 を返す。
+    """
+    robot = env.scene[robot_cfg.name]
+    ball = env.scene[ball_cfg.name]
+    to_ball = ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
+    dist = torch.norm(to_ball, dim=1)
+    to_ball_unit = to_ball / (dist.unsqueeze(-1) + 1e-6)
+    kick_dir = env.command_manager.get_term(command_name).command  # (N, 2) 単位ベクトル
+    align = (to_ball_unit * kick_dir).sum(dim=1)  # [-1, 1]
+    # ボールに近いほど 1、engage_distance 以遠で 0 になる近接係数。
+    proximity = torch.clamp(1.0 - dist / engage_distance, 0.0, 1.0)
+    reward = torch.clamp(align, min=0.0, max=1.0) * proximity
+    near = dist < min_distance
     return torch.where(near, torch.zeros_like(reward), reward)
 
 
