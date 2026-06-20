@@ -100,3 +100,7 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
                 data_augmentation_func=compute_symmetric_states,
                 mirror_loss_coeff=0.5,
             )
+        if _USE_RECURRENT_POLICY and self.policy.__class__ is not RslRlPpoActorCriticRecurrentCfg:
+            raise ValueError(
+                "When using recurrent policy, please use RslRlPpoActorCriticRecurrentCfg for policy configuration."
+            )
