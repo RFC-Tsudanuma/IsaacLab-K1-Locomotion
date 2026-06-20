@@ -67,7 +67,9 @@ from .mdp.rewards import (
     high_action_rate_l2,
     high_action_smoothness_l2,
     high_action_xy_coactivation,
+    robot_behind_ball,
     robot_facing_ball,
+    robot_velocity_toward_ball,
 )
 
 
@@ -189,11 +191,31 @@ class K1DribbleRewardsCfg:
         func=approach_ball_progress,
         weight=40.0,
     )
+    # ロボット速度のボール方向成分 [0, 1] を毎ステップ密に与える接近報酬。
+    # approach_ball_progress (ポテンシャル形式 = 最適方策を変えない) と違い、
+    # 非ポテンシャルなので「立ち止まる」局所解を実際に崩して移動側へ最適方策を寄せる。
+    # 速度ベースなので立っていると 0 → parking で farm できない。
+    # weight×v が per-step 報酬 (max_speed=1.0)。移動ペナルティを上回り、かつ
+    # ball_velocity_along_kick (4.5) は超えないオーダーとして 3.0 から開始。
+    robot_velocity_toward_ball = RewTerm(
+        func=robot_velocity_toward_ball,
+        weight=3.0,
+        params={"max_speed": 1.0, "min_distance": 0.05},
+    )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
     robot_facing_ball = RewTerm(
         func=robot_facing_ball,
-        weight=1.0,
+        weight=0.7,
         params={"min_distance": 0.15},
+    )
+    # キック方向から見てボールの後ろ側 かつ ボールに近いほど大きい [0, 1]。
+    # 密な非ポテンシャル形式で「早く正しい配置に着く」挙動を誘導しつつ、
+    # 近接ゲート (engage_distance) で「遠くの後ろ側に居座って稼ぐ」局所最適を防ぐ。
+    # ball_velocity_along_kick (主報酬) を上回らないよう weight は控えめに。
+    robot_behind_ball = RewTerm(
+        func=robot_behind_ball,
+        weight=0.5,
+        params={"command_name": "kick_direction", "min_distance": 0.15, "engage_distance": 0.45},
     )
 
     # --- ペナルティ ---
@@ -212,7 +234,7 @@ class K1DribbleRewardsCfg:
     # x+theta / y+theta のどちらかのモードに寄せ、xy 同時入力による不安定を抑える。
     # weight はカリキュラム (high_action_xy_coactivation_curriculum) で 0 → -3.0 に
     # 線形ランプするので、ここの値は据え置き時のフォールバック。
-    high_action_xy_coactivation = RewTerm(func=high_action_xy_coactivation, weight=-3.0)
+    high_action_xy_coactivation = RewTerm(func=high_action_xy_coactivation, weight=-2.6)
     # ロボット root body COM の jerk (加速度の時間微分) ペナルティ。
     # 値域が大きくなりやすいので重みは非常に小さめから始める。
     com_jerk_l2 = RewTerm(func=com_jerk_l2, weight=-2e-6 * 0.5)
