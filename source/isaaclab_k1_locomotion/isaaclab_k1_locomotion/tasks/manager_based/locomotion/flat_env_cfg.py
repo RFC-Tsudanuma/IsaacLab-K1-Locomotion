@@ -77,14 +77,19 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
+            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.8, 1.8)],
             "stages_y": [(-0.5, 0.5), (-0.8, 0.8), (-0.9, 0.9)],
             # 速度範囲が広いステージほど絶対誤差が出やすいので閾値を緩めて難易度を均す
             # (最終ステージの値は据え置きなのでログ表示用)
-            "error_threshold": [0.30, 0.45, 0.55],
+            "error_threshold": [0.30, 0.60, 0.55],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
+            # ステージを進めた直後、新しい(広い)コマンド範囲が全 env に行き渡るまで
+            # 誤差計測を止めて次の遷移判定を待つ。これが無いと、各 env がまだ旧範囲の
+            # コマンドを保持したまま EMA が低いため、緩い次ステージ閾値を即満たして
+            # 0→1→2 と一気に遷移してしまう。resampling_time_range の最大値の倍数で指定。
+            "stage_cooldown_resamples": 1.5,
         },
     )
 
@@ -96,7 +101,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             "term_name": "push_robot",
             "num_steps": 6000,
             "interval_range_s": (4.0, 8.0),
-            "velocity_range": {"x": (-0.7, 0.7), "y": (-0.7, 0.7), "roll": (-0.2, 0.2), "pitch": (-0.2, 0.2)},
+            "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "roll": (-0.02, 0.02), "pitch": (-0.02, 0.02)},
         },
     )
     # push_robot_stage2 = CurrTerm(
@@ -166,7 +171,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
         self.rewards.feet_landing_impact = RewTerm(
             func=feet_landing_impact,
-            weight=-0.5e-2,
+            weight=-0.5e-2 * 0.3,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
@@ -177,7 +182,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
         self.rewards.feet_landing_vel = RewTerm(
             func=feet_landing_vel,
-            weight=-1.5,
+            weight=-1.5 * 0.2,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -196,7 +201,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
                 "contact_threshold": 1.0,
-                "target_pitch": 0.13,
+                "target_pitch": 0.10,
                 "std": 0.15,
                 "pitch_sign": -1.0,
                 "command_name": "base_velocity",

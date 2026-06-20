@@ -1009,7 +1009,53 @@ def feet_heel_strike(
     return reward * is_moving
 
 
-def action_smoothness_l2(env):
+def _stand_still_boost(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    cmd_threshold: float,
+    lin_vel_threshold: float,
+    ang_vel_threshold: float,
+    scale: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """立ち止まり「かつ実際に静止している」ときだけ penalty 倍率を ``scale`` にするゲート係数を返す。
+
+    cmd 速度が小さい (停止指令) ことに加えて base の実速度も小さい (= 外乱で動かされていない)
+    ことを条件にする。これにより、push を受けて base 速度が跳ねた瞬間は倍率が 1.0 に戻り、
+    立ち直り (push recovery) のための素早い動作を過度に罰さない。
+
+    Args:
+        env: 学習環境。
+        command_name: 速度コマンド名。停止指令の判定に使う。
+        cmd_threshold: 停止指令とみなす cmd 速度ノルム閾値 [m/s]。
+        lin_vel_threshold: 静止とみなす base xy 線速度ノルム閾値 [m/s]。これを超えたら倍率 1.0。
+        ang_vel_threshold: 静止とみなす base yaw 角速度の絶対値閾値 [rad/s]。
+        scale: 立ち止まり静止時にかける倍率 (例: 2.0)。
+        asset_cfg: base 速度を取る Articulation。
+
+    Returns:
+        各環境の倍率 [N], 立ち止まり静止時は ``scale``、それ以外は 1.0。
+    """
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    is_stopped = cmd_speed < cmd_threshold
+
+    asset = env.scene[asset_cfg.name]
+    lin_speed = torch.norm(asset.data.root_lin_vel_b[:, :2], dim=1)
+    ang_speed = asset.data.root_ang_vel_b[:, 2].abs()
+    is_still = (lin_speed < lin_vel_threshold) & (ang_speed < ang_vel_threshold)
+
+    boost = is_stopped & is_still
+    return torch.where(boost, torch.full_like(cmd_speed, scale), torch.ones_like(cmd_speed))
+
+
+def action_smoothness_l2(
+    env,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    stand_still_scale: float = 1.0,
+    lin_vel_threshold: float = 0.2,
+    ang_vel_threshold: float = 0.2,
+):
     # これはcassieのcausal transformer論文から取ってきた
     a = env.action_manager.action
     a_prev = env.action_manager.prev_action
@@ -1018,7 +1064,36 @@ def action_smoothness_l2(env):
     diff1 = torch.square(a - a_prev)
     diff2 = torch.square(a - 2.0 * a_prev + env._prev_prev_action)
     env._prev_prev_action = a_prev.clone()
-    return torch.sum((diff1 + diff2), dim=1)
+    penalty = torch.sum((diff1 + diff2), dim=1)
+    # 立ち止まり静止時のみ倍率を上げて、recurrent ポリシー特有の振動を抑える。
+    if stand_still_scale != 1.0:
+        penalty = penalty * _stand_still_boost(
+            env, command_name, cmd_threshold, lin_vel_threshold, ang_vel_threshold, stand_still_scale
+        )
+    return penalty
+
+
+def action_rate_l2(
+    env,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    stand_still_scale: float = 1.0,
+    lin_vel_threshold: float = 0.2,
+    ang_vel_threshold: float = 0.2,
+):
+    """標準 action_rate_l2 (``||a_t - a_{t-1}||²``) に立ち止まり静止時の倍率ゲートを加えたもの。
+
+    停止指令かつ base が実際に静止しているときだけ penalty を ``stand_still_scale`` 倍する。
+    ゲートの詳細は :func:`_stand_still_boost` 参照。
+    """
+    a = env.action_manager.action
+    a_prev = env.action_manager.prev_action
+    penalty = torch.sum(torch.square(a - a_prev), dim=1)
+    if stand_still_scale != 1.0:
+        penalty = penalty * _stand_still_boost(
+            env, command_name, cmd_threshold, lin_vel_threshold, ang_vel_threshold, stand_still_scale
+        )
+    return penalty
 
 
 def high_action_smoothness_l2(env):
