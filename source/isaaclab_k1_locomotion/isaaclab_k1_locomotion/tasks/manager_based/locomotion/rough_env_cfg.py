@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2, action_rate_l2, joint_mirror_symmetry
 
 ##
 # 基本設定
@@ -41,6 +41,17 @@ from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_he
 _PHASE_FREQ: float = 1.6  # Hz (歩行周期)
 _COMMAND_THRESHOLD: float = 0.05 # コマンド速度がこれ未満のときは停止とみなす
 _STANCE_RATIO: float = 0.50 # 接地時間の割合
+# 立ち止まり「かつ静止している」ときだけ action_smoothness / action_rate ペナルティを
+# この倍率に増やし、recurrent ポリシーの停止時振動を抑える。push を受けて base が動いた
+# 瞬間は倍率が 1.0 に戻るので push recovery は阻害しない (rewards._stand_still_boost 参照)。
+_STAND_STILL_PENALTY_SCALE: float = 3.0
+# True: LSTM/GRU (recurrent) 方策を使う前提。False: MLP 方策。
+# recurrent では rsl_rl の mirror loss が構造的に動かないため、対称性は報酬
+# (joint_mirror_symmetry) で担保する。MLP では mirror loss を使うのでこの報酬は不要。
+# この1フラグで「env 側の joint_mirror_symmetry 報酬」と「runner 側の mirror loss」を
+# 排他に切り替える (agents/rsl_rl_ppo_cfg.py も同じフラグを参照)。アーキを変えるときは
+# ここを切り替えること。
+_USE_RECURRENT_POLICY: bool = True
 
 _K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -348,12 +359,26 @@ class K1Rewards(RewardsCfg):
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
         weight=-0.15,
+        params={
+            "command_name": "base_velocity",
+            "cmd_threshold": _COMMAND_THRESHOLD,
+            "stand_still_scale": _STAND_STILL_PENALTY_SCALE,
+        },
     )
 
     dof_vel_l2 = RewTerm(
         func=mdp.joint_vel_l2,
         weight=-5.0e-4,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"])},
+    )
+
+    # 左右対称性を報酬で担保する (アーキ非依存)。recurrent (LSTM/GRU) 方策では rsl_rl の
+    # mirror loss が構造的に動かない (rsl_rl_ppo_cfg.py のコメント参照) ため、その代替。
+    # exp(-error/0.1) の [0,1] 報酬で、左右股関節・膝が鏡像対称なほど高い。weight は要調整。
+    # MLP では mirror loss 側を使うので weight=0 にして二重がけを避ける (_USE_RECURRENT_POLICY)。
+    joint_mirror_symmetry = RewTerm(
+        func=joint_mirror_symmetry,
+        weight=0.5 if _USE_RECURRENT_POLICY else 0.0,
     )
 
 # ---------------------------------------------------------------------------
@@ -394,7 +419,15 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
             },
         )
         self.rewards.flat_orientation_l2.weight = -20.0
-        self.rewards.action_rate_l2.weight = -0.005
+        self.rewards.action_rate_l2 = RewTerm(
+            func=action_rate_l2,
+            weight=-0.005,
+            params={
+                "command_name": "base_velocity",
+                "cmd_threshold": _COMMAND_THRESHOLD,
+                "stand_still_scale": _STAND_STILL_PENALTY_SCALE,
+            },
+        )
         self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]
