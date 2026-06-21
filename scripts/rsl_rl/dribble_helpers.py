@@ -224,7 +224,14 @@ def _build_frozen_policy(
         pass
 
     agent_dict = agent_cfg.to_dict()
-    policy_cfg = dict(agent_dict["policy"])
+    # 凍結する下位 (歩行) 方策は上位 (ドリブル) 方策とは別ネットワークなので、その構造は
+    # ``low_level_policy`` で指定する (rsl_rl_ppo_cfg_dribble.py)。後方互換のため未指定なら
+    # 従来どおり ``policy`` にフォールバックする。
+    low_level_cfg = agent_dict.get("low_level_policy")
+    if low_level_cfg is None:
+        print("[dribble] 'low_level_policy' が未指定のため 'policy' の構造で凍結方策を構築します。")
+        low_level_cfg = agent_dict["policy"]
+    policy_cfg = dict(low_level_cfg)
     policy_class_name = policy_cfg.pop("class_name", "ActorCritic")
     policy_class = {"ActorCritic": ActorCritic, "ActorCriticRecurrent": ActorCriticRecurrent}[policy_class_name]
 
@@ -235,11 +242,9 @@ def _build_frozen_policy(
     # strict=False, so drop them entirely.
     state_dict = {k: v for k, v in state_dict.items() if not k.startswith(("critic", "critic_obs_normalizer"))}
 
-    # The frozen low-level policy is a *different* network than the high-level
-    # dribble policy, so its architecture comes from its own checkpoint, not from
-    # ``agent_cfg.policy`` (which describes the high-level net). Infer the actor's
-    # hidden-layer sizes from the checkpoint so any flat/rough model loads cleanly
-    # regardless of the dribble agent cfg's ``actor_hidden_dims``.
+    # 構造は ``low_level_policy`` で指定するが、念のため checkpoint から actor の隠れ層
+    # サイズを推定し、指定とずれていれば checkpoint 側に合わせる (load 失敗を防ぐ安全網)。
+    # ずれた場合は警告を出すので、本来は ``low_level_policy`` を checkpoint に合わせること。
     actor_layer_idxs = sorted(
         int(k.split(".")[1]) for k in state_dict if k.startswith("actor.") and k.endswith(".weight")
     )
