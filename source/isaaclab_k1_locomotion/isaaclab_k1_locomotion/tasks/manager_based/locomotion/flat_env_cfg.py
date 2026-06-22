@@ -286,6 +286,50 @@ class K1FlatImproveSteadynessCfg(K1FlatEnvCfg):
         self.rewards.dof_torques_l2.weight = -1.0e-5
 
 @configclass
+class K1FlatImproveAngTrackingCfg(K1FlatEnvCfg):
+    """学習済ポリシーに対して角速度(yaw)追従を強化するための追加学習用環境設定。
+
+    背景: lin_vel 高速域の追従はカリキュラム+coarse項の追加で改善した一方、
+    その過程で track_ang_vel_z_exp の重みが 3.0→2.0 に下げられ lin 偏重になり、
+    結果として yaw 追従精度が低下した。本設定は lin の高速追従を維持しつつ
+    ang の追従を取り戻すよう、報酬バランスを yaw 側に振り直して再学習する。
+
+    使い方: 既存 Flat ポリシーの checkpoint から --resume で追加学習する。
+        ./train_ang_tracking.sh --resume --load_run <既存run名>
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 角速度追従を強化 ---
+        # 鋭い項 (std=0.25) の重みを 2.0 → 4.0 に引き上げ、yaw 追従を最優先にする。
+        self.rewards.track_ang_vel_z_exp.weight = 4.0
+        self.rewards.track_ang_vel_z_exp.params["std"] = 0.25
+        # lin 側の coarse 項と同じ思想で ang にも広い std の項を追加する。
+        # 鋭い項 (std=0.25) は誤差 ~0.4 rad/s で exp(-err²/std²) が飽和し勾配が消えるため、
+        # 旋回コマンドが大きく追従誤差が大きい領域で「もっと回せ」の信号が死ぬ。
+        # std を広げた同形の報酬を小重みで加算し、高誤差域でも勾配を残す。
+        self.rewards.track_ang_vel_z_coarse = RewTerm(
+            func=mdp.track_ang_vel_z_world_exp,
+            weight=1.0,
+            params={"command_name": "base_velocity", "std": 0.5},
+        )
+
+        # --- lin の高速追従を「忘れさせない」ためカリキュラムを凍結 ---
+        # checkpoint には curriculum の進捗が保存されないため、resume すると
+        # lin_vel_command カリキュラムが stage0 (±0.6) から再進行してしまい、
+        # せっかく獲得した高速追従を一時的に練習しなくなる。yaw 追従の再学習に
+        # 集中するため、lin の段階的拡張は止めて最終ステージ相当の広い範囲で固定する。
+        self.curriculum.lin_vel_command = None
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.8, 1.8)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.9, 0.9)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+        # 多様な yaw コマンドに頻繁に晒すためリサンプリング間隔を短めに固定する。
+        self.commands.base_velocity.resampling_time_range = (1.0, 5.0)
+
+
+@configclass
 class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
