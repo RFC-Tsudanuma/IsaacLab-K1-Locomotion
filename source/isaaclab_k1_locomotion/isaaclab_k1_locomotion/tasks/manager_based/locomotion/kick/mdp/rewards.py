@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import time
 
 import torch
 from typing import TYPE_CHECKING
@@ -22,6 +24,21 @@ KICK_STAGE_DISCOVERY = 1
 KICK_STAGE_POWER = 2
 KICK_STAGE_RECOVERY = 3
 KICK_STAGE_FINAL_POSE = 4
+PROFILER_MAX_COMMON_STEPS = 2048
+PROFILER_LOG_INTERVAL_STEPS = 128
+PROFILER_PRINT_TOP_K = 8
+K1_LEFT_LEG_BODY_NAMES = (
+    "Left_Hip_Yaw",
+    "Left_Shank",
+    "Left_Ankle_Cross",
+    "left_foot_link",
+)
+K1_RIGHT_LEG_BODY_NAMES = (
+    "Right_Hip_Yaw",
+    "Right_Shank",
+    "Right_Ankle_Cross",
+    "right_foot_link",
+)
 
 
 def _ball_contact_force(env: ManagerBasedRLEnv, sensor_name: str) -> torch.Tensor:
@@ -44,6 +61,98 @@ def _ensure_curriculum_buffers(env: ManagerBasedRLEnv) -> dict[str, torch.Tensor
     if "peak_ball_forward_distance" not in kick_buffers:
         kick_buffers["peak_ball_forward_distance"] = torch.zeros(env.num_envs, device=env.device)
     return kick_buffers
+
+
+def _ensure_reward_profiler(env: ManagerBasedRLEnv) -> dict[str, dict[str, float] | int | bool]:
+    if not hasattr(env, "_kick_reward_profiler"):
+        env._kick_reward_profiler = {
+            "stats": {},
+            "last_log_step": -1,
+            "printed_summary": False,
+        }
+    return env._kick_reward_profiler
+
+
+def _get_step_cache(env: ManagerBasedRLEnv) -> dict[tuple, object]:
+    current_step = int(getattr(env, "common_step_counter", 0))
+    if not hasattr(env, "_kick_step_cache") or getattr(env, "_kick_step_cache_step", None) != current_step:
+        env._kick_step_cache = {}
+        env._kick_step_cache_step = current_step
+    return env._kick_step_cache
+
+
+def _profile_step_enabled(env: ManagerBasedRLEnv) -> bool:
+    return getattr(env, "common_step_counter", 0) <= PROFILER_MAX_COMMON_STEPS
+
+
+def _record_profile_stat(env: ManagerBasedRLEnv, name: str, elapsed_s: float) -> None:
+    profiler = _ensure_reward_profiler(env)
+    stats = profiler["stats"]
+    if name not in stats:
+        stats[name] = {"cum_s": 0.0, "max_s": 0.0, "calls": 0.0}
+    entry = stats[name]
+    entry["cum_s"] += elapsed_s
+    entry["calls"] += 1.0
+    entry["max_s"] = max(entry["max_s"], elapsed_s)
+
+
+def _flush_profile_stats(env: ManagerBasedRLEnv) -> None:
+    if not hasattr(env, "extras"):
+        return
+    profiler = _ensure_reward_profiler(env)
+    current_step = int(getattr(env, "common_step_counter", 0))
+    should_log = current_step <= PROFILER_MAX_COMMON_STEPS and (
+        current_step <= 16 or current_step % PROFILER_LOG_INTERVAL_STEPS == 0 or current_step == PROFILER_MAX_COMMON_STEPS
+    )
+    if not should_log or profiler["last_log_step"] == current_step:
+        return
+    stats = profiler["stats"]
+    if "log" not in env.extras:
+        env.extras["log"] = {}
+    for name, entry in stats.items():
+        calls = max(entry["calls"], 1.0)
+        env.extras["log"][f"RewardProfiler/{name}_avg_ms"] = 1000.0 * entry["cum_s"] / calls
+        env.extras["log"][f"RewardProfiler/{name}_cum_ms"] = 1000.0 * entry["cum_s"]
+        env.extras["log"][f"RewardProfiler/{name}_max_ms"] = 1000.0 * entry["max_s"]
+        env.extras["log"][f"RewardProfiler/{name}_call_count"] = float(entry["calls"])
+    profiler["last_log_step"] = current_step
+
+    if current_step >= PROFILER_MAX_COMMON_STEPS and not profiler["printed_summary"] and stats:
+        ranking = sorted(
+            (
+                name,
+                1000.0 * entry["cum_s"] / max(entry["calls"], 1.0),
+                1000.0 * entry["cum_s"],
+                int(entry["calls"]),
+            )
+            for name, entry in stats.items()
+        )
+        ranking = sorted(ranking, key=lambda item: item[1], reverse=True)[:PROFILER_PRINT_TOP_K]
+        print("[K1Kick RewardProfiler] avg-ms ranking over profiled steps:")
+        for rank, (name, avg_ms, cum_ms, calls) in enumerate(ranking, start=1):
+            print(f"  {rank}. {name}: avg={avg_ms:.4f} ms, cum={cum_ms:.2f} ms, calls={calls}")
+        profiler["printed_summary"] = True
+
+
+def _profile_named_call(env: ManagerBasedRLEnv, name: str, fn, *args, **kwargs):
+    if not _profile_step_enabled(env):
+        return fn(*args, **kwargs)
+    start = time.perf_counter()
+    result = fn(*args, **kwargs)
+    _record_profile_stat(env, name, time.perf_counter() - start)
+    _flush_profile_stats(env)
+    return result
+
+
+def _profile_term(name: str):
+    def decorator(fn):
+        @functools.wraps(fn)
+        def wrapper(env: ManagerBasedRLEnv, *args, **kwargs):
+            return _profile_named_call(env, name, fn, env, *args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 def get_curriculum_stage(env: ManagerBasedRLEnv) -> int:
@@ -359,6 +468,118 @@ def _stance_x_separation(
     return torch.abs(left_rel_x - right_rel_x)
 
 
+def _stance_width_y(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    _, _, left_rel_y, right_rel_y = _foot_positions_relative_to_com(env, asset_cfg)
+    return torch.abs(left_rel_y - right_rel_y)
+
+
+def _foot_distance_xy(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    left_rel_x, right_rel_x, left_rel_y, right_rel_y = _foot_positions_relative_to_com(env, asset_cfg)
+    return torch.sqrt(torch.square(left_rel_x - right_rel_x) + torch.square(left_rel_y - right_rel_y))
+
+
+def _leg_distance_body_ids(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kick_buffers = _ensure_kick_buffers(env)
+    cache_key = f"leg_distance_body_ids::{asset_cfg.name}"
+    if cache_key not in kick_buffers:
+        robot: Articulation = env.scene[asset_cfg.name]
+        # K1 has no dedicated toe link, so the foot link is used as the terminal leg-link proxy.
+        left_ids = [robot.find_bodies(name)[0][0] for name in K1_LEFT_LEG_BODY_NAMES]
+        right_ids = [robot.find_bodies(name)[0][0] for name in K1_RIGHT_LEG_BODY_NAMES]
+        kick_buffers[cache_key] = (
+            torch.tensor(left_ids, device=env.device, dtype=torch.long),
+            torch.tensor(right_ids, device=env.device, dtype=torch.long),
+        )
+    return kick_buffers[cache_key]
+
+
+def _leg_pair_labels() -> list[str]:
+    return [f"{left}__{right}" for left in K1_LEFT_LEG_BODY_NAMES for right in K1_RIGHT_LEG_BODY_NAMES]
+
+
+def _pair_label_metric_suffix(label: str) -> str:
+    return label.replace(".", "_").replace("/", "_")
+
+
+def _same_leg_pair_labels() -> tuple[tuple[str, str], ...]:
+    return (
+        ("hip_link_distance", "Left_Hip_Yaw__Right_Hip_Yaw"),
+        ("shank_distance", "Left_Shank__Right_Shank"),
+        ("ankle_distance", "Left_Ankle_Cross__Right_Ankle_Cross"),
+        ("foot_link_distance", "left_foot_link__right_foot_link"),
+    )
+
+
+def _min_leg_link_info(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = ("min_leg_link_info", asset_cfg.name)
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
+
+    robot: Articulation = env.scene[asset_cfg.name]
+    left_ids, right_ids = _leg_distance_body_ids(env, asset_cfg)
+    left_body_pos_w = robot.data.body_pos_w.index_select(1, left_ids)
+    right_body_pos_w = robot.data.body_pos_w.index_select(1, right_ids)
+    pairwise_distance = torch.linalg.norm(left_body_pos_w.unsqueeze(2) - right_body_pos_w.unsqueeze(1), dim=-1)
+    flat_distance = pairwise_distance.view(env.num_envs, -1)
+    min_distance, min_pair_index = torch.min(flat_distance, dim=1)
+    result = (min_distance.clone(), min_pair_index.clone(), pairwise_distance.clone())
+    step_cache[cache_key] = result
+    return result
+
+
+def _min_leg_link_distance(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    min_distance, _, _ = _min_leg_link_info(env, asset_cfg)
+    return min_distance
+
+
+def _leg_self_contact_info(
+    env: ManagerBasedRLEnv,
+    sensor_name: str = "leg_self_contact_left",
+    contact_force_threshold: float = 1.0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = ("leg_self_contact_info", sensor_name, float(contact_force_threshold))
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
+
+    sensor = env.scene.sensors[sensor_name]
+    force_matrix_w = sensor.data.force_matrix_w
+    if force_matrix_w is None:
+        num_pairs = len(K1_LEFT_LEG_BODY_NAMES) * len(K1_RIGHT_LEG_BODY_NAMES)
+        pair_contact_mask = torch.zeros((env.num_envs, num_pairs), device=env.device, dtype=torch.bool)
+        pair_force_norm = torch.zeros((env.num_envs, num_pairs), device=env.device)
+    else:
+        left_body_indices = [sensor.find_bodies(name, preserve_order=True)[0][0] for name in K1_LEFT_LEG_BODY_NAMES]
+        ordered_force_matrix_w = force_matrix_w.index_select(
+            1, torch.tensor(left_body_indices, device=env.device, dtype=torch.long)
+        )
+        pair_force_norm = torch.linalg.norm(ordered_force_matrix_w, dim=-1).view(env.num_envs, -1)
+        pair_contact_mask = pair_force_norm > contact_force_threshold
+    any_contact = torch.any(pair_contact_mask, dim=1)
+    contact_count = torch.sum(pair_contact_mask, dim=1)
+    result = (any_contact.clone(), contact_count.clone(), pair_contact_mask.clone(), pair_force_norm.clone())
+    step_cache[cache_key] = result
+    return result
+
+
 def _set_logged_metric(env: ManagerBasedRLEnv, key: str, value: float) -> None:
     if not hasattr(env, "extras"):
         return
@@ -367,24 +588,178 @@ def _set_logged_metric(env: ManagerBasedRLEnv, key: str, value: float) -> None:
     env.extras["log"][key] = float(value)
 
 
+def _log_mask_rate(env: ManagerBasedRLEnv, key: str, mask: torch.Tensor) -> None:
+    _set_logged_metric(env, key, torch.mean(mask.float()).item())
+
+
+def _masked_mean(values: torch.Tensor, mask: torch.Tensor) -> float:
+    if values.numel() == 0 or mask.numel() == 0 or not torch.any(mask):
+        return 0.0
+    return torch.mean(values[mask].float()).item()
+
+
+def _masked_max(values: torch.Tensor, mask: torch.Tensor) -> float:
+    if values.numel() == 0 or mask.numel() == 0 or not torch.any(mask):
+        return 0.0
+    return torch.max(values[mask].float()).item()
+
+
+def _selected_correlation(values_a: torch.Tensor, values_b: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+    if mask is not None:
+        if mask.numel() == 0 or not torch.any(mask):
+            return 0.0
+        values_a = values_a[mask]
+        values_b = values_b[mask]
+    if values_a.numel() < 2 or values_b.numel() < 2:
+        return 0.0
+    a = values_a.float()
+    b = values_b.float()
+    a_centered = a - torch.mean(a)
+    b_centered = b - torch.mean(b)
+    denom = torch.sqrt(torch.sum(a_centered * a_centered) * torch.sum(b_centered * b_centered))
+    if torch.isnan(denom) or denom <= 1.0e-8:
+        return 0.0
+    corr = torch.sum(a_centered * b_centered) / denom
+    return corr.item()
+
+
+def _quantile(values: torch.Tensor, q: float) -> float:
+    if values.numel() == 0:
+        return 0.0
+    return torch.quantile(values.float(), q).item()
+
+
+def _paired_body_relative_y_in_heading_frame(
+    env: ManagerBasedRLEnv,
+    left_body_name: str,
+    right_body_name: str,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> tuple[torch.Tensor, torch.Tensor]:
+    robot: Articulation = env.scene[asset_cfg.name]
+    left_id = robot.find_bodies(left_body_name)[0][0]
+    right_id = robot.find_bodies(right_body_name)[0][0]
+    com_xy = robot.data.root_pos_w[:, :2]
+    left_rel_w = robot.data.body_pos_w[:, left_id, :2] - com_xy
+    right_rel_w = robot.data.body_pos_w[:, right_id, :2] - com_xy
+    _, _, base_yaw = euler_xyz_from_quat(robot.data.root_quat_w)
+    cos_yaw = torch.cos(-base_yaw)
+    sin_yaw = torch.sin(-base_yaw)
+    left_rel_y = sin_yaw * left_rel_w[:, 0] + cos_yaw * left_rel_w[:, 1]
+    right_rel_y = sin_yaw * right_rel_w[:, 0] + cos_yaw * right_rel_w[:, 1]
+    return left_rel_y, right_rel_y
+
+
+def _log_leg_collision_metrics(
+    env: ManagerBasedRLEnv,
+    min_leg_link_distance: torch.Tensor,
+    min_pair_index: torch.Tensor,
+    pairwise_distance: torch.Tensor,
+    any_contact: torch.Tensor,
+    contact_count: torch.Tensor,
+    pair_contact_mask: torch.Tensor,
+    pair_force_norm: torch.Tensor,
+    log_detailed_pair_metrics: bool = False,
+) -> None:
+    pair_labels = _leg_pair_labels()
+    _set_logged_metric(env, "Metrics/min_leg_link_distance", torch.min(min_leg_link_distance).item())
+    _set_logged_metric(env, "Metrics/min_leg_link_distance_p10", _quantile(min_leg_link_distance, 0.10))
+    _set_logged_metric(env, "Metrics/min_leg_link_distance_p05", _quantile(min_leg_link_distance, 0.05))
+    _set_logged_metric(env, "Metrics/min_leg_link_distance_p01", _quantile(min_leg_link_distance, 0.01))
+    _set_logged_metric(env, "Metrics/leg_self_contact_rate", torch.mean(any_contact.float()).item())
+    _set_logged_metric(env, "Metrics/leg_self_contact_count", torch.mean(contact_count.float()).item())
+    if pair_force_norm.numel() > 0:
+        active_force_values = pair_force_norm[pair_contact_mask]
+        _set_logged_metric(
+            env, "Metrics/leg_self_contact_force", torch.mean(active_force_values).item() if active_force_values.numel() > 0 else 0.0
+        )
+        _set_logged_metric(env, "Metrics/max_leg_self_contact_force", torch.max(pair_force_norm).item())
+    same_pair_names = _same_leg_pair_labels()
+    pair_label_to_index = {label: idx for idx, label in enumerate(pair_labels)}
+    flat_distance = pairwise_distance.view(env.num_envs, -1)
+    for metric_name, pair_label in same_pair_names:
+        pair_index = pair_label_to_index[pair_label]
+        pair_values = flat_distance[:, pair_index]
+        _set_logged_metric(env, f"Metrics/{metric_name}", torch.mean(pair_values).item())
+    left_foot_y, right_foot_y = _paired_body_relative_y_in_heading_frame(env, "left_foot_link", "right_foot_link")
+    left_ankle_y, right_ankle_y = _paired_body_relative_y_in_heading_frame(env, "Left_Ankle_Cross", "Right_Ankle_Cross")
+    crossed_feet = left_foot_y < right_foot_y
+    crossed_ankle = left_ankle_y < right_ankle_y
+    crossed_leg = crossed_feet & crossed_ankle
+    _set_logged_metric(env, "Metrics/crossed_feet_rate", torch.mean(crossed_feet.float()).item())
+    _set_logged_metric(env, "Metrics/crossed_ankle_rate", torch.mean(crossed_ankle.float()).item())
+    _set_logged_metric(env, "Metrics/crossed_leg_rate", torch.mean(crossed_leg.float()).item())
+    if min_pair_index.numel() > 0:
+        pair_index_counts = torch.bincount(min_pair_index.to(dtype=torch.long), minlength=len(pair_labels))
+        dominant_min_pair_index = int(torch.argmax(pair_index_counts).item())
+        _set_logged_metric(env, "Metrics/min_leg_link_pair", float(dominant_min_pair_index))
+        if log_detailed_pair_metrics:
+            for pair_index, pair_label in enumerate(pair_labels):
+                pair_mask = min_pair_index == pair_index
+                _set_logged_metric(
+                    env,
+                    f"Metrics/min_leg_link_pair_rate/{_pair_label_metric_suffix(pair_label)}",
+                    torch.mean(pair_mask.float()).item(),
+                )
+                pair_values = flat_distance[:, pair_index]
+                pair_suffix = _pair_label_metric_suffix(pair_label)
+                _set_logged_metric(env, f"Metrics/leg_link_distance/{pair_suffix}_mean", torch.mean(pair_values).item())
+                _set_logged_metric(env, f"Metrics/leg_link_distance/{pair_suffix}_min", torch.min(pair_values).item())
+                _set_logged_metric(env, f"Metrics/leg_link_distance/{pair_suffix}_p05", _quantile(pair_values, 0.05))
+                _set_logged_metric(env, f"Metrics/leg_link_distance/{pair_suffix}_p01", _quantile(pair_values, 0.01))
+    if log_detailed_pair_metrics and pair_contact_mask.numel() > 0:
+        for pair_index, pair_label in enumerate(pair_labels):
+            _set_logged_metric(
+                env,
+                f"Metrics/leg_self_contact_pair_rate/{_pair_label_metric_suffix(pair_label)}",
+                torch.mean(pair_contact_mask[:, pair_index].float()).item(),
+            )
+
+
 def _update_support_foot_metrics(
     env: ManagerBasedRLEnv,
     support_foot_x_drift: torch.Tensor,
     support_valid_mask: torch.Tensor,
     stance_x_separation: torch.Tensor,
+    stance_width_y: torch.Tensor,
+    foot_distance_xy: torch.Tensor,
+    min_leg_link_distance: torch.Tensor | None = None,
 ) -> None:
     if torch.any(support_valid_mask):
         drift_values = support_foot_x_drift[support_valid_mask]
         stance_values = stance_x_separation[support_valid_mask]
+        stance_width_values = stance_width_y[support_valid_mask]
+        foot_distance_values = foot_distance_xy[support_valid_mask]
         _set_logged_metric(env, "Metrics/support_foot_x_drift_mean", torch.mean(drift_values).item())
         _set_logged_metric(env, "Metrics/support_foot_x_drift_max", torch.max(drift_values).item())
         _set_logged_metric(env, "Metrics/stance_x_separation_mean", torch.mean(stance_values).item())
         _set_logged_metric(env, "Metrics/stance_x_separation_max", torch.max(stance_values).item())
+        _set_logged_metric(env, "Metrics/stance_width_y_mean", torch.mean(stance_width_values).item())
+        _set_logged_metric(env, "Metrics/stance_width_y_max", torch.max(stance_width_values).item())
+        _set_logged_metric(env, "Metrics/stance_width_y_min", torch.min(stance_width_values).item())
+        _set_logged_metric(env, "Metrics/stance_width_y_p50", _quantile(stance_width_values, 0.50))
+        _set_logged_metric(env, "Metrics/stance_width_y_p90", _quantile(stance_width_values, 0.90))
+        _set_logged_metric(env, "Metrics/stance_width_y_p95", _quantile(stance_width_values, 0.95))
+        _set_logged_metric(env, "Metrics/narrow_stance_rate", torch.mean((stance_width_values < 0.10).float()).item())
+        _set_logged_metric(env, "Metrics/wide_stance_rate", torch.mean((stance_width_values > 0.25).float()).item())
+        _set_logged_metric(env, "Metrics/foot_distance_xy_mean", torch.mean(foot_distance_values).item())
+        _set_logged_metric(env, "Metrics/foot_distance_xy_min", torch.min(foot_distance_values).item())
     else:
         _set_logged_metric(env, "Metrics/support_foot_x_drift_mean", 0.0)
         _set_logged_metric(env, "Metrics/support_foot_x_drift_max", 0.0)
         _set_logged_metric(env, "Metrics/stance_x_separation_mean", 0.0)
         _set_logged_metric(env, "Metrics/stance_x_separation_max", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_mean", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_max", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_min", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_p50", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_p90", 0.0)
+        _set_logged_metric(env, "Metrics/stance_width_y_p95", 0.0)
+        _set_logged_metric(env, "Metrics/narrow_stance_rate", 0.0)
+        _set_logged_metric(env, "Metrics/wide_stance_rate", 0.0)
+        _set_logged_metric(env, "Metrics/foot_distance_xy_mean", 0.0)
+        _set_logged_metric(env, "Metrics/foot_distance_xy_min", 0.0)
+    if min_leg_link_distance is not None:
+        _set_logged_metric(env, "Metrics/min_leg_link_distance", torch.min(min_leg_link_distance).item())
 
 
 def _support_foot_x_drift(
@@ -409,6 +784,12 @@ def _update_ball_contact_state(
     left_sensor_name: str = "ball_contact_left_foot",
     right_sensor_name: str = "ball_contact_right_foot",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = ("ball_contact_state", float(threshold), left_sensor_name, right_sensor_name)
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
+
     kick_buffers = _ensure_kick_buffers(env)
     if "had_ball_contact" not in kick_buffers:
         kick_buffers["had_ball_contact"] = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
@@ -450,7 +831,9 @@ def _update_ball_contact_state(
             kick_foot_sign[first_contact] < 0, right_rel_y[first_contact], left_rel_y[first_contact]
         )
     had_ball_contact |= current_contact
-    return current_contact, first_contact, had_ball_contact.clone()
+    result = (current_contact.clone(), first_contact.clone(), had_ball_contact.clone())
+    step_cache[cache_key] = result
+    return result
 
 
 def _had_ball_contact_mask(
@@ -510,6 +893,19 @@ def _update_kick_success_state(
     min_success_distance_for_speed: float = 0.12,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (
+        "kick_success_state",
+        tuple(ball_spawn_pos),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+        asset_cfg.name,
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
+
     kick_buffers = _ensure_kick_buffers(env)
     if "had_kick_success" not in kick_buffers:
         kick_buffers["had_kick_success"] = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
@@ -528,7 +924,9 @@ def _update_kick_success_state(
     )
     first_success = current_success & ~had_kick_success
     had_kick_success |= current_success
-    return current_success, first_success, had_kick_success.clone()
+    result = (current_success.clone(), first_success.clone(), had_kick_success.clone())
+    step_cache[cache_key] = result
+    return result
 
 
 def _get_kick_success_steps(
@@ -600,6 +998,24 @@ def _recovery_condition_mask(
     roll_pitch_threshold: float = 0.25,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
+    cache_key = (
+        "recovery_condition_mask",
+        tuple(ball_spawn_pos),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+        float(min_recovery_delay_s),
+        float(foot_contact_force_threshold),
+        float(support_margin_x),
+        float(support_margin_y),
+        float(max_foot_height_diff),
+        float(max_foot_height),
+        float(roll_pitch_threshold),
+        asset_cfg.name,
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        return step_cache[cache_key].clone()
     diagnostics = get_recovery_condition_diagnostics(
         env,
         ball_spawn_pos,
@@ -615,7 +1031,9 @@ def _recovery_condition_mask(
         roll_pitch_threshold,
         asset_cfg,
     )
-    return diagnostics["recovery_condition_mask"]
+    result = diagnostics["recovery_condition_mask"].clone()
+    step_cache[cache_key] = result
+    return result
 
 
 def get_recovery_condition_diagnostics(
@@ -633,6 +1051,24 @@ def get_recovery_condition_diagnostics(
     roll_pitch_threshold: float = 0.25,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> dict[str, torch.Tensor]:
+    cache_key = (
+        "recovery_condition_diagnostics",
+        tuple(ball_spawn_pos),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+        float(min_recovery_delay_s),
+        float(foot_contact_force_threshold),
+        float(support_margin_x),
+        float(support_margin_y),
+        float(max_foot_height_diff),
+        float(max_foot_height),
+        float(roll_pitch_threshold),
+        asset_cfg.name,
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        return step_cache[cache_key]
     recovery_phase = _recovery_phase_mask(
         env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed, min_recovery_delay_s
     )
@@ -657,7 +1093,14 @@ def get_recovery_condition_diagnostics(
     support_max_x = torch.maximum(left_rel_x, right_rel_x) + support_margin_x
     support_min_y = torch.minimum(left_rel_y, right_rel_y) - support_margin_y
     support_max_y = torch.maximum(left_rel_y, right_rel_y) + support_margin_y
-    return {
+    com_support_violation_x = torch.maximum(torch.relu(support_min_x), torch.relu(-support_max_x))
+    com_support_violation_y = torch.maximum(torch.relu(support_min_y), torch.relu(-support_max_y))
+    com_support_violation = torch.sqrt(torch.square(com_support_violation_x) + torch.square(com_support_violation_y))
+    upright_error_deg = torch.rad2deg(torch.maximum(torch.abs(roll), torch.abs(pitch)))
+    stance_width_y = _stance_width_y(env, asset_cfg)
+    stance_x_separation = _stance_x_separation(env, asset_cfg)
+    max_foot_height_value = torch.maximum(foot_pose["left_z"], foot_pose["right_z"])
+    result = {
         "recovery_phase": recovery_phase,
         "double_support": double_support,
         "com_in_support": com_in_support,
@@ -670,18 +1113,26 @@ def get_recovery_condition_diagnostics(
         "foot_height_difference": torch.abs(foot_pose["left_z"] - foot_pose["right_z"]),
         "roll": roll,
         "pitch": pitch,
+        "upright_error_deg": upright_error_deg,
         "support_polygon_inside": com_in_support,
+        "com_support_violation": com_support_violation,
+        "com_support_distance": com_support_violation,
         "com_position_x": robot.data.root_pos_w[:, 0],
         "com_position_y": robot.data.root_pos_w[:, 1],
         "left_foot_rel_x": left_rel_x,
         "right_foot_rel_x": right_rel_x,
         "left_foot_rel_y": left_rel_y,
         "right_foot_rel_y": right_rel_y,
+        "stance_width_y": stance_width_y,
+        "stance_x_separation": stance_x_separation,
+        "max_foot_height_value": max_foot_height_value,
         "support_min_x": support_min_x,
         "support_max_x": support_max_x,
         "support_min_y": support_min_y,
         "support_max_y": support_max_y,
     }
+    step_cache[cache_key] = result
+    return result
 
 
 def get_recovery_failure_probe(
@@ -765,6 +1216,27 @@ def _update_recovery_success_state(
     roll_pitch_threshold: float = 0.20,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    cache_key = (
+        "recovery_success_state",
+        tuple(ball_spawn_pos),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+        float(min_recovery_delay_s),
+        float(required_hold_time_s),
+        float(foot_contact_force_threshold),
+        float(support_margin_x),
+        float(support_margin_y),
+        float(max_foot_height_diff),
+        float(max_foot_height),
+        float(roll_pitch_threshold),
+        asset_cfg.name,
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
+
     kick_buffers = _ensure_kick_buffers(env)
     if "had_recovery_success" not in kick_buffers:
         kick_buffers["had_recovery_success"] = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
@@ -799,7 +1271,9 @@ def _update_recovery_success_state(
     current_success = recovery_conditions_met & (recovery_hold_steps >= required_hold_steps)
     first_success = current_success & ~had_recovery_success
     had_recovery_success |= current_success
-    return current_success, first_success, had_recovery_success.clone()
+    result = (current_success.clone(), first_success.clone(), had_recovery_success.clone())
+    step_cache[cache_key] = result
+    return result
 
 
 def _get_recovery_success_steps(
@@ -900,6 +1374,26 @@ def _recovery_time_to_success(
     roll_pitch_threshold: float = 0.20,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    cache_key = (
+        "recovery_time_to_success",
+        tuple(ball_spawn_pos),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+        float(min_recovery_delay_s),
+        float(required_hold_time_s),
+        float(foot_contact_force_threshold),
+        float(support_margin_x),
+        float(support_margin_y),
+        float(max_foot_height_diff),
+        float(max_foot_height),
+        float(roll_pitch_threshold),
+        asset_cfg.name,
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return tuple(item.clone() for item in cached)
     kick_buffers = _ensure_kick_buffers(env)
     if "recovery_time_s" not in kick_buffers:
         kick_buffers["recovery_time_s"] = torch.full((env.num_envs,), -1.0, device=env.device)
@@ -928,7 +1422,9 @@ def _recovery_time_to_success(
     first_record_mask = (recovery_time_s < 0.0) & (success_steps >= 0) & (contact_steps >= 0)
     recovery_time_s[first_record_mask] = (success_steps[first_record_mask] - contact_steps[first_record_mask]).float() * env.step_dt
     success_mask = recovery_time_s >= 0.0
-    return success_mask, torch.where(success_mask, recovery_time_s, torch.zeros_like(recovery_time_s))
+    result = (success_mask.clone(), torch.where(success_mask, recovery_time_s, torch.zeros_like(recovery_time_s)).clone())
+    step_cache[cache_key] = result
+    return result
 
 
 def _recovery_timeout_mask(
@@ -939,11 +1435,24 @@ def _recovery_timeout_mask(
     success_speed: float = 1.0,
     min_success_distance_for_speed: float = 0.12,
 ) -> torch.Tensor:
+    cache_key = (
+        "recovery_timeout_mask",
+        tuple(ball_spawn_pos),
+        float(recovery_timeout_s),
+        float(success_distance),
+        float(success_speed),
+        float(min_success_distance_for_speed),
+    )
+    step_cache = _get_step_cache(env)
+    if cache_key in step_cache:
+        return step_cache[cache_key].clone()
     contact_mask, contact_elapsed_s = _ball_contact_elapsed_time(env)
     _, _, had_recovery_success = _update_recovery_success_state(
         env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
     )
-    return contact_mask & ~had_recovery_success & (contact_elapsed_s >= recovery_timeout_s)
+    result = contact_mask & ~had_recovery_success & (contact_elapsed_s >= recovery_timeout_s)
+    step_cache[cache_key] = result.clone()
+    return result
 
 
 def _update_recovery_timing_metrics(
@@ -1053,6 +1562,77 @@ def get_curriculum_episode_stats(
     time_outs = getattr(env, "reset_time_outs", torch.zeros(env.num_envs, device=env.device, dtype=torch.bool))
     recovery_success = had_recovery_success & ~terminated
     final_pose_success = recovery_success_mask & (recovery_elapsed_s >= 0.5) & ~terminated
+    kick_success_steps = _get_kick_success_steps(env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed)
+    recovery_success_steps = _get_recovery_success_steps(
+        env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
+    )
+    episode_end_time_s = env.episode_length_buf.float() * env.step_dt
+    kick_time_s = torch.where(kick_success_steps >= 0, kick_success_steps.float() * env.step_dt, torch.zeros_like(episode_end_time_s))
+    recovery_event_time_s = torch.where(
+        recovery_success_steps >= 0, recovery_success_steps.float() * env.step_dt, torch.zeros_like(episode_end_time_s)
+    )
+
+    if isinstance(env_ids, slice):
+        selected = torch.arange(env.num_envs, device=env.device)
+    elif isinstance(env_ids, torch.Tensor):
+        selected = env_ids.to(device=env.device, dtype=torch.long)
+    else:
+        selected = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+
+    def _selected_mean(values: torch.Tensor) -> float:
+        if selected.numel() == 0:
+            return 0.0
+        return torch.mean(values[selected].float()).item()
+
+    def _selected_max(values: torch.Tensor) -> float:
+        if selected.numel() == 0:
+            return 0.0
+        return torch.max(values[selected].float()).item()
+
+    def _selected_success_failure_stats(metric_name: str, values: torch.Tensor, active_mask: torch.Tensor | None = None) -> None:
+        selected_values = values[selected].float()
+        if active_mask is None:
+            active_mask = torch.ones_like(selected_values, dtype=torch.bool)
+        selected_success = recovery_success[selected] & active_mask
+        selected_failure = (~recovery_success[selected]) & active_mask
+        _set_logged_metric(env, f"Metrics/{metric_name}", _masked_mean(selected_values, active_mask))
+        _set_logged_metric(env, f"Metrics/{metric_name}_max", _masked_max(selected_values, active_mask))
+        _set_logged_metric(env, f"Metrics/{metric_name}_success_mean", _masked_mean(selected_values, selected_success))
+        _set_logged_metric(env, f"Metrics/{metric_name}_failure_mean", _masked_mean(selected_values, selected_failure))
+
+    _set_logged_metric(env, "Metrics/recovery_cond_double_support", _selected_mean(recovery_diagnostics["double_support"]))
+    _set_logged_metric(env, "Metrics/recovery_cond_com_in_support", _selected_mean(recovery_diagnostics["com_in_support"]))
+    _set_logged_metric(env, "Metrics/recovery_cond_feet_level", _selected_mean(recovery_diagnostics["feet_level"]))
+    _set_logged_metric(env, "Metrics/recovery_cond_both_feet_low", _selected_mean(recovery_diagnostics["both_feet_low"]))
+    _set_logged_metric(env, "Metrics/recovery_cond_upright", _selected_mean(recovery_diagnostics["upright"]))
+    _set_logged_metric(env, "Metrics/recovery_cond_final_success", _selected_mean(recovery_success))
+    _set_logged_metric(env, "Metrics/com_support_margin", max(0.03, 0.02))
+    _set_logged_metric(env, "Metrics/com_support_margin_x", 0.03)
+    _set_logged_metric(env, "Metrics/com_support_margin_y", 0.02)
+    _set_logged_metric(env, "Metrics/feet_height_difference_threshold", 0.05)
+    _set_logged_metric(env, "Metrics/feet_height_threshold", 0.10)
+    _set_logged_metric(env, "Metrics/upright_threshold_deg", math.degrees(0.20))
+    selected_post_contact = had_ball_contact[selected]
+    _selected_success_failure_stats("com_support_distance", recovery_diagnostics["com_support_distance"], selected_post_contact)
+    _selected_success_failure_stats("com_support_violation", recovery_diagnostics["com_support_violation"], selected_post_contact)
+    _selected_success_failure_stats("upright_error_deg", recovery_diagnostics["upright_error_deg"], selected_post_contact)
+    _selected_success_failure_stats("feet_height_difference", recovery_diagnostics["foot_height_difference"], selected_post_contact)
+    _selected_success_failure_stats("max_foot_height_value", recovery_diagnostics["max_foot_height_value"], selected_post_contact)
+    _selected_success_failure_stats("stance_width_y", recovery_diagnostics["stance_width_y"], selected_post_contact)
+    _selected_success_failure_stats("stance_x_separation", recovery_diagnostics["stance_x_separation"], selected_post_contact)
+    _set_logged_metric(
+        env,
+        "Metrics/stance_width_y_vs_com_support_violation_corr",
+        _selected_correlation(
+            recovery_diagnostics["stance_width_y"][selected].float(),
+            recovery_diagnostics["com_support_violation"][selected].float(),
+            selected_post_contact,
+        ),
+    )
+    _set_logged_metric(env, "Metrics/kick_time_mean", _selected_mean(kick_time_s))
+    _set_logged_metric(env, "Metrics/recovery_event_time_mean", _selected_mean(recovery_event_time_s))
+    _set_logged_metric(env, "Metrics/episode_end_time_mean", _selected_mean(episode_end_time_s))
+
     return {
         "contact_success": had_ball_contact[env_ids].float(),
         "kick_success": had_kick_success[env_ids].float(),
@@ -1140,6 +1720,17 @@ def _joint_symmetry_error(
         right_rel = joint_pos(right_name) - joint_default(right_name)
         error += torch.square(left_rel + right_rel)
     return error
+
+
+def _joint_deviation_sum(
+    env: ManagerBasedRLEnv,
+    joint_names: list[str],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    robot: Articulation = env.scene[asset_cfg.name]
+    joint_ids = [robot.find_joints(name)[0][0] for name in joint_names]
+    joint_error = torch.abs(robot.data.joint_pos[:, joint_ids] - robot.data.default_joint_pos[:, joint_ids])
+    return torch.sum(joint_error, dim=1)
 
 
 def _update_previous_ball_speed(
@@ -1272,6 +1863,7 @@ def reward_stand_still(
     ang_vel_std: float = 0.3,
 ) -> torch.Tensor:
     if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        _set_logged_metric(env, "Metrics/reward_stance_x_alignment_fire_rate", 0.0)
         return _zero_reward(env)
     robot: Articulation = env.scene[asset_cfg.name]
     lin_speed = torch.linalg.norm(robot.data.root_lin_vel_w[:, :2], dim=1)
@@ -1294,6 +1886,7 @@ def reward_base_position_hold(
     lateral_std: float = 0.06,
 ) -> torch.Tensor:
     if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        _set_logged_metric(env, "Metrics/reward_stance_width_y_fire_rate", 0.0)
         return _zero_reward(env)
     forward_offset, lateral_offset = _base_step_offsets(env, asset_cfg)
     hold_reward = torch.exp(
@@ -1397,6 +1990,7 @@ def reward_symmetric_posture(
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        _set_logged_metric(env, "Metrics/reward_nominal_stance_width_fire_rate", 0.0)
         return _zero_reward(env)
     recovery_mask = _recovery_window_mask(
         env,
@@ -1570,6 +2164,10 @@ def reward_step_recovery(
         min_recovery_delay_s,
         max_recovery_delay_s,
     )
+    _, _, had_recovery_success = _update_recovery_success_state(
+        env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
+    )
+    recovery_mask &= ~had_recovery_success
     forward_offset, lateral_offset = _base_step_offsets(env, asset_cfg)
     step_reward = torch.exp(
         -torch.square(forward_offset - target_forward_offset) / (forward_std**2)
@@ -1603,6 +2201,10 @@ def reward_forward_step_stability(
         min_recovery_delay_s,
         max_recovery_delay_s,
     )
+    _, _, had_recovery_success = _update_recovery_success_state(
+        env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
+    )
+    recovery_mask &= ~had_recovery_success
     forward_offset, lateral_offset = _base_step_offsets(env, asset_cfg)
     step_shape = torch.exp(
         -torch.square(forward_offset - target_forward_offset) / (forward_std**2)
@@ -1640,6 +2242,10 @@ def reward_opposite_foot_recovery(
         min_recovery_delay_s,
         max_recovery_delay_s,
     )
+    _, _, had_recovery_success = _update_recovery_success_state(
+        env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
+    )
+    recovery_mask &= ~had_recovery_success
     kick_sign = _kick_foot_sign(env)
     left_fx, right_fx, left_fy, right_fy = _foot_step_offsets(env, asset_cfg)
     opposite_forward = torch.where(kick_sign < 0, right_fx, left_fx)
@@ -1833,6 +2439,66 @@ def reward_feet_under_com_x(
     return settle_mask.float() * under_com
 
 
+def reward_stance_x_alignment(
+    env: ManagerBasedRLEnv,
+    ball_spawn_pos: tuple[float, float, float],
+    success_distance: float = 0.8,
+    success_speed: float = 1.0,
+    min_success_distance_for_speed: float = 0.12,
+    min_recovery_delay_s: float = 0.25,
+    target_max_x_separation: float = 0.05,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        return _zero_reward(env)
+    settle_mask = _post_recovery_success_window_mask(
+        env,
+        ball_spawn_pos,
+        success_distance,
+        success_speed,
+        min_success_distance_for_speed,
+        min_recovery_delay_s,
+        required_hold_time_s=0.25,
+        min_post_recovery_success_s=0.0,
+        max_post_recovery_success_s=None,
+        asset_cfg=asset_cfg,
+    )
+    _log_mask_rate(env, "Metrics/reward_stance_x_alignment_fire_rate", settle_mask)
+    stance_x = _stance_x_separation(env, asset_cfg)
+    scale = max(target_max_x_separation, 1.0e-6)
+    return settle_mask.float() * torch.exp(-torch.square(stance_x / scale))
+
+
+def reward_stance_width_y(
+    env: ManagerBasedRLEnv,
+    ball_spawn_pos: tuple[float, float, float],
+    success_distance: float = 0.8,
+    success_speed: float = 1.0,
+    min_success_distance_for_speed: float = 0.12,
+    min_recovery_delay_s: float = 0.25,
+    target_stance_width_y: float = 0.195,
+    stance_width_std: float = 0.025,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        return _zero_reward(env)
+    settle_mask = _post_recovery_success_window_mask(
+        env,
+        ball_spawn_pos,
+        success_distance,
+        success_speed,
+        min_success_distance_for_speed,
+        min_recovery_delay_s,
+        required_hold_time_s=0.25,
+        min_post_recovery_success_s=0.0,
+        max_post_recovery_success_s=None,
+        asset_cfg=asset_cfg,
+    )
+    _log_mask_rate(env, "Metrics/reward_stance_width_y_fire_rate", settle_mask)
+    width_y = _stance_width_y(env, asset_cfg)
+    return settle_mask.float() * torch.exp(-torch.square(width_y - target_stance_width_y) / (stance_width_std**2))
+
+
 def reward_nominal_stance_width(
     env: ManagerBasedRLEnv,
     ball_spawn_pos: tuple[float, float, float],
@@ -1856,6 +2522,7 @@ def reward_nominal_stance_width(
         min_recovery_delay_s,
         max_recovery_delay_s=None,
     )
+    _log_mask_rate(env, "Metrics/reward_nominal_stance_width_fire_rate", settle_mask)
     _, _, left_rel_y, right_rel_y = _foot_positions_relative_to_com(env, asset_cfg)
     # Use width magnitude as the main term and keep sign preference soft to avoid a dead reward.
     left_width = torch.abs(left_rel_y)
@@ -1933,6 +2600,34 @@ def penalty_post_kick_walking(
     return settle_mask.float() * walking_penalty
 
 
+def penalty_torso_pitch(
+    env: ManagerBasedRLEnv,
+    pitch_tolerance: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    _, pitch = _root_roll_pitch(env, asset_cfg)
+    post_contact_mask = _had_ball_contact_mask(env)
+    return post_contact_mask.float() * torch.relu(pitch - pitch_tolerance)
+
+
+def penalty_hip_roll_deviation(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    post_contact_mask = _had_ball_contact_mask(env)
+    hip_roll_error = _joint_deviation_sum(env, ["Left_Hip_Roll", "Right_Hip_Roll"], asset_cfg)
+    return post_contact_mask.float() * hip_roll_error
+
+
+def penalty_hip_yaw_deviation(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    post_contact_mask = _had_ball_contact_mask(env)
+    hip_yaw_error = _joint_deviation_sum(env, ["Left_Hip_Yaw", "Right_Hip_Yaw"], asset_cfg)
+    return post_contact_mask.float() * hip_yaw_error
+
+
 def penalty_support_foot_drift(
     env: ManagerBasedRLEnv,
     ball_spawn_pos: tuple[float, float, float],
@@ -1947,7 +2642,18 @@ def penalty_support_foot_drift(
 ) -> torch.Tensor:
     support_foot_x_drift, support_valid_mask = _support_foot_x_drift(env, asset_cfg)
     stance_x_separation = _stance_x_separation(env, asset_cfg)
-    _update_support_foot_metrics(env, support_foot_x_drift, support_valid_mask, stance_x_separation)
+    stance_width_y = _stance_width_y(env, asset_cfg)
+    foot_distance_xy = _foot_distance_xy(env, asset_cfg)
+    min_leg_link_distance = _min_leg_link_distance(env, asset_cfg)
+    _update_support_foot_metrics(
+        env,
+        support_foot_x_drift,
+        support_valid_mask,
+        stance_x_separation,
+        stance_width_y,
+        foot_distance_xy,
+        min_leg_link_distance,
+    )
     _update_recovery_timing_metrics(
         env, ball_spawn_pos, recovery_timeout_s, success_distance, success_speed, min_success_distance_for_speed
     )
@@ -1971,7 +2677,8 @@ def penalty_split_stance(
     success_speed: float = 1.0,
     min_success_distance_for_speed: float = 0.12,
     min_recovery_delay_s: float = 0.25,
-    tolerated_split_x: float = 0.08,
+    tolerated_split_x: float = 0.10,
+    penalty_scale_x: float = 0.05,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     if not _stage_active(env, KICK_STAGE_RECOVERY):
@@ -1982,9 +2689,107 @@ def penalty_split_stance(
         env, ball_spawn_pos, success_distance, success_speed, min_success_distance_for_speed
     )
     settle_mask = _had_ball_contact_mask(env) & ~had_recovery_success
-    left_rel_x, right_rel_x, _, _ = _foot_positions_relative_to_com(env, asset_cfg)
-    split_x = torch.abs(left_rel_x - right_rel_x)
-    return settle_mask.float() * torch.relu(split_x - tolerated_split_x)
+    split_x = _stance_x_separation(env, asset_cfg)
+    scale = max(penalty_scale_x, 1.0e-6)
+    excess = torch.relu(split_x - tolerated_split_x) / scale
+    return settle_mask.float() * (excess * excess + 0.5 * excess)
+
+
+def penalty_narrow_stance_width(
+    env: ManagerBasedRLEnv,
+    target_stance_width_y: float = 0.19,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    stance_width_y = _stance_width_y(env, asset_cfg)
+    post_contact_mask = _had_ball_contact_mask(env)
+    return post_contact_mask.float() * torch.relu(target_stance_width_y - stance_width_y)
+
+
+def penalty_wide_stance_width(
+    env: ManagerBasedRLEnv,
+    target_stance_width_y: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    stance_width_y = _stance_width_y(env, asset_cfg)
+    post_contact_mask = _had_ball_contact_mask(env)
+    wide_error = torch.relu(stance_width_y - target_stance_width_y)
+    return post_contact_mask.float() * wide_error
+
+
+def penalty_min_leg_link_distance(
+    env: ManagerBasedRLEnv,
+    no_penalty_distance: float = 0.15,
+    strong_penalty_distance: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    min_leg_link_distance = _min_leg_link_distance(env, asset_cfg)
+    post_contact_mask = _had_ball_contact_mask(env)
+    mild_penalty = torch.relu(no_penalty_distance - min_leg_link_distance) / max(no_penalty_distance, 1.0e-6)
+    strong_penalty = torch.relu(strong_penalty_distance - min_leg_link_distance) / max(strong_penalty_distance, 1.0e-6)
+    return post_contact_mask.float() * (mild_penalty + 4.0 * torch.square(strong_penalty))
+
+
+def penalty_foot_overlap(
+    env: ManagerBasedRLEnv,
+    ball_spawn_pos: tuple[float, float, float],
+    success_distance: float = 0.8,
+    success_speed: float = 1.0,
+    min_success_distance_for_speed: float = 0.12,
+    min_recovery_delay_s: float = 0.25,
+    minimum_foot_distance_xy: float = 0.15,
+    strong_penalty_distance_xy: float = 0.10,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        return _zero_reward(env)
+    settle_mask = _post_recovery_success_window_mask(
+        env,
+        ball_spawn_pos,
+        success_distance,
+        success_speed,
+        min_success_distance_for_speed,
+        min_recovery_delay_s,
+        required_hold_time_s=0.25,
+        min_post_recovery_success_s=0.0,
+        max_post_recovery_success_s=None,
+        asset_cfg=asset_cfg,
+    )
+    foot_distance_xy = _foot_distance_xy(env, asset_cfg)
+    mild_deficit = torch.relu(minimum_foot_distance_xy - foot_distance_xy)
+    strong_deficit = torch.relu(strong_penalty_distance_xy - foot_distance_xy)
+    mild_term = mild_deficit / max(minimum_foot_distance_xy, 1.0e-6)
+    strong_term = torch.square(strong_deficit / max(strong_penalty_distance_xy, 1.0e-6))
+    return settle_mask.float() * (mild_term + 4.0 * strong_term)
+
+
+def penalty_final_pose_hip_deviation(
+    env: ManagerBasedRLEnv,
+    ball_spawn_pos: tuple[float, float, float],
+    success_distance: float = 0.8,
+    success_speed: float = 1.0,
+    min_success_distance_for_speed: float = 0.12,
+    min_recovery_delay_s: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    if not _stage_active(env, KICK_STAGE_FINAL_POSE):
+        return _zero_reward(env)
+    settle_mask = _post_recovery_success_window_mask(
+        env,
+        ball_spawn_pos,
+        success_distance,
+        success_speed,
+        min_success_distance_for_speed,
+        min_recovery_delay_s,
+        required_hold_time_s=0.25,
+        min_post_recovery_success_s=0.0,
+        max_post_recovery_success_s=None,
+        asset_cfg=asset_cfg,
+    )
+    robot: Articulation = env.scene[asset_cfg.name]
+    joint_names = ["Left_Hip_Roll", "Right_Hip_Roll", "Left_Hip_Yaw", "Right_Hip_Yaw"]
+    joint_ids = [robot.find_joints(name)[0][0] for name in joint_names]
+    joint_error = torch.abs(robot.data.joint_pos[:, joint_ids] - robot.data.default_joint_pos[:, joint_ids]).sum(dim=1)
+    return settle_mask.float() * joint_error
 
 
 def penalty_single_leg_freeze(
@@ -2174,6 +2979,33 @@ def terminate_time_out(
     return _time_out_mask(env) & had_ball_contact
 
 
+def terminate_leg_self_collision(
+    env: ManagerBasedRLEnv,
+    minimum_leg_link_distance: float = 0.05,
+    contact_force_threshold: float = 1.0,
+    log_detailed_pair_metrics: bool = False,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    min_leg_link_distance, min_pair_index, pairwise_distance = _min_leg_link_info(env, asset_cfg)
+    any_contact, contact_count, pair_contact_mask, pair_force_norm = _leg_self_contact_info(
+        env, sensor_name="leg_self_contact_left", contact_force_threshold=contact_force_threshold
+    )
+    _log_leg_collision_metrics(
+        env,
+        min_leg_link_distance,
+        min_pair_index,
+        pairwise_distance,
+        any_contact,
+        contact_count,
+        pair_contact_mask,
+        pair_force_norm,
+        log_detailed_pair_metrics,
+    )
+    collision_mask = (min_leg_link_distance < minimum_leg_link_distance) | any_contact
+    _log_mask_rate(env, "Episode_Termination/leg_self_collision", collision_mask)
+    return collision_mask
+
+
 def terminate_no_kick_timeout(
     env: ManagerBasedRLEnv,
     threshold: float = 0.2,
@@ -2182,3 +3014,82 @@ def terminate_no_kick_timeout(
 ) -> torch.Tensor:
     _, _, had_ball_contact = _update_ball_contact_state(env, threshold, left_sensor_name, right_sensor_name)
     return _time_out_mask(env) & ~had_ball_contact
+
+
+def _install_reward_profiling() -> None:
+    profile_targets = [
+        "reward_ball_contact",
+        "first_ball_contact_bonus",
+        "reward_ball_speed_increase",
+        "reward_ball_forward_velocity",
+        "reward_kick_distance_progress",
+        "reward_kick_speed_progress",
+        "reward_kick_success",
+        "reward_stand_still",
+        "reward_base_position_hold",
+        "reward_post_kick_stability",
+        "reward_recover_to_stand",
+        "reward_symmetric_posture",
+        "reward_double_support",
+        "reward_post_kick_balance",
+        "reward_return_to_default_pose",
+        "reward_joint_symmetry",
+        "reward_feet_alignment",
+        "reward_post_kick_settling",
+        "reward_step_recovery",
+        "reward_forward_step_stability",
+        "reward_opposite_foot_recovery",
+        "reward_com_stability",
+        "reward_stop_after_recovery",
+        "reward_zero_velocity_after_settle",
+        "reward_stable_double_support",
+        "reward_final_double_support",
+        "reward_feet_under_com_x",
+        "reward_stance_x_alignment",
+        "reward_stance_width_y",
+        "reward_nominal_stance_width",
+        "reward_yaw_stabilization",
+        "reward_heading_recovery",
+        "penalty_base_position_drift",
+        "penalty_unnecessary_walking",
+        "penalty_yaw_rate",
+        "penalty_post_kick_yaw",
+        "penalty_torso_pitch",
+        "penalty_hip_roll_deviation",
+        "penalty_hip_yaw_deviation",
+        "penalty_post_kick_walking",
+        "penalty_support_foot_drift",
+        "penalty_split_stance",
+        "penalty_narrow_stance_width",
+        "penalty_wide_stance_width",
+        "penalty_min_leg_link_distance",
+        "penalty_foot_overlap",
+        "penalty_final_pose_hip_deviation",
+        "penalty_single_leg_freeze",
+        "penalty_raised_kick_leg",
+        "penalty_no_kick_timeout",
+        "penalty_recovery_timeout",
+        "terminate_ball_travel_distance",
+        "terminate_leg_self_collision",
+        "terminate_post_kick_settle_time",
+        "terminate_time_out",
+        "terminate_no_kick_timeout",
+        "terminate_recovery_timeout",
+        "_update_recovery_success_state",
+        "_recovery_condition_mask",
+        "_post_recovery_success_window_mask",
+        "_recovery_time_to_success",
+        "_min_leg_link_info",
+        "_leg_self_contact_info",
+        "get_curriculum_episode_stats",
+    ]
+    for name in profile_targets:
+        fn = globals().get(name)
+        if fn is None or getattr(fn, "_kick_profile_wrapped", False):
+            continue
+        wrapped = _profile_term(name)(fn)
+        wrapped._kick_profile_wrapped = True
+        globals()[name] = wrapped
+
+
+_install_reward_profiling()

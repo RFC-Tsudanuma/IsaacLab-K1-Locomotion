@@ -33,6 +33,9 @@ BALL_TRAVEL_DISTANCE_THRESHOLD = 1.5
 POST_KICK_RECOVERY_TIME_S = 3.0
 RECOVERY_TIMEOUT_S = 2.75
 POST_RECOVERY_OBSERVE_TIME_S = 0.4
+LEG_SELF_COLLISION_DISTANCE_THRESHOLD = 0.15
+LEG_SELF_COLLISION_CONTACT_FORCE_THRESHOLD = 0.1
+LEG_SELF_COLLISION_DEBUG_PAIR_METRICS = False
 
 
 @configclass
@@ -90,6 +93,17 @@ class K1KickSceneCfg(InteractiveSceneCfg):
         update_period=0.0,
         history_length=1,
         filter_prim_paths_expr=["{ENV_REGEX_NS}/SoccerBall"],
+    )
+    leg_self_contact_left = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(Left_Hip_Yaw|Left_Shank|Left_Ankle_Cross|left_foot_link)",
+        update_period=0.0,
+        history_length=1,
+        filter_prim_paths_expr=[
+            "{ENV_REGEX_NS}/Robot/Right_Hip_Yaw",
+            "{ENV_REGEX_NS}/Robot/Right_Shank",
+            "{ENV_REGEX_NS}/Robot/Right_Ankle_Cross",
+            "{ENV_REGEX_NS}/Robot/right_foot_link",
+        ],
     )
 
     sky_light = AssetBaseCfg(
@@ -405,6 +419,29 @@ class RewardsCfg:
             "min_recovery_delay_s": 0.25,
         },
     )
+    reward_stance_x_alignment = RewTerm(
+        func=kick_mdp.reward_stance_x_alignment,
+        weight=7.0,
+        params={
+            "ball_spawn_pos": BALL_SPAWN_POS,
+            "success_distance": KICK_SUCCESS_DISTANCE,
+            "success_speed": KICK_SUCCESS_SPEED,
+            "min_recovery_delay_s": 0.25,
+            "target_max_x_separation": 0.05,
+        },
+    )
+    reward_stance_width_y = RewTerm(
+        func=kick_mdp.reward_stance_width_y,
+        weight=5.0,
+        params={
+            "ball_spawn_pos": BALL_SPAWN_POS,
+            "success_distance": KICK_SUCCESS_DISTANCE,
+            "success_speed": KICK_SUCCESS_SPEED,
+            "min_recovery_delay_s": 0.25,
+            "target_stance_width_y": 0.195,
+            "stance_width_std": 0.025,
+        },
+    )
     reward_nominal_stance_width = RewTerm(
         func=kick_mdp.reward_nominal_stance_width,
         weight=4.0,
@@ -490,6 +527,19 @@ class RewardsCfg:
             "success_speed": KICK_SUCCESS_SPEED,
         },
     )
+    penalty_torso_pitch = RewTerm(
+        func=kick_mdp.penalty_torso_pitch,
+        weight=-1.0,
+        params={"pitch_tolerance": 0.10},
+    )
+    penalty_hip_roll_deviation = RewTerm(
+        func=kick_mdp.penalty_hip_roll_deviation,
+        weight=-0.25,
+    )
+    penalty_hip_yaw_deviation = RewTerm(
+        func=kick_mdp.penalty_hip_yaw_deviation,
+        weight=-0.15,
+    )
     penalty_post_kick_walking = RewTerm(
         func=kick_mdp.penalty_post_kick_walking,
         weight=-5.0,
@@ -502,7 +552,7 @@ class RewardsCfg:
     )
     penalty_support_foot_drift = RewTerm(
         func=kick_mdp.penalty_support_foot_drift,
-        weight=-2.0,
+        weight=-1.5,
         params={
             "ball_spawn_pos": BALL_SPAWN_POS,
             "success_distance": KICK_SUCCESS_DISTANCE,
@@ -514,7 +564,52 @@ class RewardsCfg:
     )
     penalty_split_stance = RewTerm(
         func=kick_mdp.penalty_split_stance,
-        weight=-6.0,
+        weight=-8.0,
+        params={
+            "ball_spawn_pos": BALL_SPAWN_POS,
+            "success_distance": KICK_SUCCESS_DISTANCE,
+            "success_speed": KICK_SUCCESS_SPEED,
+            "min_recovery_delay_s": 0.25,
+            "tolerated_split_x": 0.10,
+            "penalty_scale_x": 0.05,
+        },
+    )
+    penalty_narrow_stance_width = RewTerm(
+        func=kick_mdp.penalty_narrow_stance_width,
+        weight=-3.0,
+        params={
+            "target_stance_width_y": 0.19,
+        },
+    )
+    penalty_wide_stance_width = RewTerm(
+        func=kick_mdp.penalty_wide_stance_width,
+        weight=-1.0,
+        params={
+            "target_stance_width_y": 0.25,
+        },
+    )
+    penalty_min_leg_link_distance = RewTerm(
+        func=kick_mdp.penalty_min_leg_link_distance,
+        weight=-2.5,
+        params={
+            "no_penalty_distance": 0.15,
+            "strong_penalty_distance": 0.10,
+        },
+    )
+    penalty_foot_overlap = RewTerm(
+        func=kick_mdp.penalty_foot_overlap,
+        weight=-4.0,
+        params={
+            "ball_spawn_pos": BALL_SPAWN_POS,
+            "success_distance": KICK_SUCCESS_DISTANCE,
+            "success_speed": KICK_SUCCESS_SPEED,
+            "min_recovery_delay_s": 0.25,
+            "minimum_foot_distance_xy": 0.15,
+        },
+    )
+    penalty_final_pose_hip_deviation = RewTerm(
+        func=kick_mdp.penalty_final_pose_hip_deviation,
+        weight=-0.35,
         params={
             "ball_spawn_pos": BALL_SPAWN_POS,
             "success_distance": KICK_SUCCESS_DISTANCE,
@@ -566,6 +661,14 @@ class TerminationsCfg:
     time_out = DoneTerm(func=kick_mdp.terminate_time_out, time_out=True)
     no_kick_timeout = DoneTerm(func=kick_mdp.terminate_no_kick_timeout, time_out=True)
     base_height = DoneTerm(func=mdp.root_height_below_minimum, params={"minimum_height": 0.40})
+    leg_self_collision = DoneTerm(
+        func=kick_mdp.terminate_leg_self_collision,
+        params={
+            "minimum_leg_link_distance": LEG_SELF_COLLISION_DISTANCE_THRESHOLD,
+            "contact_force_threshold": LEG_SELF_COLLISION_CONTACT_FORCE_THRESHOLD,
+            "log_detailed_pair_metrics": LEG_SELF_COLLISION_DEBUG_PAIR_METRICS,
+        },
+    )
     trunk_contact = DoneTerm(
         func=mdp.illegal_contact,
         params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names="Trunk"), "threshold": 1.0},
@@ -643,6 +746,8 @@ class K1KickEnvCfg(ManagerBasedRLEnvCfg):
             self.scene.ball_contact_left_foot.update_period = self.sim.dt
         if self.scene.ball_contact_right_foot is not None:
             self.scene.ball_contact_right_foot.update_period = self.sim.dt
+        if self.scene.leg_self_contact_left is not None:
+            self.scene.leg_self_contact_left.update_period = self.sim.dt
 
 
 @configclass

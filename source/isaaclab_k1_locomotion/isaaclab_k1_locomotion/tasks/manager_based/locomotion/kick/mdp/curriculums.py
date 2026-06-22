@@ -58,6 +58,35 @@ class kick_success_rate_curriculum(ManagerTermBase):
         avg_ball_speed_threshold: float = 1.2,
         recovery_rate_threshold: float = 0.8,
     ) -> dict[str, float]:
+        return kick_rewards._profile_named_call(
+            env,
+            "curriculum_kick_stage",
+            self._compute_curriculum,
+            env,
+            env_ids,
+            ball_spawn_pos,
+            success_distance,
+            success_speed,
+            window_size,
+            contact_rate_threshold,
+            kick_rate_threshold,
+            avg_ball_speed_threshold,
+            recovery_rate_threshold,
+        )
+
+    def _compute_curriculum(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        ball_spawn_pos: tuple[float, float, float],
+        success_distance: float,
+        success_speed: float,
+        window_size: int = 128,
+        contact_rate_threshold: float = 0.8,
+        kick_rate_threshold: float = 0.7,
+        avg_ball_speed_threshold: float = 1.2,
+        recovery_rate_threshold: float = 0.8,
+    ) -> dict[str, float]:
         if isinstance(env_ids, slice):
             done_env_ids = torch.arange(env.num_envs, device=env.device)
         else:
