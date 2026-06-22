@@ -199,7 +199,7 @@ class K1DribbleRewardsCfg:
     # ball_velocity_along_kick (4.5) は超えないオーダーとして 3.0 から開始。
     robot_velocity_toward_ball = RewTerm(
         func=robot_velocity_toward_ball,
-        weight=3.0,
+        weight=4.0,
         params={"max_speed": 1.0, "min_distance": 0.05},
     )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
