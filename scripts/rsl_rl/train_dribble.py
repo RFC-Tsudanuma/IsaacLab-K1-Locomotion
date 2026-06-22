@@ -62,6 +62,12 @@ parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
+parser.add_argument(
+    "--override_json",
+    type=str,
+    default=None,
+    help="JSON file with dot-path overrides for env_cfg / agent_cfg (used by Optuna tuning).",
+)
 # -- hierarchical-specific arguments
 parser.add_argument(
     "--frozen_checkpoint",
@@ -177,6 +183,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
+
+    # apply Optuna-style JSON overrides last so they win over Hydra/CLI defaults
+    if args_cli.override_json is not None:
+        from config_overrides import apply_overrides_from_file
+
+        apply_overrides_from_file(args_cli.override_json, env_cfg=env_cfg, agent_cfg=agent_cfg)
 
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device

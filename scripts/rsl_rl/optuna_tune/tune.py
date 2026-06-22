@@ -122,6 +122,7 @@ def _python_exec() -> list[str]:
 
 def _run_training(
     *,
+    script: str,
     task: str,
     experiment_name: str,
     num_envs: int | None,
@@ -133,7 +134,7 @@ def _run_training(
     log_path: Path,
 ) -> int:
     cmd = _python_exec() + [
-        str(SCRIPTS_DIR / "train.py"),
+        str(SCRIPTS_DIR / script),
         "--task", task,
         "--max_iterations", str(max_iterations),
         "--seed", str(seed),
@@ -205,6 +206,7 @@ def make_objective(cfg: dict, *, runs_dir: Path):
 
         started = dt.datetime.now()
         rc = _run_training(
+            script=train_cfg.get("script", "train.py"),
             task=train_cfg["task"],
             experiment_name=train_cfg["experiment_name"],
             num_envs=train_cfg.get("num_envs"),
