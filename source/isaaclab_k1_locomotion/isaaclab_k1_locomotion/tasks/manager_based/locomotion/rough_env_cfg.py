@@ -247,7 +247,7 @@ class K1Rewards(RewardsCfg):
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
         func=feet_phase,
-        weight=2.0, # 位相に合わせて足を動かすことへの報酬
+        weight=1.4, # 位相に合わせて足を動かすことへの報酬
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "command_name": "base_velocity",
