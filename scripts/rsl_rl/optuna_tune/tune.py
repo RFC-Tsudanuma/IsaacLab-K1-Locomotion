@@ -144,6 +144,9 @@ def _run_training(
     ]
     if num_envs is not None:
         cmd += ["--num_envs", str(num_envs)]
+    # Force all tuning trials onto GPU 1 unless the config already overrides --device.
+    if not any(a == "--device" or a.startswith("--device=") for a in extra_args):
+        cmd += ["--device", "cuda:1"]
     cmd += list(extra_args)
 
     print(f"[tune] launching: {' '.join(cmd)}")
