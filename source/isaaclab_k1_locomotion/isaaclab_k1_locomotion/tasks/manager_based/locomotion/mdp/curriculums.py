@@ -462,3 +462,145 @@ class kick_direction_command_curriculum(ManagerTermBase):
     def _apply_stage(self, y_range: tuple[float, float]) -> None:
         cmd_term = self._env.command_manager.get_term(self._command_name)
         cmd_term.cfg.ranges.pos_y = tuple(y_range)
+
+
+class kick_angle_range_curriculum(ManagerTermBase):
+    """``KickDirectionCommand`` の ``angle_range`` を性能ベースで段階的に拡げるカリキュラム。
+
+    最初は正面付近の狭い角度レンジ (例: ``(-0.5, 0.5)``) のみを出題する。ロボットの初期
+    yaw はほぼ正面・ボールも正面なので、狭いレンジでは「直線接近 → そのまま前へ蹴る」が
+    そのまま正解になり、回り込みを必要としない。これにより「とにかく蹴る」局所解ではなく
+    「正しい方向に蹴る」挙動を先に獲得させ、その後レンジを ``(-π, π)`` まで広げて
+    回り込みが必要なケースを徐々に導入する。
+
+    動いているボールに対する方向誤差 ``1 - cos(ball_vel, kick_dir)`` の EMA が
+    ``error_threshold`` を下回ったら次のステージへ進む。最終ステージで据え置く。
+
+    Args:
+        stages: 各ステージで使用する ``(angle_min, angle_max)`` [rad] のリスト。
+            0 を中心に対称に広げるのが基本 (例: ``[(-0.5,0.5), (-1.2,1.2), (-2.0,2.0), (-π,π)]``)。
+        error_threshold: ステージを進めるための ``1 - cos_sim`` の上限。
+            例: 0.3 なら cos_sim > 0.7 (≒ 45° 以内) で進む。
+            float を渡すと全ステージ共通。``stages`` と同じ長さのリストを渡すとステージ毎に
+            設定でき、広い角度レンジのステージほど緩い (大きい) 閾値にして「広い範囲は本質的に
+            精度が落ちる」分を均し、永久停滞を防げる。
+        command_name: 対象コマンド名 (``KickDirectionCommandCfg``)。
+        ball_asset: ボールのシーンエンティティ名。
+        min_speed: 角度誤差を集計するボール速度下限 [m/s]。停止中はノイズなので除外する。
+        ema_alpha: EMA の更新係数 (0,1]。
+        min_updates: 閾値判定を行う呼び出し回数の周期 (EMA を温める)。
+        stage_cooldown_resamples: ステージを進めた直後、計測を再開するまで待つ「コマンド
+            再サンプリング周期」の倍数。レンジを広げても各 env が新レンジのキック方向を
+            実際に引くのは次の再サンプリング時 (最大 ``resampling_time_range[1]`` 秒後) で、
+            それまでに蹴られて飛んでいるボールは **前の狭いレンジ** のものなので、待たずに
+            計測すると古い (揃った) 誤差を見て即連鎖遷移する。再サンプリング周期 ÷ step_dt で
+            待機ステップ数を算出する。
+        post_switch_hold_steps: 切替直後に計測・更新・判定を止める最小ステップ数。実際の
+            hold は再サンプリング待ちとこの値の大きい方。固定下限で確実に連鎖遷移を防ぐ。
+        post_switch_ema_scale: 切替直後に EMA を固定する初期値の、閾値に対する倍率。hold 明けは
+            この高い値から実測値へ減衰するため、運良く低い誤差を 1 回引いただけでは進まない。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages: list[tuple[float, float]] = [tuple(s) for s in params["stages"]]
+        # error_threshold は float (全ステージ共通) か stages と同じ長さのリスト (ステージ毎)。
+        raw_threshold = params["error_threshold"]
+        if isinstance(raw_threshold, (list, tuple)):
+            self._error_thresholds: list[float] = [float(t) for t in raw_threshold]
+            if len(self._error_thresholds) != len(self._stages):
+                raise ValueError(
+                    f"error_threshold をリストで渡す場合は stages と同じ長さにすること: "
+                    f"len(error_threshold)={len(self._error_thresholds)}, len(stages)={len(self._stages)}"
+                )
+        else:
+            self._error_thresholds = [float(raw_threshold)] * len(self._stages)
+        self._command_name: str = params["command_name"]
+        self._ball_asset: str = params.get("ball_asset", "soccer_ball")
+        self._min_speed: float = float(params.get("min_speed", 0.5))
+
+        self._current_stage: int = 0
+        self._error_ema: float | None = None
+        self._cached_ema: float = -1.0
+        self._update_count: int = 0
+        self._hold_remaining: int = 0
+
+        self._apply_stage(self._stages[self._current_stage])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages: Sequence[Sequence[float]],
+        error_threshold: float | Sequence[float],
+        command_name: str,
+        ball_asset: str = "soccer_ball",
+        min_speed: float = 0.5,
+        ema_alpha: float = 0.02,
+        min_updates: int = 100,
+        stage_cooldown_resamples: float = 1.5,
+        post_switch_hold_steps: int = 1500,
+        post_switch_ema_scale: float = 2.0,
+    ) -> dict[str, float]:
+        current_threshold = self._error_thresholds[self._current_stage]
+
+        # --- ステージ変更直後の hold ---
+        # 新レンジのキック方向が全 env に行き渡り、前レンジで飛んでいたボールが消えて
+        # ポリシーが適応するまで、計測・更新・判定を完全に止める (連鎖遷移を防ぐ)。
+        if self._hold_remaining > 0:
+            self._hold_remaining -= 1
+            return {
+                "stage": float(self._current_stage),
+                "error_ema": float(self._cached_ema),
+                "error_threshold": float(current_threshold),
+                "angle_max": float(self._stages[self._current_stage][1]),
+            }
+
+        ball = env.scene[ball_asset]
+        ball_vel_w = ball.data.root_com_vel_w[:, :2]
+        kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2) 単位ベクトル
+
+        ball_speed = torch.norm(ball_vel_w, dim=1)
+        mask = ball_speed > min_speed
+        if mask.any():
+            cos_sim = torch.nn.functional.cosine_similarity(
+                ball_vel_w[mask], kick_dir_w[mask], dim=1, eps=1e-6
+            )
+            err = (1.0 - cos_sim).mean()
+            if self._error_ema is None:
+                self._error_ema = err
+            else:
+                self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
+
+        self._update_count += 1
+
+        # 閾値判定とログ用 .item() 同期は min_updates 周期でまとめて行う。
+        if self._update_count >= min_updates and self._error_ema is not None:
+            ema_val = float(self._error_ema)
+            self._cached_ema = ema_val
+            if self._current_stage < len(self._stages) - 1 and ema_val < current_threshold:
+                self._current_stage += 1
+                self._apply_stage(self._stages[self._current_stage])
+                current_threshold = self._error_thresholds[self._current_stage]
+                # EMA を「新ステージ閾値」より十分高い値で固定し、hold 明けに実測値へ減衰させる。
+                high_ema = current_threshold * post_switch_ema_scale
+                self._error_ema = self._error_ema.new_full((), high_ema)
+                self._cached_ema = high_ema
+                # hold = 「新レンジが全 env に行き渡るまで」と固定下限の大きい方。
+                cmd_term = env.command_manager.get_term(command_name)
+                max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                resample_steps = int(math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt))
+                self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            self._update_count = 0
+
+        return {
+            "stage": float(self._current_stage),
+            "error_ema": float(self._cached_ema),
+            "error_threshold": float(current_threshold),
+            "angle_max": float(self._stages[self._current_stage][1]),
+        }
+
+    def _apply_stage(self, angle_range: tuple[float, float]) -> None:
+        cmd_term = self._env.command_manager.get_term(self._command_name)
+        cmd_term.cfg.angle_range = tuple(angle_range)

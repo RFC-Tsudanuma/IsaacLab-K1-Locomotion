@@ -32,6 +32,8 @@ Design:
       toward the ball (zeroed out when very close)
 """
 
+import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import EventTermCfg as EventTerm
@@ -52,6 +54,7 @@ from .mdp.commands import KickDirectionCommandCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
 from .mdp.curriculums import (
+    kick_angle_range_curriculum,
     modify_reward_weight_linear,
     randomize_ball_init_velocity,
     randomize_ball_init_pose,
@@ -61,7 +64,7 @@ from .mdp.observations import ball_pos_rel, ball_vel, kick_direction_b, last_hig
 from .mdp.terminations import time_after_ball_contact
 from .mdp.rewards import (
     approach_ball_progress,
-    ball_speed,
+    ball_speed_along_kick,
     ball_velocity_along_kick,
     com_jerk_l2,
     high_action_rate_l2,
@@ -159,6 +162,9 @@ class K1DribbleCommandsCfg(CommandsCfg):
     kick_direction = KickDirectionCommandCfg(
         asset_name="robot",
         resampling_time_range=(6.0, 10.0),
+        # 学習初期は正面付近のみ出題し、カリキュラム (kick_angle_curriculum) で
+        # 段階的に全周へ広げる。ここの値はカリキュラム初段で上書きされる初期値。
+        angle_range=(-0.5, 0.5),
         debug_vis=True,
     )
 
@@ -174,11 +180,15 @@ class K1DribbleRewardsCfg:
         weight=4.5,
         params={"command_name": "kick_direction"},
     )
-    # ボール速度の大きさ (方向問わず)。max_speed で正規化、上限 1.0。
-    ball_speed = RewTerm(
-        func=ball_speed,
-        weight=0.8,
-        params={"max_speed": 2.0},
+    # ボール速度の「キック方向への射影成分」 [0, 1]。max_speed で正規化、逆方向は 0。
+    # 方向無視の ball_speed と違い「速く かつ 正しい方向に」蹴ったときだけ報酬が出るので、
+    # 方向を無視してとにかく蹴る局所解を資金提供しない (主報酬 ball_velocity_along_kick と協調)。
+    # 方向射影なので farm 不可・目的 (正しい方向に速く蹴る) に直結する。robot_velocity_toward_ball
+    # の支配を崩すため、接近系の weight を下げる代わりにこの目的直結項を 0.8→1.5 に上げる。
+    ball_speed_along_kick = RewTerm(
+        func=ball_speed_along_kick,
+        weight=1.5,
+        params={"command_name": "kick_direction", "max_speed": 2.0},
     )
 
     # --- Shaping ---
@@ -187,41 +197,52 @@ class K1DribbleRewardsCfg:
     # 常時密な勾配がかかるので「動かない」局所解に陥りにくい。
     # weight の目安: 制御ステップ dt=0.02s・接近速度~0.9m/s → 約0.018m/step なので、
     # 旧 shaping ([0,1]×1.0) と同オーダーにするには ~40。
+    # ターゲットを「キック方向から見てボール後ろ側 behind_offset[m] の staging 地点」にする。
+    # これで「ボールに寄る」と「正しい側へ回り込む」が同一勾配になり、最短直線接近で
+    # 間違った向きに蹴る挙動を抑える (= ball_velocity_along_kick への追従を促す)。
     approach_ball_progress = RewTerm(
         func=approach_ball_progress,
         weight=40.0,
+        params={"command_name": "kick_direction", "behind_offset": 0.5},
     )
     # ロボット速度のボール方向成分 [0, 1] を毎ステップ密に与える接近報酬。
     # approach_ball_progress (ポテンシャル形式 = 最適方策を変えない) と違い、
     # 非ポテンシャルなので「立ち止まる」局所解を実際に崩して移動側へ最適方策を寄せる。
-    # 速度ベースなので立っていると 0 → parking で farm できない。
-    # weight×v が per-step 報酬 (max_speed=1.0)。移動ペナルティを上回り、かつ
-    # ball_velocity_along_kick (4.5) は超えないオーダーとして 3.0 から開始。
+    # 速度ベースなので立っていると 0 → parking で farm できない。が、移動し続ける限り毎ステップ
+    # 稼げる (≒ farmable) ので、これが大きいと「接近 (手段)」が「正しく蹴る (目的)」を上回り続ける。
+    # ロボットは既に十分動くようになったので anti-parking としての役目は薄れた。支配を崩すため
+    # 2.5→1.2 に下げ、接近の主役は farm 不可なポテンシャル形式 approach_ball_progress に委ねる。
     robot_velocity_toward_ball = RewTerm(
         func=robot_velocity_toward_ball,
-        weight=4.0,
-        params={"max_speed": 1.0, "min_distance": 0.05},
+        weight=1.2,
+        params={
+            "max_speed": 1.0,
+            "min_distance": 0.05,
+            "command_name": "kick_direction",
+            "behind_offset": 0.5,
+        },
     )
     # ロボット Trunk の正面 (base +x) がボール方向を向いているほど大きい [0, 1]。
     robot_facing_ball = RewTerm(
         func=robot_facing_ball,
-        weight=0.7,
+        weight=0.4,
         params={"min_distance": 0.15},
     )
     # キック方向から見てボールの後ろ側 かつ ボールに近いほど大きい [0, 1]。
     # 密な非ポテンシャル形式で「早く正しい配置に着く」挙動を誘導しつつ、
     # 近接ゲート (engage_distance) で「遠くの後ろ側に居座って稼ぐ」局所最適を防ぐ。
-    # ball_velocity_along_kick (主報酬) を上回らないよう weight は控えめに。
+    # stage 1 で along_kick が頭打ち & behind_ball がほぼ 0 (裏取りできていない) だったため、
+    # engage_distance 0.45→1.2 で「遠くから裏取りを形成」、weight 1.2→2.5 で接近系に勝てる
+    # オーダーにして回り込みを本気で誘導する (横〜後方キックの精度を上げる)。
     robot_behind_ball = RewTerm(
         func=robot_behind_ball,
-        weight=0.5,
-        params={"command_name": "kick_direction", "min_distance": 0.15, "engage_distance": 0.45},
+        weight=2.5,
+        params={"command_name": "kick_direction", "min_distance": 0.15, "engage_distance": 1.2},
     )
 
     # --- ペナルティ ---
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-500.0)
     lin_vel_z_l2 = RewTerm(func=mdp.lin_vel_z_l2, weight=-4.5 * 0.5)
-    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-15.0 * 0.5)
     ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.6 * 0.5)
     # 上位ポリシーが出力する 3D 歩行コマンドに対する平滑性ペナルティ。
     # 元の action_smoothness_l2 は env.action_manager.action (= frozen の 22D 関節指令)
@@ -354,6 +375,29 @@ class K1DribbleEnvCfg(K1FlatEnvCfg):
                 "end_weight": -3.0,
                 "start_step": 3000,
                 "end_step": 8000,
+            },
+        )
+
+        # キック方向の角度レンジを性能ベースで段階的に拡げるカリキュラム。
+        # 初期は正面付近 (±0.5rad) のみ → 直線接近がそのまま正解になるので「正しい方向に
+        # 蹴る」を先に獲得させ、動くボールの方向誤差 1-cos が閾値を下回るたびに全周 (±π) へ
+        # 広げて回り込みが必要なケースを徐々に導入する。
+        self.curriculum.kick_angle_curriculum = CurrTerm(
+            func=kick_angle_range_curriculum,
+            params={
+                "command_name": "kick_direction",
+                "stages": [
+                    (-0.5, 0.5),
+                    (-1.2, 1.2),
+                    (-2.0, 2.0),
+                    (-math.pi, math.pi),
+                ],
+                # ステージ別閾値: 広いレンジほど本質的に精度が落ちるので緩める (永久停滞を防ぐ)。
+                # 0.3→cos>0.7(≒45°), 0.4→cos>0.6(≒53°), 0.5→cos>0.5(≒60°)。最後の値は最終段なので未使用。
+                "error_threshold": [0.3, 0.4, 0.5, 0.55],
+                "min_speed": 0.5,
+                "ema_alpha": 0.02,
+                "min_updates": 100,
             },
         )
 

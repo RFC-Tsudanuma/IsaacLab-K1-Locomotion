@@ -652,6 +652,48 @@ def ball_speed(
     return torch.clamp(speed / max_speed, 0.0, 1.0)
 
 
+def ball_speed_along_kick(
+    env: ManagerBasedRLEnv,
+    command_name: str = "kick_direction",
+    max_speed: float = 2.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """ボール速度の「キック方向 (ワールド単位ベクトル) への射影成分」を [0, 1] に正規化して返す。
+
+    ``v_along = dot(ball_vel_w, kick_dir_w)`` を ``max_speed`` で割り、負 (逆方向) は 0 に
+    クランプする。方向に依らず大きさだけを見る :func:`ball_speed` と違い、「速く **かつ
+    正しい方向に**」蹴ったときだけ報酬が出るので、方向を無視してとにかく蹴る局所解を
+    資金提供しない。:func:`ball_velocity_along_kick` (cos のみ・大きさ無視) と組み合わせると
+    「方向精度」と「速度の大きさ」を両取りできる。
+    """
+    ball = env.scene[asset_cfg.name]
+    ball_vel_w = ball.data.root_com_vel_w[:, :2]
+    kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2) 単位ベクトル
+    v_along = (ball_vel_w * kick_dir_w).sum(dim=1)
+    v_along = torch.clamp(v_along, min=0.0)
+    return torch.clamp(v_along / max_speed, 0.0, 1.0)
+
+
+def _approach_target_w(
+    env: ManagerBasedRLEnv,
+    ball_pos_w: torch.Tensor,
+    command_name: str | None,
+    behind_offset: float,
+) -> torch.Tensor:
+    """接近報酬のターゲット点 (ワールド xy) を返す。
+
+    ``command_name`` が None または ``behind_offset`` が 0 ならボール中心をそのまま返す。
+    指定された場合は「キック方向から見てボールの後ろ側」に ``behind_offset`` [m] ずらした
+    staging 地点 ``p = ball_pos - kick_dir * behind_offset`` を返す。ここを目標に接近させると
+    「ボールに寄る」と「正しい側 (裏) に回り込む」が一本化され、最短直線接近と裏取りの
+    対立が消える。
+    """
+    if command_name is None or behind_offset == 0.0:
+        return ball_pos_w
+    kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2) 単位ベクトル
+    return ball_pos_w - kick_dir_w * behind_offset
+
+
 def com_jerk_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -682,24 +724,32 @@ def robot_velocity_toward_ball(
     env: ManagerBasedRLEnv,
     max_speed: float = 1.0,
     min_distance: float = 0.05,
+    command_name: str | None = None,
+    behind_offset: float = 0.0,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
-    """ロボットがボールに向かって進んでいる成分を [0, 1] で返す shaping 報酬。
+    """ロボットが接近ターゲットに向かって進んでいる成分を [0, 1] で返す shaping 報酬。
 
-    ワールド xy で、ロボット→ボール方向の単位ベクトルにロボットの線速度を射影する。
-    ボールに十分近づいたとき (`min_distance` 未満) は方向が定義しにくいので 0 を返す。
+    ワールド xy で、ロボット→ターゲット方向の単位ベクトルにロボットの線速度を射影する。
+    ターゲットに十分近づいたとき (`min_distance` 未満) は方向が定義しにくいので 0 を返す。
+
+    ``command_name`` / ``behind_offset`` を指定すると、ターゲットがボール中心ではなく
+    「キック方向から見てボールの後ろ側」に ``behind_offset`` [m] ずらした staging 地点になる。
+    こうすると「ボールに寄る」と「正しい側へ回り込む」が同じ勾配になり、最短直線接近で
+    間違った方向に蹴ってしまう挙動を抑えられる。
     """
     robot = env.scene[robot_cfg.name]
     ball = env.scene[ball_cfg.name]
-    to_ball = ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
-    dist = torch.norm(to_ball, dim=1, keepdim=True)
-    direction = to_ball / (dist + 1e-6)
+    target = _approach_target_w(env, ball.data.root_pos_w[:, :2], command_name, behind_offset)
+    to_target = target - robot.data.root_pos_w[:, :2]
+    dist = torch.norm(to_target, dim=1, keepdim=True)
+    direction = to_target / (dist + 1e-6)
     robot_vel_w = robot.data.root_lin_vel_w[:, :2]
     v_along = (robot_vel_w * direction).sum(dim=1)
     v_along = torch.clamp(v_along, min=0.0)
     reward = torch.clamp(v_along / max_speed, 0.0, 1.0)
-    # ボールに十分近づいたら shaping 不要にする。
+    # ターゲットに十分近づいたら shaping 不要にする。
     near = (dist.squeeze(-1) < min_distance)
     reward = torch.where(near, torch.zeros_like(reward), reward)
     return reward
@@ -707,28 +757,42 @@ def robot_velocity_toward_ball(
 
 def approach_ball_progress(
     env: ManagerBasedRLEnv,
+    command_name: str | None = None,
+    behind_offset: float = 0.0,
+    max_progress_per_step: float | None = 0.1,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
-    """ロボット→ボール距離の 1 ステップ減少量 (m) を返すポテンシャル形式の接近報酬。
+    """ロボット→接近ターゲット距離の 1 ステップ減少量 (m) を返すポテンシャル形式の接近報酬。
 
     ``progress = dist_{t-1} - dist_t``。近づくと正、離れると負、止まると 0。
     速度を直接見る :func:`robot_velocity_toward_ball` (上限クランプ・近接で 0) と違い、
     上限がなく常時密な勾配がかかるため「動かない」局所解に陥りにくい。
+
+    ``command_name`` / ``behind_offset`` を指定すると、ターゲットがボール中心ではなく
+    「キック方向の後ろ側」に ``behind_offset`` [m] ずらした staging 地点になる。
     ポテンシャル差なのでエピソード総和は ``dist_0 - dist_final`` に telescope する。
 
     リセット直後 (``episode_length_buf < 2``) は距離が不連続に飛ぶので 0 を返す。
+    staging 地点はキック方向に依存して動くので、キック方向の再サンプリング時に
+    ターゲットが最大 ``2*behind_offset`` 飛び、その 1 ステップだけ偽の巨大 progress が
+    乗る。``max_progress_per_step`` (既定 0.1m) で |progress| をクランプしてこのスパイクを
+    潰す。1 ステップの物理的な距離変化は高々 ``robot_speed * dt`` (~0.04m) なので、
+    0.1m クランプは通常移動には影響しない。``None`` でクランプ無効。
     """
     robot = env.scene[robot_cfg.name]
     ball = env.scene[ball_cfg.name]
-    to_ball = ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2]
-    dist = torch.norm(to_ball, dim=1)
+    target = _approach_target_w(env, ball.data.root_pos_w[:, :2], command_name, behind_offset)
+    to_target = target - robot.data.root_pos_w[:, :2]
+    dist = torch.norm(to_target, dim=1)
     prev = getattr(env, "_prev_ball_distance", None)
     if prev is None or prev.shape != dist.shape:
         env._prev_ball_distance = dist.clone()
         return torch.zeros_like(dist)
     progress = prev - dist
     env._prev_ball_distance = dist.clone()
+    if max_progress_per_step is not None:
+        progress = torch.clamp(progress, -max_progress_per_step, max_progress_per_step)
     fresh = env.episode_length_buf < 2
     return torch.where(fresh, torch.zeros_like(progress), progress)
 
