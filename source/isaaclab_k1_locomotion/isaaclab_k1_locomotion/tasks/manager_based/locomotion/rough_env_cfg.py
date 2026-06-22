@@ -51,7 +51,7 @@ _STAND_STILL_PENALTY_SCALE: float = 3.0
 # この1フラグで「env 側の joint_mirror_symmetry 報酬」と「runner 側の mirror loss」を
 # 排他に切り替える (agents/rsl_rl_ppo_cfg.py も同じフラグを参照)。アーキを変えるときは
 # ここを切り替えること。
-_USE_RECURRENT_POLICY: bool = True
+_USE_RECURRENT_POLICY: bool = False
 
 _K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),

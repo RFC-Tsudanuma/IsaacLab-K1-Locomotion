@@ -23,25 +23,25 @@ class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     max_iterations = 3000
     save_interval = 50
     experiment_name = "k1_rough"
-    # policy = RslRlPpoActorCriticCfg(
-    #     init_noise_std=0.7207805082202461,
-    #     actor_obs_normalization=True,
-    #     critic_obs_normalization=True,
-    #     actor_hidden_dims=[512, 256, 128],
-    #     critic_hidden_dims=[512, 256, 128],
-    #     activation="elu",
-    # )
-    policy = RslRlPpoActorCriticRecurrentCfg(
+    policy = RslRlPpoActorCriticCfg(
         init_noise_std=0.7207805082202461,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
-        actor_hidden_dims=[128],
-        critic_hidden_dims=[128],
+        actor_hidden_dims=[512, 256, 128],
+        critic_hidden_dims=[512, 256, 128],
         activation="elu",
-        rnn_type="gru",
-        rnn_hidden_dim=256,
-        rnn_num_layers=2,
     )
+    # policy = RslRlPpoActorCriticRecurrentCfg(
+    #     init_noise_std=0.7207805082202461,
+    #     actor_obs_normalization=True,
+    #     critic_obs_normalization=True,
+    #     actor_hidden_dims=[128],
+    #     critic_hidden_dims=[128],
+    #     activation="elu",
+    #     rnn_type="gru",
+    #     rnn_hidden_dim=256,
+    #     rnn_num_layers=2,
+    # )
     # actor = RslRlRNNModelCfg(
     #     init_noise_std=0.7207805082202461,
     #     obs_normalization=True,
