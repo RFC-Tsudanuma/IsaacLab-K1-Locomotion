@@ -14,6 +14,7 @@ from isaaclab.terrains import TerrainGeneratorCfg
 from .rough_env_cfg import K1RoughEnvCfg, _PHASE_FREQ, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
 import math
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.events import randomize_phase_freq
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
@@ -77,8 +78,8 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.8, 1.8)],
-            "stages_y": [(-0.5, 0.5), (-0.8, 0.8), (-0.9, 0.9)],
+            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5), (-1.8, 1.8)],
+            "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.8, 0.8), (-0.9, 0.9)],
             # 各ステージを「本物の関門」にするための閾値。広い範囲ほど絶対誤差は出やすいので
             # わずかに緩めるが、緩めすぎると「狭い範囲を習得した時点で広い範囲のゆるい閾値も
             # 満たしてしまい」0→1→2 と一気に遷移する。実測では stage0(±0.6)の到達誤差が ~0.30、
@@ -87,7 +88,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # そこで stage1 は ±1.2 でまだ達成していない 0.34 まで締めて再学習を要求する
             # (stage0=0.30 は約500iter かけて到達する適切なゲートなので維持。
             #  最終 stage2 の値は遷移判定に使われずログ表示専用)。
-            "error_threshold": [0.30, 0.35, 0.36],
+            "error_threshold": [0.30, 0.35, 0.40, 0.43],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
@@ -167,6 +168,18 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.scene.contact_forces.prim_path = "{ENV_REGEX_NS}/Robot/(Trunk|.*_foot_link)"
 
         # Rewards
+        # 速度追従の「粗い」項を追加する
+        # 既存の track_lin_vel_xy_exp は std=0.25 と鋭く、誤差が ~0.4 m/s を超えると
+        # exp(-err²/std²) が飽和して勾配が消える。これにより速度コマンドのカリキュラム上端
+        # (±1.8 など) でロボットが追従を諦め、その場足踏みの局所最適に落ちていた。
+        # 鋭い項 (重み 3.5) はそのまま残しつつ、std を広げた同じ報酬を小さい重みで加算する。
+        # 誤差 0.8 m/s でも exp(-0.64/0.36)=0.17 と勾配が残り「もっと速く」の信号が生きる一方、
+        # 誤差が小さい領域では鋭い項が支配して追従精度を保つ。
+        self.rewards.track_lin_vel_xy_coarse = RewTerm(
+            func=mdp.track_lin_vel_xy_yaw_frame_exp,
+            weight=1.0,
+            params={"command_name": "base_velocity", "std": 0.6},
+        )
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.32
         self.rewards.lin_vel_z_l2.weight = -0.8
