@@ -208,7 +208,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # --checkpoint に実在するファイルパスが渡された場合はそれを直接使う。
+        # これにより load_run を介さず、別 experiment / 任意の場所にある .pt からでも
+        # 追加学習を開始できる (追加学習で checkpoint パスだけ指定したいケース)。
+        # ファイルが見つからない場合は従来通り logs/rsl_rl/<experiment_name>/<load_run>/
+        # 配下を load_run・load_checkpoint の正規表現で解決する (後方互換)。
+        if agent_cfg.load_checkpoint and os.path.isfile(agent_cfg.load_checkpoint):
+            resume_path = os.path.abspath(agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
