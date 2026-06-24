@@ -376,6 +376,7 @@ class K1Rewards(RewardsCfg):
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot"),
+            "foot_asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
             "force_threshold": 2.0,
             "ema_alpha": 0.6,
             "sigma": 0.05,

@@ -497,8 +497,19 @@ class kick_angle_range_curriculum(ManagerTermBase):
             待機ステップ数を算出する。
         post_switch_hold_steps: 切替直後に計測・更新・判定を止める最小ステップ数。実際の
             hold は再サンプリング待ちとこの値の大きい方。固定下限で確実に連鎖遷移を防ぐ。
-        post_switch_ema_scale: 切替直後に EMA を固定する初期値の、閾値に対する倍率。hold 明けは
-            この高い値から実測値へ減衰するため、運良く低い誤差を 1 回引いただけでは進まない。
+        post_switch_ema_scale: 切替直後にログ表示用 EMA をスパイクさせる、閾値に対する倍率
+            (判定には未使用)。切替が TensorBoard 上で見えるようにするためだけのもの。
+        confirm_windows: ステージ進行を確定させるために必要な「連続で閾値を下回った評価
+            ウィンドウ」数 (既定 3)。1 ウィンドウだけの偶発的な低誤差では進行せず、
+            confirm_windows 回連続で下回ったときのみ進む。stage 0/1 は正面付近で誤差が偶発的に
+            低くなりやすいため、これがないと収束前に一気に駆け抜けて (0→1→2) しまう。途中で
+            1 度でも上回るとカウンタは 0 に戻るので、真に追従できる場合のみ進行する。
+        min_stage_steps: 各ステージに最低限留まる呼び出し (env-step) 回数のハードフロア
+            (既定 0 = 無効)。性能ベースのゲートは正面付近の狭いレンジ (stage 0/1) では
+            「前進 ≒ 正方向キック」で誤差が偶発的に低くなり、ポリシーが本当に方向制御を
+            学ぶ前に通過してしまう。このフロアを設けると、誤差が閾値を下回っても
+            min_stage_steps 経過するまでは進行せず、各レンジで実際に学習する時間を確保できる。
+            ``num_steps_per_env`` 倍すると iteration 換算 (例: 8000 / 24 ≒ 333 iter)。
     """
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
@@ -525,6 +536,13 @@ class kick_angle_range_curriculum(ManagerTermBase):
         self._cached_ema: float = -1.0
         self._update_count: int = 0
         self._hold_remaining: int = 0
+        # 閾値を連続で下回った評価ウィンドウ数 (デバウンス用)。1 回だけの偶発的な
+        # 低誤差では進行させず、confirm_windows 回連続で下回ったときのみ進行する。
+        self._confirm_count: int = 0
+        # 現ステージに入ってからの呼び出し (env-step) 回数。min_stage_steps 未満の間は
+        # 性能が良く見えても進行を許さない (早期ステージが簡単すぎて即通過するのを防ぐ
+        # ハードフロア)。
+        self._steps_in_stage: int = 0
 
         self._apply_stage(self._stages[self._current_stage])
 
@@ -542,8 +560,11 @@ class kick_angle_range_curriculum(ManagerTermBase):
         stage_cooldown_resamples: float = 1.5,
         post_switch_hold_steps: int = 1500,
         post_switch_ema_scale: float = 2.0,
+        confirm_windows: int = 3,
+        min_stage_steps: int = 0,
     ) -> dict[str, float]:
         current_threshold = self._error_thresholds[self._current_stage]
+        self._steps_in_stage += 1
 
         # --- ステージ変更直後の hold ---
         # 新レンジのキック方向が全 env に行き渡り、前レンジで飛んでいたボールが消えて
@@ -579,19 +600,35 @@ class kick_angle_range_curriculum(ManagerTermBase):
         if self._update_count >= min_updates and self._error_ema is not None:
             ema_val = float(self._error_ema)
             self._cached_ema = ema_val
-            if self._current_stage < len(self._stages) - 1 and ema_val < current_threshold:
-                self._current_stage += 1
-                self._apply_stage(self._stages[self._current_stage])
-                current_threshold = self._error_thresholds[self._current_stage]
-                # EMA を「新ステージ閾値」より十分高い値で固定し、hold 明けに実測値へ減衰させる。
-                high_ema = current_threshold * post_switch_ema_scale
-                self._error_ema = self._error_ema.new_full((), high_ema)
-                self._cached_ema = high_ema
-                # hold = 「新レンジが全 env に行き渡るまで」と固定下限の大きい方。
-                cmd_term = env.command_manager.get_term(command_name)
-                max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
-                resample_steps = int(math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt))
-                self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            can_advance = (
+                self._current_stage < len(self._stages) - 1
+                and self._steps_in_stage >= min_stage_steps
+            )
+            if can_advance and ema_val < current_threshold:
+                # デバウンス: 1 ウィンドウだけ閾値を下回っても進行せず、confirm_windows 回
+                # 連続で下回ったときのみ進行する。stage 0/1 は「前進 ≒ 正方向キック」で
+                # 誤差が偶発的に低くなりやすく、これがないと収束前に一気に駆け抜けてしまう。
+                self._confirm_count += 1
+                if self._confirm_count >= confirm_windows:
+                    self._current_stage += 1
+                    self._apply_stage(self._stages[self._current_stage])
+                    current_threshold = self._error_thresholds[self._current_stage]
+                    self._confirm_count = 0
+                    self._steps_in_stage = 0
+                    # 前ステージの EMA は破棄し (None)、hold 明けに新レンジの実測値から
+                    # 測り直す。seed-high 方式だと前ステージの低い誤差から減衰した値が残り、
+                    # 1 ウィンドウ下回った瞬間に連鎖遷移してしまうため、純粋に新レンジを測る。
+                    self._error_ema = None
+                    # cached_ema はログ表示用に切替を見えるようスパイクさせるだけ (判定には未使用)。
+                    self._cached_ema = current_threshold * post_switch_ema_scale
+                    # hold = 「新レンジが全 env に行き渡るまで」と固定下限の大きい方。
+                    cmd_term = env.command_manager.get_term(command_name)
+                    max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                    resample_steps = int(math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt))
+                    self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            else:
+                # 閾値を上回ったら連続カウンタをリセット (sustained でなければ進めない)。
+                self._confirm_count = 0
             self._update_count = 0
 
         return {

@@ -1303,6 +1303,65 @@ def foot_height_penalty(
     excess = (foot_z - threshold).clamp(min=0.0)
     return excess.sum(dim=1)
 
+
+def compute_zmp_xy(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """力学ベース ZMP の XY を world frame で返す (E, 2)。"""
+    robot = env.scene[asset_cfg.name]
+    g = 9.81
+    m  = robot.data.default_mass.to(env.device)      # (E, B)
+    pc = robot.data.body_com_pos_w                   # (E, B, 3)  無ければ body_pos_w
+    ac = robot.data.body_lin_acc_w                   # (E, B, 3)  無ければ body_acc_w の線形成分
+
+    z0 = pc[..., 2].min(dim=1, keepdim=True).values  # 接地高さ近似(最下リンク)
+    wz    = m * (ac[..., 2] + g)                     # (E, B)
+    denom = wz.sum(1).clamp(min=1e-6)                # (E,)
+    px = (wz * pc[..., 0] - m * ac[..., 0] * (pc[..., 2] - z0)).sum(1) / denom
+    py = (wz * pc[..., 1] - m * ac[..., 1] * (pc[..., 2] - z0)).sum(1) / denom
+    return torch.stack([px, py], dim=-1)             # (E, 2)
+
+
+def zmp_support_center(
+    env: ManagerBasedRLEnv,
+    sigma: float = 0.08,            # [m] 距離スケール。足裏半長より少し小さめが目安
+    force_threshold: float = 20.0, # [N] 接地判定の Fz しきい値
+    ema_alpha: float = 0.2,        # ZMP の平滑化係数。1.0 で無効
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),  # ZMP 力学は全身質量で計算するため全リンク
+    foot_asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot_link"),  # 支持基準点用の足リンク
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+) -> torch.Tensor:
+    """ZMP と支持基準点(片脚=立脚足中心 / 両足=両足中点)の距離を exp カーネルで報酬化。"""
+    robot   = env.scene[asset_cfg.name]
+    contact = env.scene.sensors[sensor_cfg.name]
+
+    # foot_asset_cfg は足リンクのみ、sensor_cfg と本数が一致している必要がある。
+    # asset_cfg(全身)を foot_ids に使うと body 数が contact sensor とずれてブロードキャストに失敗する。
+    foot_ids = foot_asset_cfg.body_ids                              # 足リンクの body id
+    foot_xy  = robot.data.body_pos_w[:, foot_ids, :2]               # (E, F, 2)
+    fz       = contact.data.net_forces_w[:, sensor_cfg.body_ids, 2].clamp(min=0.0)  # (E, F)
+
+    # --- 支持基準点:接地している足の XY 平均 ---
+    in_contact = fz > force_threshold                               # (E, F) bool
+    w     = in_contact.float()                                      # (E, F)
+    denom = w.sum(1, keepdim=True).clamp(min=1.0)                   # (E, 1)
+    ref_xy = (foot_xy * w.unsqueeze(-1)).sum(1) / denom            # (E, 2)
+
+    # --- ZMP(EMA で平滑化)---
+    zmp_xy = compute_zmp_xy(env, asset_cfg)                         # (E, 2)
+    if ema_alpha < 1.0:
+        prev = getattr(env, "_zmp_ema", None)
+        if prev is None or prev.shape[0] != zmp_xy.shape[0]:
+            prev = zmp_xy.detach()
+        zmp_xy = ema_alpha * zmp_xy + (1.0 - ema_alpha) * prev
+        env._zmp_ema = zmp_xy.detach()
+
+    # --- exp カーネル ---
+    d = torch.norm(zmp_xy - ref_xy, dim=-1)                         # (E,)
+    reward = torch.exp(-(d ** 2) / (sigma ** 2))
+
+    # 遊脚相(無接地)は基準点が定義できないので 0 にゲート
+    any_contact = in_contact.any(1)
+    return torch.where(any_contact, reward, torch.zeros_like(reward))
+
 __all__ = [
     "minimum_height",
     "track_lin_vel_xy_discrete_exp",
@@ -1318,4 +1377,6 @@ __all__ = [
     "feet_stride_length",
     "feet_landing_impact",
     "feet_landing_vel",
+    "compute_zmp_xy",
+    "zmp_support_center",
 ]
