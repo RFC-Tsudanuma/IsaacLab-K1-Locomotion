@@ -177,61 +177,61 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 誤差が小さい領域では鋭い項が支配して追従精度を保つ。
         self.rewards.track_lin_vel_xy_coarse = RewTerm(
             func=mdp.track_lin_vel_xy_yaw_frame_exp,
-            weight=1.0,
+            weight=0.7,
             params={"command_name": "base_velocity", "std": 0.6},
         )
         self.rewards.track_ang_vel_z_exp.weight = 2.0
-        self.rewards.ang_vel_xy_l2.weight = -0.32
+        self.rewards.ang_vel_xy_l2.weight = -0.25
         self.rewards.lin_vel_z_l2.weight = -0.8
         self.rewards.action_rate_l2.weight = -0.4
         self.rewards.dof_acc_l2.weight = -1.0e-6
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
-        self.rewards.dof_torques_l2.weight = -1.0e-5
+        self.rewards.dof_torques_l2.weight = -5.0e-5
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        # 着地時の衝撃力ペナルティ: 接地瞬間の力ノルムが大きいほどペナルティを与える。
-        # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
-        self.rewards.feet_landing_impact = RewTerm(
-            func=feet_landing_impact,
-            weight=-0.5e-2 * 0.3,
-            params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-                "contact_threshold": 1.0,
-            },
-        )
+        # # 着地時の衝撃力ペナルティ: 接地瞬間の力ノルムが大きいほどペナルティを与える。
+        # # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
+        # self.rewards.feet_landing_impact = RewTerm(
+        #     func=feet_landing_impact,
+        #     weight=-0.5e-2 * 0.3,
+        #     params={
+        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+        #         "contact_threshold": 1.0,
+        #     },
+        # )
         # 着地時の速度ペナルティ: 接地した瞬間の足の(鉛直)速度が大きいほどペナルティを与える。
         # 硬い踏みつけ(下向き速度が大きい着地)を抑制し、柔らかい接地を促す。
         # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
-        self.rewards.feet_landing_vel = RewTerm(
-            func=feet_landing_vel,
-            weight=-1.5 * 0.2,
-            params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
-                "contact_threshold": 1.0,
-                "vertical_only": False,
-            },
-        )
+        # self.rewards.feet_landing_vel = RewTerm(
+        #     func=feet_landing_vel,
+        #     weight=-1.5 * 0.2,
+        #     params={
+        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+        #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+        #         "contact_threshold": 1.0,
+        #         "vertical_only": False,
+        #     },
+        # )
         # 着地時のかかと接地報酬: 着地の瞬間に足がつま先上げ(かかと下がり)姿勢ほど報酬を与える。
         # 足裏ベタ着き/つま先着地ではなく、かかとから接地する歩容を促す。
         # 着地イベント時のみ非0・両足合計 (0〜2 程度) なので重みは中程度にとる。
         # NOTE: 学習しても逆 (つま先着地) が促進される場合は pitch_sign を -1.0 に反転する。
-        self.rewards.feet_heel_strike = RewTerm(
-            func=feet_heel_strike,
-            weight=5.0,
-            params={
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
-                "contact_threshold": 1.0,
-                "target_pitch": 0.10,
-                "std": 0.15,
-                "pitch_sign": -1.0,
-                "command_name": "base_velocity",
-                "cmd_threshold": _COMMAND_THRESHOLD,
-            },
-        )
+        # self.rewards.feet_heel_strike = RewTerm(
+        #     func=feet_heel_strike,
+        #     weight=5.0,
+        #     params={
+        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+        #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+        #         "contact_threshold": 1.0,
+        #         "target_pitch": 0.10,
+        #         "std": 0.15,
+        #         "pitch_sign": -1.0,
+        #         "command_name": "base_velocity",
+        #         "cmd_threshold": _COMMAND_THRESHOLD,
+        #     },
+        # )
         # 重心(全身CoM)位置の jerk ペナルティ: CoM 速度の二階差分 (≒躍度) の二乗ノルムを罰する。
         # 体重移動の急変(カクつき)を抑え、滑らかな重心移動を促す。
         # jerk は dt² で割るため値が大きくなりやすい。重みは dof_acc_l2 (-1e-6) と同程度の桁から開始し、
@@ -258,8 +258,8 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 ang_vel_z=(-1.0, 1.0),
                 heading=(-math.pi, math.pi),
             ),
-            lin_vel_x_resolution=0.2,
-            lin_vel_y_resolution=0.1,
+            lin_vel_x_resolution=0.05,
+            lin_vel_y_resolution=0.05,
             ang_vel_z_resolution=0.2,
         )
 

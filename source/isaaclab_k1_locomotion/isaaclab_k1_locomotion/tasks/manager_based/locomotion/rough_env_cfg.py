@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2, action_rate_l2, joint_mirror_symmetry
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, zmp_support_center, action_smoothness_l2, action_rate_l2, compute_zmp_xy
 
 ##
 # 基本設定
@@ -93,11 +93,11 @@ delayed_pd_leg = DelayedPDActuatorCfg(
             velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
             # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
             # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
-            stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
-            damping={".*_Hip_.*": 3.5 , ".*_Knee_Pitch": 3.5},
+            stiffness={".*_Hip_.*": 160.0, ".*_Knee_Pitch": 160.0},
+            damping={".*_Hip_.*": 4.0 , ".*_Knee_Pitch": 4.0},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
             min_delay=2,
-            max_delay=10,
+            max_delay=7,
         )
 
 K1_LOCOMOTION_CFG = ArticulationCfg(
@@ -160,7 +160,7 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             damping=2.5,
             armature=0.0282528,
             min_delay=2,
-            max_delay=10,
+            max_delay=7,
         ),
         # "arms": IdealPDActuatorCfg(
         #     joint_names_expr=[".*_Shoulder_Pitch", ".*_Shoulder_Roll", ".*_Elbow_Pitch", ".*_Elbow_Yaw"],
@@ -212,6 +212,7 @@ class K1CriticCfg(ObsGroup):
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
     gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ, "cmd_threshold": _COMMAND_THRESHOLD})
+    zmp_position = ObsTerm(func=compute_zmp_xy, params={"asset_cfg": SceneEntityCfg("robot")})
 
     def __post_init__(self):
         self.enable_corruption = False # Criticにノイズは不要
@@ -304,13 +305,13 @@ class K1Rewards(RewardsCfg):
         weight=-1.0,
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]),
-            "soft_ratio": 0.9
+            "soft_ratio": 0.95
         },
     )
 
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.12,
+        weight=-0.10,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     # joint_deviation_arm = RewTerm(
@@ -332,33 +333,21 @@ class K1Rewards(RewardsCfg):
         func=feet_close_penalty,
         weight=-20.0,
         params={
-            "feet_distance_threshold": 0.14,
+            "feet_distance_threshold": 0.12,
         },
     )
 
-    # feet_parallel_to_ground = RewTerm(
-    #     func=feet_parallel_to_ground,
-    #     weight=3.0,
-    #     params={
-    #         "sigma": 0.08
-    #     },
-    # )
-
-    # foot_clearance_ji_pen = RewTerm(
-    #     func=foot_clearance_ji_pen,
-    #     weight=4.0,
-    #     params={
-    #         "command_name": "base_velocity",
-    #         "target_clearance": 0.09,
-    #         "phase_freq": _PHASE_FREQ,
-    #         "stance_ratio": _STANCE_RATIO,
-    #         "cmd_threshold": _COMMAND_THRESHOLD,
-    #     },
-    # )
+    feet_parallel_to_ground = RewTerm(
+        func=feet_parallel_to_ground,
+        weight=3.0,
+        params={
+            "sigma": 0.08
+        },
+    )
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
-        weight=-0.15,
+        weight=-0.12,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": _COMMAND_THRESHOLD,
@@ -366,20 +355,33 @@ class K1Rewards(RewardsCfg):
         },
     )
 
-    dof_vel_l2 = RewTerm(
-        func=mdp.joint_vel_l2,
-        weight=-5.0e-4,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"])},
-    )
+    # dof_vel_l2 = RewTerm(
+    #     func=mdp.joint_vel_l2,
+    #     weight=-5.0e-4,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"])},
+    # )
 
     # 左右対称性を報酬で担保する (アーキ非依存)。recurrent (LSTM/GRU) 方策では rsl_rl の
     # mirror loss が構造的に動かない (rsl_rl_ppo_cfg.py のコメント参照) ため、その代替。
     # exp(-error/0.1) の [0,1] 報酬で、左右股関節・膝が鏡像対称なほど高い。weight は要調整。
     # MLP では mirror loss 側を使うので weight=0 にして二重がけを避ける (_USE_RECURRENT_POLICY)。
-    joint_mirror_symmetry = RewTerm(
-        func=joint_mirror_symmetry,
-        weight=0.5 if _USE_RECURRENT_POLICY else 0.0,
+    # joint_mirror_symmetry = RewTerm(
+    #     func=joint_mirror_symmetry,
+    #     weight=0.5 if _USE_RECURRENT_POLICY else 0.0,
+    # )
+
+    zmp_stability = RewTerm(
+        func=zmp_support_center,
+        weight=1.0,
+        params={
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+            "asset_cfg": SceneEntityCfg("robot"),
+            "force_threshold": 2.0,
+            "ema_alpha": 0.6,
+            "sigma": 0.05,
+        },
     )
+
 
 # ---------------------------------------------------------------------------
 # Environment configs
