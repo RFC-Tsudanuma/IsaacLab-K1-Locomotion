@@ -284,7 +284,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    # `runner.load` does a strict load of the full actor-critic; it raises if the
+    # critic obs dim differs from the checkpoint (e.g. the critic observation grew
+    # after this policy was trained). For rollout collection we only need the actor,
+    # which the strict=False safeguard below loads regardless, so tolerate the error.
+    try:
+        runner.load(resume_path)
+    except RuntimeError as exc:
+        print(f"[WARN] runner.load strict load failed ({exc}); relying on strict=False safeguard.")
 
     # Safeguard against `runner.load` no-op (see play.py:281-290).
     raw_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
@@ -294,7 +301,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         target_device = next(policy_to_load.parameters()).device
         ckpt_on_device = {k: (v.to(target_device) if isinstance(v, torch.Tensor) else v)
                           for k, v in ckpt_msd.items()}
-        policy_to_load.load_state_dict(ckpt_on_device, strict=False)
+        # strict=False ignores missing/extra keys but NOT shape mismatches, so drop any
+        # checkpoint tensor whose shape differs from the current model (e.g. a critic that
+        # grew after this policy was trained). The actor is unaffected and loads fine.
+        model_sd = policy_to_load.state_dict()
+        filtered = {k: v for k, v in ckpt_on_device.items()
+                    if not (isinstance(v, torch.Tensor) and k in model_sd and v.shape != model_sd[k].shape)}
+        skipped = [k for k in ckpt_on_device if k not in filtered]
+        if skipped:
+            print(f"[WARN] skipping {len(skipped)} checkpoint tensors with shape mismatch: {skipped}")
+        policy_to_load.load_state_dict(filtered, strict=False)
 
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
