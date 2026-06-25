@@ -1,13 +1,32 @@
 """Command-time-series sampling for velocity tracking data collection.
 
-Mixes constant / step / ramp / sinusoidal / random-walk patterns so the policy
-sees a wide distribution of command shapes.
+Mixes constant / step / ramp / sinusoidal / piecewise-constant / random-walk patterns
+so the policy sees a wide distribution of command shapes.
+
+The ``piecewise`` pattern issues a fresh random command every ~0.25-1.25 s (discrete
+jumps), mimicking a path planner that re-issues velocity targets frequently. It is given
+the largest share because the planning use case switches commands far more often than the
+flat env's native 10 s resampling.
 """
 
 from __future__ import annotations
 
 import numpy as np
 import torch
+
+# Pattern order is the contract shared with eval_velocity_predictor.py (label indices).
+PATTERN_NAMES = ["constant", "step", "ramp", "sinusoid", "random_walk", "piecewise"]
+
+
+def pattern_partition(num_envs: int) -> list[tuple[str, int]]:
+    """Split ``num_envs`` across patterns. ``piecewise`` (frequent switching) gets ~3/8.
+
+    Returns a list of (pattern_name, count) in PATTERN_NAMES order, summing to num_envs.
+    """
+    base = num_envs // 8
+    counts = {name: base for name in PATTERN_NAMES}
+    counts["piecewise"] = num_envs - base * (len(PATTERN_NAMES) - 1)
+    return [(name, counts[name]) for name in PATTERN_NAMES]
 
 
 def sample_commands(
@@ -21,12 +40,26 @@ def sample_commands(
 ) -> torch.Tensor:
     """Return (num_envs, T, 3) command tensor on device."""
     cmd = torch.zeros(num_envs, T, 3, device=device)
-    n = num_envs // 5
-    cmd[0:n] = _constant(n, T, vx_range, vy_range, wz_range, device)
-    cmd[n : 2 * n] = _step(n, T, vx_range, vy_range, wz_range, device)
-    cmd[2 * n : 3 * n] = _ramp(n, T, vx_range, vy_range, wz_range, device)
-    cmd[3 * n : 4 * n] = _sinusoidal(n, T, dt, vx_range, vy_range, wz_range, device)
-    cmd[4 * n :] = _random_walk(num_envs - 4 * n, T, dt, vx_range, vy_range, wz_range, device)
+    start = 0
+    for name, cnt in pattern_partition(num_envs):
+        if cnt <= 0:
+            continue
+        sl = slice(start, start + cnt)
+        if name == "constant":
+            cmd[sl] = _constant(cnt, T, vx_range, vy_range, wz_range, device)
+        elif name == "step":
+            cmd[sl] = _step(cnt, T, vx_range, vy_range, wz_range, device)
+        elif name == "ramp":
+            cmd[sl] = _ramp(cnt, T, vx_range, vy_range, wz_range, device)
+        elif name == "sinusoid":
+            cmd[sl] = _sinusoidal(cnt, T, dt, vx_range, vy_range, wz_range, device)
+        elif name == "random_walk":
+            cmd[sl] = _random_walk(cnt, T, dt, vx_range, vy_range, wz_range, device)
+        elif name == "piecewise":
+            cmd[sl] = _piecewise_const(cnt, T, dt, vx_range, vy_range, wz_range, device)
+        else:
+            raise ValueError(f"Unknown pattern: {name}")
+        start += cnt
     return cmd
 
 
@@ -89,3 +122,32 @@ def _random_walk(n, T, dt, vx_r, vy_r, wz_r, device, sigma: float = 0.5) -> torc
         noise = torch.randn(n, 3, device=device) * noise_scale
         cmd[:, t] = torch.clamp(alpha * cmd[:, t - 1] + noise, -bounds, bounds)
     return cmd
+
+
+def _piecewise_const(
+    n, T, dt, vx_r, vy_r, wz_r, device,
+    min_hold_s: float = 0.25, max_hold_s: float = 1.25,
+) -> torch.Tensor:
+    """Frequent discrete switching: hold a random command for a random duration then jump.
+
+    Each env independently re-samples its target every ``[min_hold_s, max_hold_s]`` seconds,
+    matching a path planner that issues new velocity goals frequently.
+    """
+    min_h = max(1, int(round(min_hold_s / dt)))
+    max_h = max(min_h, int(round(max_hold_s / dt)))
+    # Enough segments to always cover T even if every hold is the minimum length.
+    n_seg = T // min_h + 2
+    vals = torch.stack(
+        [
+            torch.empty(n, n_seg, device=device).uniform_(*vx_r),
+            torch.empty(n, n_seg, device=device).uniform_(*vy_r),
+            torch.empty(n, n_seg, device=device).uniform_(*wz_r),
+        ],
+        dim=-1,
+    )  # (n, n_seg, 3)
+    lengths = torch.randint(min_h, max_h + 1, (n, n_seg), device=device)
+    bounds = torch.cumsum(lengths, dim=1)                       # (n, n_seg) segment end (exclusive)
+    t_idx = torch.arange(T, device=device).view(1, T, 1)        # (1, T, 1)
+    # segment index for each t = number of segment boundaries <= t
+    seg_id = (t_idx >= bounds.unsqueeze(1)).sum(dim=-1).clamp(max=n_seg - 1)  # (n, T)
+    return torch.gather(vals, 1, seg_id.unsqueeze(-1).expand(n, T, 3))

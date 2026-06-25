@@ -72,7 +72,7 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
-from isaaclab_k1_locomotion.velocity_model import sample_commands
+from isaaclab_k1_locomotion.velocity_model import PATTERN_NAMES, pattern_partition, sample_commands
 
 # Load VelocityPredictor directly to avoid pulling the parent package init twice.
 from isaaclab_k1_locomotion.velocity_model.predictor import VelocityPredictor
@@ -137,16 +137,15 @@ def get_velocity(robot) -> torch.Tensor:
 
 
 def make_pattern_labels(num_envs: int, device) -> torch.Tensor:
-    """Mirror sample_commands() partitioning: 0=const,1=step,2=ramp,3=sin,4=walk."""
+    """Label each env by its command pattern, mirroring sample_commands()'s partition."""
     labels = torch.zeros(num_envs, dtype=torch.long, device=device)
-    n = num_envs // 5
-    for i in range(5):
-        end = num_envs if i == 4 else (i + 1) * n
-        labels[i * n : end] = i
+    start = 0
+    for idx, (_name, cnt) in enumerate(pattern_partition(num_envs)):
+        labels[start : start + cnt] = idx
+        start += cnt
     return labels
 
 
-PATTERN_NAMES = ["constant", "step", "ramp", "sinusoid", "walk"]
 AXIS_NAMES = ["vx", "vy", "wz"]
 
 

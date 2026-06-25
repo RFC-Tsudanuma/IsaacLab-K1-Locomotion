@@ -62,6 +62,9 @@ def parse_args() -> argparse.Namespace:
                         help="Path to the zarr group produced by collect_velocity_data.py.")
     parser.add_argument("--output", type=str, default="logs/velocity_predictor/predictor.pt",
                         help="Where to write the trained predictor checkpoint.")
+    # 50 was selected by an epoch sweep (40/50/75/100) on the no-proprio frequent-switching
+    # dataset: it gives the lowest val MSE with a near-zero train/val gap. Training longer only
+    # widens the gap (mild overfitting) without improving validation error.
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
