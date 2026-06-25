@@ -70,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--hidden_dim", type=int, default=64)
+    parser.add_argument("--num_layers", type=int, default=1, help="Number of stacked GRU layers.")
     parser.add_argument("--residual_scale", type=float, default=0.5)
     parser.add_argument("--val_frac", type=float, default=0.1)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -186,6 +187,7 @@ def main() -> None:
     model = VelocityPredictor(
         dim=3, dt=dt, hidden_dim=args.hidden_dim,
         proprio_dim=proprio_dim, residual_scale=args.residual_scale,
+        num_layers=args.num_layers,
     ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
@@ -198,6 +200,7 @@ def main() -> None:
             {
                 "model": model.state_dict(),
                 "hidden_dim": args.hidden_dim,
+                "num_layers": args.num_layers,
                 "proprio_dim": proprio_dim,
                 "dt": dt,
                 "residual_scale": args.residual_scale,

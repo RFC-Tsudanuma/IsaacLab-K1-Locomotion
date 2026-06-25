@@ -75,6 +75,7 @@ class VelocityPredictor(nn.Module):
         hidden_dim: int = 64,
         proprio_dim: int = 0,
         residual_scale: float = 0.5,
+        num_layers: int = 1,
     ):
         super().__init__()
         self.baseline = FirstOrderBaseline(dim=dim, dt=dt)
@@ -83,6 +84,7 @@ class VelocityPredictor(nn.Module):
             base_dim=dim,
             proprio_dim=proprio_dim,
             hidden_dim=hidden_dim,
+            num_layers=num_layers,
             output_dim=dim,
         )
         self.residual_scale = residual_scale

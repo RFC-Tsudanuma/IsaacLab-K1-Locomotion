@@ -328,6 +328,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     use_proprio = bool(pred_args.get("use_proprio", False))
     proprio_keys = list(pred_args.get("proprio_keys", []))
     hidden_dim = int(pred_ckpt["hidden_dim"])
+    num_layers = int(pred_ckpt.get("num_layers", 1))
     proprio_dim = int(pred_ckpt["proprio_dim"])
     dt = float(pred_ckpt["dt"])
     residual_scale = float(pred_ckpt["residual_scale"])
@@ -338,6 +339,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     model = VelocityPredictor(
         dim=3, dt=sim_dt, hidden_dim=hidden_dim,
         proprio_dim=proprio_dim, residual_scale=residual_scale,
+        num_layers=num_layers,
     ).to(device)
     model.load_state_dict(pred_ckpt["model"])
     model.eval()
@@ -361,7 +363,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
     for r in range(args_cli.num_rollouts):
         commands = sample_commands(num_envs, args_cli.episode_length, sim_dt, device)
         v_base = torch.zeros(num_envs, 3, device=device)
-        h = torch.zeros(1, num_envs, hidden_dim, device=device)
+        h = torch.zeros(num_layers, num_envs, hidden_dim, device=device)
         # alive mask: once an env terminates within a rollout we drop it for the rest of that rollout.
         alive = torch.ones(num_envs, dtype=torch.bool, device=device)
 

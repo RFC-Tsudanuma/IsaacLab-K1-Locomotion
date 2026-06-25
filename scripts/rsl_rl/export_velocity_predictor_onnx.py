@@ -87,6 +87,7 @@ def main() -> None:
 
     ckpt = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
     hidden_dim = int(ckpt["hidden_dim"])
+    num_layers = int(ckpt.get("num_layers", 1))
     proprio_dim = int(ckpt["proprio_dim"])
     dt = float(ckpt["dt"])
     residual_scale = float(ckpt["residual_scale"])
@@ -97,6 +98,7 @@ def main() -> None:
     VelocityPredictor = _load_predictor_cls()
     model = VelocityPredictor(
         dim=3, dt=dt, hidden_dim=hidden_dim, proprio_dim=proprio_dim, residual_scale=residual_scale,
+        num_layers=num_layers,
     )
     model.load_state_dict(ckpt["model"])
     model.eval()
