@@ -177,8 +177,8 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 誤差が小さい領域では鋭い項が支配して追従精度を保つ。
         self.rewards.track_lin_vel_xy_coarse = RewTerm(
             func=mdp.track_lin_vel_xy_yaw_frame_exp,
-            weight=0.7,
-            params={"command_name": "base_velocity", "std": 0.6},
+            weight=1.2,
+            params={"command_name": "base_velocity", "std": 0.5},
         )
         self.rewards.track_ang_vel_z_exp.weight = 2.0
         self.rewards.ang_vel_xy_l2.weight = -0.25

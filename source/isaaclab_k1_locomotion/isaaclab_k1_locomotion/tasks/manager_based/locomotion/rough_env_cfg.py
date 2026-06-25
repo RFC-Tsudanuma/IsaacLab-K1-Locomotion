@@ -235,7 +235,7 @@ class K1Rewards(RewardsCfg):
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=2.8,
+        weight=2.5,
         params={"command_name": "base_velocity", "std": 0.25},
     )
     track_ang_vel_z_exp = RewTerm(
@@ -372,7 +372,7 @@ class K1Rewards(RewardsCfg):
 
     zmp_stability = RewTerm(
         func=zmp_support_center,
-        weight=1.0,
+        weight=0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot"),
