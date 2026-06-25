@@ -13,6 +13,7 @@ dependencies = [
     "setuptools<81",
     "zarr<3",
     "numcodecs<0.16",
+    "onnxruntime>=1.27.0",
 ]
 
 [[tool.uv.index]]
