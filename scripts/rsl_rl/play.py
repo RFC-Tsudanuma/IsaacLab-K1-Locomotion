@@ -55,6 +55,10 @@ args_cli, hydra_args = parser.parse_known_args()
 if args_cli.video:
     args_cli.enable_cameras = True
 
+# when viser is enabled, force headless to avoid spinning up the Isaac Sim viewer.
+if args_cli.viser:
+    args_cli.headless = True
+
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
 
@@ -95,17 +99,18 @@ import isaaclab_k1_locomotion.tasks  # noqa: F401
 
 DEFAULT_VISER_URDF = str(
     Path(__file__).resolve().parent
-    / "../../assets_soccer/booster_robotics_robots/K1/K1_22dof.urdf"
+    / "../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf"
 )
 
 
 def setup_viser(env, urdf_path: str, port: int):
     """Spin up a viser server and load the given URDF for visualization.
 
-    Returns a tuple ``(server, base_frame, viser_urdf, joint_indices)`` where
+    Returns a tuple ``(server, base_frame, viser_urdf, joint_indices, gui)`` where
     ``joint_indices[k]`` is the index in Isaac Lab's joint state for the k-th
     actuated joint reported by ``viser_urdf.get_actuated_joint_names()``. An
-    entry is ``None`` when no matching joint exists.
+    entry is ``None`` when no matching joint exists. ``gui`` is a dict of viser
+    GUI handles for the velocity command sliders.
     """
     import viser
     from viser.extras import ViserUrdf
@@ -136,8 +141,53 @@ def setup_viser(env, urdf_path: str, port: int):
         else:
             print(f"[WARNING] Viser: joint '{name}' not found in Isaac robot; will use 0.0.")
             joint_indices.append(None)
+
+    # GUI for velocity command override
+    with server.gui.add_folder("Velocity Command"):
+        gui_vx = server.gui.add_slider("lin_vel_x [m/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
+        gui_vy = server.gui.add_slider("lin_vel_y [m/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
+        gui_wz = server.gui.add_slider("ang_vel_z [rad/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
+        gui_reset = server.gui.add_button("Reset to 0")
+
+    @gui_reset.on_click
+    def _(_):
+        gui_vx.value = 0.0
+        gui_vy.value = 0.0
+        gui_wz.value = 0.0
+
+    gui = {"vx": gui_vx, "vy": gui_vy, "wz": gui_wz}
+
     print(f"[INFO] Viser visualization available at http://localhost:{port}")
-    return server, base_frame, viser_urdf, joint_indices
+    return server, base_frame, viser_urdf, joint_indices, gui
+
+
+def override_command_from_viser(env, gui):
+    """Overwrite the ``base_velocity`` command tensor with viser GUI values.
+
+    Also disables the heading-based ang_vel_z recomputation and the standing-env
+    zeroing so the GUI values survive the next ``_update_command`` call.
+    """
+    cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+    ref = getattr(cmd_term, "vel_command_b", None)
+    if ref is None:
+        ref = getattr(cmd_term, "command", None)
+    if ref is None:
+        return
+    device = ref.device
+    num_envs = ref.shape[0]
+    fixed = torch.tensor(
+        [[float(gui["vx"].value), float(gui["vy"].value), float(gui["wz"].value)]],
+        device=device,
+    ).repeat(num_envs, 1)
+
+    if hasattr(cmd_term, "vel_command_b"):
+        cmd_term.vel_command_b[:] = fixed
+    # Disable heading-based ang_vel_z recomputation (overwrites vel_command_b[:, 2]).
+    if hasattr(cmd_term, "is_heading_env"):
+        cmd_term.is_heading_env[:] = False
+    # Disable standing-env zeroing of the whole command vector.
+    if hasattr(cmd_term, "is_standing_env"):
+        cmd_term.is_standing_env[:] = False
 
 
 def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
@@ -172,6 +222,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.device is not None:
+        agent_cfg.device = args_cli.device
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
@@ -226,6 +278,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     runner.load(resume_path)
 
+    # `runner.load` can silently no-op for some checkpoints, leaving the live policy at
+    # initialization values. Re-load the state_dict directly into the policy as a safeguard.
+    raw_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
+    ckpt_msd = raw_ckpt.get("model_state_dict", raw_ckpt) if isinstance(raw_ckpt, dict) else None
+    if isinstance(ckpt_msd, dict):
+        policy_to_load = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
+        target_device = next(policy_to_load.parameters()).device
+        ckpt_on_device = {k: (v.to(target_device) if isinstance(v, torch.Tensor) else v)
+                          for k, v in ckpt_msd.items()}
+        policy_to_load.load_state_dict(ckpt_on_device, strict=False)
+
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
 
@@ -269,6 +332,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
+            # override velocity command from viser GUI before policy inference
+            if viser_state is not None:
+                try:
+                    override_command_from_viser(env, viser_state[4])
+                except Exception as e:
+                    print(f"[WARNING] Viser command override failed: {e}")
             # agent stepping
             actions = policy(obs)
             # env stepping
@@ -277,7 +346,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy_nn.reset(dones)
         if viser_state is not None:
             try:
-                _, base_frame, viser_urdf, joint_indices = viser_state
+                _, base_frame, viser_urdf, joint_indices, _ = viser_state
                 update_viser(env, base_frame, viser_urdf, joint_indices, env_idx=args_cli.viser_env_idx)
             except Exception as e:
                 print(f"[WARNING] Viser update failed: {e}")

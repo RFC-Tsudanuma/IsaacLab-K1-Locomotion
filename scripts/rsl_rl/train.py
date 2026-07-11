@@ -36,7 +36,19 @@ parser.add_argument(
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--reset_noise_std",
+    type=float,
+    default=None,
+    help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint (resume only).",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
+)
+parser.add_argument(
+    "--override_json",
+    type=str,
+    default=None,
+    help="JSON file with dot-path overrides for env_cfg / agent_cfg (used by Optuna tuning).",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -125,10 +137,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # apply Optuna-style JSON overrides last so they win over Hydra/CLI defaults
+    if args_cli.override_json is not None:
+        from config_overrides import apply_overrides_from_file
+
+        apply_overrides_from_file(args_cli.override_json, env_cfg=env_cfg, agent_cfg=agent_cfg)
+
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
+    if args_cli.device is not None:
+        agent_cfg.device = args_cli.device
     # check for invalid combination of CPU device with distributed training
     if args_cli.distributed and args_cli.device is not None and "cpu" in args_cli.device:
         raise ValueError(
@@ -223,8 +243,51 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+        # When resetting std, also drop the optimizer state. The saved Adam moments for the std
+        # parameter carry strong "push std down" momentum that immediately drives std negative on
+        # the first update, regardless of any post-load clamp.
+        load_optimizer = args_cli.reset_noise_std is None
+        runner.load(resume_path, load_optimizer=load_optimizer)
+        if not load_optimizer:
+            print("[INFO]: Skipped optimizer state load (--reset_noise_std set).")
+
+        policy = runner.alg.policy
+
+        # Force-load workaround: runner.load() can silently no-op for some checkpoints
+        # (see PLAY_LOAD_ISSUE.md). Detect and force-load if needed.
+        ckpt = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+        ckpt_msd = ckpt["model_state_dict"]
+        live_msd = policy.state_dict()
+        mismatched = [
+            k for k in ckpt_msd if k in live_msd and not torch.equal(live_msd[k].cpu(), ckpt_msd[k].cpu())
+        ]
+        if mismatched:
+            print(f"[WARN]: runner.load no-op detected; force-loading {len(mismatched)} mismatched keys.")
+            policy.load_state_dict(ckpt_msd, strict=False)
+
+        # re-inject action noise std if requested (recover from collapsed std after long training)
+        if args_cli.reset_noise_std is not None:
+            import math
+
+            with torch.no_grad():
+                if policy.noise_std_type == "scalar":
+                    before = policy.std.data.clone()
+                    policy.std.data.clamp_(min=args_cli.reset_noise_std)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std}\n"
+                        f"        before: {before.tolist()}\n"
+                        f"        after : {policy.std.data.tolist()}"
+                    )
+                elif policy.noise_std_type == "log":
+                    log_floor = math.log(args_cli.reset_noise_std)
+                    before = policy.log_std.data.exp().clone()
+                    policy.log_std.data.clamp_(min=log_floor)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std} (log_std clamp)\n"
+                        f"        before std: {before.tolist()}\n"
+                        f"        after  std: {policy.log_std.data.exp().tolist()}"
+                    )
+
         # sync common_step_counter so curriculum resumes from the correct phase
         if agent_cfg.resume:
             synced_steps = runner.current_learning_iteration * runner.cfg["num_steps_per_env"]

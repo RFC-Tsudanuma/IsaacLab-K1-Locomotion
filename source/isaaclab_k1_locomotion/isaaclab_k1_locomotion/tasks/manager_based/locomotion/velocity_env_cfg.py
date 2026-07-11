@@ -32,9 +32,9 @@ from isaaclab.terrains.config.rough import ROUGH_TERRAINS_CFG  # isort: skip
 
 # K1の関節名リスト、この順番に合わせるためobsのjoint_posやvel、アクションなどはこれで指定する必要がある
 JOINT_NAMES_K1 = [
-    "AAHead_yaw", "Head_pitch",
-    "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch", "Left_Elbow_Yaw",
-    "ARight_Shoulder_Pitch", "Right_Shoulder_Roll", "Right_Elbow_Pitch", "Right_Elbow_Yaw",
+    # "AAHead_yaw", "Head_pitch",
+    # "ALeft_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch", "Left_Elbow_Yaw",
+    # "ARight_Shoulder_Pitch", "Right_Shoulder_Roll","Right_Elbow_Pitch", "Right_Elbow_Yaw",
     "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw",
     "Left_Knee_Pitch", "Left_Ankle_Pitch", "Left_Ankle_Roll",
     "Right_Hip_Pitch", "Right_Hip_Roll", "Right_Hip_Yaw",
@@ -81,7 +81,16 @@ class MySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    # 接触センサは実際に query される body だけに絞る (収集フェーズの CPU 律速対策)。
+    # 報酬/終了判定が参照するのは足・股関節・すね・胴体のみ:
+    #   .*_foot_link (着地系報酬/air_time), .*_Hip_(Pitch|Roll|Yaw)/.*_Shank (undesired_contacts),
+    #   Trunk (base_contact 終了判定)。
+    # 全 23 body → 11 body に減らしても観測・報酬・終了はビット一致 (純粋な高速化)。
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(Trunk|.*_foot_link|.*_Hip_(Pitch|Roll|Yaw)|.*_Shank)",
+        history_length=3,
+        track_air_time=True,
+    )
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
@@ -139,7 +148,7 @@ class ObservationsCfg:
         )
         velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
         joint_pos = ObsTerm(func=mdp.joint_pos_rel, noise=Unoise(n_min=-0.01, n_max=0.01))
-        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-1.5, n_max=1.5))
+        joint_vel = ObsTerm(func=mdp.joint_vel_rel, noise=Unoise(n_min=-0.3, n_max=0.3))
         actions = ObsTerm(func=mdp.last_action)
         height_scan = ObsTerm(
             func=mdp.height_scan,
@@ -166,8 +175,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.5, 0.8),
-            "dynamic_friction_range": (0.3, 0.6),
+            "static_friction_range": (0.4, 0.8),
+            "dynamic_friction_range": (0.2, 0.6),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -178,7 +187,7 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="base"),
-            "mass_distribution_params": (-5.0, 5.0),
+            "mass_distribution_params": (-1.5, 1.5),
             "operation": "add",
         },
     )
@@ -197,8 +206,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", joint_names=".*"),
-            "stiffness_distribution_params": (0.8, 1.2),
-            "damping_distribution_params": (0.8, 1.2),
+            "stiffness_distribution_params": (0.7, 1.3),
+            "damping_distribution_params": (0.7, 1.3),
             "operation": "scale",
             "distribution": "uniform",
         },
@@ -244,7 +253,7 @@ class EventCfg:
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(10.0, 15.0),
+        interval_range_s=(7.0, 10.0),
         params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 
