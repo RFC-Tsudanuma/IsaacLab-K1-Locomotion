@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
-from .events import get_phase_freq
+from .events import get_gait_phase
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -24,18 +24,21 @@ if TYPE_CHECKING:
 
 def phase_obs(
     env: ManagerBasedRLEnv,
-    phase_freq: float = 1.5,
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.1,
+    low_speed: float = 1.0,
+    high_speed: float = 1.8,
+    low_freq: float = 1.5,
+    high_freq: float = 2.0,
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
+    位相の周波数は速度コマンドのノルムに応じて線形遷移する
+    (:func:`mdp.events.compute_cmd_phase_freq` 参照)。
     コマンド速度が ``cmd_threshold`` 未満のときは位相をゼロで埋め、
     停止すべき状況であることをポリシーに明示する。
     """
-    t = env.episode_length_buf * env.step_dt
-    pf = get_phase_freq(env, phase_freq)
-    phase_left = 2.0 * math.pi * pf * t
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

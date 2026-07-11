@@ -38,7 +38,20 @@ from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_he
 ##
 # 基本設定
 ##
-_PHASE_FREQ: float = 1.6  # Hz (歩行周期)
+# 歩行周波数は速度コマンドのノルムに応じて線形遷移する (mdp.events.compute_cmd_phase_freq):
+#   ||cmd_xy|| <= _PHASE_SPEED_LOW  → _PHASE_FREQ_LOW で固定
+#   それ以上                        → _PHASE_SPEED_HIGH で _PHASE_FREQ_HIGH になる傾きで線形増加
+# per-env の ±0.05 Hz ランダムオフセット (flat_env_cfg の randomize_phase_freq_offset) が加算される。
+_PHASE_FREQ_LOW: float = 1.5    # Hz (低速歩行の基本周波数)
+_PHASE_FREQ_HIGH: float = 2.0   # Hz (_PHASE_SPEED_HIGH 時の周波数)
+_PHASE_SPEED_LOW: float = 1.0   # m/s (この速度までは _PHASE_FREQ_LOW 固定)
+_PHASE_SPEED_HIGH: float = 1.8  # m/s (この速度で _PHASE_FREQ_HIGH に到達)
+_PHASE_FREQ_PARAMS: dict = {
+    "low_speed": _PHASE_SPEED_LOW,
+    "high_speed": _PHASE_SPEED_HIGH,
+    "low_freq": _PHASE_FREQ_LOW,
+    "high_freq": _PHASE_FREQ_HIGH,
+}
 _COMMAND_THRESHOLD: float = 0.05 # コマンド速度がこれ未満のときは停止とみなす
 _STANCE_RATIO: float = 0.50 # 接地時間の割合
 # 立ち止まり「かつ静止している」ときだけ action_smoothness / action_rate ペナルティを
@@ -193,8 +206,8 @@ class K1PolicyCfg(ObsGroup):
                         params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
     
-    # 整理した位相観測
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ, "cmd_threshold": _COMMAND_THRESHOLD}) # 頻度は適宜調整
+    # 整理した位相観測 (周波数はコマンド速度に応じて線形遷移)
+    gait_phase = ObsTerm(func=phase_obs, params={"cmd_threshold": _COMMAND_THRESHOLD, **_PHASE_FREQ_PARAMS})
 
     def __post_init__(self):
         self.enable_corruption = True
@@ -211,7 +224,7 @@ class K1CriticCfg(ObsGroup):
     joint_pos = ObsTerm(func=mdp.joint_pos_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     joint_vel = ObsTerm(func=mdp.joint_vel_rel,params={"asset_cfg": SceneEntityCfg("robot", joint_names=JOINT_NAMES_K1, preserve_order=True)})
     actions = ObsTerm(func=mdp.last_action)
-    gait_phase = ObsTerm(func=phase_obs, params={"phase_freq": _PHASE_FREQ, "cmd_threshold": _COMMAND_THRESHOLD})
+    gait_phase = ObsTerm(func=phase_obs, params={"cmd_threshold": _COMMAND_THRESHOLD, **_PHASE_FREQ_PARAMS})
     zmp_position = ObsTerm(func=compute_zmp_xy, params={"asset_cfg": SceneEntityCfg("robot")})
 
     def __post_init__(self):
@@ -235,26 +248,26 @@ class K1Rewards(RewardsCfg):
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=2.5,
+        weight=1.5,
         params={"command_name": "base_velocity", "std": 0.25},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
         weight=3.0,
-        params={"command_name": "base_velocity", "std": 0.25},
+        params={"command_name": "base_velocity", "std": 0.35},
     )
 
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
         func=feet_phase,
-        weight=1.4, # 位相に合わせて足を動かすことへの報酬
+        weight=1.0, # 位相に合わせて足を動かすことへの報酬
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "command_name": "base_velocity",
-            "phase_freq": _PHASE_FREQ,
             "stance_ratio": _STANCE_RATIO,
             "cmd_threshold": _COMMAND_THRESHOLD,
+            **_PHASE_FREQ_PARAMS,
         },
     )
 
@@ -300,14 +313,14 @@ class K1Rewards(RewardsCfg):
     #     weight=-0.5,
     #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
     # )
-    dof_vel_limits = RewTerm(
-        func=mdp.joint_vel_limits,
-        weight=-1.0,
-        params={
-            "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]),
-            "soft_ratio": 0.95
-        },
-    )
+    # dof_vel_limits = RewTerm(
+    #     func=mdp.joint_vel_limits,
+    #     weight=-1.0,
+    #     params={
+    #         "asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]),
+    #         "soft_ratio": 0.95
+    #     },
+    # )
 
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
@@ -324,7 +337,7 @@ class K1Rewards(RewardsCfg):
         func=minimum_height,
         weight=-100.0,
         params={
-            "min_height": 0.52,
+            "min_height": 0.54,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
@@ -333,13 +346,13 @@ class K1Rewards(RewardsCfg):
         func=feet_close_penalty,
         weight=-20.0,
         params={
-            "feet_distance_threshold": 0.12,
+            "feet_distance_threshold": 0.14,
         },
     )
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=3.0,
+        weight=30.0,
         params={
             "sigma": 0.08
         },
@@ -347,7 +360,7 @@ class K1Rewards(RewardsCfg):
 
     action_smoothness_l2 = RewTerm(
         func=action_smoothness_l2,
-        weight=-0.12,
+        weight=-0.15,
         params={
             "command_name": "base_velocity",
             "cmd_threshold": _COMMAND_THRESHOLD,
@@ -372,7 +385,7 @@ class K1Rewards(RewardsCfg):
 
     zmp_stability = RewTerm(
         func=zmp_support_center,
-        weight=0.5,
+        weight=0.20,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot"),

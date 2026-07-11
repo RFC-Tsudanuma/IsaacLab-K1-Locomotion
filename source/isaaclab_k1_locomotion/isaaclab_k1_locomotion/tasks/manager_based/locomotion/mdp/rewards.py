@@ -21,7 +21,7 @@ from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
 from .observations import ball_vel as get_ball_vel
-from .events import get_phase_freq
+from .events import get_phase_freq, get_gait_phase
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -75,9 +75,12 @@ def feet_phase(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
     command_name: str,
-    phase_freq: float = 1.5,
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
+    low_speed: float = 1.0,
+    high_speed: float = 1.8,
+    low_freq: float = 1.5,
+    high_freq: float = 2.0,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -99,23 +102,20 @@ def feet_phase(
         env: The learning environment.
         sensor_cfg: Contact sensor configuration (must cover both foot bodies, left first).
         command_name: Name of the velocity command in the command manager.
-        phase_freq: Frequency of the gait cycle in Hz.  Default 1.5 Hz (~normal walking).
         stance_ratio: Fraction of the cycle that each foot spends in stance (0–1).
             Default 0.55 (slightly more stance than swing, typical for walking).
         cmd_threshold: Speed below which the robot is considered "stopped" and both feet
             are expected to be in contact.
+        low_speed / high_speed / low_freq / high_freq: コマンド速度→歩行周波数の線形
+            マッピング (``mdp.events.compute_cmd_phase_freq`` 参照)。phase_obs と揃えること。
 
     Returns:
         Per-environment reward tensor of shape (N,).
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    # Current time within the episode for each environment  [N]
-    t = env.episode_length_buf * env.step_dt
-
-    pf = get_phase_freq(env, phase_freq)
-    # Phase angle in [0, 2*pi) for the LEFT foot
-    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)   # [N]
+    # Phase angle in [0, 2*pi) for the LEFT foot (コマンド依存周波数の積分位相; obs と共有)
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)  # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 

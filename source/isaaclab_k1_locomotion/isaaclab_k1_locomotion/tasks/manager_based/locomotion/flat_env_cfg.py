@@ -11,12 +11,12 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains import TerrainGeneratorCfg
 
-from .rough_env_cfg import K1RoughEnvCfg, _PHASE_FREQ, _COMMAND_THRESHOLD
+from .rough_env_cfg import K1RoughEnvCfg, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.commands import DiscreteVelocityCommandCfg
-from .mdp.events import randomize_phase_freq
+from .mdp.events import randomize_phase_freq_offset
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
@@ -88,7 +88,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # そこで stage1 は ±1.2 でまだ達成していない 0.34 まで締めて再学習を要求する
             # (stage0=0.30 は約500iter かけて到達する適切なゲートなので維持。
             #  最終 stage2 の値は遷移判定に使われずログ表示専用)。
-            "error_threshold": [0.30, 0.35, 0.40, 0.43],
+            "error_threshold": [0.30, 0.39, 0.45, 0.43],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
@@ -133,13 +133,13 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        # 環境毎に歩行周波数 _PHASE_FREQ を ±0.1 Hz の範囲でランダム化 (startup で1度だけ)。
-        # phase_obs / feet_phase / foot_clearance_ji_pen がこの per-env 値を自動で参照する。
+        # 環境毎に歩行周波数オフセットを ±0.05 Hz の範囲でランダム化 (startup で1度だけ)。
+        # 基本周波数はコマンド速度に応じて線形遷移し (rough_env_cfg._PHASE_FREQ_PARAMS 参照)、
+        # このオフセットがそれに常時加算される。phase_obs / feet_phase が自動で参照する。
         self.events.randomize_phase_freq = EventTerm(
-            func=randomize_phase_freq,
+            func=randomize_phase_freq_offset,
             mode="startup",
             params={
-                "base_phase_freq": _PHASE_FREQ,
                 "offset_range": (-0.05, 0.05),
             },
         )
@@ -175,15 +175,21 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 鋭い項 (重み 3.5) はそのまま残しつつ、std を広げた同じ報酬を小さい重みで加算する。
         # 誤差 0.8 m/s でも exp(-0.64/0.36)=0.17 と勾配が残り「もっと速く」の信号が生きる一方、
         # 誤差が小さい領域では鋭い項が支配して追従精度を保つ。
+        # 重みはコマンド依存位相周波数の導入時に 15 サイクルのチューニングで決定 (2026-07)。
+        # 目的: track_lin_vel_xy_coarse と track_ang_vel_z_exp の正規化スコア (÷weight) を
+        # 両立させ調和平均を最大化。3seed 検証で (sharp, coarse, ang) = (1.5, 2.4, 4.2) が
+        # 平均 0.554 / 最悪 0.534 でベスト。coarse↑はカリキュラム最終段階 (±1.8 m/s) 到達に
+        # 必須、sharp は 1.5 未満に下げるとカリキュラムが進まない、ang は coarse に対し
+        # 比率 ~1.75 を外れるとどちらかが崩れる (ang=3.8/coarse=2.0 で lin 崩壊を確認)。
         self.rewards.track_lin_vel_xy_coarse = RewTerm(
             func=mdp.track_lin_vel_xy_yaw_frame_exp,
-            weight=1.2,
+            weight=2.4,
             params={"command_name": "base_velocity", "std": 0.5},
         )
-        self.rewards.track_ang_vel_z_exp.weight = 2.0
+        self.rewards.track_ang_vel_z_exp.weight = 4.2
         self.rewards.ang_vel_xy_l2.weight = -0.25
         self.rewards.lin_vel_z_l2.weight = -0.8
-        self.rewards.action_rate_l2.weight = -0.4
+        self.rewards.action_rate_l2.weight = -0.5
         self.rewards.dof_acc_l2.weight = -1.0e-6
         self.rewards.feet_air_time.weight = 0.2
         self.rewards.feet_air_time.params["threshold"] = 0.4
@@ -191,47 +197,6 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
             "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
         )
-        # # 着地時の衝撃力ペナルティ: 接地瞬間の力ノルムが大きいほどペナルティを与える。
-        # # 単位は [N]・両足合計なので、過大ペナルティにならないよう重みは小さめにする。
-        # self.rewards.feet_landing_impact = RewTerm(
-        #     func=feet_landing_impact,
-        #     weight=-0.5e-2 * 0.3,
-        #     params={
-        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-        #         "contact_threshold": 1.0,
-        #     },
-        # )
-        # 着地時の速度ペナルティ: 接地した瞬間の足の(鉛直)速度が大きいほどペナルティを与える。
-        # 硬い踏みつけ(下向き速度が大きい着地)を抑制し、柔らかい接地を促す。
-        # 単位は [m/s]・両足合計 (着地イベント時のみ非0) なので、重みは衝撃力より大きめにとる。
-        # self.rewards.feet_landing_vel = RewTerm(
-        #     func=feet_landing_vel,
-        #     weight=-1.5 * 0.2,
-        #     params={
-        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-        #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
-        #         "contact_threshold": 1.0,
-        #         "vertical_only": False,
-        #     },
-        # )
-        # 着地時のかかと接地報酬: 着地の瞬間に足がつま先上げ(かかと下がり)姿勢ほど報酬を与える。
-        # 足裏ベタ着き/つま先着地ではなく、かかとから接地する歩容を促す。
-        # 着地イベント時のみ非0・両足合計 (0〜2 程度) なので重みは中程度にとる。
-        # NOTE: 学習しても逆 (つま先着地) が促進される場合は pitch_sign を -1.0 に反転する。
-        # self.rewards.feet_heel_strike = RewTerm(
-        #     func=feet_heel_strike,
-        #     weight=5.0,
-        #     params={
-        #         "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-        #         "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
-        #         "contact_threshold": 1.0,
-        #         "target_pitch": 0.10,
-        #         "std": 0.15,
-        #         "pitch_sign": -1.0,
-        #         "command_name": "base_velocity",
-        #         "cmd_threshold": _COMMAND_THRESHOLD,
-        #     },
-        # )
         # 重心(全身CoM)位置の jerk ペナルティ: CoM 速度の二階差分 (≒躍度) の二乗ノルムを罰する。
         # 体重移動の急変(カクつき)を抑え、滑らかな重心移動を促す。
         # jerk は dt² で割るため値が大きくなりやすい。重みは dof_acc_l2 (-1e-6) と同程度の桁から開始し、
