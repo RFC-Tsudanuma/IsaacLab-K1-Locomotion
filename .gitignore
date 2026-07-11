@@ -6,7 +6,12 @@ __pycache__/
 
 # IsaacLab / Hydra
 outputs/
+# logs は全階層無視する(重いモデル/tfeventsを除外)。
+# frozen歩行ckpt(0524_walk.pt)はコミット済みで追跡され続けるため、ここで無視しても問題ない。
 logs/
+
+# ローカルバックアップ(push不要)
+backup/
 
 # Isaac Sim
 _isaac_sim/

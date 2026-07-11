@@ -276,7 +276,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    # checkpoints saved on another machine's cuda:1 fail to load on a single-GPU machine
+    try:
+        runner.load(resume_path, map_location=agent_cfg.device)
+    except RuntimeError as e:
+        # critic obs dims may differ between the checkpoint and the current env cfg;
+        # the critic is unused at play time, so fall back to an actor-only load below
+        print(f"[WARN] runner.load failed, falling back to actor-only load:\n{e}")
 
     # `runner.load` can silently no-op for some checkpoints, leaving the live policy at
     # initialization values. Re-load the state_dict directly into the policy as a safeguard.
@@ -286,7 +292,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy_to_load = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
         target_device = next(policy_to_load.parameters()).device
         ckpt_on_device = {k: (v.to(target_device) if isinstance(v, torch.Tensor) else v)
-                          for k, v in ckpt_msd.items()}
+                          for k, v in ckpt_msd.items() if not k.startswith("critic")}
         policy_to_load.load_state_dict(ckpt_on_device, strict=False)
 
     # obtain the trained policy for inference
