@@ -198,13 +198,13 @@ class K1Rewards(RewardsCfg):
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
     track_lin_vel_xy_exp = RewTerm(
         func=mdp.track_lin_vel_xy_yaw_frame_exp,
-        weight=1.0,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=3.5,
+        params={"command_name": "base_velocity", "std": 0.25},
     )
     track_ang_vel_z_exp = RewTerm(
         func=mdp.track_ang_vel_z_world_exp,
-        weight=2.0,
-        params={"command_name": "base_velocity", "std": 0.5},
+        weight=3.0,
+        params={"command_name": "base_velocity", "std": 0.25},
     )
 
     
@@ -232,7 +232,7 @@ class K1Rewards(RewardsCfg):
     )
     feet_slide = RewTerm(
         func=mdp.feet_slide,
-        weight=-1.0,
+        weight=-0.5,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
@@ -304,7 +304,7 @@ class K1Rewards(RewardsCfg):
     
     joint_deviation_hip = RewTerm(
         func=mdp.joint_deviation_l1,
-        weight=-0.33,
+        weight=-0.13,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
     
@@ -319,9 +319,9 @@ class K1Rewards(RewardsCfg):
     
     base_height_penalty = RewTerm(
         func=minimum_height,
-        weight=-1.0,
+        weight=-100.0,
         params={
-            "min_height": 0.45,
+            "min_height": 0.53,
             "asset_cfg": SceneEntityCfg("robot"),
             "sensor_cfg": None, 
         },
@@ -330,15 +330,15 @@ class K1Rewards(RewardsCfg):
 
     feet_close_penalty = RewTerm(
         func=feet_close_penalty,
-        weight=-14.0, #-17.0,
+        weight=-20.0,
         params={
-            "feet_distance_threshold": 0.09,
+            "feet_distance_threshold": 0.14,
         },
     )
 
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=10.0,
+        weight=0.0,
         params={
             "sigma": 0.08
         },
@@ -438,15 +438,15 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
                 "threshold": 1.0,
             },
         )
-        self.rewards.flat_orientation_l2.weight = -3.5#-1.0
+        self.rewards.flat_orientation_l2.weight = -20.0
         self.rewards.action_rate_l2.weight = -0.005
-        self.rewards.dof_acc_l2.weight = -1.25e-7
+        self.rewards.dof_acc_l2.weight = -1.0e-7
         self.rewards.dof_acc_l2.params["asset_cfg"] = SceneEntityCfg(
-            "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
+            "robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]
         )
-        self.rewards.dof_torques_l2.weight = -1.5e-7
+        self.rewards.dof_torques_l2.weight = -1.0e-7
         self.rewards.dof_torques_l2.params["asset_cfg"] = SceneEntityCfg(
-            "robot", joint_names=[".*_Hip_.*", ".*_Ankle_.*"]
+            "robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"]
         )
 
         # Commands

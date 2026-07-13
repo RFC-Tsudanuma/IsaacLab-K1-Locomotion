@@ -11,7 +11,7 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
-
+from .events import get_phase_freq
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -31,7 +31,8 @@ def phase_obs(
     停止すべき状況であることをポリシーに明示する。
     """
     t = env.episode_length_buf * env.step_dt
-    phase_left = 2.0 * math.pi * phase_freq * t
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = 2.0 * math.pi * pf * t
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

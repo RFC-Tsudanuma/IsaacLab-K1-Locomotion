@@ -5,12 +5,19 @@
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import (
+    RslRlOnPolicyRunnerCfg,
+    RslRlPpoActorCriticCfg,
+    RslRlPpoAlgorithmCfg,
+    RslRlSymmetryCfg,
+)
+
+from ..mdp.symmetry import compute_symmetric_states
 
 
 @configclass
 class K1RoughPPORunnerCfg(RslRlOnPolicyRunnerCfg):
-    num_steps_per_env = 24
+    num_steps_per_env = 48
     max_iterations = 3000
     save_interval = 50
     experiment_name = "k1_rough"
@@ -43,8 +50,14 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
 
-        self.max_iterations = 1500
+        self.max_iterations = 3000
         self.experiment_name = "k1_flat"
         self.policy.actor_hidden_dims = [256, 128, 128]
-        self.policy.critic_hidden_dims = [256, 128, 128]
+        self.policy.critic_hidden_dims = [256, 256, 128]
         self.save_interval = 100
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_symmetric_states,
+            mirror_loss_coeff=0.5,
+        )
