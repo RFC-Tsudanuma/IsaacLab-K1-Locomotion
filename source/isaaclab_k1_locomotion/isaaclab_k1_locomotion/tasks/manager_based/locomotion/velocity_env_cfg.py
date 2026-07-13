@@ -83,7 +83,16 @@ class MySceneCfg(InteractiveSceneCfg):
         debug_vis=False,
         mesh_prim_paths=["/World/ground"],
     )
-    contact_forces = ContactSensorCfg(prim_path="{ENV_REGEX_NS}/Robot/.*", history_length=3, track_air_time=True)
+    # 接触センサは実際に query される body だけに絞る (収集フェーズの CPU 律速対策)。
+    # 報酬/終了判定が参照するのは足・股関節・すね・胴体のみ:
+    #   .*_foot_link (着地系報酬/air_time), .*_Hip_(Pitch|Roll|Yaw)/.*_Shank (undesired_contacts),
+    #   Trunk (base_contact 終了判定)。
+    # 全 23 body → 11 body に減らしても観測・報酬・終了はビット一致 (純粋な高速化)。
+    contact_forces = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/(Trunk|.*_foot_link|.*_Hip_(Pitch|Roll|Yaw)|.*_Shank)",
+        history_length=3,
+        track_air_time=True,
+    )
     # lights
     sky_light = AssetBaseCfg(
         prim_path="/World/skyLight",
@@ -112,7 +121,7 @@ class CommandsCfg:
         heading_control_stiffness=0.5,
         debug_vis=True,
         ranges=mdp.UniformVelocityCommandCfg.Ranges(
-            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-1.0, 1.0), heading=(-math.pi, math.pi)
+            lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0), ang_vel_z=(-2.0, 2.0), heading=(-math.pi, math.pi)
         ),
     )
     
@@ -169,8 +178,8 @@ class EventCfg:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-            "static_friction_range": (0.5, 0.8),
-            "dynamic_friction_range": (0.3, 0.6),
+            "static_friction_range": (0.4, 0.8),
+            "dynamic_friction_range": (0.2, 0.6),
             "restitution_range": (0.0, 0.0),
             "num_buckets": 64,
         },
@@ -247,7 +256,7 @@ class EventCfg:
     push_robot = EventTerm(
         func=mdp.push_by_setting_velocity,
         mode="interval",
-        interval_range_s=(10.0, 15.0),
+        interval_range_s=(7.0, 10.0),
         params={"velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5)}},
     )
 

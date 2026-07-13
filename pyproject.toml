@@ -1,0 +1,32 @@
+[project]
+name = "isaaclab-k1-locomotion-workspace"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.11.*"
+dependencies = [
+    "isaacsim[all,extscache]==5.1.0",
+    "isaaclab[isaacsim,all]==2.3.2.post1",
+    "isaaclab_k1_locomotion",
+    "torch==2.7.0",
+    "torchvision==0.22.0",
+    "setuptools<81",
+    "zarr<3",
+    "numcodecs<0.16",
+    "onnxruntime>=1.27.0",
+]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = false
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+isaaclab_k1_locomotion = { path = "source/isaaclab_k1_locomotion", editable = true }

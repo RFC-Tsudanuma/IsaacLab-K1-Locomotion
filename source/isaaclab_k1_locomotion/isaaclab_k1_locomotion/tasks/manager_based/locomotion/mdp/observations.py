@@ -11,7 +11,10 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
-from .events import get_phase_freq
+from isaaclab.assets import Articulation
+from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+from .events import get_gait_phase
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -21,18 +24,21 @@ if TYPE_CHECKING:
 
 def phase_obs(
     env: ManagerBasedRLEnv,
-    phase_freq: float = 1.5,
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.1,
+    low_speed: float = 1.0,
+    high_speed: float = 1.8,
+    low_freq: float = 1.5,
+    high_freq: float = 2.0,
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
-    コマンド速度が ``cmd_threshold`` 以下のときは位相をゼロで埋め、
+    位相の周波数は速度コマンドのノルムに応じて線形遷移する
+    (:func:`mdp.events.compute_cmd_phase_freq` 参照)。
+    コマンド速度が ``cmd_threshold`` 未満のときは位相をゼロで埋め、
     停止すべき状況であることをポリシーに明示する。
     """
-    t = env.episode_length_buf * env.step_dt
-    pf = get_phase_freq(env, phase_freq)
-    phase_left = 2.0 * math.pi * pf * t
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([
@@ -42,7 +48,55 @@ def phase_obs(
 
     cmd = env.command_manager.get_command(command_name)
     cmd_speed = torch.norm(cmd[:, :3], dim=1, keepdim=True)
-    is_stopped = cmd_speed <= cmd_threshold
+    is_stopped = cmd_speed < cmd_threshold
     phase = torch.where(is_stopped, torch.zeros_like(phase), phase)
 
     return phase
+
+def ball_vel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """ボールの線速度を、ロボットの base yaw frame で返す (x: 前後, y: 左右)。"""
+    ball: Articulation = env.scene["soccer_ball"]
+    robot: Articulation = env.scene[asset_cfg.name]
+    vel_w = ball.data.root_com_vel_w[:, :3]
+    vel_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), vel_w)
+    return vel_b[:, :2]
+
+def ball_pos_rel(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+    """ボールとロボットの相対位置を、ロボットの base yaw frame で返す (x: 前後, y: 左右)。"""
+    ball: Articulation = env.scene["soccer_ball"]
+    robot: Articulation = env.scene[asset_cfg.name]
+    offset_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
+    offset_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), offset_w)
+    return offset_b[:, :2]
+
+
+def last_high_action(
+    env: ManagerBasedRLEnv,
+    action_dim: int = 3,
+) -> torch.Tensor:
+    """前回ステップで上位ポリシーが出力した行動 (歩行コマンド) を返す。
+
+    ``HierarchicalVecEnvWrapper`` が毎ステップ ``env._prev_high_action``
+    (shape ``(num_envs, action_dim)``) を更新する。リセット時は
+    :func:`mdp.events.reset_prev_high_action` で対象 env のスロットが 0 にされる。
+    未初期化のときは 0 を返す (起動時など)。
+    """
+    buf = getattr(env, "_prev_high_action", None)
+    if buf is None or buf.shape != (env.num_envs, action_dim):
+        return torch.zeros((env.num_envs, action_dim), device=env.device)
+    return buf
+
+
+def kick_direction_b(
+    env: ManagerBasedRLEnv,
+    command_name: str = "kick_direction",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ワールド座標系のキック方向コマンドをロボットの base yaw frame に回転して返す (2D 単位ベクトル)。"""
+    robot: Articulation = env.scene[asset_cfg.name]
+    kick_dir_w_xy = env.command_manager.get_term(command_name).command  # (N, 2)
+    # 3D に拡張 (z=0) してから base yaw frame に回転
+    z = torch.zeros_like(kick_dir_w_xy[:, :1])
+    kick_dir_w = torch.cat([kick_dir_w_xy, z], dim=1)
+    kick_dir_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), kick_dir_w)
+    return kick_dir_b[:, :2]

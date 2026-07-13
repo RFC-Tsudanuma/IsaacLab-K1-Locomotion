@@ -9,5 +9,8 @@ outputs/
 logs/
 
 # Isaac Sim
-_isaac_sim/logs/
-outputs/
+_isaac_sim/
+data/
+
+#optuna
+runs/

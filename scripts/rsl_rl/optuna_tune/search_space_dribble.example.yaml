@@ -1,0 +1,88 @@
+# Optuna search space for K1 Dribble (hierarchical) training.
+#
+# Unlike the flat search space, dribble trials launch `train_dribble.py`
+# (set via `train.script`). That script trains a high-level policy on top of a
+# FROZEN low-level walking policy, so you MUST point it at a walking checkpoint
+# through `train.extra_args` (--frozen_checkpoint ...). The frozen checkpoint is
+# held fixed across every trial — only the high-level policy / dribble rewards
+# are tuned here.
+#
+# Copy this file (e.g. to search_space_dribble.yaml), edit the frozen checkpoint
+# path, then run:
+#   ./scripts/rsl_rl/optuna_tune/tune.sh --config scripts/rsl_rl/optuna_tune/search_space_dribble.yaml
+#
+# Resume support: re-running with the same study_name + storage continues
+# adding trials to the same SQLite study.
+
+study_name: k1_dribble_v1
+storage: sqlite:///scripts/rsl_rl/optuna_tune/studies/k1_dribble_v1.db
+direction: maximize
+sampler: tpe                    # tpe | random | cmaes
+n_trials: 30
+seed: 42
+
+train:
+  # train_dribble.py instead of the default train.py (hierarchical training).
+  script: train_dribble.py
+  task: Isaac-Dribble-K1-v0
+  experiment_name: k1_dribble   # must match K1DribblePPORunnerCfg.experiment_name so logs land in logs/rsl_rl/k1_dribble/
+  num_envs: 4096
+  max_iterations: 4000          # short per-trial budget; bump for final tuning
+  trial_seed_offset: 1000
+  # Forwarded verbatim to train_dribble.py. --frozen_checkpoint is REQUIRED.
+  # Edit the path below to your trained walking policy (model_*.pt). Keep
+  # --low_level_obs_group / --high_action_clip in sync with how that policy was
+  # trained (see train_dribble.py docstring).
+  extra_args:
+    - "--headless"
+    - "--frozen_checkpoint"
+    - "/home/satoshi/IsaacLab-K1-Locomotion/scripts/rsl_rl/logs/rsl_rl/k1_flat/REPLACE_ME/model_XXXX.pt"
+    - "--low_level_obs_group"
+    - "low_level"
+
+metric:
+  # REQUIRED. Pick a TensorBoard scalar tag that appears in your
+  # logs/rsl_rl/k1_dribble/<run>/events.* files (open the run in TensorBoard
+  # to confirm the exact name). Useful dribble-specific choices:
+  #   "Train/mean_reward"
+  #   "Train/Episode_Reward/ball_velocity_along_kick"
+  #   "Train/Episode_Reward/ball_speed"
+  #   "Train/Episode_Reward/approach_ball_progress"
+  #   "Train/mean_episode_length"
+  tag: "Train/mean_reward"
+  reduce: mean_last_n           # last | final | mean_last_n | max
+  last_n: 30
+  fail_value: -1.0e9            # returned when train_dribble.py crashes or tag is missing
+
+# Each entry is "<scope>.<dot.path>: {type, ...}"
+# scope must be either "agent" (for K1DribblePPORunnerCfg) or "env" (K1DribbleEnvCfg).
+# NOTE: overrides are applied AFTER the env's __post_init__, so env.rewards.*
+# paths target the K1DribbleRewardsCfg terms set there. The
+# high_action_xy_coactivation weight is driven by a runtime curriculum, so
+# tuning env.rewards.high_action_xy_coactivation.weight has no lasting effect —
+# leave it out (it is intentionally omitted below).
+space:
+  # ---- high-level PPO algorithm ----
+  agent.algorithm.learning_rate:        {type: loguniform, low: 1.0e-4, high: 5.0e-3}
+  agent.algorithm.entropy_coef:         {type: loguniform, low: 1.0e-4, high: 1.0e-2}
+  agent.algorithm.clip_param:           {type: float,      low: 0.10,   high: 0.30}
+  agent.algorithm.gamma:                {type: float,      low: 0.95,   high: 0.999}
+  agent.algorithm.lam:                  {type: float,      low: 0.90,   high: 0.99}
+  agent.algorithm.num_learning_epochs:  {type: int,        low: 3,      high: 10}
+  agent.algorithm.num_mini_batches:     {type: categorical, choices: [2, 4, 8]}
+  agent.algorithm.desired_kl:           {type: loguniform, low: 5.0e-3, high: 5.0e-2}
+  agent.policy.init_noise_std:          {type: float,      low: 0.3,    high: 1.0}
+
+  # ---- dribble reward weights (see K1DribbleRewardsCfg in dribble_env_cfg.py) ----
+  # ball reward (main objective)
+  env.rewards.ball_velocity_along_kick.weight:   {type: float, low: 2.0,   high: 8.0}
+  env.rewards.ball_speed.weight:                 {type: float, low: 0.2,   high: 2.0}
+  # approach / shaping
+  env.rewards.approach_ball_progress.weight:     {type: float, low: 10.0,  high: 80.0}
+  env.rewards.robot_velocity_toward_ball.weight: {type: float, low: 1.0,   high: 6.0}
+  env.rewards.robot_facing_ball.weight:          {type: float, low: 0.2,   high: 2.0}
+  env.rewards.robot_behind_ball.weight:          {type: float, low: 0.2,   high: 2.0}
+  # penalties (kept negative)
+  # env.rewards.flat_orientation_l2.weight:        {type: float, low: -20.0, high: -2.0}
+  # env.rewards.action_smoothness_l2.weight:       {type: float, low: -0.4,  high: -0.02}
+  # env.rewards.action_rate_l2.weight:             {type: float, low: -0.8,  high: -0.05}
