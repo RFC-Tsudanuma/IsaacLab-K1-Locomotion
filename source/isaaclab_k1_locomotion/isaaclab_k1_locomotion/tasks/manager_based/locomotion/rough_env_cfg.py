@@ -66,7 +66,6 @@ _STAND_STILL_PENALTY_SCALE: float = 3.0
 # ここを切り替えること。
 _USE_RECURRENT_POLICY: bool = False
 
-
 _K1_URDF_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf",
@@ -258,14 +257,13 @@ class K1Rewards(RewardsCfg):
         params={"command_name": "base_velocity", "std": 0.35},
     )
 
-    
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
     feet_phase = RewTerm(
         func=feet_phase,
         weight=1.0, # 位相に合わせて足を動かすことへの報酬
         params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"), #body_names=".*_foot_link"
+            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "command_name": "base_velocity",
             "stance_ratio": _STANCE_RATIO,
             "cmd_threshold": _COMMAND_THRESHOLD,
@@ -329,16 +327,12 @@ class K1Rewards(RewardsCfg):
         weight=-0.10,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw", ".*_Hip_Roll"])},
     )
-    
+    # joint_deviation_arm = RewTerm(
+    #     func=mdp.joint_deviation_l1,
+    #     weight=-0.5,
+    #     params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
+    # )
 
-    """
-    joint_deviation_arm = RewTerm(
-        func=mdp.joint_deviation_l1,
-        weight=-0.5,
-        params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Shoulder_Pitch",".*_Shoulder_Roll",".*_Elbow_Pitch",".*_Elbow_Yaw"])},
-    )
-    """
-    
     base_height_penalty = RewTerm(
         func=minimum_height,
         weight=-100.0,
@@ -348,8 +342,6 @@ class K1Rewards(RewardsCfg):
             "sensor_cfg": None, 
         },
     )
-    
-
     feet_close_penalty = RewTerm(
         func=feet_close_penalty,
         weight=-20.0,
@@ -375,50 +367,6 @@ class K1Rewards(RewardsCfg):
             "stand_still_scale": _STAND_STILL_PENALTY_SCALE,
         },
     )
-    """
-    
-    feet_swing = RewTerm(
-        func=feet_swing,
-        weight=3.0,
-        params={
-            "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-            "phase_freq": _PHASE_FREQ,
-            "stance_ratio": _STANCE_RATIO,
-            "swing_period": 0.3,
-            "cmd_threshold": 0.1,
-            "command_name": "base_velocity",
-        },
-    )
-    
-    
-    foot_clearance_ji = RewTerm(
-        func=foot_clearance_ji,
-        weight=-75.0,
-        params={
-            "target_clearance": 0.11,
-        },
-    )
-
-    stand_still_joint_deviation = RewTerm(
-        func=stand_still_joint_deviation_l1,
-        weight=-0.5,
-        params={
-            "command_name": "base_velocity",
-            "cmd_threshold": 0.05,
-            "asset_cfg": SceneEntityCfg(
-                "robot",
-                joint_names=[
-                    ".*_Hip_Pitch",
-                    ".*_Knee_Pitch",
-                    ".*_Ankle_Pitch",
-                    ".*_Hip_Roll",
-                    ".*_Hip_Yaw",
-                ],
-            ),
-        },
-    )
-    
-    
 
     # dof_vel_l2 = RewTerm(
     #     func=mdp.joint_vel_l2,
@@ -507,7 +455,7 @@ class K1RoughEnvCfg(LocomotionVelocityRoughEnvCfg):
 
         # Commands
         self.commands.base_velocity.ranges.lin_vel_x = (0.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
         self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # Terminations

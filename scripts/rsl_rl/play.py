@@ -45,6 +45,9 @@ parser.add_argument(
 parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
+parser.add_argument("--cmd-vel-x", type=float, default=None, help="Override command lin_vel_x [m/s].")
+parser.add_argument("--cmd-vel-y", type=float, default=None, help="Override command lin_vel_y [m/s].")
+parser.add_argument("--cmd-yaw", type=float, default=None, help="Override command ang_vel_z [rad/s].")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -161,12 +164,8 @@ def setup_viser(env, urdf_path: str, port: int):
     return server, base_frame, viser_urdf, joint_indices, gui
 
 
-def override_command_from_viser(env, gui):
-    """Overwrite the ``base_velocity`` command tensor with viser GUI values.
-
-    Also disables the heading-based ang_vel_z recomputation and the standing-env
-    zeroing so the GUI values survive the next ``_update_command`` call.
-    """
+def override_velocity_command(env, vx: float, vy: float, wz: float):
+    """Overwrite the ``base_velocity`` command tensor with fixed values."""
     cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
     ref = getattr(cmd_term, "vel_command_b", None)
     if ref is None:
@@ -176,18 +175,30 @@ def override_command_from_viser(env, gui):
     device = ref.device
     num_envs = ref.shape[0]
     fixed = torch.tensor(
-        [[float(gui["vx"].value), float(gui["vy"].value), float(gui["wz"].value)]],
+        [[float(vx), float(vy), float(wz)]],
         device=device,
     ).repeat(num_envs, 1)
 
     if hasattr(cmd_term, "vel_command_b"):
         cmd_term.vel_command_b[:] = fixed
+    if hasattr(cmd_term, "command"):
+        try:
+            cmd_term.command[:] = fixed
+        except (AttributeError, TypeError):
+            pass
     # Disable heading-based ang_vel_z recomputation (overwrites vel_command_b[:, 2]).
     if hasattr(cmd_term, "is_heading_env"):
         cmd_term.is_heading_env[:] = False
     # Disable standing-env zeroing of the whole command vector.
     if hasattr(cmd_term, "is_standing_env"):
         cmd_term.is_standing_env[:] = False
+    if hasattr(cmd_term, "heading_target"):
+        cmd_term.heading_target[:] = 0.0
+
+
+def override_command_from_viser(env, gui):
+    """Overwrite the ``base_velocity`` command tensor with viser GUI values."""
+    override_velocity_command(env, float(gui["vx"].value), float(gui["vy"].value), float(gui["wz"].value))
 
 
 def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
@@ -322,6 +333,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         urdf_path = args_cli.viser_urdf or DEFAULT_VISER_URDF
         viser_state = setup_viser(env, urdf_path, args_cli.viser_port)
 
+    cli_override_enabled = args_cli.cmd_vel_x is not None or args_cli.cmd_vel_y is not None or args_cli.cmd_yaw is not None
+    cmd_vx = float(args_cli.cmd_vel_x) if args_cli.cmd_vel_x is not None else 0.0
+    cmd_vy = float(args_cli.cmd_vel_y) if args_cli.cmd_vel_y is not None else 0.0
+    cmd_wz = float(args_cli.cmd_yaw) if args_cli.cmd_yaw is not None else 0.0
+    if cli_override_enabled:
+        print(f"[INFO] CLI command override enabled: lin_vel_x={cmd_vx}, lin_vel_y={cmd_vy}, ang_vel_z={cmd_wz}")
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
@@ -338,6 +356,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     override_command_from_viser(env, viser_state[4])
                 except Exception as e:
                     print(f"[WARNING] Viser command override failed: {e}")
+            elif cli_override_enabled:
+                override_velocity_command(env, cmd_vx, cmd_vy, cmd_wz)
             # agent stepping
             actions = policy(obs)
             # env stepping

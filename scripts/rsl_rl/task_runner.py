@@ -115,6 +115,48 @@ def _build_axis(axis_cfg: dict[str, Any], default_end: float) -> SweepAxis:
     return SweepAxis(values=values)
 
 
+def _build_effort_axis(axis_cfg: dict[str, Any], default_end: float) -> SweepAxis:
+    """Build effort sweep axis.
+
+    Supports the standard start/step/end and the special pattern:
+    start -> (start + first_step) -> then +step_after_first repeatedly.
+    """
+    if "values" in axis_cfg:
+        return _build_axis(axis_cfg, default_end)
+
+    start = float(axis_cfg["start"])
+    end_raw = axis_cfg["end"]
+    end = default_end if isinstance(end_raw, str) and end_raw.lower() == "default" else float(end_raw)
+    first_step = float(axis_cfg.get("first_step", axis_cfg.get("step", 0.0)))
+    step_after_first = float(axis_cfg.get("step_after_first", axis_cfg.get("step", 0.0)))
+
+    if first_step <= 0 or step_after_first <= 0:
+        raise ValueError("Effort sweep 'first_step' and 'step_after_first' (or 'step') must be > 0.")
+    if start > end:
+        raise ValueError("Sweep axis 'start' must be <= 'end'.")
+
+    values: List[float] = [round(start, 6)]
+    current = start
+
+    if current < end - 1e-9:
+        current += first_step
+        if current <= end + 1e-9:
+            values.append(round(current, 6))
+
+    while current + step_after_first <= end + 1e-9:
+        current += step_after_first
+        values.append(round(current, 6))
+
+    if abs(values[-1] - end) > 1e-9:
+        values.append(round(end, 6))
+
+    unique_values: List[float] = []
+    for value in values:
+        if not unique_values or abs(unique_values[-1] - value) > 1e-9:
+            unique_values.append(value)
+    return SweepAxis(values=unique_values)
+
+
 def _format_value(value: float) -> str:
     return f"{value:g}".replace(".", "p")
 
@@ -787,7 +829,7 @@ def main() -> int:
 
     effort_end_default = max(default_effort.values())
     velocity_end_default = max(default_velocity.values())
-    effort_axis = _build_axis(sweep["effort_limit"], effort_end_default)
+    effort_axis = _build_effort_axis(sweep["effort_limit"], effort_end_default)
     velocity_axis = _build_axis(sweep["velocity_limit"], velocity_end_default)
 
     train_script = _repo_root() / Path(base.get("train_script", "scripts/rsl_rl/train.py"))
@@ -839,6 +881,9 @@ def main() -> int:
     print(f"Config: {cfg_path}")
     print(f"Default joint limits: effort_limit={default_effort}, velocity_limit={default_velocity}")
     print(f"Sweep counts: effort={len(effort_axis.values)}, velocity={len(velocity_axis.values)}")
+    print(f"Effort values: {effort_axis.values}")
+    print(f"Velocity values: {velocity_axis.values}")
+    print(f"Parameter grid (index, effort, velocity): {[(idx, eff, vel) for idx, eff, vel, _ in sweep_entries]}")
     if resume_state_path is not None and resume_state_path.exists():
         state = _load_state(resume_state_path)
         runner_log_root = Path(state["task_runner_log_root"])

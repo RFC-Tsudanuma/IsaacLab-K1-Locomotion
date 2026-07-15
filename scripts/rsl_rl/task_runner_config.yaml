@@ -42,7 +42,10 @@ sweep:
   # If end is "default", the value is taken from the env config
   effort_limit:
     start: 10
-    step: 10
+    # first step: 10 -> 20
+    first_step: 10
+    # then 20-step increments: 20 -> 40 -> 60 -> ...
+    step_after_first: 20
     end: default
 
   velocity_limit:

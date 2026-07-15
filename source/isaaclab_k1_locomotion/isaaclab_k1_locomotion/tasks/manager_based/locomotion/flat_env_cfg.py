@@ -74,6 +74,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
 
     # 線速度コマンド範囲を段階的に拡げるカリキュラム
     # 追従誤差(EMA)が threshold を下回るとステージが進む: ±0.3 → ±0.6 → ±1.0
+    '''
     lin_vel_command = CurrTerm(
         func=lin_vel_command_curriculum,
         params={
@@ -104,6 +105,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             "post_switch_ema_scale": 2.0,
         },
     )
+    '''
 
     # push_robot を段階的に強くするカリキュラム
     # 初期値 (EventCfg): interval 7-10s, vel ±0.5 → ±0.5
@@ -132,14 +134,6 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.events.randomize_phase_freq = EventTerm(
-            func=randomize_phase_freq,
-            mode="startup",
-            params={
-                "base_phase_freq": _PHASE_FREQ,
-                "offset_range": (-0.05, 0.05),
-            },
-        )
 
         # 環境毎に歩行周波数オフセットを ±0.05 Hz の範囲でランダム化 (startup で1度だけ)。
         # 基本周波数はコマンド速度に応じて線形遷移し (rough_env_cfg._PHASE_FREQ_PARAMS 参照)、
@@ -294,9 +288,9 @@ class K1FlatImproveAngTrackingCfg(K1FlatEnvCfg):
         # せっかく獲得した高速追従を一時的に練習しなくなる。yaw 追従の再学習に
         # 集中するため、lin の段階的拡張は止めて最終ステージ相当の広い範囲で固定する。
         self.curriculum.lin_vel_command = None
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.8, 1.8)
-        self.commands.base_velocity.ranges.lin_vel_y = (-0.9, 0.9)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
+        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
 
         # 多様な yaw コマンドに頻繁に晒すためリサンプリング間隔を短めに固定する。
         self.commands.base_velocity.resampling_time_range = (1.0, 5.0)
@@ -312,11 +306,3 @@ class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
-        
-
-        #前見る用コマンド
-        """
-        self.commands.base_velocity.ranges.lin_vel_x = (0.0, 0.6)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
-        """
