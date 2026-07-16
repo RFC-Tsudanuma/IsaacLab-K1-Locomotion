@@ -55,11 +55,12 @@ class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
 
 
 class KickDirectionCommand(UniformVelocityCommand):
-    """蹴り方向コマンド。
+    """蹴り方向 + 目標ボール速度コマンド。
 
-    エピソードごとにランダムな角度 θ をサンプリングし、
-    command = [sin θ, cos θ, 0] を返す。
-    kick_ball_velocity 報酬は command[:, :2] を方向ベクトルとして使用する。
+    エピソードごとにランダムな角度 θ と目標ボール速度 v をサンプリングし、
+    command = [sin θ, cos θ, v] を返す。
+    kick_state は command[:, :2] を蹴り方向ベクトル (cos θ, sin θ) として、
+    target_kick_velocity 観測と kick_velocity_scaled 報酬は command[:, 2] を目標速度として使用する。
     """
 
     cfg: "KickDirectionCommandCfg"
@@ -76,9 +77,11 @@ class KickDirectionCommand(UniformVelocityCommand):
         offset = torch.empty(n, device=self.device).uniform_(low, high)
         theta = robot_yaw + offset
 
+        speed_low, speed_high = self.cfg.target_speed_range
+
         self.command[env_ids, 0] = torch.sin(theta)
         self.command[env_ids, 1] = torch.cos(theta)
-        self.command[env_ids, 2] = 0.0
+        self.command[env_ids, 2] = torch.empty(n, device=self.device).uniform_(speed_low, speed_high)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -113,11 +116,14 @@ class KickDirectionCommand(UniformVelocityCommand):
 class KickDirectionCommandCfg(UniformVelocityCommandCfg):
     """蹴り方向コマンドの設定クラス。
 
-    ranges.heading でサンプリング範囲を指定する。
+    ranges.heading で蹴り方向のサンプリング範囲を指定する。
     ranges.lin_vel_x/y, ang_vel_z は使用しない（0 に設定すること）。
     """
 
     class_type: type = KickDirectionCommand
+
+    target_speed_range: tuple[float, float] = (1.0, 4.0)
+    """目標ボール速度 [m/s] のサンプリング範囲。command[:, 2] に格納される。"""
 
 
 class BallFollowVelocityCommand(UniformVelocityCommand):

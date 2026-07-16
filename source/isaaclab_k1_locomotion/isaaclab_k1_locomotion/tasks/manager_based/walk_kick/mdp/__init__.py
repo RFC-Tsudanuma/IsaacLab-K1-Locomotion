@@ -5,6 +5,7 @@
 
 from .curriculums import *
 from .events import *
+from .kick_state import kick_state
 from .observations import *
 from .rewards import *
 from .terminations import *

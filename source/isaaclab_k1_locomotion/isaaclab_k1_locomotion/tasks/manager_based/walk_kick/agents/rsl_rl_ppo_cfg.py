@@ -14,3 +14,10 @@ class K1WalkKickPPORunnerCfg(K1FlatPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick"
+
+        # 左右対称性 (mirror loss) は walk_kick では使えないので無効化する。
+        # locomotion.mdp.symmetry の _mirror_policy_obs は歩行タスクの 49 次元観測
+        # 専用で、走らせると次元不一致で ValueError になる。加えて walk_kick の観測は
+        # 左足裏の位置だけを含む (対応する右足裏が観測に無い) ため、矢状面での左右反転が
+        # そもそも定義できない。キック足を固定する論文の設定とも整合する。
+        self.algorithm.symmetry_cfg = None

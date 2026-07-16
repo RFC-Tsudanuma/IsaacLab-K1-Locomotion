@@ -8,55 +8,38 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
+from .kick_state import kick_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def reached_ball(
+def kick_finished(
     env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    threshold: float = 0.3,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    delay_steps: int = 30,
 ) -> torch.Tensor:
-    """ロボットがボールに十分近づいたら True を返す終了条件。shape: (N,) bool"""
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
-    dist = torch.norm(
-        ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
-    )
-    return dist < threshold
+    """キック成立 (kick_done) から delay_steps 後にエピソードを終了する。shape: (N,) bool
 
+    1 エピソード = 1 キック。飛翔後しばらくは項1-3 を凍結値で dense に払い続けたいので、
+    latch 直後ではなく delay_steps だけ待ってから終了させる。
 
-def ball_kicked_after_contact(
-    env: ManagerBasedRLEnv,
-    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
-    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
-    delay_steps: int = 20,
-    contact_threshold: float = 0.5,
-) -> torch.Tensor:
-    """足がボールに触れてから delay_steps ステップ後に True を返す終了条件。shape: (N,) bool
-
-    delay_steps=20 は制御周波数 50Hz で約 0.4 秒に相当。
+    NOTE: この項は weight とは無関係に毎ステップ評価されるため、:func:`kick_state` の
+          更新を保証する役割も担っている。RewardManager は weight==0 の項をスキップするので、
+          カリキュラムで 0 から立ち上げる報酬項に状態更新を任せることはできない。
+          TerminationManager は RewardManager より先に走るので、報酬項が読む時点で最新になる。
     """
-    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
-    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
 
-    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
-    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
-    contacted = (force_right > contact_threshold) | (force_left > contact_threshold)
+    if not hasattr(env, "_kick_done_counter"):
+        env._kick_done_counter = torch.zeros(env.num_envs, dtype=torch.int32, device=env.device)
 
-    if not hasattr(env, "_kick_contact_counter"):
-        env._kick_contact_counter = torch.zeros(env.num_envs, dtype=torch.int32, device=env.device)
+    just_reset = env.episode_length_buf == 1
+    env._kick_done_counter[just_reset] = 0
 
-    # エピソードリセット時にカウンタをリセット
-    just_reset = env.episode_length_buf <= 1
-    env._kick_contact_counter[just_reset] = 0
+    counting = state["kick_done"]
+    env._kick_done_counter[counting] += 1
 
-    # 接触開始またはカウント中 → まだ delay_steps に達していなければインクリメント
-    counting = env._kick_contact_counter > 0
-    should_increment = (counting | contacted) & (env._kick_contact_counter < delay_steps)
-    env._kick_contact_counter[should_increment] += 1
-
-    return env._kick_contact_counter >= delay_steps
+    return env._kick_done_counter >= delay_steps

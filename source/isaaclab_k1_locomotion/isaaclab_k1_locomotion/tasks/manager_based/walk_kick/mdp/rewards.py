@@ -3,318 +3,157 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""walk_kick のキック報酬。
+
+B-Human "A Modular Ball Kicking Behavior with Reinforcement Learning" の
+報酬テーブルを K1 向けに実装したもの。latch 状態は :mod:`.kick_state` が管理する。
+
+フェーズゲート:
+  * pre-latch  (kick_done=false): 項1-3 = 0、項4/5 有効
+  * L 発火時                    : τ_direction, v_ball, p_style を凍結、kick_done=true、G を P_kick に固定
+  * post-latch (kick_done=true) : 項1-3 を凍結値で毎ステップ dense に払う、項5 = 0、項4 継続
+  * 項6 (overshoot) は常時有効
+"""
+
 from __future__ import annotations
 
-import math
 import torch
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
-from isaaclab.sensors import ContactSensor
-from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
+from .kick_state import kick_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
-def touch_ball(
+def _r_direction(
     env: ManagerBasedRLEnv,
-    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
-    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
-    threshold: float = 0.5,
-) -> torch.Tensor:
-    """足がボールに接触したときの報酬。どちらの足でも可。shape: (N,)"""
-    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
-    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float,
+) -> tuple[torch.Tensor, dict]:
+    """r_direction = (f(τ_direction) − 0.5) * 2 * p_style （いずれも凍結値）。
 
-    # net_forces_w: (N, n_bodies, 3) — フィルタ済みなのでボールからの力のみ
-    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
-    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
-
-    return ((force_right > threshold) | (force_left > threshold)).float()
-
-
-def ball_distance(
-    env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-) -> torch.Tensor:
-    """ボールに近いほど高い報酬（接近を促す）。shape: (N,)"""
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
-
-    dist = torch.norm(
-        ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
-    )
-    return torch.exp(-dist)
-
-
-def kick_ball_velocity(
-    env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    command_name: str = "base_velocity",
-) -> torch.Tensor:
-    """ボールが速度コマンド方向に動いているときの報酬。shape: (N,)"""
-    ball = env.scene[ball_cfg.name]
-    ball_vel = ball.data.root_lin_vel_w[:, :2]  # (N, 2)
-
-    command = env.command_manager.get_command(command_name)  # (N, 3) [vx, vy, wz]
-    cmd_dir = command[:, :2]
-    cmd_dir_normalized = cmd_dir / (cmd_dir.norm(dim=-1, keepdim=True) + 1e-6)
-
-    ball_speed_in_cmd_dir = (ball_vel * cmd_dir_normalized).sum(dim=-1)
-    return torch.clamp(ball_speed_in_cmd_dir, min=0.0)
-
-
-def kick_ball_forward(
-    env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-) -> torch.Tensor:
-    """ボールがロボットの前方に動いているときの報酬（コマンドマネージャー不要）。shape: (N,)"""
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
-
-    ball_vel_w = ball.data.root_lin_vel_w[:, :2]
-
-    # ロボットのヨー角から前方ベクトルを計算
-    quat = robot.data.root_quat_w  # (N, 4) [w, x, y, z]
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    forward = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)  # (N, 2)
-
-    speed_forward = (ball_vel_w * forward).sum(dim=-1)
-    return torch.clamp(speed_forward, min=0.0)
-
-
-def ball_in_front(
-    env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    fov_half_angle: float = 0.524,
-) -> torch.Tensor:
-    """ボールがロボットのカメラ視野内にあるときの報酬。shape: (N,)
-
-    ロボット前方を基準に水平角が fov_half_angle [rad] 以内なら 1.0，
-    それ以外は指数的に減衰。デフォルト 0.524 rad ≈ 30°（片側）。
+    f(τ) = exp(−τ² / 2σ²) なので τ=0 (方向ぴったり) で f=1 → r_direction = +p_style、
+    方向が大きく外れると f→0 → r_direction = −p_style。
+    pre-latch では凍結値が 0 のままなので、呼び出し側で kick_done ゲートを掛けること。
     """
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
 
-    rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-    rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
+    tau = state["tau_direction_frozen"]
+    f_dir = torch.exp(-(tau**2) / (2.0 * sigma_direction**2))
+    r_dir = (f_dir - 0.5) * 2.0 * state["p_style_frozen"]
 
-    x_rel = rel_pos_b[:, 0]
-    y_rel = rel_pos_b[:, 1]
-
-    # ロボット前方からボールへの水平角（絶対値）
-    horiz_angle = torch.atan2(torch.abs(y_rel), x_rel.clamp(min=1e-6))
-
-    in_front = (x_rel > 0.0).float()
-    # FOV 内は 1.0，外側は指数減衰
-    in_fov_score = torch.exp(-((horiz_angle - fov_half_angle).clamp(min=0.0) ** 2) / (fov_half_angle ** 2))
-    return in_front * in_fov_score
+    # pre-latch は 0
+    return r_dir * state["kick_done"].float(), state
 
 
-def robot_xy_speed(
+def kick_direction(
     env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
 ) -> torch.Tensor:
-    """ロボットの水平面（XY）移動速度ノルム。shape: (N,)"""
-    robot = env.scene["robot"]
-    return robot.data.root_lin_vel_w[:, :2].norm(dim=-1)
+    """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)"""
+    r_dir, _ = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    return r_dir
 
 
-def reach_ball_bonus(
+def kick_velocity_scaled(
     env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    threshold: float = 0.3,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    sigma_velocity: float = 1.0,
 ) -> torch.Tensor:
-    """ボールに到達したとき（かつ time_out でないとき）に 1 を返す成功ボーナス。shape: (N,)"""
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
-    dist = torch.norm(
-        ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
-    )
-    reached = dist < threshold
-    not_timeout = ~env.termination_manager.time_outs
-    return (reached & not_timeout).float()
+    """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
-
-def approach_ball(
-    env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-) -> torch.Tensor:
-    """前ステップより近づいた分だけ報酬（ポテンシャル差分）。shape: (N,)"""
-    ball = env.scene[ball_cfg.name]
-    robot = env.scene["robot"]
-    dist = torch.norm(
-        ball.data.root_pos_w[:, :2] - robot.data.root_pos_w[:, :2], dim=-1
-    )
-
-    if not hasattr(env, "_approach_ball_prev_dist"):
-        env._approach_ball_prev_dist = dist.clone()
-        return torch.zeros(env.num_envs, device=env.device)
-
-    # エピソードリセット直後は差分をゼロにする
-    just_reset = env.episode_length_buf <= 1
-    env._approach_ball_prev_dist[just_reset] = dist[just_reset]
-
-    reward = env._approach_ball_prev_dist - dist
-    env._approach_ball_prev_dist = dist.clone()
-    return reward
-
-
-def align_to_kick_direction(
-    env: ManagerBasedRLEnv,
-    command_name: str = "kick_direction",
-) -> torch.Tensor:
-    """ロボットのヨー方向が kick_direction コマンドと一致しているときの報酬。shape: (N,)
-
-    command = [sin θ, cos θ, 0]（KickDirectionCommand の形式）。
-    前方向ベクトルとの cos 類似度を [0, 1] にクリップして返す。
+    f(v_ball) は「要求された蹴り速度 v_target にどれだけ一致したか」を測る。
+    指令速度に対する一致度を見ないと可変キック強度が学習できないため、
+    f(v) = exp(−((v − v_target) / σ)²) とした。
     """
-    robot = env.scene["robot"]
-    command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
 
-    quat = robot.data.root_quat_w  # (N, 4) [w, x, y, z]
-    w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
-    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-
-    # ロボット前方ベクトル (cos yaw, sin yaw)
-    forward_x = torch.cos(yaw)
-    forward_y = torch.sin(yaw)
-
-    # kick_direction ベクトル: command[0]=sin θ, command[1]=cos θ → (cos θ, sin θ)
-    kick_x = command[:, 1]  # cos θ
-    kick_y = command[:, 0]  # sin θ
-
-    cos_sim = forward_x * kick_x + forward_y * kick_y
-    return torch.clamp(cos_sim, min=0.0)
+    v_err = state["v_ball_frozen"] - state["v_target"]
+    f_vel = torch.exp(-((v_err / sigma_velocity) ** 2))
+    return r_dir * f_vel
 
 
-def kick_direction_exp(
+def kick_velocity_strong(
     env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    command_name: str = "kick_direction",
-    sigma: float = 0.25,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
 ) -> torch.Tensor:
-    """ボール速度方向が kick_direction コマンドと一致しているときの指数報酬。shape: (N,)
-
-    ボールが動いていないときは報酬なし。
-    sigma: 方向誤差の許容幅（小さいほど厳密な方向一致を要求）。
-    """
-    ball = env.scene[ball_cfg.name]
-    ball_vel = ball.data.root_lin_vel_w[:, :2]  # (N, 2)
-    ball_speed = ball_vel.norm(dim=-1)
-
-    moving = (ball_speed > 0.01).float()
-    ball_dir = ball_vel / (ball_speed.unsqueeze(-1) + 1e-6)
-
-    command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
-    kick_dir = torch.stack([command[:, 1], command[:, 0]], dim=-1)  # (cos θ, sin θ)
-
-    cos_sim = (ball_dir * kick_dir).sum(dim=-1)
-    return moving * torch.exp(-(1.0 - cos_sim) / sigma)
+    """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    return r_dir * state["v_ball_frozen"]
 
 
-def kick_velocity_exp(
+def walk_speed(
     env: ManagerBasedRLEnv,
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    command_name: str = "kick_direction",
-    sigma: float = 1.0,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_walk: float = 0.5,
+    sigma_walk_potential: float = 0.5,
 ) -> torch.Tensor:
-    """kick_direction 方向のボール速度が大きいときの指数報酬。shape: (N,)
+    """項4. Walk Speed = (f(τ_walk) − 0.5) * 2 * p_walk。shape: (N,)
 
-    1 - exp(-v / sigma) の形式で，速度が増すほど 1 に近づく。
-    sigma: 報酬が飽和する速度スケール [m/s]。
+    τ_walk はロボット速度の G 方向成分（符号付き）。f = sigmoid(τ_walk / σ) なので、
+    G に向かって進めば正、遠ざかれば負になる。p_walk = exp(−d(robot, G) / σ_pot) は
+    G への接近度 (1 = 到達)。G は P_kick で下限クランプされるので、キック立ち位置に
+    着いた時点で p_walk が飽和し、この項は self-gate する。凍結しない。
     """
-    ball = env.scene[ball_cfg.name]
-    ball_vel = ball.data.root_lin_vel_w[:, :2]  # (N, 2)
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
 
-    command = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, 0]
-    kick_dir = torch.stack([command[:, 1], command[:, 0]], dim=-1)  # (cos θ, sin θ)
-
-    speed_in_kick_dir = (ball_vel * kick_dir).sum(dim=-1)
-    return 1.0 - torch.exp(-torch.clamp(speed_in_kick_dir, min=0.0) / sigma)
+    f_walk = torch.sigmoid(state["tau_walk"] / sigma_walk)
+    p_walk = torch.exp(-state["d_to_G"] / sigma_walk_potential)
+    return (f_walk - 0.5) * 2.0 * p_walk
 
 
-def reset_ball_after_kick(
+def approach_penalty(
     env: ManagerBasedRLEnv,
-    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
-    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
-    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    delay_steps: int = 20,
-    contact_threshold: float = 0.5,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_sole: float = 0.35,
+    sigma_pose: float = 0.3,
 ) -> torch.Tensor:
-    """足がボールに触れてから delay_steps 後にボールを初期位置へリセットする。
+    """項5. Approach Penalty = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
-    エピソードを終了せずボールだけをリセットすることで、ロボットが
-    連続してキック練習を行えるようにする。報酬は常に 0。
+    * f(d_soleToBall) = 1 − exp(−(d/σ)²) : 足裏がボールから **遠いほど大きい** (近い=0, 遠い=1)
+    * p_kickPose                          : 理想キック姿勢からの **ズレほど大きい** (合致=0, ズレ=1)
+
+    理想（足がボールに近い × 姿勢が P_kick と一致）で 0、最悪（遠い × ズレ）で最大の罰。
+    pre-latch のみ有効（kick_done で 0 ゲート）。
     """
-    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
-    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
 
-    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
-    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
-    contacted = (force_right > contact_threshold) | (force_left > contact_threshold)
+    # 遠いほど 1 に近づく
+    f_sole = 1.0 - torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
 
-    if not hasattr(env, "_ball_reset_counter"):
-        env._ball_reset_counter = torch.zeros(env.num_envs, dtype=torch.int32, device=env.device)
+    # 理想キック姿勢 = P_kick に立ち、蹴り方向を向いている。合致度が高いほど 0 に近づく。
+    pose_match = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2)) * state["p_style"]
+    p_kick_pose = 1.0 - pose_match
 
-    just_reset = env.episode_length_buf <= 1
-    env._ball_reset_counter[just_reset] = 0
-
-    counting = env._ball_reset_counter > 0
-    should_increment = (counting | contacted) & (env._ball_reset_counter < delay_steps)
-    env._ball_reset_counter[should_increment] += 1
-
-    triggered = (env._ball_reset_counter >= delay_steps).nonzero(as_tuple=False).squeeze(-1)
-    if triggered.numel() > 0:
-        ball = env.scene[ball_cfg.name]
-        robot = env.scene["robot"]
-        n = triggered.numel()
-
-        robot_pos_w = robot.data.root_pos_w[triggered]
-        robot_quat_w = robot.data.root_quat_w[triggered]
-        qw, qx, qy, qz = robot_quat_w[:, 0], robot_quat_w[:, 1], robot_quat_w[:, 2], robot_quat_w[:, 3]
-        yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-
-        dist = torch.empty(n, device=env.device).uniform_(0.3, 0.8)
-        angle_offset = torch.empty(n, device=env.device).uniform_(-math.pi / 3, math.pi / 3)
-        target_angle = yaw + angle_offset
-        dx = dist * torch.cos(target_angle)
-        dy = dist * torch.sin(target_angle)
-
-        ball_state = ball.data.default_root_state[triggered].clone()
-        ball_state[:, :3] += env.scene.env_origins[triggered]
-        ball_state[:, 0] = robot_pos_w[:, 0] + dx
-        ball_state[:, 1] = robot_pos_w[:, 1] + dy
-        ball_state[:, 2] = 0.11
-        ball_state[:, 7:] = 0.0
-
-        ball.write_root_state_to_sim(ball_state, env_ids=triggered)
-        env._ball_reset_counter[triggered] = 0
-
-        kick_cmd_term = env.command_manager._terms.get("kick_direction")
-        if kick_cmd_term is not None:
-            kick_cmd_term._resample(triggered)
-
-    return torch.zeros(env.num_envs, device=env.device)
+    return f_sole * p_kick_pose * (~state["kick_done"]).float()
 
 
-def single_foot_contact(
+def kick_pose_overshoot(
     env: ManagerBasedRLEnv,
-    sensor_cfg_right: SceneEntityCfg = SceneEntityCfg("contact_balls_right"),
-    sensor_cfg_left: SceneEntityCfg = SceneEntityCfg("contact_balls_left"),
-    threshold: float = 0.5,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
 ) -> torch.Tensor:
-    """両足同時接触ペナルティ（片足接触を推奨）。負の重みで使用。shape: (N,)
+    """項6. Kick Pose Overshoot。後方レイ R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
-    両足が同時にボールに接触しているとき 1.0 を返す。
-    負の重みを設定することで同時接触を抑制し，片足キックを促す。
+    エピソード開始時に記録した s = dot(base_pos − ball_pos, right_vec) の符号を初期側とし、
+    符号が反転したら発火して latch する。戻っても解除せず、1 エピソード最大 1 回だけ罰する。
     """
-    sensor_right: ContactSensor = env.scene[sensor_cfg_right.name]
-    sensor_left: ContactSensor = env.scene[sensor_cfg_left.name]
-
-    force_right = sensor_right.data.net_forces_w[:, 0, :].norm(dim=-1)
-    force_left = sensor_left.data.net_forces_w[:, 0, :].norm(dim=-1)
-
-    both_contact = (force_right > threshold) & (force_left > threshold)
-    return both_contact.float()
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    return state["overshoot_event"]
