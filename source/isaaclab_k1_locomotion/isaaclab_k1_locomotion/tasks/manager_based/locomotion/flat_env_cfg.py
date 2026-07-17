@@ -13,9 +13,7 @@ from isaaclab.terrains import TerrainGeneratorCfg
 
 from .rough_env_cfg import K1RoughEnvCfg, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
-import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
-from .mdp.commands import DiscreteVelocityCommandCfg
 from .mdp.events import randomize_phase_freq_offset
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
 from .mdp.curriculums import (
@@ -206,27 +204,25 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             weight=-1.0e-6,
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
-        # 速度コマンドを離散格子からサンプリングする版に差し替える
-        # lin_vel_x / lin_vel_y は lin_vel_command カリキュラムが段階的に拡張する
-        prev = self.commands.base_velocity
-        self.commands.base_velocity = DiscreteVelocityCommandCfg(
-            asset_name=prev.asset_name,
-            resampling_time_range=prev.resampling_time_range,
-            rel_standing_envs=prev.rel_standing_envs,
-            rel_heading_envs=prev.rel_heading_envs,
-            heading_command=prev.heading_command,
-            heading_control_stiffness=prev.heading_control_stiffness,
-            debug_vis=prev.debug_vis,
-            ranges=DiscreteVelocityCommandCfg.Ranges(
-                lin_vel_x=prev.ranges.lin_vel_x,
-                lin_vel_y=prev.ranges.lin_vel_y,
-                ang_vel_z=(-1.0, 1.0),
-                heading=(-math.pi, math.pi),
-            ),
-            lin_vel_x_resolution=0.05,
-            lin_vel_y_resolution=0.05,
-            ang_vel_z_resolution=0.2,
+        # ガニ股対策 (2026-07-13): 左右 Hip_Yaw が外向きに開いた歩容になったため、
+        # Hip_Yaw の偏差を独立項に分離して強く罰する。joint_deviation_hip (rough 側で
+        # Yaw+Roll 合算 weight=-0.10) は Roll のみに変更。旧挙動は
+        # joint_deviation_hip_yaw.weight=-0.10 と等価なので、重みだけで新旧比較できる。
+        self.rewards.joint_deviation_hip.params["asset_cfg"] = SceneEntityCfg(
+            "robot", joint_names=[".*_Hip_Roll"]
         )
+        # weight は -0.1/-0.5/-1.0/-2.0 の比較で決定: -1.0 で Σ|yaw| 0.33→0.107 rad
+        # (67%減) かつ追従スコアはむしろ向上。-2.0 は lin 追従が崩れるため過剰。
+        self.rewards.joint_deviation_hip_yaw = RewTerm(
+            func=mdp.joint_deviation_l1,
+            weight=-1.0,
+            params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw"])},
+        )
+
+        # 速度コマンドは velocity_env_cfg の UniformVelocityCommandCfg (連続サンプリング) を
+        # そのまま使う。以前は離散格子サンプリング (DiscreteVelocityCommandCfg) に差し替えて
+        # いたが、速度追従が十分になったため連続版に戻した (2026-07-13)。
+        # lin_vel_x / lin_vel_y の範囲は lin_vel_command カリキュラムが段階的に拡張する。
 
 @configclass
 class K1FlatEnvLearnStandingCfg(K1FlatEnvCfg):

@@ -350,9 +350,12 @@ class K1Rewards(RewardsCfg):
         },
     )
 
+    # weight は 30/45/60/90/120 の 5000iter 比較 (2026-07-17) で決定。追従調和平均は
+    # 30:0.584 → 45:0.588 → 60:0.590 → 90:0.593 → 120:0.490 と 90 までは単調改善、
+    # 120 で lin 追従が崩壊する。10000iter 継続でも 90 (0.616) > 60 (0.605) を確認し 90 を採用。
     feet_parallel_to_ground = RewTerm(
         func=feet_parallel_to_ground,
-        weight=30.0,
+        weight=90.0,
         params={
             "sigma": 0.08
         },
