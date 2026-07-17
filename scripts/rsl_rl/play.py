@@ -207,6 +207,41 @@ def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
     viser_urdf.update_cfg(cfg)
 
 
+def log_terminations(env, step: int, counts: dict, episode_start: torch.Tensor) -> None:
+    """Print which termination term fired this step, for which env, and after how long.
+
+    ``termination_manager._term_dones`` is only overwritten by ``compute()`` and is not
+    cleared by ``_reset_idx``, so it still holds this step's values once ``env.step()``
+    returns. Several terms can fire for the same env on the same step (e.g. a robot that
+    falls exactly on the timeout), so every active term is checked rather than just the first.
+    """
+    term_mgr = getattr(env.unwrapped, "termination_manager", None)
+    if term_mgr is None:  # direct-workflow envs have no termination manager
+        return
+
+    for name in term_mgr.active_terms:
+        fired = term_mgr.get_term(name).nonzero(as_tuple=False).squeeze(-1)
+        if fired.numel() == 0:
+            continue
+        counts[name] = counts.get(name, 0) + int(fired.numel())
+        for env_idx in fired.tolist():
+            duration = step - int(episode_start[env_idx].item())
+            print(f"[TERM] step {step:6d} | env {env_idx:3d} | {name:16s} | episode {duration:4d} steps")
+        episode_start[fired] = step
+
+
+def print_termination_summary(counts: dict) -> None:
+    """Print how often each termination term fired over the whole play session."""
+    total = sum(counts.values())
+    print("\n[TERM] ---- termination summary ----")
+    if total == 0:
+        print("[TERM] no terminations recorded")
+        return
+    for name, n in sorted(counts.items(), key=lambda kv: -kv[1]):
+        print(f"[TERM] {name:16s} {n:6d}  ({100.0 * n / total:5.1f}%)")
+    print(f"[TERM] {'total':16s} {total:6d}")
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -325,48 +360,58 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # reset environment
     obs = env.get_observations()
     timestep = 0
+    # termination logging: cumulative per-term counts + the step each env's episode started on
+    term_counts: dict[str, int] = {}
+    step_count = 0
+    episode_start = torch.zeros(env.unwrapped.num_envs, dtype=torch.long)
     # manual frame buffer for robust video recording
     _manual_frames = [] if args_cli.video else None
     # simulate environment
-    while simulation_app.is_running():
-        start_time = time.time()
-        # run everything in inference mode
-        with torch.inference_mode():
-            # override velocity command from viser GUI before policy inference
+    try:
+        while simulation_app.is_running():
+            start_time = time.time()
+            # run everything in inference mode
+            with torch.inference_mode():
+                # override velocity command from viser GUI before policy inference
+                if viser_state is not None:
+                    try:
+                        override_command_from_viser(env, viser_state[4])
+                    except Exception as e:
+                        print(f"[WARNING] Viser command override failed: {e}")
+                # agent stepping
+                actions = policy(obs)
+                # env stepping
+                obs, _, dones, _ = env.step(actions)
+                # reset recurrent states for episodes that have terminated
+                policy_nn.reset(dones)
+            step_count += 1
+            log_terminations(env, step_count, term_counts, episode_start)
             if viser_state is not None:
                 try:
-                    override_command_from_viser(env, viser_state[4])
+                    _, base_frame, viser_urdf, joint_indices, _ = viser_state
+                    update_viser(env, base_frame, viser_urdf, joint_indices, env_idx=args_cli.viser_env_idx)
                 except Exception as e:
-                    print(f"[WARNING] Viser command override failed: {e}")
-            # agent stepping
-            actions = policy(obs)
-            # env stepping
-            obs, _, dones, _ = env.step(actions)
-            # reset recurrent states for episodes that have terminated
-            policy_nn.reset(dones)
-        if viser_state is not None:
-            try:
-                _, base_frame, viser_urdf, joint_indices, _ = viser_state
-                update_viser(env, base_frame, viser_urdf, joint_indices, env_idx=args_cli.viser_env_idx)
-            except Exception as e:
-                print(f"[WARNING] Viser update failed: {e}")
-        if args_cli.video:
-            # Manually capture frame as fallback in case RecordVideo fails
-            try:
-                frame = env.unwrapped.render()
-            except Exception:
-                frame = None
-            if frame is not None and hasattr(frame, "shape") and frame.size > 0:
-                _manual_frames.append(frame.copy())
-            timestep += 1
-            # Exit the play loop after recording one video
-            if timestep == args_cli.video_length:
-                break
+                    print(f"[WARNING] Viser update failed: {e}")
+            if args_cli.video:
+                # Manually capture frame as fallback in case RecordVideo fails
+                try:
+                    frame = env.unwrapped.render()
+                except Exception:
+                    frame = None
+                if frame is not None and hasattr(frame, "shape") and frame.size > 0:
+                    _manual_frames.append(frame.copy())
+                timestep += 1
+                # Exit the play loop after recording one video
+                if timestep == args_cli.video_length:
+                    break
 
-        # time delay for real-time evaluation
-        sleep_time = dt - (time.time() - start_time)
-        if args_cli.real_time and sleep_time > 0:
-            time.sleep(sleep_time)
+            # time delay for real-time evaluation
+            sleep_time = dt - (time.time() - start_time)
+            if args_cli.real_time and sleep_time > 0:
+                time.sleep(sleep_time)
+    finally:
+        # the play loop normally runs until interrupted, so print the summary on the way out
+        print_termination_summary(term_counts)
 
     # Save video from manual frames if RecordVideo wrapper produced no output
     if args_cli.video and _manual_frames:
