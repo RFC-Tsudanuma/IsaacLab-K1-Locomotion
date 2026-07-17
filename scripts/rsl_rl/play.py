@@ -345,9 +345,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         normalizer = None
 
     # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    run_dir = os.path.dirname(resume_path)
+    export_model_dir = os.path.join(run_dir, "exported")
+    onnx_filename = f"{agent_cfg.experiment_name}_{os.path.basename(run_dir)}.onnx"
     export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
+    print(f"[INFO]: Exported policy to: {os.path.join(export_model_dir, onnx_filename)}")
 
     dt = env.unwrapped.step_dt
 
