@@ -300,13 +300,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         loaded = torch.load(pretrained_path, map_location=agent_cfg.device)
         state_dict = loaded.get("model_state_dict", loaded)
 
-        # 入力層・normalizerはobs次元が違うので除外してロード
-        filtered = {k: v for k, v in state_dict.items()
-                    if not any(k.startswith(p) for p in [
-                        "actor.0.weight",
-                        "actor_obs_normalizer",
-                    ])}
         policy = getattr(runner.alg, 'actor_critic', None) or getattr(runner.alg, 'policy', None)
+
+        # 形の合うテンソルだけをロードする。
+        # obs次元が違う転移では入力層 (actor.0.weight) と normalizer の形が合わないので
+        # 自動的に除外され、新しい次元で初期化されたままになる。
+        # obs次元が同じ転移 (例: walk_kick の walk phase → kick phase) では入力層も
+        # normalizer の統計もそのまま引き継がれる。
+        live_msd = policy.state_dict()
+        filtered = {}
+        skipped = []
+        for k, v in state_dict.items():
+            if k in live_msd and live_msd[k].shape == v.shape:
+                filtered[k] = v
+            else:
+                shape_info = f"{tuple(v.shape)} -> {tuple(live_msd[k].shape)}" if k in live_msd else "not in model"
+                skipped.append(f"{k} ({shape_info})")
+        print(f"[INFO]: Loaded {len(filtered)} tensors from pretrained checkpoint.")
+        if skipped:
+            print(f"[INFO]: Skipped {len(skipped)} tensors (shape mismatch / unknown key):")
+            for s in skipped:
+                print(f"          {s}")
+
         result = policy.load_state_dict(filtered, strict=False)
         if isinstance(result, tuple):
             missing, unexpected = result

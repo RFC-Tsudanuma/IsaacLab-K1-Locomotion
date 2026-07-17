@@ -14,6 +14,7 @@ class K1WalkKickPPORunnerCfg(K1FlatPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick"
+        self.max_iterations = 20000
 
         # 左右対称性 (mirror loss) は walk_kick では使えないので無効化する。
         # locomotion.mdp.symmetry の _mirror_policy_obs は歩行タスクの 49 次元観測
@@ -31,3 +32,4 @@ class K1WalkKickWalkPhasePPORunnerCfg(K1WalkKickPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick_walk_phase"
+        self.max_iterations = 20000
