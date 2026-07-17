@@ -290,11 +290,14 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # NOTE: perturb_ball（定期的にボールをずらすイベント）は無効化した。
         #       P_kick はエピソード開始時のボール位置に固定するため、途中でボールが
         #       動くと理想キック立ち位置が実際のボールとずれてしまう。
+        # NOTE: dist_range の下限は「リセット直後にロボットの足がボールに触れない距離」。
+        #       base 中心からの距離なので、ball_radius (0.11m) と足の張り出しを考えると
+        #       0.3m では正面に湧いたときに接触する。r_stance (0.25m) より十分外側でもある。
         self.events.reset_ball = EventTerm(
             func=mdp.reset_ball_in_front_of_robot,
             mode="reset",
             params={
-                "dist_range": (0.3, 0.8),
+                "dist_range": (0.5, 0.8),
                 "half_angle": 1.047,
                 "ball_radius": _BALL_RADIUS,
             },

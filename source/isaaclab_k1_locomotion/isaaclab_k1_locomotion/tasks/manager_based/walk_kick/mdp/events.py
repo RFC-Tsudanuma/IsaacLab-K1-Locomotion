@@ -14,26 +14,35 @@ def reset_ball_in_front_of_robot(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
-    dist_range: tuple[float, float] = (0.3, 0.8),
+    dist_range: tuple[float, float] = (0.5, 0.8),
     half_angle: float = math.pi / 3,
     ball_radius: float = 0.11,
 ) -> None:
     """ボールをロボット前方コーン内にリセットする。
 
-    ロボットの向きを基準に ±half_angle のコーン内、dist_range の距離でランダム配置する。
-    リセットイベント時は default_root_state のヨー角を使用する。
+    ロボットの実際のリセット後の姿勢を基準に、±half_angle のコーン内・dist_range の距離で
+    ランダム配置する。
+
+    NOTE: 基準は ``default_root_state`` ではなく ``root_pos_w`` / ``root_quat_w``。
+          reset_base (reset_root_state_uniform) がロボットを default から x,y ±0.5m・
+          yaw ±π だけランダムにずらすため、default を基準にするとボールがロボットから見て
+          まったく別の場所 (最悪は足の間) に湧く。このイベントは reset_base より後に走り
+          (``__post_init__`` で後から追加されるので ``__dict__`` の末尾に入る)、
+          ``write_root_link_pose_to_sim`` が内部バッファを即時更新するので、ここでは
+          リセット済みの姿勢が読める。
+
+    NOTE: dist_range の下限はロボットの足がボールに初期接触しない距離にすること。
+          距離は base 中心からなので、ball_radius (0.11m) と足の張り出し (~0.15m) を
+          考えると 0.3m では正面に湧いたときに接触する。
     """
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
     n = len(env_ids)
 
-    env_origins = env.scene.env_origins[env_ids]
-
-    robot_default = robot.data.default_root_state[env_ids]
-    robot_reset_x = env_origins[:, 0] + robot_default[:, 0]
-    robot_reset_y = env_origins[:, 1] + robot_default[:, 1]
-
-    qw, qx, qy, qz = robot_default[:, 3], robot_default[:, 4], robot_default[:, 5], robot_default[:, 6]
+    # リセット後の実際のロボット位置・向き
+    robot_pos_w = robot.data.root_pos_w[env_ids]
+    quat = robot.data.root_quat_w[env_ids]
+    qw, qx, qy, qz = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
     yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
 
     dist = torch.empty(n, device=env.device).uniform_(*dist_range)
@@ -41,10 +50,10 @@ def reset_ball_in_front_of_robot(
     target_angle = yaw + angle_offset
 
     state = ball.data.default_root_state[env_ids].clone()
-    state[:, :3] += env_origins
-    state[:, 0] = robot_reset_x + dist * torch.cos(target_angle)
-    state[:, 1] = robot_reset_y + dist * torch.sin(target_angle)
+    state[:, 0] = robot_pos_w[:, 0] + dist * torch.cos(target_angle)
+    state[:, 1] = robot_pos_w[:, 1] + dist * torch.sin(target_angle)
     state[:, 2] = ball_radius
+    state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
     state[:, 7:] = 0.0
 
     ball.write_root_state_to_sim(state, env_ids=env_ids)
