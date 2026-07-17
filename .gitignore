@@ -14,3 +14,6 @@ data/
 
 #optuna
 runs/
+
+# 手元用の仕様メモ
+source/isaaclab_k1_locomotion/docs/walk_kick.md
