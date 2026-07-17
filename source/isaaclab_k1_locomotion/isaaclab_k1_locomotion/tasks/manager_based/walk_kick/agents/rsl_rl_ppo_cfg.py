@@ -21,3 +21,13 @@ class K1WalkKickPPORunnerCfg(K1FlatPPORunnerCfg):
         # 左足裏の位置だけを含む (対応する右足裏が観測に無い) ため、矢状面での左右反転が
         # そもそも定義できない。キック足を固定する論文の設定とも整合する。
         self.algorithm.symmetry_cfg = None
+
+
+@configclass
+class K1WalkKickWalkPhasePPORunnerCfg(K1WalkKickPPORunnerCfg):
+    """Stage 1 (歩行のみ) 用。観測・ネットワークは stage 2 と同一に保つ。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_walk_phase"

@@ -143,6 +143,51 @@ def target_kick_velocity(
     return command[:, 2].unsqueeze(-1)
 
 
+# --------------------------------------------------------------------------- #
+# walk phase 用: ボール/キック由来のスロットを歩行コマンドで置き換える
+#
+# 観測の次元と並びを kick phase と 1 bit も違わないように保ったまま、中身だけ差し替える。
+# こうすると walk phase の checkpoint をそのまま kick phase に引き継げる。
+#
+# スロットの対応は kick phase の BallFollowVelocityCommand の式から決めている:
+#   vx, vy = clamp(<G のロボット相対位置>, ±max_vel)  ← prev_ball_pos スロットと同じ土俵
+#   wz     = clamp(<kick_dir_b の偏角>,   ±max_ang_vel) ← kick_direction スロットそのもの
+# なので walk phase では「仮想的な目標点」を prev_ball_pos に、「仮想的な目標向き」を
+# kick_direction に載せる。policy から見た「スロットが指す方へ歩き、指す向きへ回る」という
+# 入力→挙動の対応が両 phase で共通になるので、歩容がそのまま転移する。
+#
+# NOTE: kick phase の vx,vy は G (ボールの後方 reach の点) を指すので、対応は厳密な恒等では
+#       なく reach 分のオフセットが乗る。歩容そのものの転移が目的なので許容し、その差は
+#       kick phase 側のフェードイン期間で吸収させる。
+# --------------------------------------------------------------------------- #
+
+
+def walk_command_xy(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """walk phase: 速度コマンドの (vx, vy) を prev_ball_pos スロットに載せる。shape: (N, 2)"""
+    return env.command_manager.get_command(command_name)[:, :2]
+
+
+def walk_command_yaw_dir(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """walk phase: 角速度コマンド wz を kick_direction スロットに載せる。shape: (N, 2)
+
+    kick phase の kick_dir_b は単位ベクトルで、その偏角が wz 指令に対応する。
+    合わせて (cos wz, sin wz) の単位ベクトルとして渡す。
+    """
+    wz = env.command_manager.get_command(command_name)[:, 2]
+    return torch.stack([torch.cos(wz), torch.sin(wz)], dim=-1)
+
+
+def zero_obs(env: ManagerBasedRLEnv, dim: int = 1) -> torch.Tensor:
+    """walk phase: ボールが存在しないスロットをゼロで埋める。shape: (N, dim)"""
+    return torch.zeros(env.num_envs, dim, device=env.device)
+
+
 def prev_ball_pos_b(
     env: ManagerBasedRLEnv,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),

@@ -12,8 +12,6 @@ from .terminations import *
 from .commands import (
     BallFollowVelocityCommand,
     BallFollowVelocityCommandCfg,
-    DiscreteVelocityCommand,
-    DiscreteVelocityCommandCfg,
     KickDirectionCommand,
     KickDirectionCommandCfg,
 )

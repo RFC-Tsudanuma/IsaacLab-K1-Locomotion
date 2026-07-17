@@ -16,42 +16,11 @@ from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
+from ...locomotion.mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
+from .kick_state import kick_state
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
-
-
-class DiscreteVelocityCommand(UniformVelocityCommand):
-    """lin_vel_x, lin_vel_y, ang_vel_z をすべて離散的にサンプリングする。"""
-
-    cfg: "DiscreteVelocityCommandCfg"
-
-    def _sample_discrete(self, n: int, high_val: float, low_max: float) -> torch.Tensor:
-        use_high = torch.rand(n, device=self.device) < self.cfg.high_prob
-        low_vel = torch.rand(n, device=self.device) * low_max
-        high_vel = torch.full((n,), high_val, device=self.device)
-        vel = torch.where(use_high, high_vel, low_vel)
-        sign = torch.sign(torch.randn(n, device=self.device))
-        return vel * sign
-
-    def _resample(self, env_ids: torch.Tensor):
-        super()._resample(env_ids)
-        n = len(env_ids)
-        self.command[env_ids, 0] = self._sample_discrete(n, self.cfg.high_vel, self.cfg.low_vel_max)
-        self.command[env_ids, 1] = self._sample_discrete(n, self.cfg.high_vel, self.cfg.low_vel_max)
-        self.command[env_ids, 2] = self._sample_discrete(n, self.cfg.high_ang_vel, self.cfg.low_ang_vel_max)
-
-
-@configclass
-class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
-    """離散速度コマンド（0~low_vel_max と high_vel のみ）の設定クラス。"""
-
-    class_type: type = DiscreteVelocityCommand
-
-    high_vel: float = 1.0
-    low_vel_max: float = 0.2
-    high_ang_vel: float = 1.0
-    low_ang_vel_max: float = 0.2
-    high_prob: float = 0.5
 
 
 class KickDirectionCommand(UniformVelocityCommand):
@@ -126,42 +95,65 @@ class KickDirectionCommandCfg(UniformVelocityCommandCfg):
     """目標ボール速度 [m/s] のサンプリング範囲。command[:, 2] に格納される。"""
 
 
-class BallFollowVelocityCommand(UniformVelocityCommand):
-    """ボール追従速度コマンド。
+class BallFollowVelocityCommand(DiscreteVelocityCommand):
+    """目標終端 G へ向かう速度コマンド。walk phase では通常の歩行コマンドに切り替わる。
 
-    毎ステップ、速度コマンド (vx, vy, wz) をロボットフレームでの
-    ボール相対位置 (x, y) と wz=0 に更新する。
-    velocity tracking 報酬と組み合わせることでボール追従を実現する。
+    ``cfg.follow_ball`` が True (kick phase) のとき、毎ステップ速度コマンド (vx, vy, wz) を
+    「G へのロボット相対位置」と「kick_direction への角度誤差」で上書きする。
+
+    G はボールそのものではなく :mod:`.kick_state` が計算する理想キック立ち位置側の点
+    (後方レイ R 上をボール側へ滑る点で、P_kick で下限クランプされる)。ボール中心へ直行
+    させると walk_speed 報酬 (G へ引く) と kick_pose_overshoot 罰 (後方レイ R の左右跨ぎ)
+    の両方と衝突するため、指令も G を向ける。latch 後は kick_state 側で G が P_kick に
+    固定されるので、飛翔したボールを追いかけることもない。
+
+    False (walk phase) のときは何も上書きせず、親の :class:`DiscreteVelocityCommand`
+    そのもの、つまり K1FlatEnvCfg で使っている通常の歩行コマンド（離散格子からの
+    ランダムサンプリング）として振る舞う。lin_vel_command / command_resampling_time_range
+    カリキュラムもこのときだけ意味を持つ。
     """
 
     cfg: "BallFollowVelocityCommandCfg"
 
-    def _resample_command(self, _env_ids):
-        # 毎ステップ _update_command で上書きするためリサンプルは不要
-        pass
+    def _resample_command(self, env_ids):
+        if not self.cfg.follow_ball:
+            # walk phase: 通常の歩行コマンドを離散格子からサンプリングする
+            super()._resample_command(env_ids)
+        # kick phase: 毎ステップ _update_command で上書きするためリサンプルは不要
 
     def _update_command(self):
-        ball = self._env.scene["soccer_ball"]
+        if not self.cfg.follow_ball:
+            # walk phase: 親 (UniformVelocityCommand) の standing-env ゼロ化などに任せる
+            super()._update_command()
+            return
+
         robot = self._env.scene["robot"]
 
-        ball_pos_w = ball.data.root_pos_w[:, :3]
-        robot_pos_w = robot.data.root_pos_w[:, :3]
+        # NOTE: kick_state はステップ単位でキャッシュされる。CommandManager は
+        #       TerminationManager / RewardManager より後に走るので、ここで得られるのは
+        #       同じステップに確定済みの状態 (再計算されない)。
+        state = kick_state(
+            self._env,
+            r_stance=self.cfg.r_stance,
+            alpha=self.cfg.alpha,
+            v_thresh=self.cfg.v_thresh,
+            command_name=self.cfg.kick_direction_command_name or "kick_direction",
+        )
 
-        kick_cmd = None
-        if self.cfg.kick_direction_command_name:
-            kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
+        robot_pos_w = robot.data.root_pos_w[:, :2]
 
-        # ボール - ロボット のワールドフレームベクトルをロボットフレームに変換
-        to_ball_3d = torch.zeros_like(ball_pos_w)
-        to_ball_3d[:, :2] = ball_pos_w[:, :2] - robot_pos_w[:, :2]
-        to_ball_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), to_ball_3d)
+        # G - ロボット のワールドフレームベクトルをロボットフレームに変換
+        to_G_w = torch.zeros(self.num_envs, 3, device=self.device)
+        to_G_w[:, :2] = state["G"] - robot_pos_w
+        to_G_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), to_G_w)
 
         max_vel = self.cfg.max_vel
-        self.vel_command_b[:, 0] = torch.clamp(to_ball_b[:, 0], -max_vel, max_vel)
-        self.vel_command_b[:, 1] = torch.clamp(to_ball_b[:, 1], -max_vel, max_vel)
+        self.vel_command_b[:, 0] = torch.clamp(to_G_b[:, 0], -max_vel, max_vel)
+        self.vel_command_b[:, 1] = torch.clamp(to_G_b[:, 1], -max_vel, max_vel)
 
         # wz: ロボットのヨー角と kick_direction の角度誤差
-        if kick_cmd is not None:
+        if self.cfg.kick_direction_command_name:
+            kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
             kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
 
             quat = robot.data.root_quat_w
@@ -176,17 +168,34 @@ class BallFollowVelocityCommand(UniformVelocityCommand):
 
 
 @configclass
-class BallFollowVelocityCommandCfg(UniformVelocityCommandCfg):
-    """ボール追従速度コマンドの設定クラス。"""
+class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
+    """ボール追従速度コマンドの設定クラス。
+
+    ``follow_ball=False`` にすると DiscreteVelocityCommandCfg（通常の歩行コマンド）として
+    振る舞うので、ranges / *_resolution も引き継いで設定しておくこと。
+    """
 
     class_type: type = BallFollowVelocityCommand
 
+    follow_ball: bool = True
+    """True (kick phase) で G 追従、False (walk phase) で通常の歩行コマンド。"""
+
     max_vel: float = 1.0
-    """速度コマンドの上限 [m/s]。"""
+    """速度コマンドの上限 [m/s]。follow_ball=True のときのみ使用。"""
 
     max_ang_vel: float = 1.0
-    """角速度コマンドの上限 [rad/s]。"""
+    """角速度コマンドの上限 [rad/s]。follow_ball=True のときのみ使用。"""
 
     kick_direction_command_name: str | None = None
     """角速度コマンドの参照先となる kick_direction コマンド名。None なら wz=0。"""
+
+    # -- kick_state (G の計算) に渡すパラメータ。キック報酬側と同じ値にすること。
+    r_stance: float = 0.25
+    """P_kick 半径 [m]。follow_ball=True のときのみ使用。"""
+
+    alpha: float = 0.5
+    """G の追従係数。follow_ball=True のときのみ使用。"""
+
+    v_thresh: float = 0.8
+    """値 latch のトリガー速度 [m/s]。follow_ball=True のときのみ使用。"""
 

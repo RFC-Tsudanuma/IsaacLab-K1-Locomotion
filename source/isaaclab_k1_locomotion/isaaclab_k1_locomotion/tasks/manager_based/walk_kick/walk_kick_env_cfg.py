@@ -244,20 +244,29 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         #   vy = ロボットフレームでのボール相対 y 位置（クランプ済み）
         #   wz = 0
         # ------------------------------------------------------------------ #
+        # follow_ball=False にすると通常の歩行コマンドに戻るので (walk phase)、
+        # K1FlatEnvCfg が設定した DiscreteVelocityCommandCfg の中身をそのまま引き継ぐ。
+        # こうしておくと walk phase は元の歩行タスクと同一の速度コマンド分布になり、
+        # lin_vel_command / command_resampling_time_range カリキュラムもそのまま効く。
+        prev = self.commands.base_velocity
         self.commands.base_velocity = mdp.BallFollowVelocityCommandCfg(
-            asset_name="robot",
-            resampling_time_range=(10.0, 10.0),
-            heading_command=False,
+            asset_name=prev.asset_name,
+            resampling_time_range=prev.resampling_time_range,
+            rel_standing_envs=prev.rel_standing_envs,
+            rel_heading_envs=prev.rel_heading_envs,
+            heading_command=prev.heading_command,
+            heading_control_stiffness=prev.heading_control_stiffness,
             debug_vis=False,
+            ranges=prev.ranges,
+            lin_vel_x_resolution=prev.lin_vel_x_resolution,
+            lin_vel_y_resolution=prev.lin_vel_y_resolution,
+            ang_vel_z_resolution=prev.ang_vel_z_resolution,
+            follow_ball=True,
             max_vel=1.0,
             max_ang_vel=1.0,
             kick_direction_command_name="kick_direction",
-            ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
-                lin_vel_x=(-1.0, 1.0),
-                lin_vel_y=(-1.0, 1.0),
-                ang_vel_z=(-1.0, 1.0),
-                heading=(0.0, 0.0),
-            ),
+            # G の計算はキック報酬と同じ kick_state を共有するので、値も必ず揃える
+            **_KICK_STATE_PARAMS,
         )
 
         # 蹴り方向 + 目標ボール速度コマンドを追加
@@ -350,14 +359,17 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
 
         # ------------------------------------------------------------------ #
-        # Curriculum: 2フェーズ
-        #   Phase 1 (   0-5000): 速度追従のみ（ボール追従歩行を覚える）
-        #   Phase 2 (5000-5500): 速度追従をフェードアウト、キック報酬を一斉フェードイン
+        # Curriculum: キック報酬のフェードイン
+        #
+        # このタスクは K1WalkKickWalkPhaseEnvCfg (walk phase) の checkpoint から
+        # 再開する前提なので、歩行はすでに獲得済み。よって 0 から立ち上げてよく、
+        # ランプ (0 → 500 iteration) 自体が段階的導入になる。
+        # walk phase を挟まず 0 から学習する場合は start_step を大きく取ること。
         # ------------------------------------------------------------------ #
         # steps_per_iteration = num_steps_per_env (PPO config)
         # start_step / end_step は iteration 数で指定する
         _spi = 24
-        _phase2 = {"start_step": 5000, "end_step": 5500, "steps_per_iteration": _spi}
+        _phase2 = {"start_step": 0, "end_step": 500, "steps_per_iteration": _spi}
 
         # Phase 1→2: 速度追従報酬をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
@@ -410,7 +422,86 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
 
 
 @configclass
-class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
+class K1WalkKickWalkPhaseEnvCfg(K1WalkKickEnvCfg):
+    """Stage 1: 通常の歩行だけを学習する。
+
+    論文の 3-stage training の 1 段目 (「まず通常の歩行ポリシーを学習する」) にあたる。
+    観測は K1WalkKickEnvCfg と同じ 55 次元のまま揃えてあるので、この run の checkpoint を
+    そのまま K1WalkKickEnvCfg (stage 2) に引き継げる::
+
+        # stage 1
+        _labpython2 train.py --task Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0 --headless --num_envs 4096
+        # stage 2 (stage 1 の checkpoint から再開)
+        _labpython2 train.py --task Isaac-Velocity-Flat-K1-Walk-Kick-v0 --headless --num_envs 4096 \
+            --checkpoint logs/rsl_rl/k1_walk_kick_walk_phase/<run>/model_<N>.pt
+
+    観測は 55 次元・同じ並びのまま、ボール/キック由来のスロットの中身だけを歩行コマンドに
+    差し替える (:func:`mdp.walk_command_xy` / :func:`mdp.walk_command_yaw_dir`)。
+    55 次元の観測には速度指令が含まれないため、スロットを流用せずランダムな歩行コマンドを
+    出すと、policy から見て指令が観測不能になり追従を学習できない (期待値 = 静止が最適解に
+    なってしまう)。スロットを流用することで指令が可観測になり、かつ「スロットが指す方へ歩く」
+    という入力→挙動の対応が kick phase と共通になる。
+
+    ボールはこの phase では観測にも報酬にも一切現れないので、シーンごと取り除く。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 通常の歩行コマンド（K1FlatEnvCfg と同じ離散速度コマンド）に戻す
+        self.commands.base_velocity.follow_ball = False
+        self.commands.base_velocity.kick_direction_command_name = None
+        self.commands.kick_direction = None
+
+        # -- 観測: 次元と並びを保ったまま、ボール/キック由来のスロットを歩行コマンドに置換
+        for _group in (self.observations.policy, self.observations.critic):
+            _group.prev_ball_pos.func = mdp.walk_command_xy
+            _group.prev_ball_pos.params = {"command_name": "base_velocity"}
+            _group.kick_direction.func = mdp.walk_command_yaw_dir
+            _group.kick_direction.params = {"command_name": "base_velocity"}
+            _group.ball_vel.func = mdp.zero_obs
+            _group.ball_vel.params = {"dim": 2}
+            _group.target_kick_velocity.func = mdp.zero_obs
+            _group.target_kick_velocity.params = {"dim": 1}
+        # critic の特権情報のボール位置もゼロ埋め (次元は 3 のまま)
+        self.observations.critic.ball_pos_rel.func = mdp.zero_obs
+        self.observations.critic.ball_pos_rel.params = {"dim": 3}
+
+        # -- ボールをシーンから取り除く（観測にも報酬にも現れないため）
+        self.scene.soccer_ball = None
+        self.scene.contact_balls_left = None
+        self.scene.contact_balls_right = None
+        self.events.reset_ball = None
+
+        # -- 速度追従の重みを K1FlatEnvCfg (= 元の歩行タスク) の値に戻す
+        self.rewards.track_lin_vel_xy_exp.weight = 3.5
+        self.rewards.track_ang_vel_z_exp.weight = 2.0
+
+        # -- キック関連の報酬とそのカリキュラムを全て無効化する
+        for _term in (
+            "kick_direction",
+            "kick_velocity_scaled",
+            "kick_velocity_strong",
+            "walk_speed",
+            "approach_penalty",
+            "kick_pose_overshoot",
+        ):
+            setattr(self.rewards, _term, None)
+            setattr(self.curriculum, f"{_term}_weight", None)
+        self.curriculum.track_lin_vel_weight = None
+        self.curriculum.track_ang_vel_weight = None
+
+        # -- キック成立による終了も無効化する。
+        # ボールが動かない以上 latch は発火しないが、kick_state を毎ステップ回す意味が
+        # 無いので項ごと外す。エピソードは time_out か転倒で終わる。
+        self.terminations.kick_finished = None
+
+        # 歩行学習なので、キック用に切り詰めた 10 秒ではなく元の歩行タスク相当に戻す
+        self.episode_length_s = 20.0
+
+
+@configclass
+class K1WalkKickWalkPhaseEnvCfg_PLAY(K1WalkKickWalkPhaseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
@@ -420,7 +511,14 @@ class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
-        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
-        self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
+
+@configclass
+class K1WalkKickEnvCfg_PLAY(K1WalkKickEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
