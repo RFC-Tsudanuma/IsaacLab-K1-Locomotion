@@ -330,13 +330,13 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
 
         # ------------------------------------------------------------------ #
         # Curriculum: 2フェーズ
-        #   Phase 1 (   0-1000): 速度追従のみ（ボール追従歩行を覚える）
-        #   Phase 2 (1000-1500): 速度追従をフェードアウト、キック報酬を一斉フェードイン
+        #   Phase 1 (   0-5000): 速度追従のみ（ボール追従歩行を覚える）
+        #   Phase 2 (5000-5500): 速度追従をフェードアウト、キック報酬を一斉フェードイン
         # ------------------------------------------------------------------ #
         # steps_per_iteration = num_steps_per_env (PPO config)
         # start_step / end_step は iteration 数で指定する
         _spi = 24
-        _phase2 = {"start_step": 1000, "end_step": 1500, "steps_per_iteration": _spi}
+        _phase2 = {"start_step": 5000, "end_step": 5500, "steps_per_iteration": _spi}
 
         # Phase 1→2: 速度追従報酬をフェードアウト
         self.curriculum.track_lin_vel_weight = CurrTerm(
