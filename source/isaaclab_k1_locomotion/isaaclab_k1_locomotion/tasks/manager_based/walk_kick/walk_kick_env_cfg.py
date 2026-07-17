@@ -52,6 +52,27 @@ _KICK_STATE_PARAMS = {
 # τ_direction のシェイピング係数 [rad]。項1-3 で共有する。
 _SIGMA_DIRECTION = 0.35
 
+# --------------------------------------------------------------------------- #
+# キック後の猶予窓
+#
+# latch から何秒エピソードを続けるか。蹴った直後に転ぶ挙動を罰するには、転倒が完成する
+# (胴体が接地して base_contact が発火する) まで窓が届いている必要がある。K1 は重心高
+# 0.6m 程度で、片足を振ってバランスを崩してから接地するまで概ね 1-1.5 秒かかるため
+# 2.0 秒とる。0.6 秒では転倒の前にエピソードが終わり、転倒罰も、姿勢を支える dense な
+# ペナルティ (base_height_penalty, flat_orientation_l2 など) も効かなかった。
+#
+# NOTE: RewardManager は value = func * weight * dt で払うので、post-latch に dense で
+#       払う項1-3 の累積は「weight × 凍結値 × 窓の秒数」= 窓の長さに比例する。窓を延ばす
+#       ぶん weight を割り戻さないとキック報酬だけが膨らみ、転倒罰 (-100 * dt = -2.0 の
+#       一度きり) や歩行の安定ペナルティが相対的に薄まってしまう。
+#       → _KICK_W_SCALE で割り戻し、窓を変えてもキック 1 回あたりの収益を一定に保つ。
+# --------------------------------------------------------------------------- #
+_KICK_WINDOW_S = 2.0
+_CTRL_DT = 0.02  # decimation(4) * sim.dt(0.005) = 50Hz
+_KICK_DELAY_STEPS = int(_KICK_WINDOW_S / _CTRL_DT)  # 100 steps
+# 仕様書の weight は窓 0.6 秒 (30 steps) 前提の配分なので、その比で割り戻す。
+_KICK_W_SCALE = 0.6 / _KICK_WINDOW_S
+
 
 def _leg_joints() -> SceneEntityCfg:
     """脚 12 関節を JOINT_NAMES_K1 の順で参照する cfg。
@@ -277,7 +298,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # NOTE: この項は kick_state の毎ステップ更新も担っている（rewards.py 冒頭の NOTE 参照）。
         self.terminations.kick_finished = DoneTerm(
             func=mdp.kick_finished,
-            params={**_KICK_STATE_PARAMS, "delay_steps": 30},
+            params={**_KICK_STATE_PARAMS, "delay_steps": _KICK_DELAY_STEPS},
         )
 
         # ------------------------------------------------------------------ #
@@ -349,17 +370,22 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         )
 
         # Phase 2: キック報酬を一斉フェードイン（end_weight は仕様書の重み範囲の中央付近）
+        # 項1-3 は post-latch に dense で払うので、猶予窓の長さに比例して累積が増える。
+        # _KICK_W_SCALE で割り戻し、窓を変えてもキック 1 回あたりの収益を一定に保つ。
         self.curriculum.kick_direction_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_direction", "start_weight": 0.0, "end_weight": 6.0, **_phase2},
+            params={"term_name": "kick_direction", "start_weight": 0.0,
+                    "end_weight": 6.0 * _KICK_W_SCALE, **_phase2},
         )
         self.curriculum.kick_velocity_scaled_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_scaled", "start_weight": 0.0, "end_weight": 4.0, **_phase2},
+            params={"term_name": "kick_velocity_scaled", "start_weight": 0.0,
+                    "end_weight": 4.0 * _KICK_W_SCALE, **_phase2},
         )
         self.curriculum.kick_velocity_strong_weight = CurrTerm(
             func=mdp.linear_reward_weight,
-            params={"term_name": "kick_velocity_strong", "start_weight": 0.0, "end_weight": 3.0, **_phase2},
+            params={"term_name": "kick_velocity_strong", "start_weight": 0.0,
+                    "end_weight": 3.0 * _KICK_W_SCALE, **_phase2},
         )
         self.curriculum.walk_speed_weight = CurrTerm(
             func=mdp.linear_reward_weight,

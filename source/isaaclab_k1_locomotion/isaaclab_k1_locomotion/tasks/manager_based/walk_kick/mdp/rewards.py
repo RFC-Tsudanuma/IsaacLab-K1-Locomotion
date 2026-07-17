@@ -38,12 +38,20 @@ def _r_direction(
     f(τ) = exp(−τ² / 2σ²) なので τ=0 (方向ぴったり) で f=1 → r_direction = +p_style、
     方向が大きく外れると f→0 → r_direction = −p_style。
     pre-latch では凍結値が 0 のままなので、呼び出し側で kick_done ゲートを掛けること。
+
+    NOTE: 負値は 0 にクリップする。項1-3 は post-latch に凍結値を毎ステップ dense で払うが、
+          転倒すると base_contact でエピソードが終わり支払いも止まる。負のまま払うと
+          「方向を外したキックの後は早く転んで損失を止めた方が得」という抜け道ができるため
+          (転倒罰は -100 * dt = -2.0 の一度きりなのに対し、負の dense 払いは窓の秒数だけ
+          累積する)。クリップの代償として、方向を外したキックは「罰される」のではなく
+          「報われない」(= 蹴らないのと同値) 扱いになる。
     """
     state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
 
     tau = state["tau_direction_frozen"]
     f_dir = torch.exp(-(tau**2) / (2.0 * sigma_direction**2))
     r_dir = (f_dir - 0.5) * 2.0 * state["p_style_frozen"]
+    r_dir = torch.clamp(r_dir, min=0.0)
 
     # pre-latch は 0
     return r_dir * state["kick_done"].float(), state
