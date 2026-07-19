@@ -22,6 +22,7 @@ from ...locomotion.mdp.rewards import (
 # goalkeeper 固有の項
 from .curriculums import adaptive_ball_speed
 from .events import (
+    reset_ball_perception,
     reset_ball_shot,
     reset_gk_buffers,
     reset_stage1_target_and_park,
@@ -31,7 +32,9 @@ from .observations import (
     compute_target_y,
     gk_ball_active,
     gk_ball_pos_rel,
+    gk_ball_pos_rel_perceived,
     gk_ball_vel,
+    gk_ball_vel_perceived,
     gk_buffers,
     gk_self_state,
     gk_target_y,

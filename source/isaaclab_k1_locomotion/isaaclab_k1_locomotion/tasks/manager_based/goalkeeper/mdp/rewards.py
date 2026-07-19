@@ -47,27 +47,38 @@ def track_target_y(
 def target_reach_velocity(
     env: "ManagerBasedRLEnv",
     deadband: float = 0.12,
-    v_cap: float = 0.6,
+    v_cap: float = 0.8,
+    cmd_scale: float = 0.5,
     max_y: float = 1.25,
 ) -> torch.Tensor:
     """目標方向への横移動速度に比例する密報酬 ∈ [-1, 1]。
 
-    目標が遠くても勾配が一定に出る (exp 型の勾配消失の補完)。deadband 内では
-    満額 1 (到達を減点しない)。逆方向への移動は負になる。
+    目標が遠くても勾配が一定に出る (exp 型の勾配消失の補完)。逆方向への移動は負。
+
+    deadband 内 (到達済み) では「上位コマンドを 0 へ落とすほど高い」線形報酬
+    ``1 - |cmd|/cmd_scale`` に切り替える。旧実装は deadband 内を無条件で満額 1 に
+    しており、**足踏みしたまま (コマンドを残したまま) 目標付近に立つだけで
+    主報酬が取り切れてしまい、停止方向への勾配が一切出なかった**
+    (Stage1 の学習で hold_at_target が終始 0.000 だった直接の原因)。
+    線形なのでコマンドがどんなに大きくても勾配が消えない (exp 型の欠点を回避)。
     """
     err = _target_y_error(env, max_y)
     robot = env.scene["robot"]
     v_y = robot.data.root_lin_vel_w[:, 1]
     toward = -torch.sign(err) * v_y  # 誤差を減らす向きの速度
-    r = (toward / v_cap).clamp(-1.0, 1.0)
-    return torch.where(err.abs() <= deadband, torch.ones_like(r), r)
+    r_move = (toward / v_cap).clamp(-1.0, 1.0)
+
+    cmd_norm = torch.norm(_high_action_cmd(env)[:, :3], dim=1)
+    r_stop = (1.0 - cmd_norm / cmd_scale).clamp(0.0, 1.0)
+    return torch.where(err.abs() <= deadband, r_stop, r_move)
 
 
 def hold_at_target(
     env: "ManagerBasedRLEnv",
-    pos_std: float = 0.2,
-    cmd_std: float = 0.1,
-    lin_vel_std: float = 0.3,
+    pos_std: float = 0.25,
+    cmd_std_coarse: float = 0.35,
+    cmd_std_fine: float = 0.1,
+    lin_vel_std: float = 0.4,
     yaw_rate_weight: float = 0.25,
     max_y: float = 1.25,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -79,13 +90,22 @@ def hold_at_target(
     frozen が初期姿勢で立つのはコマンドノルム < 0.05 (gait_phase ゼロ埋め閾値) の
     ときだけなので、実ベース速度だけを見る停止報酬では「コマンド 0.1〜0.3 を残した
     その場足踏み」がほぼ満額を取ってしまい、0.05 の壁を越える勾配が出ない。
+
+    stop_cmd は σ の異なる 2 つのガウスの平均 (マルチスケール)。旧実装は σ=0.1 の
+    単一ガウスで、歩行コマンド ~0.5 の地点では exp(-25)≈1e-11 と数値的にゼロになり
+    「報酬の存在自体がポリシーから観測できない」勾配消失を起こしていた
+    (Stage1 で hold_at_target が終始 0.000 だった要因のひとつ)。粗い σ=0.35 が
+    遠くから 0.05 の壁際まで誘導し、細かい σ=0.1 が最後の押し込みを担当する。
     """
     robot = env.scene[robot_cfg.name]
     err = _target_y_error(env, max_y)
     gate = torch.exp(-torch.square(err) / pos_std**2)
 
     cmd_norm = torch.norm(_high_action_cmd(env)[:, :3], dim=1)
-    stop_cmd = torch.exp(-torch.square(cmd_norm) / cmd_std**2)
+    stop_cmd = 0.5 * (
+        torch.exp(-torch.square(cmd_norm) / cmd_std_coarse**2)
+        + torch.exp(-torch.square(cmd_norm) / cmd_std_fine**2)
+    )
 
     lin_speed = torch.norm(robot.data.root_lin_vel_w[:, :2], dim=1)
     yaw_rate = robot.data.root_ang_vel_w[:, 2].abs()
@@ -119,13 +139,17 @@ def return_to_center_after_save(
 def stay_on_goal_line(
     env: "ManagerBasedRLEnv",
     std: float = 0.3,
-    x_offset: float = 0.0,
+    x_offset: float | None = None,
 ) -> torch.Tensor:
-    """ゴールライン近傍 (x ≈ x_offset) に留まるほど高い報酬 [0, 1]。
+    """守備面 (x ≈ guard_x、ゴールラインのフィールド側) に留まるほど高い報酬 [0, 1]。
 
-    横移動セーブのタスクなので前後方向はライン上が定位置。前へ飛び出す/後退して
-    ゴール内に入る動きを抑える shaping。
+    ロボットはライン上ではなく **ラインの guard_x [m] 前** で守る (ボールを
+    ゴールの外側で止めるため + 前に出るほどシュートコースが狭まる)。
+    ``x_offset`` を省略すると GoalkeeperParamsCfg.guard_x を使う (JSON で変更可能)。
+    ガウス (σ=0.3) の緩い誘導なので、ボールに合わせた前後の微調整は妨げない。
     """
+    if x_offset is None:
+        x_offset = float(env.cfg.goalkeeper.guard_x)
     x = robot_pos_goal(env)[:, 0]
     return torch.exp(-torch.square(x - x_offset) / std**2)
 

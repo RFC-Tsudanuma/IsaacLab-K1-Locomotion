@@ -168,14 +168,18 @@ def reset_ball_shot(
 
     ランダム化 (すべて GoalkeeperParamsCfg から):
         * スポーン位置: ゴール中央からの距離 d ∈ spawn_dist_range、
-          方位 θ ∈ ±spawn_half_angle (+x 正面基準)
+          方位 θ ∈ ±spawn_half_angle (+x 正面基準)。ロボットに近すぎる位置
+          (< 0.6m) はロボットから見て radial に押し出して重なりを防ぐ。
         * 狙い先: ゴールライン上の y_aim ∈ ±aim_y_range (ポスト内側)
         * 初速: v ∈ [ball_speed_min, hi]。hi は通常 ball_speed_max だが、
           ステージ3 の適応カリキュラム (adaptive_ball_speed) が ``_gk_speed_hi``
           バッファを持っている場合はそちらを使う (成功率に応じて連続的に引き上げ)。
+        * 実現可能性クランプ: ゴールライン到達までの時間が min_time_to_line [s] を
+          下回らないよう初速に上限を掛ける (近距離×高速の「原理的にセーブ不可能な
+          球」を作らない。距離と速度に自然な相関がつく: 近い球は遅く、遠い球は速い)。
 
     ボールには転がり整合の角速度 ω = (-vy, vx, 0)/r も与える (滑り減速の過渡を消す)。
-    ★ reset_gk_buffers より後に登録すること。
+    ★ reset_gk_buffers より後、reset_base (ロボット配置) より後に登録すること。
     """
     p = _gk_params(env)
     ball = env.scene[ball_cfg.name]
@@ -188,6 +192,16 @@ def reset_ball_shot(
     spawn_x = dist * torch.cos(ang)
     spawn_y = dist * torch.sin(ang)
 
+    # ロボットとの重なり防止: 近すぎるスポーンはロボットから radial に 0.6m まで押し出す
+    robot_xy = robot_pos_goal(env)[env_ids, :2]
+    d_rel_x = spawn_x - robot_xy[:, 0]
+    d_rel_y = spawn_y - robot_xy[:, 1]
+    d_rel = torch.sqrt(d_rel_x**2 + d_rel_y**2).clamp(min=1e-6)
+    too_close = d_rel < 0.6
+    scale = torch.where(too_close, 0.6 / d_rel, torch.ones_like(d_rel))
+    spawn_x = robot_xy[:, 0] + d_rel_x * scale
+    spawn_y = robot_xy[:, 1] + d_rel_y * scale
+
     aim_y = torch.empty(n, device=env.device).uniform_(-float(p.aim_y_range), float(p.aim_y_range))
 
     hi_buf = getattr(env, "_gk_speed_hi", None)
@@ -198,6 +212,9 @@ def reset_ball_shot(
     dir_x = -spawn_x
     dir_y = aim_y - spawn_y
     norm = torch.sqrt(dir_x**2 + dir_y**2).clamp(min=1e-6)
+    # 実現可能性クランプ: 到達時間 = 距離/速度 ≥ min_time_to_line
+    v_feasible = norm / max(float(p.min_time_to_line), 1e-3)
+    speed = torch.minimum(speed, v_feasible)
     vx = speed * dir_x / norm
     vy = speed * dir_y / norm
 
@@ -217,3 +234,34 @@ def reset_ball_shot(
     ball.write_root_velocity_to_sim(vel, env_ids=env_ids)
 
     bufs["ball_active"][env_ids] = True
+
+
+def reset_ball_perception(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+):
+    """知覚DR (観測側の遅延・更新レート・ノイズ) の per-episode パラメータを採番し、
+    履歴・認識出力バッファを現在の真値で初期化する (起動時トランジェント回避)。
+
+    ★ reset_ball (ボール配置イベント) より後に登録すること (配置後の真値で初期化)。
+    パラメータは GoalkeeperParamsCfg の perc_*。PLAY 環境ではこれらを 0 / (1,1) に
+    上書きすればクリーン観測になる。
+    """
+    from .observations import _gk_perc_buffers, _gk_true_rel_state
+
+    p = _gk_params(env)
+    _gk_perc_buffers(env)
+    n = len(env_ids)
+
+    lo, hi = int(p.perc_latency_range[0]), int(p.perc_latency_range[1])
+    env._gkp_latency[env_ids] = torch.randint(lo, hi + 1, (n,), device=env.device)
+    lo2, hi2 = int(p.perc_update_period_range[0]), int(p.perc_update_period_range[1])
+    env._gkp_period[env_ids] = torch.randint(lo2, hi2 + 1, (n,), device=env.device)
+    env._gkp_ctr[env_ids] = 0  # 次 tick を更新 tick にする
+    env._gkp_bias[env_ids] = torch.randn(n, 2, device=env.device) * float(p.perc_bias_sigma)
+
+    pos_b, vel_b = _gk_true_rel_state(env)
+    env._gkp_hist_pos[env_ids] = pos_b[env_ids].unsqueeze(1)  # (n, H, 2) にブロードキャスト
+    env._gkp_hist_vel[env_ids] = vel_b[env_ids].unsqueeze(1)
+    env._gkp_out_pos[env_ids] = pos_b[env_ids]
+    env._gkp_out_vel[env_ids] = vel_b[env_ids]

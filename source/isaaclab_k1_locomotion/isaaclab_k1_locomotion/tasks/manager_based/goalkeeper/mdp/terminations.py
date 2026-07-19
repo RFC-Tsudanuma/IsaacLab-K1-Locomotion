@@ -79,12 +79,17 @@ def update_save_state(env: "ManagerBasedRLEnv") -> torch.Tensor:
     bufs["touched"][newly] = True
     setattr(env, _NEWLY_TOUCHED_ATTR, newly)
 
-    # セーブ確定カウントダウン
+    # セーブ確定カウントダウン。「無害化」に加えて **ボールがゴールラインの外側
+    # (フィールド側, x > 0)** にあることを要求する — ロボットは guard_x でライン前に
+    # 立つので、正しく守れていればボールはゴールの外で止まる。ライン上に乗った
+    # 微妙な球はセーブ確定にせず、タイムアウトまで様子を見る (ルール上は失点では
+    # ないが「外で止めた」とは言えないため)。
+    ball_outside = ball_pos_goal(env)[:, 0] > 0.0
     no_threat = (vel[:, 0] >= -0.05) | (speed_xy < 0.15)
-    start = active & bufs["touched"] & no_threat & (bufs["save_cd"] < 0)
+    start = active & bufs["touched"] & no_threat & ball_outside & (bufs["save_cd"] < 0)
     bufs["save_cd"][start] = int(p.save_delay_steps)
-    # 再度脅威になったら解除
-    rearmed = active & (bufs["save_cd"] >= 0) & (~no_threat)
+    # 再度脅威になった / ボールがライン内側へ入ったら解除
+    rearmed = active & (bufs["save_cd"] >= 0) & ((~no_threat) | (~ball_outside))
     bufs["save_cd"][rearmed] = -1
     bufs["save_cd"][bufs["save_cd"] > 0] -= 1
     return newly

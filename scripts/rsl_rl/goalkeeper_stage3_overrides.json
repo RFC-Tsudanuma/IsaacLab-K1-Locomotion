@@ -1,9 +1,10 @@
 {
-  "_comment": "ゴールキーパー Stage 3 の設定上書き (train_dribble.py --override_json)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。ball_speed_cap は eval_goalkeeper_speed.py の提案値 (0.9 x v_lat x spawn_dist_min / 1.25) に差し替えること。",
+  "_comment": "ゴールキーパー Stage 3 の設定上書き (train_goalkeeper.py --override_json)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。ball_speed_cap は eval_goalkeeper_speed.py の提案値に差し替えること。min_time_to_line は近距離×高速の不可能球を防ぐ下限到達時間で、詰めるほど難しくなる。",
   "env": {
     "goalkeeper.ball_speed_min": 0.5,
     "goalkeeper.ball_speed_max": 1.0,
-    "goalkeeper.ball_speed_cap": 2.2,
+    "goalkeeper.ball_speed_cap": 3.0,
+    "goalkeeper.min_time_to_line": 1.2,
     "goalkeeper.adaptive_success_threshold": 0.85,
     "goalkeeper.adaptive_fail_threshold": 0.55,
     "goalkeeper.adaptive_speed_delta": 0.05,
