@@ -32,7 +32,7 @@ class K1KeeperWalkEnvCfg(K1FlatEnvCfg):
         # 前後は「ボールに詰める / 下がる」程度の狭い範囲に留め、左右を広くとる。
         cmd = self.commands.base_velocity
         cmd.ranges.lin_vel_x = (-0.6, 0.6)
-        cmd.ranges.lin_vel_y = (-1.0, 1.0)
+        cmd.ranges.lin_vel_y = (-1.5, 1.5)
         # yaw は正面維持が基本なので旋回コマンドは弱める。
         cmd.ranges.ang_vel_z = (-0.5, 0.5)
         # heading_command=True (velocity_env_cfg の既定) なので ang_vel_z は heading 追従から生成される。
@@ -48,21 +48,28 @@ class K1KeeperWalkEnvCfg(K1FlatEnvCfg):
         # --- カリキュラム: y 方向を段階的に広げる ---
         # Flat の lin_vel_command カリキュラムは x を大きく広げる設定なので、
         # keeper 用に x/y の役割を入れ替えた stage 構成に差し替える。
+        # 横 1.5 m/s は Flat の到達値 (0.9) を大きく超える挑戦的な目標なので、
+        # 1.0 以降を細かく刻んで各ステージの飛び幅を抑える (5 ステージ構成)。
         if self.curriculum.lin_vel_command is not None:
             self.curriculum.lin_vel_command.params["stages_x"] = [
                 (-0.3, 0.3),
                 (-0.4, 0.4),
                 (-0.5, 0.5),
                 (-0.6, 0.6),
+                (-0.6, 0.6),
             ]
             self.curriculum.lin_vel_command.params["stages_y"] = [
                 (-0.4, 0.4),
-                (-0.6, 0.6),
-                (-0.8, 0.8),
+                (-0.7, 0.7),
                 (-1.0, 1.0),
+                (-1.25, 1.25),
+                (-1.5, 1.5),
             ]
             # 横移動は前進より追従が難しいので、閾値は Flat より少し緩めに設定する。
-            self.curriculum.lin_vel_command.params["error_threshold"] = [0.30, 0.35, 0.40, 0.45]
+            # 高速域ほど絶対誤差が出やすいため後段は更に緩めるが、緩めすぎると
+            # 「狭い範囲を習得した時点で次の緩い閾値も満たして一気に遷移」するので、
+            # 前ステージの到達誤差より必ず厳しい値になるよう刻み幅を 0.05 に抑える。
+            self.curriculum.lin_vel_command.params["error_threshold"] = [0.30, 0.35, 0.40, 0.45, 0.50]
 
         # Flat 側にある「コマンド更新間隔を段階的に短くする」カリキュラムは、
         # ここでは最初から短周期にしているため無効化する。
