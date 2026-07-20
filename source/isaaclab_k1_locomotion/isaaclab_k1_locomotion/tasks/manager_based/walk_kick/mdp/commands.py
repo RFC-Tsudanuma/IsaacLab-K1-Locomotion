@@ -30,9 +30,50 @@ class KickDirectionCommand(UniformVelocityCommand):
     command = [sin θ, cos θ, v] を返す。
     kick_state は command[:, :2] を蹴り方向ベクトル (cos θ, sin θ) として、
     target_kick_velocity 観測と kick_velocity_scaled 報酬は command[:, 2] を目標速度として使用する。
+
+    メトリクス (walk_kick / walk_pass 共通、Metrics/kick_direction/ 以下に出る):
+
+    * ``kick_vel_ratio``: 指令速度に対する実測ボール速度の追従率 (v_ball / v_target)。
+    * ``kick_vel_error``: 同じく絶対誤差 [m/s]。
+    * ``kick_rate``: キックが成立した (値 latch した) エピソードの割合。
+
+    前 2 つは未キックの env を 0 として平均するため、キック成立分だけの追従率が欲しい
+    ときは ``kick_vel_ratio / kick_rate`` で割り戻すこと。
     """
 
     cfg: "KickDirectionCommandCfg"
+
+    def __init__(self, cfg: "KickDirectionCommandCfg", env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        # 親 (UniformVelocityCommand) の速度追従メトリクスは、このコマンドが速度指令では
+        # ないため意味を持たない。ログを汚さないように捨てる。
+        self.metrics.pop("error_vel_xy", None)
+        self.metrics.pop("error_vel_yaw", None)
+        # 指令キック速度 v_target に対する実測ボール速度の追従メトリクス。
+        # いずれも「キックが成立した (値 latch した) env」でのみ値を持ち、
+        # 未キックの env は 0 のまま。CommandManager はエピソード終了時に
+        # リセット対象 env の平均を Metrics/kick_direction/<name> として記録する。
+        self.metrics["kick_vel_ratio"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_vel_error"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_rate"] = torch.zeros(self.num_envs, device=self.device)
+
+    def _update_metrics(self):
+        # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
+        # (ここで再計算するとパラメータの二重管理になる)。まだ無ければ何もしない。
+        state = getattr(self._env, "_kick_latch_state", None)
+        if state is None:
+            return
+
+        kick_done = state["kick_done"].float()
+        v_ball = state["v_ball_frozen"]
+        v_target = state["v_target"]
+
+        # 追従率 = 実測ボール速度 / 指令速度。1.0 で指令どおり、>1 で蹴りすぎ。
+        ratio = v_ball / torch.clamp(v_target, min=1e-6)
+
+        self.metrics["kick_vel_ratio"] = ratio * kick_done
+        self.metrics["kick_vel_error"] = torch.abs(v_ball - v_target) * kick_done
+        self.metrics["kick_rate"] = kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
