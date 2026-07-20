@@ -63,10 +63,31 @@ def kick_direction(
     alpha: float,
     v_thresh: float,
     sigma_direction: float = 0.35,
+    v_gate_frac: float = 0.0,
+    sigma_gate: float = 0.05,
 ) -> torch.Tensor:
-    """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)"""
-    r_dir, _ = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
-    return r_dir
+    """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)
+
+    ``v_gate_frac > 0`` で片側の速度ゲート g(v) = sigmoid((v_ball − f·v_target) / σ_gate)
+    を掛ける。**弱すぎる蹴りだけを削り、蹴りすぎは削らない**（オーバーシュートは項2 が見る）。
+
+    このゲートが必要な理由: 項1 は重み最大 (6.0) でありながら素の定義では速度に一切依存
+    しないため、「接近中に足がボールをかすっただけ」でも方向さえ合っていれば満点が出る。
+    しかも latch は不可逆で、その 100 ステップ後に kick_finished がエピソードを終わらせる。
+    結果、ポリシーは振り足を出す前にエピソードが終わり「ちゃんと蹴った経験」を一度も
+    サンプリングできなくなる（walk_pass の 3000 iteration で実際にこれが起きた）。
+
+    デフォルト 0.0 でゲート無効 = 従来の挙動。walk_pass のように v_target が
+    かすり当ての速度域と近いタスクでのみ有効にする。
+    """
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+
+    if v_gate_frac <= 0.0:
+        return r_dir
+
+    v_gate = v_gate_frac * state["v_target"]
+    g = torch.sigmoid((state["v_ball_frozen"] - v_gate) / sigma_gate)
+    return r_dir * g
 
 
 def kick_velocity_scaled(
