@@ -6,7 +6,21 @@ __pycache__/
 
 # IsaacLab / Hydra
 outputs/
-logs/
+
+# logs/ は基本的に追跡しないが、転移学習の起点にする walk phase の checkpoint だけは
+# リポジトリに含める（--load_pretrained で walk_kick / walk_pass の両方から参照するため）。
+#
+# NOTE: git は除外されたディレクトリの中を走査しないので、`logs/` のように親ごと
+#       除外していると中のファイルを `!` で再包含できない。階層ごとに
+#       「`*` で中身を除外 → `!` でディレクトリだけ復活」を繰り返す必要がある。
+logs/*
+!logs/rsl_rl/
+logs/rsl_rl/*
+!logs/rsl_rl/k1_walk_kick_walk_phase/
+logs/rsl_rl/k1_walk_kick_walk_phase/*
+!logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/
+logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/*
+!logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/model_4999.pt
 
 # Isaac Sim
 _isaac_sim/
