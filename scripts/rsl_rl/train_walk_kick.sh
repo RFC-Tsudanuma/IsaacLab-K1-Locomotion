@@ -92,7 +92,11 @@ ITER=${ITER:-20000}
 STAGE=${STAGE:-all}
 
 WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
-KICK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-v0"
+# Stage 2 のタスクは差し替え可能。walk phase (Stage 1) は 3 タスク共通なので、
+# パス／ループシュートもこのスクリプトをそのまま使い回せる。
+#   KICK_TASK=Isaac-Velocity-Flat-K1-Walk-Pass-v0 ./scripts/rsl_rl/train_walk_kick.sh
+#   KICK_TASK=Isaac-Velocity-Flat-K1-Walk-Loop-v0 ./scripts/rsl_rl/train_walk_kick.sh
+KICK_TASK=${KICK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-v0"}
 WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
 
 # Stage 1 の最新 run から最終 checkpoint を拾う。

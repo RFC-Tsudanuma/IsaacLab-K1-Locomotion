@@ -31,14 +31,16 @@ class KickDirectionCommand(UniformVelocityCommand):
     kick_state は command[:, :2] を蹴り方向ベクトル (cos θ, sin θ) として、
     target_kick_velocity 観測と kick_velocity_scaled 報酬は command[:, 2] を目標速度として使用する。
 
-    メトリクス (walk_kick / walk_pass 共通、Metrics/kick_direction/ 以下に出る):
+    メトリクス (walk_kick / walk_pass / walk_loop 共通、Metrics/kick_direction/ 以下に出る):
 
     * ``kick_vel_ratio``: 指令速度に対する実測ボール速度の追従率 (v_ball / v_target)。
     * ``kick_vel_error``: 同じく絶対誤差 [m/s]。
     * ``kick_rate``: キックが成立した (値 latch した) エピソードの割合。
+    * ``kick_elevation_deg``: 射出仰角 φ [deg]。ループシュートが出ているかの直接の指標。
+    * ``kick_apex_height``: latch 後にボールが到達した最高高度 [m]。
 
-    前 2 つは未キックの env を 0 として平均するため、キック成立分だけの追従率が欲しい
-    ときは ``kick_vel_ratio / kick_rate`` で割り戻すこと。
+    ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
+    欲しいときは ``kick_rate`` で割り戻すこと。
     """
 
     cfg: "KickDirectionCommandCfg"
@@ -56,6 +58,9 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_vel_ratio"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_vel_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_rate"] = torch.zeros(self.num_envs, device=self.device)
+        # ループシュート (walk_loop) 用。他タスクでも「意図せず浮いていないか」の監視に使える。
+        self.metrics["kick_elevation_deg"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_apex_height"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -74,6 +79,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_vel_ratio"] = ratio * kick_done
         self.metrics["kick_vel_error"] = torch.abs(v_ball - v_target) * kick_done
         self.metrics["kick_rate"] = kick_done
+        self.metrics["kick_elevation_deg"] = torch.rad2deg(state["phi_frozen"]) * kick_done
+        self.metrics["kick_apex_height"] = state["apex_height"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)

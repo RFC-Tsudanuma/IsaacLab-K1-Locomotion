@@ -7,8 +7,8 @@
 
 値 latch (凍結) と状態 latch (フラグ) を厳密に分けて保持する。
 
-* 値 latch: トリガー L (``v_ball > v_thresh``) の発火時に τ_direction / v_ball / p_style を
-  **同時に**スナップショットして固定する。以降はその凍結値で dense に払う。
+* 値 latch: トリガー L (``v_ball > v_thresh``) の発火時に τ_direction / v_ball / v_ball_3d /
+  φ (仰角) / p_style を **同時に**スナップショットして固定する。以降はその凍結値で dense に払う。
 * 状態 latch: ``kick_done`` (L 発火) と ``overshoot_fired`` (後方レイ R の左右跨ぎ)。
   いずれもエピソード内で一度立ったら解除しない。
 
@@ -53,6 +53,8 @@ def kick_state(
 
     ball_pos = ball.data.root_pos_w[:, :2]
     ball_vel = ball.data.root_lin_vel_w[:, :2]
+    ball_vel_z = ball.data.root_lin_vel_w[:, 2]
+    ball_z = ball.data.root_pos_w[:, 2]
     robot_pos = robot.data.root_pos_w[:, :2]
     robot_vel = robot.data.root_lin_vel_w[:, :2]
 
@@ -79,7 +81,10 @@ def kick_state(
             "overshoot_event": torch.zeros(env.num_envs, device=device),
             "tau_direction_frozen": torch.zeros(env.num_envs, device=device),
             "v_ball_frozen": torch.zeros(env.num_envs, device=device),
+            "v_ball_3d_frozen": torch.zeros(env.num_envs, device=device),
+            "phi_frozen": torch.zeros(env.num_envs, device=device),
             "p_style_frozen": torch.zeros(env.num_envs, device=device),
+            "apex_height": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -115,7 +120,10 @@ def kick_state(
         state["overshoot_fired"][just_reset] = False
         state["tau_direction_frozen"][just_reset] = 0.0
         state["v_ball_frozen"][just_reset] = 0.0
+        state["v_ball_3d_frozen"][just_reset] = 0.0
+        state["phi_frozen"][just_reset] = 0.0
         state["p_style_frozen"][just_reset] = 0.0
+        state["apex_height"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
@@ -123,26 +131,49 @@ def kick_state(
     p_style = torch.clamp((forward * kick_dir).sum(dim=-1), min=0.0, max=1.0)
 
     # ------------------------------------------------------------------ #
-    # 値 latch: L = (v_ball > v_thresh) の立ち上がりで τ_direction, v_ball, p_style を同時凍結
+    # 値 latch: L = (v_ball > v_thresh) の立ち上がりで
+    # τ_direction, v_ball, v_ball_3d, φ, p_style を同時凍結
+    #
+    # NOTE: トリガーは意図的に **水平成分 v_ball のみ** で判定している。ループシュート
+    #       (walk_loop) でもこのままで、閾値を 3D ノルムに変えてはいけない。3D にすると
+    #       「ボールを踏んで真上に跳ね上げる」だけで latch が成立してしまい、φ 報酬の
+    #       抜け道になる。水平トリガーのままなら「前に飛んでいること」が latch の前提条件
+    #       として無料で手に入る。仰角 30° / v=3m/s のループでも v_xy = 2.6 m/s あるので
+    #       閾値 0.8 は余裕で超える（見逃すのは 70° 超の、そもそも狙っていない打ち上げだけ）。
     # ------------------------------------------------------------------ #
     v_ball = ball_vel.norm(dim=-1)
     trigger = (v_ball > v_thresh) & (~state["kick_done"])
 
     if trigger.any():
         # τ_direction: ボールの飛翔方向と蹴り方向の角度誤差 [rad]
+        # 水平投影で測るので、ボールが浮いていてもそのまま「狙った方位か」を意味する。
         ball_dir = ball_vel / (v_ball.unsqueeze(-1) + 1e-6)
         cos_err = torch.clamp((ball_dir * kick_dir).sum(dim=-1), min=-1.0, max=1.0)
         sin_err = ball_dir[:, 0] * kick_dir[:, 1] - ball_dir[:, 1] * kick_dir[:, 0]
         tau_direction = torch.abs(torch.atan2(sin_err, cos_err))
 
+        # φ: 仰角 [rad]。水平 = 0、真上 = π/2。負値 (打ち下ろし) もそのまま持つ。
+        phi = torch.atan2(ball_vel_z, v_ball + 1e-6)
+        v_ball_3d = torch.sqrt(v_ball**2 + ball_vel_z**2)
+
         state["tau_direction_frozen"] = torch.where(
             trigger, tau_direction, state["tau_direction_frozen"]
         )
         state["v_ball_frozen"] = torch.where(trigger, v_ball, state["v_ball_frozen"])
+        state["v_ball_3d_frozen"] = torch.where(trigger, v_ball_3d, state["v_ball_3d_frozen"])
+        state["phi_frozen"] = torch.where(trigger, phi, state["phi_frozen"])
         state["p_style_frozen"] = torch.where(trigger, p_style, state["p_style_frozen"])
         state["kick_done"] = state["kick_done"] | trigger
 
     kick_done = state["kick_done"]
+
+    # ------------------------------------------------------------------ #
+    # 到達最高高度: latch 後のボール z の running max。報酬には使わず、メトリクス専用。
+    # kick_finished の猶予窓 (2.0 秒) の間に実際の弾道の頂点を捕まえる。
+    # ------------------------------------------------------------------ #
+    state["apex_height"] = torch.where(
+        kick_done, torch.maximum(state["apex_height"], ball_z), state["apex_height"]
+    )
 
     # ------------------------------------------------------------------ #
     # 目標終端 G: R 上をボール側へ滑る点。latch 後は P_kick に固定して飛翔ボールを追わせない。

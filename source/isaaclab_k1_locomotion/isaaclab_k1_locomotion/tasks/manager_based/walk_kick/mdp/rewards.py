@@ -76,16 +76,23 @@ def kick_velocity_scaled(
     v_thresh: float,
     sigma_direction: float = 0.35,
     sigma_velocity: float = 1.0,
+    use_3d_speed: bool = False,
 ) -> torch.Tensor:
     """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
     f(v_ball) は「要求された蹴り速度 v_target にどれだけ一致したか」を測る。
     指令速度に対する一致度を見ないと可変キック強度が学習できないため、
     f(v) = exp(−((v − v_target) / σ)²) とした。
+
+    ``use_3d_speed=True`` で水平ノルムではなく 3D ノルムを使う。ループシュート
+    (walk_loop) 用。仰角 30° で蹴ると水平成分は 3D ノルムの 0.87 倍しかないため、
+    水平で測ったままだと「指令速度に届いていない」と誤判定され、φ 報酬（浮かせろ）と
+    速度報酬（もっと強く）が恒常的に綱引きしてしまう。
     """
     r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
 
-    v_err = state["v_ball_frozen"] - state["v_target"]
+    v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
+    v_err = v_meas - state["v_target"]
     f_vel = torch.exp(-((v_err / sigma_velocity) ** 2))
     return r_dir * f_vel
 
@@ -100,6 +107,35 @@ def kick_velocity_strong(
     """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
     r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
     return r_dir * state["v_ball_frozen"]
+
+
+def kick_elevation(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    phi_target: float = 0.52,
+    sigma_phi: float = 0.25,
+) -> torch.Tensor:
+    """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
+
+    f(φ) = exp(−((φ − φ_target) / σ_φ)²)。φ は latch 時に凍結したボール射出仰角。
+    φ_target = 0.52 rad ≈ 30°、σ_φ = 0.25 rad ≈ 14°。
+
+    **r_direction への乗算であることが設計の肝**。加算にすると「方向を無視してボールを
+    真上に跳ね上げる」「踏んで潰す」で報酬が取れてしまう。乗算なら kick_done ゲート・
+    方向精度 (τ_direction)・胴体の正対 (p_style) を全て通過した蹴りにしか払われない。
+    さらに latch トリガー自体が水平速度基準なので (kick_state 参照)、「前に飛んでいる」
+    ことも暗黙の前提条件になっている。
+
+    NOTE: 「vz が大きいほど得」という青天井の項には **絶対にしないこと**。必ず踏みつけ
+          スクープに収束する。目標仰角の帯を Gaussian で狙わせる形を保つ。
+    """
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+
+    f_phi = torch.exp(-(((state["phi_frozen"] - phi_target) / sigma_phi) ** 2))
+    return r_dir * f_phi
 
 
 def walk_speed(
