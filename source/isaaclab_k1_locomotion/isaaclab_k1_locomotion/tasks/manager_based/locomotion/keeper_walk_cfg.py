@@ -99,6 +99,15 @@ class K1KeeperWalkEnvCfg_PLAY(K1KeeperWalkEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        # カリキュラムは __init__ で _apply_stage(0) を呼び、cfg.ranges を直接
+        # 上書きする。PLAY で範囲を固定するには先に無効化しないと必ず負ける。
+        self.curriculum.lin_vel_command = None
+        self.commands.base_velocity.rel_standing_envs = 0.0
+        cmd = self.commands.base_velocity
+        cmd.ranges.lin_vel_x = (0.0, 0.0)
+        cmd.ranges.lin_vel_y = (-1.5, -1.5)
+        cmd.ranges.heading = (0.0, 0.0)   # ang_vel_z ではなくこちらを止める
+
         self.scene.num_envs = 50
         self.scene.env_spacing = 0.1
         self.observations.policy.enable_corruption = False
