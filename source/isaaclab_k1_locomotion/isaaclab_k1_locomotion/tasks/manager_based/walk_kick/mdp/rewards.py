@@ -209,6 +209,27 @@ def approach_penalty(
     return f_sole * p_kick_pose * (~state["kick_done"]).float()
 
 
+def extra_ball_touch(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+) -> torch.Tensor:
+    """項8. 2 回目以降のボール接触。発火したステップだけ 1。負の重みで使う。shape: (N,)
+
+    「まず軽く触って、それから蹴る」を潰すための項。1 回目の接触は無料なので、
+    ポリシーが罰を避ける唯一の道は **最初の接触をそのままキックにする** こと。
+
+    NOTE: 現在のポリシーでは「2 回目の接触 = 本命のキック」なので、この項は一見
+          キック本体を罰しているように見える。それで正しい。キック報酬 (項1+2 で
+          dense 2 秒ぶん ≈ +5) の方が 1 回の余分な接触の罰より十分大きいので、
+          「蹴らない」ではなく「1 回目で蹴る」方向に動くはず。逆に重みを上げすぎると
+          ボールに触ること自体を避けて kick_rate が落ちるので、Metrics で監視すること。
+    """
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    return state["extra_touch_event"]
+
+
 def kick_pose_overshoot(
     env: ManagerBasedRLEnv,
     r_stance: float,

@@ -36,9 +36,12 @@ Walk-Kick / Walk-Loop の挙動は変わらない。これは v_thresh を下げ
 収束してしまったため（詳細は _PASS_V_THRESH のコメント参照）。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
-from ..walk_kick.walk_kick_env_cfg import _KICK_W_SCALE, K1WalkKickEnvCfg
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS, _KICK_W_SCALE, K1WalkKickEnvCfg
 
 # --------------------------------------------------------------------------- #
 # パス用の目標ボール速度レンジ [m/s]
@@ -114,6 +117,7 @@ _KICK_STATE_REWARD_TERMS = (
     "walk_speed",
     "approach_penalty",
     "kick_pose_overshoot",
+    "extra_ball_touch",
 )
 
 
@@ -150,6 +154,34 @@ class K1WalkPassEnvCfg(K1WalkKickEnvCfg):
         # -- 3b. 項1 に片側速度ゲートを掛けて、かすり当てで満点が出る穴を塞ぐ
         self.rewards.kick_direction.params["v_gate_frac"] = _PASS_V_GATE_FRAC
         self.rewards.kick_direction.params["sigma_gate"] = _PASS_SIGMA_GATE
+
+        # -- 3c. 項8: 2 回目以降のボール接触を罰する
+        #
+        # v_thresh を 0.40 に上げて「かすり当てでは latch せず、エピソードも終わらない」
+        # ようにした副作用で、「まず軽く触って、それから蹴る」が無コストになった。
+        # 1 回目の接触は無料なので、罰を避ける唯一の道は最初の接触で蹴り切ること。
+        self.rewards.extra_ball_touch = RewTerm(
+            func=mdp.extra_ball_touch,
+            weight=0.0,
+            # _apply_v_thresh はこの項を追加する前に走っているので、v_thresh は
+            # ここで直に上書きしておく (kick_state はステップ単位のキャッシュなので、
+            # 1 項でも違う値を渡すと状態が評価順に依存してしまう)。
+            params={**_KICK_STATE_PARAMS, "v_thresh": _PASS_V_THRESH},
+        )
+        self.curriculum.extra_ball_touch_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "extra_ball_touch",
+                "start_weight": 0.0,
+                # イベント項なので value = weight * dt。-50.0 で 1 回あたり -1.0。
+                # キック 1 回の収益 (項1+2 の dense 2 秒ぶんで概ね +5) の 2 割程度。
+                # kick_rate が落ちるようなら弱めること (ボールに触ること自体を避け始める)。
+                "end_weight": -50.0,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
 
         # -- 4. kick_velocity_strong を外す
         #

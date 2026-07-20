@@ -38,6 +38,7 @@ class KickDirectionCommand(UniformVelocityCommand):
     * ``kick_rate``: キックが成立した (値 latch した) エピソードの割合。
     * ``kick_elevation_deg``: 射出仰角 φ [deg]。ループシュートが出ているかの直接の指標。
     * ``kick_apex_height``: latch 後にボールが到達した最高高度 [m]。
+    * ``ball_touch_count``: エピソード中に足がボールに触れた回数。1.0 が理想。
 
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
@@ -61,6 +62,9 @@ class KickDirectionCommand(UniformVelocityCommand):
         # ループシュート (walk_loop) 用。他タスクでも「意図せず浮いていないか」の監視に使える。
         self.metrics["kick_elevation_deg"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_apex_height"] = torch.zeros(self.num_envs, device=self.device)
+        # エピソード中に足がボールに触れた回数。1.0 が理想 (1 回で蹴り切る)。
+        # 未キックの env も含めた全 env 平均なので、kick_rate と併せて読むこと。
+        self.metrics["ball_touch_count"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -81,6 +85,9 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_rate"] = kick_done
         self.metrics["kick_elevation_deg"] = torch.rad2deg(state["phi_frozen"]) * kick_done
         self.metrics["kick_apex_height"] = state["apex_height"] * kick_done
+        # 接触回数は kick_done でマスクしない。「触ったが蹴れていない」エピソードこそ
+        # 見たい対象なので、未キックの env も含めて数える。
+        self.metrics["ball_touch_count"] = state["touch_count"]
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)

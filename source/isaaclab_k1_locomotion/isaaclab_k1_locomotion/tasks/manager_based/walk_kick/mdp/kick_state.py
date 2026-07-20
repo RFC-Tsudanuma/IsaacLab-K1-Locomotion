@@ -32,6 +32,22 @@ if TYPE_CHECKING:
 
 _ATTR = "_kick_latch_state"
 
+# --------------------------------------------------------------------------- #
+# 接触回数カウントのパラメータ
+#
+# 「足がボールに何回触ったか」を、接触センサーではなく **ボール速度の跳ね上がり**
+# で数える。接触センサー (contact_balls_left/right) は history_length=1 かつ
+# decimation=4 なので、衝突フレームを取りこぼすと数え落とす。一方ボールの速度変化は
+# 接触後も残るため、50Hz のサンプリングでも確実に捕捉できる。
+#
+# _TOUCH_DV_THRESH: ステップ間の水平速度の増分がこの値を超えたら「触った」とみなす。
+#     ボールは転がりながら減速する (dv < 0) ので、正方向の跳ね上がりだけが接触を意味する。
+# _TOUCH_REFRACTORY_STEPS: 1 回の接触が複数ステップにまたがって二重カウントされるのを
+#     防ぐ不応期。0.1 秒。これより短い間隔の再接触は 1 回として数える。
+# --------------------------------------------------------------------------- #
+_TOUCH_DV_THRESH = 0.15
+_TOUCH_REFRACTORY_STEPS = 5
+
 
 def kick_state(
     env: ManagerBasedRLEnv,
@@ -85,6 +101,10 @@ def kick_state(
             "phi_frozen": torch.zeros(env.num_envs, device=device),
             "p_style_frozen": torch.zeros(env.num_envs, device=device),
             "apex_height": torch.zeros(env.num_envs, device=device),
+            "prev_v_ball": torch.zeros(env.num_envs, device=device),
+            "touch_count": torch.zeros(env.num_envs, device=device),
+            "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
+            "extra_touch_event": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -124,6 +144,9 @@ def kick_state(
         state["phi_frozen"][just_reset] = 0.0
         state["p_style_frozen"][just_reset] = 0.0
         state["apex_height"][just_reset] = 0.0
+        state["prev_v_ball"][just_reset] = 0.0
+        state["touch_count"][just_reset] = 0.0
+        state["touch_refractory"][just_reset] = 0
 
     # ------------------------------------------------------------------ #
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
@@ -142,6 +165,28 @@ def kick_state(
     #       閾値 0.8 は余裕で超える（見逃すのは 70° 超の、そもそも狙っていない打ち上げだけ）。
     # ------------------------------------------------------------------ #
     v_ball = ball_vel.norm(dim=-1)
+
+    # ------------------------------------------------------------------ #
+    # 接触回数: ボール速度の跳ね上がり (dv > 閾値) の立ち上がりを数える。
+    #
+    # エピソード開始直後 (just_reset) は prev_v_ball が 0 にリセットされた直後なので、
+    # ボールが既に転がっていると偽の dv が出る。reset_ball は静止状態で置くので実害は
+    # 無いが、念のため just_reset のステップはカウントしない。
+    # ------------------------------------------------------------------ #
+    dv = v_ball - state["prev_v_ball"]
+    touched = (dv > _TOUCH_DV_THRESH) & (state["touch_refractory"] == 0) & (~just_reset)
+
+    state["touch_count"] = state["touch_count"] + touched.float()
+    # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
+    state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
+
+    state["touch_refractory"] = torch.where(
+        touched,
+        torch.full_like(state["touch_refractory"], _TOUCH_REFRACTORY_STEPS),
+        torch.clamp(state["touch_refractory"] - 1, min=0),
+    )
+    state["prev_v_ball"] = v_ball
+
     trigger = (v_ball > v_thresh) & (~state["kick_done"])
 
     if trigger.any():
