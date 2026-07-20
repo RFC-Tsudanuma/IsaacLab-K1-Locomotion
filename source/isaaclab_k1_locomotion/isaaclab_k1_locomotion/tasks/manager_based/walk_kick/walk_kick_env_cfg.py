@@ -275,7 +275,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
             resampling_time_range=(1e9, 1e9),
             heading_command=False,
             debug_vis=True,
-            target_speed_range=(1.0, 4.0),  # 目標ボール速度 [m/s]
+            target_speed_range=(0.25, 2.0),  # 目標ボール速度 [m/s]
             ranges=loco_mdp.UniformVelocityCommandCfg.Ranges(
                 lin_vel_x=(0.0, 0.0),
                 lin_vel_y=(0.0, 0.0),
