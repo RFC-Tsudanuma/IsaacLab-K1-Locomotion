@@ -45,6 +45,16 @@ parser.add_argument(
 parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
+parser.add_argument(
+    "--kick_speed",
+    type=float,
+    default=None,
+    help=(
+        "Fix the commanded ball speed [m/s] for walk_kick family tasks "
+        "(walk_kick / walk_pass / walk_loop). Without this the speed is sampled "
+        "per episode from the task's target_speed_range."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -242,6 +252,41 @@ def print_termination_summary(counts: dict) -> None:
     print(f"[TERM] {'total':16s} {total:6d}")
 
 
+def _apply_kick_speed(env_cfg, speed: float) -> None:
+    """指令ボール速度を単一値に固定する (walk_kick / walk_pass / walk_loop 用)。
+
+    キック速度はエピソードごとに ``target_speed_range`` から一様サンプリングされるので、
+    PLAY で「この強さのキックを見たい」ときはレンジを (v, v) に潰す。
+
+    NOTE: 値 latch のトリガー速度 (v_thresh) は下回れない。v_thresh 未満の指令を与えると
+          ``kick_state`` の latch が永久に発火せず、キック報酬が全て 0 のまま
+          ``kick_finished`` も出ずに time_out まで走る (= 蹴ったように見えない)。
+          タスクごとの既定は walk_kick/walk_loop が 0.8、walk_pass が 0.40。
+          ここでは黙って値を書き換えず、警告だけ出して指定値をそのまま通す。
+    """
+    cmd = getattr(env_cfg.commands, "kick_direction", None)
+    if cmd is None:
+        raise ValueError(
+            f"--kick_speed is only supported for walk_kick family tasks "
+            f"(the task '{args_cli.task}' has no 'kick_direction' command)."
+        )
+
+    old = cmd.target_speed_range
+    cmd.target_speed_range = (speed, speed)
+    print(f"[INFO] kick speed: {old} -> ({speed}, {speed}) [m/s]")
+
+    # v_thresh は kick_state を参照する全項に同じ値が配られている。代表として
+    # termination 側 (常に有効な項) から読む。
+    done_term = getattr(env_cfg.terminations, "kick_finished", None)
+    v_thresh = done_term.params.get("v_thresh") if done_term is not None else None
+    if v_thresh is not None and speed <= v_thresh:
+        print(
+            f"[WARN] --kick_speed {speed} is at or below the latch threshold "
+            f"v_thresh={v_thresh}. The kick will likely never latch, so the episode "
+            f"will run to time_out and no kick reward/termination will fire."
+        )
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
@@ -259,6 +304,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     if args_cli.device is not None:
         agent_cfg.device = args_cli.device
+
+    if args_cli.kick_speed is not None:
+        _apply_kick_speed(env_cfg, args_cli.kick_speed)
 
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
