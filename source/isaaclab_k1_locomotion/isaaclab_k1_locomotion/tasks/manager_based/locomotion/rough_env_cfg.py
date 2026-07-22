@@ -259,9 +259,13 @@ class K1Rewards(RewardsCfg):
 
     # --- 位相ベースの歩行報酬 (重要) ---
     # 空中時間報酬を0にし、位相報酬をメインにする
+    # weight=1.5 (2026-07-21 h06): 位相重み >1.0 は ±1.8m/s コマンド下では lin 追従を
+    # 崩壊させたが、カリキュラム上限を ±1.5m/s にキャップしたことで位相ロック
+    # (一致率 0.78) と lin/ang 追従が両立するようになった。速度ゲート
+    # (gate_low_speed 等) はキャップ下では不要なのでデフォルト無効 (scale=1.0)。
     feet_phase = RewTerm(
         func=feet_phase,
-        weight=1.0, # 位相に合わせて足を動かすことへの報酬
+        weight=1.5, # 位相に合わせて足を動かすことへの報酬
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "command_name": "base_velocity",

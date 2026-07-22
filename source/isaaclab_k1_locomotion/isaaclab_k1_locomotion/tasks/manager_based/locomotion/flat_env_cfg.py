@@ -76,8 +76,11 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=lin_vel_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5), (-1.8, 1.8)],
-            "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.8, 0.8), (-0.9, 0.9)],
+            # 上限は ±1.5 m/s にキャップ (2026-07-21)。±1.8 は K1 の脚長では位相通りの
+            # 歩容で物理的に届かず、「位相を無視した速い足踏み」で追従する崩れた歩容を
+            # 誘発していた。±1.5 に抑えることで位相ロック (一致率 0.78) と速度追従が両立。
+            "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
+            "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.8, 0.8)],
             # 各ステージを「本物の関門」にするための閾値。広い範囲ほど絶対誤差は出やすいので
             # わずかに緩めるが、緩めすぎると「狭い範囲を習得した時点で広い範囲のゆるい閾値も
             # 満たしてしまい」0→1→2 と一気に遷移する。実測では stage0(±0.6)の到達誤差が ~0.30、
@@ -86,7 +89,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # そこで stage1 は ±1.2 でまだ達成していない 0.34 まで締めて再学習を要求する
             # (stage0=0.30 は約500iter かけて到達する適切なゲートなので維持。
             #  最終 stage2 の値は遷移判定に使われずログ表示専用)。
-            "error_threshold": [0.30, 0.39, 0.45, 0.43],
+            "error_threshold": [0.30, 0.39, 0.43],
             "asset_name": "robot",
             "ema_alpha": 0.026,
             "min_updates": 50,
@@ -184,7 +187,9 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             weight=2.4,
             params={"command_name": "base_velocity", "std": 0.5},
         )
-        self.rewards.track_ang_vel_z_exp.weight = 4.2
+        # 4.2→4.8 (2026-07-21 h06): 旋回重視の要望に伴い増量。±1.5 キャップ+位相 w1.5 の
+        # 構成では lin と競合せず err_yaw 0.82→0.76 に改善。
+        self.rewards.track_ang_vel_z_exp.weight = 4.8
         self.rewards.ang_vel_xy_l2.weight = -0.25
         self.rewards.lin_vel_z_l2.weight = -0.8
         self.rewards.action_rate_l2.weight = -0.5

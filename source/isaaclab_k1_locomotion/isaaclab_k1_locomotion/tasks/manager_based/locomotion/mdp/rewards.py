@@ -81,6 +81,9 @@ def feet_phase(
     high_speed: float = 1.8,
     low_freq: float = 1.5,
     high_freq: float = 2.0,
+    gate_low_speed: float = 1.2,
+    gate_high_speed: float = 1.6,
+    gate_high_scale: float = 1.0,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -108,6 +111,12 @@ def feet_phase(
             are expected to be in contact.
         low_speed / high_speed / low_freq / high_freq: コマンド速度→歩行周波数の線形
             マッピング (``mdp.events.compute_cmd_phase_freq`` 参照)。phase_obs と揃えること。
+        gate_low_speed / gate_high_speed / gate_high_scale: 速度ゲート。線速度コマンドの
+            ノルムが ``gate_low_speed`` 以下では報酬を等倍、``gate_high_speed`` で
+            ``gate_high_scale`` 倍まで線形減衰させる (それ以上は一定)。厳密な位相遵守は
+            高速域の速度追従・加減速と競合するため、位相ロックを中低速に限定して
+            「低速の位相安定」と「高速の lin 追従」を両立させる。
+            ``gate_high_scale=1.0`` でゲート無効 (従来挙動)。
 
     Returns:
         Per-environment reward tensor of shape (N,).
@@ -127,7 +136,8 @@ def feet_phase(
     desired_stance = torch.stack([desired_stance_left, desired_stance_right], dim=1)
 
     # When command speed is small, override desired pattern to "both feet in contact"
-    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    cmd = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(cmd[:, :3], dim=1)
     is_stopped = (cmd_speed < cmd_threshold).unsqueeze(1)  # [N, 1]
     desired_stance = torch.where(is_stopped, torch.ones_like(desired_stance), desired_stance)
 
@@ -151,6 +161,13 @@ def feet_phase(
         is_stopped_flat, -num_lifted, torch.zeros_like(num_lifted)
     )
     reward = reward + stopped_penalty
+
+    # 速度ゲート: 中低速では位相遵守をフルに要求し、高速域では減衰させる。
+    # (停止時 lin_speed≈0 は gate_low_speed 以下なので停止ペナルティは等倍のまま)
+    if gate_high_scale != 1.0:
+        lin_speed = torch.norm(cmd[:, :2], dim=1)
+        frac = ((lin_speed - gate_low_speed) / (gate_high_speed - gate_low_speed)).clamp(0.0, 1.0)
+        reward = reward * (1.0 + (gate_high_scale - 1.0) * frac)
 
     return reward
 
