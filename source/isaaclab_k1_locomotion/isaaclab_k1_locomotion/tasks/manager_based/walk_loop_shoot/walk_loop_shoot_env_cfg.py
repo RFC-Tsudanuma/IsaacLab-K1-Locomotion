@@ -33,12 +33,14 @@
 
 Walk-Loop-Pass からの変更点
 ---------------------------
-1. ``kick_elevation`` を Gaussian から **片側飽和** に変える（最重要）。
-   Gaussian で 30° を狙わせると、ポリシーは「足を 2cm 浮かせた状態」に *最適化* して
-   しまう。それが Walk-Loop-Pass の挙動そのもの。実機ではそこからさらに目減りするので
-   浮きが消える。片側飽和なら「できる限り低く通す」が最適解になり、実機で目減りしても
-   浮きが残る余裕 (マージン) ができる。
-2. 目標ボール速度を上げる。シュートとしての飛距離を出すため。
+1. ``kick_elevation`` (角度ベース) を ``kick_loft`` (**vz ベースの片側飽和**) に
+   差し替える（最重要）。頂点高さは vz²/2g で vz = v·sinφ だけで決まる。角度ベースは
+   速度に無関心なため「速度帯の下限で角度だけ付ける」解を許し、初版 (角度片側飽和 +
+   速度帯 3.0-4.0) は実測 φ≈1.4° のほぼ水平な蹴りに収束した。
+2. 目標ボール速度を (4.0, 5.5) に上げる。φ の幾何上限 (~35°) の下では速度が
+   唯一の残りレバーのため（(v=4.0, φ=35°) の完璧な実行でも頂点 0.27 m しか出ない）。
+3. 歩行由来の feet_phase / feet_slide を緩める。どちらも「足裏を地面すれすれに通す
+   スイング」の探索を塞いでおり、足が下がらない限り φ は幾何的に付かない。
 
 NOTE: ドメインランダム化で幾何のマージンを稼ぐ案もあったが、Isaac Lab では spawn 後に
       コライダー半径を env ごとに変えられないため、ボール半径や地面高さのランダム化は
@@ -46,37 +48,40 @@ NOTE: ドメインランダム化で幾何のマージンを稼ぐ案もあっ�
       (マージン最大化) を狙っている。まずはこちらの効果を見てから次を考えること。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS, _KICK_W_SCALE, _SIGMA_DIRECTION
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPassEnvCfg
 
 # --------------------------------------------------------------------------- #
-# 片側飽和の飽和角 φ_sat [rad]
+# Loft 報酬の飽和上昇速度 vz_sat [m/s]
 #
-# f(φ) = clamp(φ / φ_sat, 0, 1)。φ_sat 以上は頭打ちなので青天井にはならず、
-# 「踏みつけて真上に跳ね上げる」exploit は r_direction 乗算と併せて塞がれたまま。
+# kick_loft = r_dir * clamp(vz / vz_sat, 0, 1)。頂点高さは vz²/2g で vz だけで決まる。
+# 2.5 m/s は頂点 0.32 m・滞空 0.51 s に相当し、「はっきり浮いた」と見える帯。
+# 速度帯の下限 4.0 m/s なら φ=33°、上限 5.5 m/s なら φ=24° で飽和に届く。
 #
-# 0.61 rad ≈ 35°。接触の第一瞬間の理論上限が 42° で、ボールが足先を乗り越える間に
-# 実効角はそれより下がるため、35° は「ほぼ上限」を意味する。ここを飽和点にすることで
-# 「足をできる限り低く通す」が最適解になる。
-#
-# NOTE: 42° に近づけすぎると達成不能域で勾配が飽和せず、いつまでも f<1 のまま
-#       「もっと低く」を要求し続けて爪先を地面に擦る解に落ちうる。まず 35° で様子を見る。
+# 当初は角度の片側飽和 (φ_sat=0.61) を使っていたが、角度は速度に無関心なため
+# 「速度帯の下限で角度だけ付ける」解を許してしまい、実測 φ≈1.4° の水平蹴りに
+# 収束した。vz は「強く」と「上に」を同時に要求する。
 # --------------------------------------------------------------------------- #
-_SHOOT_PHI_SAT = 0.61
+_SHOOT_VZ_SAT = 2.5
 
 # --------------------------------------------------------------------------- #
 # シュート用の目標ボール速度 [m/s]（3D ノルム基準）
 #
-# Walk-Loop-Pass は (2.0, 3.0)。シュートは飛距離が要るので上げる。
-# 45° 換算の飛距離は v=3.0 で約 0.9m、v=4.0 で約 1.6m。
-# 上限 4.0 は Walk-Kick の帯 (1.0-4.0) の上限と同じで、地面蹴りでは到達実績がある値。
+# 当初 (3.0, 4.0) だったが、仕様上限の (v=4.0, φ=35°) を完璧に実行しても頂点 0.27 m・
+# 滞空 0.47 s しか出ない (頂点 = (v·sinφ)²/2g、φ は幾何上限 ~42°)。「はっきり飛ぶ」には
+# 速度を盛るしかないので上げる。B-Human の評価表では K1 の Strong キックが sim で
+# 5-6.8 m/s 出ており、物理的に届く帯。
 # --------------------------------------------------------------------------- #
-_SHOOT_SPEED_RANGE = (3.0, 4.0)
+_SHOOT_SPEED_RANGE = (4.0, 5.5)
 
-# kick_velocity_scaled の速度シェイピング係数 [m/s]。帯が 3.0-4.0 と Pass (2.0-3.0) と
-# 同じ幅なので、Pass の 0.7 をそのまま引き継ぐ（明示のため再掲）。
-_SHOOT_SIGMA_VELOCITY = 0.7
+# kick_velocity_scaled の速度シェイピング係数 [m/s]。帯を上げて広げたぶん緩める。
+# kick_vel_ratio が 0.8 程度に留まる現状で厳しくシェイプすると勾配が薄くなるため。
+_SHOOT_SIGMA_VELOCITY = 1.0
 
 
 @configclass
@@ -86,15 +91,47 @@ class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. 仰角報酬を片側飽和に切り替える（最重要の変更）
+        # -- 1. 仰角報酬 (kick_elevation) を Loft 報酬 (kick_loft) に差し替える（最重要）
         #
-        # phi_sat を渡すと kick_elevation は Gaussian ではなく clamp(φ/φ_sat, 0, 1) を使う。
-        # phi_target / sigma_phi は無視されるが、設定の履歴として残しておく。
-        self.rewards.kick_elevation.params["phi_sat"] = _SHOOT_PHI_SAT
+        # 角度ベースの報酬は速度に無関心で、「速度帯の下限でわずかに角度を付ける」
+        # 水平蹴り (実測 φ≈1.4°) に収束した。頂点高さを決める vz を直接狙わせる。
+        self.rewards.kick_elevation = None
+        self.curriculum.kick_elevation_weight = None
+        self.rewards.kick_loft = RewTerm(
+            func=mdp.kick_loft,
+            weight=0.0,
+            params={
+                **_KICK_STATE_PARAMS,
+                "sigma_direction": _SIGMA_DIRECTION,
+                "vz_sat": _SHOOT_VZ_SAT,
+            },
+        )
+        self.curriculum.kick_loft_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "kick_loft",
+                "start_weight": 0.0,
+                "end_weight": 5.0 * _KICK_W_SCALE,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
 
         # -- 2. 目標ボール速度をシュートの帯へ
         self.commands.kick_direction.target_speed_range = _SHOOT_SPEED_RANGE
         self.rewards.kick_velocity_scaled.params["sigma_velocity"] = _SHOOT_SIGMA_VELOCITY
+
+        # -- 3. 足を低く通す探索を歩行報酬が塞がないようにする
+        #
+        # 射出仰角は接触時の足裏高さでほぼ決まる (足裏 1.9cm で 30°、3.6cm で 20°、
+        # 5.5cm で 10°、7.4cm で 0°)。歩行から継承した feet_phase (+2.0) は swing 期に
+        # 足が接地すると報酬全損、feet_slide (-0.5) は接地中の水平移動を罰するため、
+        # どちらも「足裏を地面すれすれに通すスイング」の探索を塞ぐ。
+        # 実測 φ≈1.4° (足裏 ≈7cm 相当) で足が下がっていないことが確認されたので、
+        # shoot に限り緩める。歩容は walk phase / loop_pass の checkpoint で獲得済み。
+        self.rewards.feet_phase.weight = 1.0
+        self.rewards.feet_slide.weight = -0.1
 
 
 @configclass

@@ -177,6 +177,36 @@ def kick_elevation(
     return r_dir * f_phi
 
 
+def kick_loft(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    vz_sat: float = 2.5,
+) -> torch.Tensor:
+    """項7'. Loft = r_direction * clamp(vz / vz_sat, 0, 1)。shape: (N,)
+
+    vz = v_ball_3d_frozen * sin(φ_frozen)。頂点高さは vz²/2g で **vz だけで決まる** ので、
+    「はっきり浮かせる」タスクの目的関数として角度 (kick_elevation) より正しい。
+
+    kick_elevation は角度にしか興味がなく速度に無関心なため、「30° のゆるい蹴り」と
+    「30° の強烈な蹴り」が同じ満点になる。walk_loop_shoot の実測でも φ≈1-2° の
+    ほぼ水平な蹴りに収束した。vz を狙わせれば「強く」と「上に」を同時に要求できる。
+
+    * 飽和 (vz_sat で頭打ち) なので青天井にならない。飽和は Gaussian と違い届かなくても
+      勾配が死なない (線形ランプ) ので、vz_sat は「十分な浮き」の値でよい。
+      vz_sat=2.5 は頂点 0.32 m・滞空 0.51 s に相当。
+    * r_direction への乗算・kick_done ゲート・打ち下ろし (φ<0 → sin<0 → clamp 0) の
+      扱いは kick_elevation と同じ。踏みつけ exploit 対策の設計原則を維持する。
+    """
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+
+    vz = state["v_ball_3d_frozen"] * torch.sin(state["phi_frozen"])
+    f_loft = torch.clamp(vz / vz_sat, min=0.0, max=1.0)
+    return r_dir * f_loft
+
+
 def walk_speed(
     env: ManagerBasedRLEnv,
     r_stance: float,
