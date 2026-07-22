@@ -51,7 +51,7 @@ parser.add_argument(
     default=None,
     help=(
         "Fix the commanded ball speed [m/s] for walk_kick family tasks "
-        "(walk_kick / walk_pass / walk_loop). Without this the speed is sampled "
+        "(walk_kick / walk_pass / walk_loop_pass / walk_loop_shoot). Without this the speed is sampled "
         "per episode from the task's target_speed_range."
     ),
 )
@@ -253,7 +253,7 @@ def print_termination_summary(counts: dict) -> None:
 
 
 def _apply_kick_speed(env_cfg, speed: float) -> None:
-    """指令ボール速度を単一値に固定する (walk_kick / walk_pass / walk_loop 用)。
+    """指令ボール速度を単一値に固定する (walk_kick / walk_pass / walk_loop_pass / walk_loop_shoot 用)。
 
     キック速度はエピソードごとに ``target_speed_range`` から一様サンプリングされるので、
     PLAY で「この強さのキックを見たい」ときはレンジを (v, v) に潰す。
@@ -261,7 +261,7 @@ def _apply_kick_speed(env_cfg, speed: float) -> None:
     NOTE: 値 latch のトリガー速度 (v_thresh) は下回れない。v_thresh 未満の指令を与えると
           ``kick_state`` の latch が永久に発火せず、キック報酬が全て 0 のまま
           ``kick_finished`` も出ずに time_out まで走る (= 蹴ったように見えない)。
-          タスクごとの既定は walk_kick/walk_loop が 0.8、walk_pass が 0.40。
+          タスクごとの既定は walk_kick/walk_loop_* が 0.8、walk_pass が 0.40。
           ここでは黙って値を書き換えず、警告だけ出して指定値をそのまま通す。
     """
     cmd = getattr(env_cfg.commands, "kick_direction", None)
