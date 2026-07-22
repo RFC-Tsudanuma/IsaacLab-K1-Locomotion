@@ -21,3 +21,13 @@ class K1WalkLoopPassPPORunnerCfg(K1WalkKickPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_loop_pass"
+
+
+@configclass
+class K1WalkLoopPass360PPORunnerCfg(K1WalkLoopPassPPORunnerCfg):
+    """全方位版。loop_pass の checkpoint から --load_pretrained で始める前提。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_loop_pass_360"

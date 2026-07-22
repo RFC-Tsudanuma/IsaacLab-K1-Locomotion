@@ -227,6 +227,44 @@ def approach_penalty(
     return f_sole * p_kick_pose * (~state["kick_done"]).float()
 
 
+def ball_avoidance(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_sole: float = 0.35,
+    sigma_pose: float = 0.3,
+) -> torch.Tensor:
+    """項5'. Ball Avoidance = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
+
+    :func:`approach_penalty` の f_sole を反転した、B-Human 原義 (と推定される) 形。
+
+    * f(d_soleToBall) = exp(−(d/σ)²) : 足裏がボールに **近いほど大きい** (近い=1, 遠い=0)
+    * p_kickPose                      : 理想キック姿勢からの **ズレほど大きい**
+
+    「構え (P_kick に立ち蹴り方向を向く) ができるまでボールに寄るな」という抑止。
+    姿勢が合えば近づいても罰が消えるので、キック自体は妨げない。全方位サンプリング
+    (ψ が大きい = ボールの正面側から接近するエピソード) では、まっすぐ突っ込んで
+    足を当てる行動をこの項が直接罰し、誘導なしで回り込みを成立させる。
+
+    approach_penalty (遠いほど罰 = 接近圧) とは逆向きであることに注意。原典ポスターの
+    項名が "Ball Avoidance" であること、他の f() が全て 0 で最大の釣鐘型であること、
+    著者の証言 (「逆向きに蹴れば報酬なし/ペナルティで大丈夫」) からこの向きと推定した。
+    フルペーパーでの式の確認は取れていない。
+
+    pre-latch のみ有効（kick_done で 0 ゲート）。
+    """
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+
+    # 近いほど 1 に近づく (approach_penalty と逆)
+    f_sole = torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
+
+    pose_match = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2)) * state["p_style"]
+    p_kick_pose = 1.0 - pose_match
+
+    return f_sole * p_kick_pose * (~state["kick_done"]).float()
+
+
 def extra_ball_touch(
     env: ManagerBasedRLEnv,
     r_stance: float,
@@ -254,10 +292,13 @@ def kick_pose_overshoot(
     alpha: float,
     v_thresh: float,
 ) -> torch.Tensor:
-    """項6. Kick Pose Overshoot。後方レイ R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
+    """項6. Kick Pose Overshoot。キック線 R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
-    エピソード開始時に記録した s = dot(base_pos − ball_pos, right_vec) の符号を初期側とし、
-    符号が反転したら発火して latch する。戻っても解除せず、1 エピソード最大 1 回だけ罰する。
+    基準側 init_side は開始時の sign(s) ではなく、ロボットが |s| > 閾値 までどちらかの
+    側へ寄った時点の符号で確定する (:mod:`.kick_state` の _INIT_SIDE_COMMIT_DIST 参照。
+    s≈0 スタートで符号がノイズになり、正しい行動がコイントスで罰されるのを防ぐ)。
+    確定側から反対側へ符号が反転したら発火して latch する。戻っても解除せず、
+    1 エピソード最大 1 回だけ罰する。未確定の間は発火しない。
     """
     state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
     return state["overshoot_event"]

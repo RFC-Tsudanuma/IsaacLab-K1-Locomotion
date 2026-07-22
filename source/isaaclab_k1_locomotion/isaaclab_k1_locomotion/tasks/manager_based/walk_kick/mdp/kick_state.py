@@ -49,6 +49,19 @@ _TOUCH_DV_THRESH = 0.15
 _TOUCH_REFRACTORY_STEPS = 5
 
 # --------------------------------------------------------------------------- #
+# init_side (overshoot 判定の基準側) を確定させる横距離の閾値 [m]
+#
+# init_side はエピソード開始時の sign(s) では決めない。ψ≈180° (ボール正面スタート) や
+# ψ≈0° (整列済みスタート) では s≈0 で符号が数値ノイズになり、正しい回り込み・整列済みの
+# 接近がコイントスで overshoot 罰 (-1.0) されてしまうため。代わりに 0 (未確定) から始め、
+# ロボットが |s| > この閾値 までどちらかの側へ「寄った」時点の符号で確定する。
+#
+# 0.1 は歩行時の base 横揺れ (±5cm 程度) より上、スタンス幅の半分 (~0.1) 程度。
+# 未確定 (init_side==0) の間は s*0=0 < 0 が偽なので crossed は発火しない。
+# --------------------------------------------------------------------------- #
+_INIT_SIDE_COMMIT_DIST = 0.1
+
+# --------------------------------------------------------------------------- #
 # 足リンク原点から足裏までの距離 [m]
 #
 # 足コライダー (MJCF の box: pos=(0.026, 0, -0.02), size=(0.09, 0.035, 0.018)) の
@@ -105,7 +118,7 @@ def kick_state(
         state = {
             "step": -1,
             "P_kick": torch.zeros(env.num_envs, 2, device=device),
-            "init_side": torch.ones(env.num_envs, device=device),
+            "init_side": torch.zeros(env.num_envs, device=device),  # 0 = 未確定
             "kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "overshoot_fired": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "overshoot_event": torch.zeros(env.num_envs, device=device),
@@ -147,10 +160,8 @@ def kick_state(
     if just_reset.any():
         # P_kick: R 上、ボールから後方 r_stance の点。エピソード終了まで固定。
         state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
-        # 初期側の符号 (s == 0 のときは + 側とみなす)
-        state["init_side"][just_reset] = torch.where(
-            s >= 0.0, torch.ones_like(s), -torch.ones_like(s)
-        )[just_reset]
+        # init_side は未確定 (0) に戻す。確定は下の commit ブロックで行う。
+        state["init_side"][just_reset] = 0.0
         state["kick_done"][just_reset] = False
         state["overshoot_fired"][just_reset] = False
         state["tau_direction_frozen"][just_reset] = 0.0
@@ -163,6 +174,16 @@ def kick_state(
         state["touch_count"][just_reset] = 0.0
         state["touch_refractory"][just_reset] = 0
         state["sole_height_at_touch"][just_reset] = 0.0
+
+    # ------------------------------------------------------------------ #
+    # init_side の確定: ロボットが |s| > 閾値 までどちらかの側へ寄った時点の符号で確定
+    # (0 = 未確定)。開始時の sign(s) で決めない理由は _INIT_SIDE_COMMIT_DIST 参照。
+    # 従来エピソード (|s| > 0.1 で開始するほぼ全部) は 1 ステップ目で確定するので
+    # 挙動は実質変わらない。
+    # ------------------------------------------------------------------ #
+    commit = (state["init_side"] == 0.0) & (s.abs() > _INIT_SIDE_COMMIT_DIST)
+    if commit.any():
+        state["init_side"] = torch.where(commit, torch.sign(s), state["init_side"])
 
     # ------------------------------------------------------------------ #
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
@@ -272,8 +293,9 @@ def kick_state(
     state["d_to_G"] = d_to_G
 
     # ------------------------------------------------------------------ #
-    # 状態 latch: overshoot。後方レイ R を跨いで初期側と反対側へ入ったら発火。
+    # 状態 latch: overshoot。キック線 R を跨いで確定側 (init_side) と反対側へ入ったら発火。
     # 前後位置・0.5m・G とは無関係。base_link の水平位置のみで判定する。
+    # init_side が未確定 (0) の間は s*0=0 なので発火しない。
     # ------------------------------------------------------------------ #
     crossed = (s * state["init_side"]) < 0.0
     newly_fired = crossed & (~state["overshoot_fired"])

@@ -45,6 +45,8 @@ NOTE: **この設定は実機で動作確認済みの「効いている」構成
       仰角を上げる方向の変更は :mod:`..walk_loop_shoot` 側で行う。
 """
 
+import math
+
 import isaaclab.sim as sim_utils
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -154,6 +156,84 @@ class K1WalkLoopPassEnvCfg(K1WalkKickEnvCfg):
 
 @configclass
 class K1WalkLoopPassEnvCfg_PLAY(K1WalkLoopPassEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkLoopPass360EnvCfg(K1WalkLoopPassEnvCfg):
+    """全方位版ループパス。ボール出現・蹴り方向とも 360°、距離 0.5-1.5 m。
+
+    :class:`K1WalkLoopPassEnvCfg` (±60°/±45°, 0.5-0.8 m) を全方位に広げたもの。
+    質的に新しいのは「ボールの正面側から半周回り込んで蹴る」エピソードで、
+    段階カリキュラムは使わず **loop_pass の checkpoint からの fine-tune を実質
+    カリキュラムとする** (蹴り方は既知・回り込みだけ新規)::
+
+        # 既存の loop_pass checkpoint から (推奨):
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Flat-K1-Walk-Loop-Pass-360-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_loop_pass/<run>/model_<N>.pt
+        # ゼロから通しで (walk phase → loop_pass → 360 の 3 段):
+        ./scripts/rsl_rl/train_walk_loop_pass_360.sh
+
+    回り込みは誘導 (G の迂回経路) ではなく **報酬の抑止で成立させる** (B-Human 方式)。
+    approach_penalty (遠いほど罰 = 接近圧) を ball_avoidance (姿勢ができていないのに
+    近いほど罰) に差し替えることで、ボール正面からまっすぐ突っ込む行動が罰され、
+    距離を保って回り込む解に寄る。差し替え理由の詳細は
+    :func:`~..walk_kick.mdp.rewards.ball_avoidance` の docstring を参照。
+
+    init_side の確定遅延 (kick_state._INIT_SIDE_COMMIT_DIST) は共有コード側の修正で、
+    ボール正面スタート (s≈0) の回り込みがコイントスで overshoot 罰されるのを防ぐ。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. サンプリングを全方位・遠距離へ
+        self.events.reset_ball.params["half_angle"] = math.pi
+        self.events.reset_ball.params["dist_range"] = (0.5, 1.5)
+        self.commands.kick_direction.ranges.heading = (-math.pi, math.pi)
+
+        # -- 2. approach_penalty → ball_avoidance
+        #
+        # approach_penalty は「姿勢が悪くても足をボールに近づけるだけで罰が減る」ので、
+        # 正面からの突っ込み (→ 衝突で latch が悪い値で凍結 → エピソード終了) を
+        # むしろ後押ししてしまう。ball_avoidance は同じ weight で向きだけ逆。
+        self.rewards.approach_penalty = None
+        self.curriculum.approach_penalty_weight = None
+        self.rewards.ball_avoidance = RewTerm(
+            func=mdp.ball_avoidance,
+            weight=0.0,
+            params={**_KICK_STATE_PARAMS, "sigma_sole": 0.35, "sigma_pose": 0.3},
+        )
+        self.curriculum.ball_avoidance_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "ball_avoidance",
+                "start_weight": 0.0,
+                "end_weight": -3.0,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
+
+        # -- 3. 移動距離が伸びるぶんエピソードを延長
+        #
+        # 1.5 m + 半周回り込みで移動 2.5-3 m。学習初期の遅い歩きだと 10 秒では
+        # 蹴る前に time_out するエピソードが増える。
+        self.episode_length_s = 15.0
+
+
+@configclass
+class K1WalkLoopPass360EnvCfg_PLAY(K1WalkLoopPass360EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
