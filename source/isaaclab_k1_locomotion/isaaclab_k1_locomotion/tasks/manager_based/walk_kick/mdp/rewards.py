@@ -138,11 +138,23 @@ def kick_elevation(
     sigma_direction: float = 0.35,
     phi_target: float = 0.52,
     sigma_phi: float = 0.25,
+    phi_sat: float | None = None,
 ) -> torch.Tensor:
     """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
 
-    f(φ) = exp(−((φ − φ_target) / σ_φ)²)。φ は latch 時に凍結したボール射出仰角。
-    φ_target = 0.52 rad ≈ 30°、σ_φ = 0.25 rad ≈ 14°。
+    φ は latch 時に凍結したボール射出仰角。f(φ) には 2 つのモードがある。
+
+    * **Gaussian** (既定): f(φ) = exp(−((φ − φ_target) / σ_φ)²)。
+      φ_target = 0.52 rad ≈ 30°、σ_φ = 0.25 rad ≈ 14°。目標仰角の「帯」を狙わせる。
+    * **片側飽和** (``phi_sat`` 指定時): f(φ) = clamp(φ / φ_sat, 0, 1)。
+      φ_sat まで単調増加し、以降は頭打ち。**「できる限り高く」を狙わせる。**
+
+    どちらを使うかは目標が物理上限からどれだけ離れているかで決まる。K1 の足で出せる
+    射出仰角には明確な天井があり (足先上エッジ高 3.6cm / ボール半径 11cm から約 42°、
+    しかも接触時に足が 2cm 浮くだけで 29° まで落ちる)、Gaussian で 30° を狙わせると
+    ポリシーは「足を 2cm 浮かせた状態」に最適化してしまう。実機ではそこからさらに
+    目減りするので浮きが消える。天井付近を狙うタスク (walk_loop_shoot) では
+    片側飽和を使い、足をできる限り低く通す解に寄せること。
 
     **r_direction への乗算であることが設計の肝**。加算にすると「方向を無視してボールを
     真上に跳ね上げる」「踏んで潰す」で報酬が取れてしまう。乗算なら kick_done ゲート・
@@ -151,11 +163,17 @@ def kick_elevation(
     ことも暗黙の前提条件になっている。
 
     NOTE: 「vz が大きいほど得」という青天井の項には **絶対にしないこと**。必ず踏みつけ
-          スクープに収束する。目標仰角の帯を Gaussian で狙わせる形を保つ。
+          スクープに収束する。片側飽和モードも φ_sat で頭打ちにすることでこれを防いで
+          いる。飽和させずに単調増加させてはいけない。
     """
     r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
 
-    f_phi = torch.exp(-(((state["phi_frozen"] - phi_target) / sigma_phi) ** 2))
+    phi = state["phi_frozen"]
+    if phi_sat is not None:
+        # 打ち下ろし (φ<0) は 0。φ_sat 以上は 1 で頭打ち。
+        f_phi = torch.clamp(phi / phi_sat, min=0.0, max=1.0)
+    else:
+        f_phi = torch.exp(-(((phi - phi_target) / sigma_phi) ** 2))
     return r_dir * f_phi
 
 

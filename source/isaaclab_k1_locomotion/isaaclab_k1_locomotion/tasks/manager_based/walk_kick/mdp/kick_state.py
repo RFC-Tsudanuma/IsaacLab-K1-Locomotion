@@ -48,6 +48,20 @@ _ATTR = "_kick_latch_state"
 _TOUCH_DV_THRESH = 0.15
 _TOUCH_REFRACTORY_STEPS = 5
 
+# --------------------------------------------------------------------------- #
+# 足リンク原点から足裏までの距離 [m]
+#
+# 足コライダー (MJCF の box: pos=(0.026, 0, -0.02), size=(0.09, 0.035, 0.018)) の
+# 底面は足リンク原点から見て z = -0.02 - 0.018 = -0.038 にある。上面は z = -0.002 なので
+# 箱の厚みは 0.036。
+#
+# 射出仰角を決めるのは「足先の上エッジ高さ」で、これは (足裏高さ + 0.036) に等しい。
+# 球とボックスの接触では法線がエッジ→球中心を向くため、ボール半径 R とエッジ高さ e から
+#     仰角 = atan((R − e) / sqrt(R² − (R − e)²))
+# で決まる。R=0.11 のとき e=3.6cm (足裏接地) で 42°、e=9.1cm (足裏 5.5cm) で 10°。
+# --------------------------------------------------------------------------- #
+_SOLE_OFFSET = 0.038
+
 
 def kick_state(
     env: ManagerBasedRLEnv,
@@ -105,6 +119,7 @@ def kick_state(
             "touch_count": torch.zeros(env.num_envs, device=device),
             "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
+            "sole_height_at_touch": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -147,6 +162,7 @@ def kick_state(
         state["prev_v_ball"][just_reset] = 0.0
         state["touch_count"][just_reset] = 0.0
         state["touch_refractory"][just_reset] = 0
+        state["sole_height_at_touch"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
@@ -175,6 +191,25 @@ def kick_state(
     # ------------------------------------------------------------------ #
     dv = v_ball - state["prev_v_ball"]
     touched = (dv > _TOUCH_DV_THRESH) & (state["touch_refractory"] == 0) & (~just_reset)
+
+    # 足リンクの位置。d_sole_to_ball と接触時足高さの両方で使う。
+    foot_ids = _foot_body_ids(env, robot)
+    foot_pos = robot.data.body_pos_w[:, foot_ids, :]  # (N, 2, 3)
+
+    # ------------------------------------------------------------------ #
+    # 接触瞬間の足裏高さ [m]。射出仰角を決めている唯一の量なので、真値で記録する。
+    #
+    # ボールに近い方の足を「蹴った足」とみなし、その足裏高さ (リンク原点 − _SOLE_OFFSET)
+    # を最初の接触が起きたステップに凍結する。目測ではなくこれを見ること。
+    # ------------------------------------------------------------------ #
+    d_foot_to_ball = (foot_pos - ball.data.root_pos_w[:, :3].unsqueeze(1)).norm(dim=-1)  # (N, 2)
+    kicking_foot = d_foot_to_ball.argmin(dim=1)  # (N,)
+    sole_z = foot_pos[torch.arange(env.num_envs, device=device), kicking_foot, 2] - _SOLE_OFFSET
+
+    first_touch = touched & (state["touch_count"] == 0.0)
+    state["sole_height_at_touch"] = torch.where(
+        first_touch, sole_z, state["sole_height_at_touch"]
+    )
 
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
@@ -247,11 +282,9 @@ def kick_state(
 
     # ------------------------------------------------------------------ #
     # d_soleToBall: 左右の足裏のうちボールに近い方の距離
+    # (foot_pos / d_foot_to_ball は接触時足高さの計算で既に求めてある)
     # ------------------------------------------------------------------ #
-    foot_ids = _foot_body_ids(env, robot)
-    foot_pos = robot.data.body_pos_w[:, foot_ids, :]  # (N, 2, 3)
-    ball_pos_3d = ball.data.root_pos_w[:, :3].unsqueeze(1)  # (N, 1, 3)
-    state["d_sole_to_ball"] = (foot_pos - ball_pos_3d).norm(dim=-1).min(dim=1).values
+    state["d_sole_to_ball"] = d_foot_to_ball.min(dim=1).values
 
     state["p_style"] = p_style
     state["d_to_P_kick"] = (robot_pos - state["P_kick"]).norm(dim=-1)
