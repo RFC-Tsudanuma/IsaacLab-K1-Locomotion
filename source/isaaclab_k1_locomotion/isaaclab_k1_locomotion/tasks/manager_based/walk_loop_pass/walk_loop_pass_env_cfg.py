@@ -3,11 +3,22 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""K1 ウォークループ環境（ループシュート = 浮かせる蹴り専用ポリシー）。
+"""K1 ウォークループパス環境（軽く浮かせるパス専用ポリシー）。
 
 :class:`K1WalkKickEnvCfg` を継承し、「狙った方位へ、指定の速さで、一定の仰角をつけて
-飛ばす」タスクに再設定したもの。Walk-Kick（強い地面蹴り）/ Walk-Pass（弱いパス）と
-3 本立てで運用し、実践では状況に応じて使い分ける前提。
+飛ばす」タスクに再設定したもの。
+
+もともとは「ループシュート」を狙って作った設定だが、実機で試したところ **強く飛ばす
+シュートではなく、軽く浮かせるパスとして機能した**（実機では射出仰角が sim より大きく
+目減りし、浮きが小さくなるため）。その挙動自体は有用なのでこの設定はそのまま残し、
+本命のループシュートは :mod:`..walk_loop_shoot` で別タスクとして扱う。
+
+したがって現在の 4 本立ては:
+
+* Walk-Kick       : 強い地面蹴り
+* Walk-Pass       : 弱い地面パス
+* Walk-Loop-Pass  : 軽く浮かせるパス ← **これ**
+* Walk-Loop-Shoot : はっきり浮かせるシュート
 
 観測・行動空間・シーンは Walk-Kick と完全に同一 (policy 55 次元) なので、
 walk phase の checkpoint (``k1_walk_kick_walk_phase``) をそのまま引き継げる::
@@ -16,7 +27,7 @@ walk phase の checkpoint (``k1_walk_kick_walk_phase``) をそのまま引き継
     _labpython2 scripts/rsl_rl/train.py --task Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0 \
         --headless --num_envs 4096
     # stage 2: ループシュート（リポジトリルートで実行すること）
-    _labpython2 scripts/rsl_rl/train.py --task Isaac-Velocity-Flat-K1-Walk-Loop-v0 \
+    _labpython2 scripts/rsl_rl/train.py --task Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0 \
         --headless --num_envs 4096 \
         --load_pretrained logs/rsl_rl/k1_walk_kick_walk_phase/<run>/model_<N>.pt
 
@@ -29,6 +40,9 @@ walk phase の checkpoint (``k1_walk_kick_walk_phase``) をそのまま引き継
 
 報酬関数そのもの (walk_kick.mdp) への追加は :func:`~...walk_kick.mdp.rewards.kick_elevation`
 の 1 項のみ。Walk-Kick / Walk-Pass の挙動は一切変えていない。
+
+NOTE: **この設定は実機で動作確認済みの「効いている」構成なので、安易に触らないこと。**
+      仰角を上げる方向の変更は :mod:`..walk_loop_shoot` 側で行う。
 """
 
 import isaaclab.sim as sim_utils
@@ -73,7 +87,7 @@ _LOOP_SIGMA_VELOCITY = 0.7
 
 
 @configclass
-class K1WalkLoopEnvCfg(K1WalkKickEnvCfg):
+class K1WalkLoopPassEnvCfg(K1WalkKickEnvCfg):
     """ループシュート専用。Walk-Kick と観測・行動空間は同一。"""
 
     def __post_init__(self) -> None:
@@ -139,7 +153,7 @@ class K1WalkLoopEnvCfg(K1WalkKickEnvCfg):
 
 
 @configclass
-class K1WalkLoopEnvCfg_PLAY(K1WalkLoopEnvCfg):
+class K1WalkLoopPassEnvCfg_PLAY(K1WalkLoopPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
