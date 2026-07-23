@@ -55,6 +55,40 @@ def modify_push_robot(
             term_cfg.params["velocity_range"] = velocity_range
 
 
+def extreme_command_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    command_name: str,
+    start_step: int,
+    ramp_steps: int,
+    extreme_prob: float,
+    extreme_frac: float = 0.7,
+    resampling_time_range: tuple[float, float] | None = None,
+) -> dict[str, float]:
+    """学習後半に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
+
+    ``start_step`` (env.common_step_counter 基準 ≒ num_steps_per_env × iteration) から
+    ``ramp_steps`` かけて ``ExtremeVelocityCommand.cfg.extreme_prob`` を 0 → ``extreme_prob``
+    へ線形に上げる。ランプ完了後、``resampling_time_range`` が指定されていれば
+    リサンプリング間隔も差し替え、極端なコマンド間の速い遷移にも晒す。
+
+    Note:
+        resume 時は ``common_step_counter`` が 0 から数え直される。学習済み
+        checkpoint から本カリキュラムを即時有効にしたい場合は override で
+        ``start_step`` を 0 にすること。
+    """
+    s = env.common_step_counter
+    if s <= start_step:
+        return {"extreme_prob": 0.0}
+    alpha = min(1.0, (s - start_step) / max(1, int(ramp_steps)))
+    term = env.command_manager.get_term(command_name)
+    term.cfg.extreme_prob = float(extreme_prob) * alpha
+    term.cfg.extreme_frac = float(extreme_frac)
+    if resampling_time_range is not None and alpha >= 1.0:
+        term.cfg.resampling_time_range = tuple(resampling_time_range)
+    return {"extreme_prob": float(extreme_prob) * alpha}
+
+
 def randomize_ball_init_velocity(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],

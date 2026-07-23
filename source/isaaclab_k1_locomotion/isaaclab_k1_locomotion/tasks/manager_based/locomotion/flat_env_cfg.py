@@ -13,13 +13,16 @@ from isaaclab.terrains import TerrainGeneratorCfg
 
 from .rough_env_cfg import K1RoughEnvCfg, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
+import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset
+from .mdp.commands import ExtremeVelocityCommandCfg
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
     modify_push_robot,
+    extreme_command_curriculum,
 )
 
 
@@ -103,6 +106,26 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # 1 回引いただけで即次ステージへ進む(一気な遷移)のを確実に防ぐ。
             "post_switch_hold_steps": 500,
             "post_switch_ema_scale": 2.0,
+        },
+    )
+
+    # 学習後半 (10000 iter 以降) に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
+    # 上位の最適制御プランナはコマンド範囲の上限付近を多用するが、一様サンプリングでは
+    # vx・vy 同時上限 + 大旋回のような corner がほぼ出ず、その領域や極端なコマンド間の
+    # 遷移で転倒していた。extreme_prob の確率で「|v| ∈ [0.7*max, max] (符号ランダム) +
+    # 飽和 yaw を作る heading」を引かせ、ランプ完了後はリサンプリングも速めて
+    # 極端コマンド間の遷移にも晒す (ExtremeVelocityCommand 参照)。
+    # NOTE: step 数は common_step_counter 基準 (iteration × num_steps_per_env=48)。
+    #       resume 時は 0 から数え直すので、即時有効化するなら start_step を override で 0 に。
+    extreme_commands = CurrTerm(
+        func=extreme_command_curriculum,
+        params={
+            "command_name": "base_velocity",
+            "start_step": 480_000,   # 10000 iter × 48 steps/iter
+            "ramp_steps": 96_000,    # 2000 iter かけて 0 → extreme_prob へ線形導入
+            "extreme_prob": 0.35,
+            "extreme_frac": 0.7,
+            "resampling_time_range": (0.5, 4.0),
         },
     )
 
@@ -224,10 +247,26 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw"])},
         )
 
-        # 速度コマンドは velocity_env_cfg の UniformVelocityCommandCfg (連続サンプリング) を
-        # そのまま使う。以前は離散格子サンプリング (DiscreteVelocityCommandCfg) に差し替えて
-        # いたが、速度追従が十分になったため連続版に戻した (2026-07-13)。
+        # 速度コマンドは連続一様サンプリング + extreme corner サンプリング対応版。
+        # extreme_prob=0.0 (既定) では UniformVelocityCommand と同一挙動で、
+        # extreme_commands カリキュラムが学習後半 (10000 iter〜) に prob を上げる。
         # lin_vel_x / lin_vel_y の範囲は lin_vel_command カリキュラムが段階的に拡張する。
+        prev = self.commands.base_velocity
+        self.commands.base_velocity = ExtremeVelocityCommandCfg(
+            asset_name=prev.asset_name,
+            resampling_time_range=prev.resampling_time_range,
+            rel_standing_envs=prev.rel_standing_envs,
+            rel_heading_envs=prev.rel_heading_envs,
+            heading_command=prev.heading_command,
+            heading_control_stiffness=prev.heading_control_stiffness,
+            debug_vis=prev.debug_vis,
+            ranges=ExtremeVelocityCommandCfg.Ranges(
+                lin_vel_x=prev.ranges.lin_vel_x,
+                lin_vel_y=prev.ranges.lin_vel_y,
+                ang_vel_z=(-1.0, 1.0),
+                heading=(-math.pi, math.pi),
+            ),
+        )
 
 @configclass
 class K1FlatEnvLearnStandingCfg(K1FlatEnvCfg):

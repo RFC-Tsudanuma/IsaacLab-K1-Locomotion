@@ -7,4 +7,9 @@ from .observations import *
 from .rewards import *
 from .curriculums import *
 from .events import *
-from .commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
+from .commands import (
+    DiscreteVelocityCommand,
+    DiscreteVelocityCommandCfg,
+    ExtremeVelocityCommand,
+    ExtremeVelocityCommandCfg,
+)

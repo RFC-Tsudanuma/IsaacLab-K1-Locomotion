@@ -71,6 +71,89 @@ class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
     ang_vel_z_resolution: float | None = None
 
 
+class ExtremeVelocityCommand(UniformVelocityCommand):
+    """一様サンプリングに「レンジ端の組み合わせ」サンプリングを混ぜる速度コマンド。
+
+    最適制御などの上位プランナはコマンド範囲の上限付近を多用するが、一様サンプリング
+    では「vx・vy が同時に上限付近」「その状態で大きな旋回」のような角 (corner) の
+    組み合わせはほとんど出現せず、その領域で転倒しやすいポリシーになる。
+
+    このコマンドは確率 ``cfg.extreme_prob`` で resample を「extreme モード」にする:
+      - lin_vel_x / lin_vel_y の各成分を、符号ランダムで ``|v| ∈ [extreme_frac*max, max]``
+        から引く (現在の ``cfg.ranges`` を参照するのでカリキュラムの範囲拡張に追従)
+      - heading target を現在の機体 yaw から ``extreme_heading_err_range`` [rad] だけ
+        離した方位に置き、heading 制御則 (stiffness×err を ang_vel_z 範囲で clip) が
+        飽和 yaw コマンドを出す状態を作る
+      - extreme に選ばれた env は standing 抽選から除外する
+
+    ``extreme_prob=0.0`` (既定) では完全に ``UniformVelocityCommand`` と同一の挙動。
+    カリキュラム (``extreme_command_curriculum``) が学習後半で prob を上げる。
+    """
+
+    cfg: "ExtremeVelocityCommandCfg"
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+        prob = float(self.cfg.extreme_prob)
+        if prob <= 0.0:
+            return
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        pick = torch.rand(ids.numel(), device=self.device) < prob
+        if not pick.any():
+            return
+        ids = ids[pick]
+        m = ids.numel()
+        frac = float(self.cfg.extreme_frac)
+
+        # lin_vel_x / lin_vel_y: 符号をランダムに選び、その側の端 [frac*|bound|, |bound|] から引く
+        for col, rng in ((0, self.cfg.ranges.lin_vel_x), (1, self.cfg.ranges.lin_vel_y)):
+            lo, hi = float(rng[0]), float(rng[1])
+            pick_pos = torch.rand(m, device=self.device) < 0.5
+            bound = torch.where(
+                pick_pos,
+                torch.full((m,), hi, device=self.device),
+                torch.full((m,), lo, device=self.device),
+            )
+            u = torch.rand(m, device=self.device)
+            self.vel_command_b[ids, col] = bound * (frac + (1.0 - frac) * u)
+
+        # heading: 現在 yaw から大きく外した目標を与え、飽和 yaw コマンドを作る。
+        # (heading_command=True の場合、実際の yaw コマンドは毎ステップ
+        #  clip(stiffness * heading_err, ang_vel_z range) で再計算されるため、
+        #  ang_vel_z を直接書いてもすぐ上書きされる。heading 側を動かすのが正)
+        if self.cfg.heading_command:
+            err_lo, err_hi = self.cfg.extreme_heading_err_range
+            err_mag = torch.empty(m, device=self.device).uniform_(float(err_lo), float(err_hi))
+            err_sign = torch.where(
+                torch.rand(m, device=self.device) < 0.5,
+                torch.ones(m, device=self.device),
+                -torch.ones(m, device=self.device),
+            )
+            target = self.robot.data.heading_w[ids] + err_sign * err_mag
+            self.heading_target[ids] = math_utils.wrap_to_pi(target)
+            self.is_heading_env[ids] = True
+
+        # extreme env は立ち止まり抽選から除外 (コマンドが 0 に上書きされるのを防ぐ)
+        self.is_standing_env[ids] = False
+
+
+@configclass
+class ExtremeVelocityCommandCfg(UniformVelocityCommandCfg):
+    """`ExtremeVelocityCommand` の設定クラス。"""
+
+    class_type: type = ExtremeVelocityCommand
+
+    extreme_prob: float = 0.0
+    """resample を extreme モードにする確率 [0,1]。0 で通常の一様サンプリングと同一。"""
+
+    extreme_frac: float = 0.7
+    """extreme モードで引く線速度成分の大きさの下限 (レンジ端に対する割合)。"""
+
+    extreme_heading_err_range: tuple[float, float] = (2.0, math.pi)
+    """extreme モードで heading target を現在 yaw から離す角度 [rad] の範囲。
+    stiffness 0.5・ang_vel_z 上限 1.0 の場合、誤差 2.0 rad 以上で yaw コマンドが飽和する。"""
+
+
 class KickDirectionCommand(CommandTerm):
     """ワールド座標系で定義されたキック方向 (xy 単位ベクトル) を返すコマンド。
 
