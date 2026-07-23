@@ -39,8 +39,9 @@ Walk-Loop-Pass からの変更点
    速度帯 3.0-4.0) は実測 φ≈1.4° のほぼ水平な蹴りに収束した。
 2. 目標ボール速度を (4.0, 5.5) に上げる。φ の幾何上限 (~35°) の下では速度が
    唯一の残りレバーのため（(v=4.0, φ=35°) の完璧な実行でも頂点 0.27 m しか出ない）。
-3. 歩行由来の feet_phase / feet_slide を緩める。どちらも「足裏を地面すれすれに通す
-   スイング」の探索を塞いでおり、足が下がらない限り φ は幾何的に付かない。
+
+NOTE: feet_phase / feet_slide は緩めない (詳細は __post_init__ の NOTE 参照)。
+      当初緩めたら歩行を再獲得できず一度も歩けなかった。
 
 NOTE: ドメインランダム化で幾何のマージンを稼ぐ案もあったが、Isaac Lab では spawn 後に
       コライダー半径を env ごとに変えられないため、ボール半径や地面高さのランダム化は
@@ -122,16 +123,18 @@ class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
         self.commands.kick_direction.target_speed_range = _SHOOT_SPEED_RANGE
         self.rewards.kick_velocity_scaled.params["sigma_velocity"] = _SHOOT_SIGMA_VELOCITY
 
-        # -- 3. 足を低く通す探索を歩行報酬が塞がないようにする
+        # NOTE: feet_phase / feet_slide は **緩めない**。
         #
-        # 射出仰角は接触時の足裏高さでほぼ決まる (足裏 1.9cm で 30°、3.6cm で 20°、
-        # 5.5cm で 10°、7.4cm で 0°)。歩行から継承した feet_phase (+2.0) は swing 期に
-        # 足が接地すると報酬全損、feet_slide (-0.5) は接地中の水平移動を罰するため、
-        # どちらも「足裏を地面すれすれに通すスイング」の探索を塞ぐ。
-        # 実測 φ≈1.4° (足裏 ≈7cm 相当) で足が下がっていないことが確認されたので、
-        # shoot に限り緩める。歩容は walk phase / loop_pass の checkpoint で獲得済み。
-        self.rewards.feet_phase.weight = 1.0
-        self.rewards.feet_slide.weight = -0.1
+        # walk phase の checkpoint は kick 環境に置くと iter 0 で episode_length が
+        # 15-20 まで一旦崩れ、feet_phase (2.0) / feet_slide (-0.5) に導かれて歩行を
+        # 再獲得して初めて 140 前後まで上がる (成功した walk_kick run で確認)。
+        # 当初この 2 項を 1.0 / -0.1 に弱めたところ、std 0.05 の細い探索では歩行の
+        # 再獲得ができず、episode_length 20 のまま固着して一度も歩けなかった。
+        #
+        # 「足を低く通す」圧力は kick_loft (vz ベース) が担う。角度ベースの旧 kick_elevation
+        # と違い vz は速度に反応するので、水平蹴りには報酬が出ない。まずこれだけで
+        # 足が下がるか見る。足りなければ feet を「歩行再獲得後に」段階的に緩める
+        # カリキュラム (start_step を 1000 以降に置く) を足すこと。いきなり弱めないこと。
 
 
 @configclass
