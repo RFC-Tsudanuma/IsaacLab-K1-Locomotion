@@ -132,7 +132,8 @@ def kick_state(
             "touch_count": torch.zeros(env.num_envs, device=device),
             "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
-            "sole_height_at_touch": torch.zeros(env.num_envs, device=device),
+            "sole_height_last_touch": torch.zeros(env.num_envs, device=device),
+            "sole_height_at_kick": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -173,7 +174,8 @@ def kick_state(
         state["prev_v_ball"][just_reset] = 0.0
         state["touch_count"][just_reset] = 0.0
         state["touch_refractory"][just_reset] = 0
-        state["sole_height_at_touch"][just_reset] = 0.0
+        state["sole_height_last_touch"][just_reset] = 0.0
+        state["sole_height_at_kick"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # init_side の確定: ロボットが |s| > 閾値 までどちらかの側へ寄った時点の符号で確定
@@ -221,15 +223,19 @@ def kick_state(
     # 接触瞬間の足裏高さ [m]。射出仰角を決めている唯一の量なので、真値で記録する。
     #
     # ボールに近い方の足を「蹴った足」とみなし、その足裏高さ (リンク原点 − _SOLE_OFFSET)
-    # を最初の接触が起きたステップに凍結する。目測ではなくこれを見ること。
+    # を接触のたびに更新する。凍結は値 latch (下の trigger) のタイミングで行う。
+    #
+    # NOTE: 「最初の接触」で凍結してはいけない。多重接触 (ball_touch_count ≈ 1.6) が
+    #       ある状態では、最初の接触は蹴る前の偶発的な接触であることが多く、
+    #       キック本体の足高さを測れない (φ=27° なのに 7.4cm という矛盾した値になった)。
+    #       latch を起こした接触 = キック本体なので、そのときの値を採る。
     # ------------------------------------------------------------------ #
     d_foot_to_ball = (foot_pos - ball.data.root_pos_w[:, :3].unsqueeze(1)).norm(dim=-1)  # (N, 2)
     kicking_foot = d_foot_to_ball.argmin(dim=1)  # (N,)
     sole_z = foot_pos[torch.arange(env.num_envs, device=device), kicking_foot, 2] - _SOLE_OFFSET
 
-    first_touch = touched & (state["touch_count"] == 0.0)
-    state["sole_height_at_touch"] = torch.where(
-        first_touch, sole_z, state["sole_height_at_touch"]
+    state["sole_height_last_touch"] = torch.where(
+        touched, sole_z, state["sole_height_last_touch"]
     )
 
     state["touch_count"] = state["touch_count"] + touched.float()
@@ -264,6 +270,12 @@ def kick_state(
         state["v_ball_3d_frozen"] = torch.where(trigger, v_ball_3d, state["v_ball_3d_frozen"])
         state["phi_frozen"] = torch.where(trigger, phi, state["phi_frozen"])
         state["p_style_frozen"] = torch.where(trigger, p_style, state["p_style_frozen"])
+        # latch を起こした接触 = キック本体。その足裏高さを凍結する。
+        # 接触検出 (touched) は同じ関数内でこの上に走っているので、キックと同じ
+        # ステップなら sole_height_last_touch は既に今回の値に更新されている。
+        state["sole_height_at_kick"] = torch.where(
+            trigger, state["sole_height_last_touch"], state["sole_height_at_kick"]
+        )
         state["kick_done"] = state["kick_done"] | trigger
 
     kick_done = state["kick_done"]

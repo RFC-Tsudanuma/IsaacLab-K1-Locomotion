@@ -78,6 +78,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import math
 import os
 import time
 from pathlib import Path
@@ -238,6 +239,51 @@ def log_terminations(env, step: int, counts: dict, episode_start: torch.Tensor) 
             duration = step - int(episode_start[env_idx].item())
             print(f"[TERM] step {step:6d} | env {env_idx:3d} | {name:16s} | episode {duration:4d} steps")
         episode_start[fired] = step
+
+
+def log_kick_metrics(env, step: int, every: int = 100) -> None:
+    """Print kick diagnostics periodically (walk_kick family tasks only).
+
+    Metrics such as ``sole_height_at_kick`` are computed every step by the command
+    manager, but only the training loop writes them to TensorBoard. This prints the
+    same quantities during play, straight from the shared latch state, so a policy can
+    be diagnosed without launching a training run.
+
+    Values are averaged over the environments whose kick has latched.
+    """
+    if step % every != 0:
+        return
+    state = getattr(env.unwrapped, "_kick_latch_state", None)
+    if state is None:  # not a walk_kick family task
+        return
+
+    done = state["kick_done"]
+    n_kicked = int(done.sum().item())
+    num_envs = env.unwrapped.num_envs
+    touches = float(state["touch_count"].mean().item())
+    if n_kicked == 0:
+        print(f"[KICK] step {step:6d} | kicked   0/{num_envs:3d} | touches {touches:4.2f}")
+        return
+
+    mask = done.float()
+
+    def avg(key: str) -> float:
+        return float((state[key] * mask).sum().item()) / n_kicked
+
+    sole_cm = avg("sole_height_at_kick") * 100.0
+    phi_deg = math.degrees(avg("phi_frozen"))
+    v3d = avg("v_ball_3d_frozen")
+    # apex は接地時のボール中心 (= 半径) を引いて「浮き」に直す
+    loft_cm = (avg("apex_height") - _BALL_RADIUS_FOR_LOG) * 100.0
+    print(
+        f"[KICK] step {step:6d} | kicked {n_kicked:3d}/{num_envs:3d} "
+        f"| sole {sole_cm:5.1f}cm | phi {phi_deg:5.1f}deg "
+        f"| v3d {v3d:4.2f}m/s | loft {loft_cm:5.1f}cm | touches {touches:4.2f}"
+    )
+
+
+# apex_height はワールド z なので、浮き量に直すには接地時のボール中心高さを引く。
+_BALL_RADIUS_FOR_LOG = 0.11
 
 
 def print_termination_summary(counts: dict) -> None:
@@ -437,6 +483,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 policy_nn.reset(dones)
             step_count += 1
             log_terminations(env, step_count, term_counts, episode_start)
+            log_kick_metrics(env, step_count)
             if viser_state is not None:
                 try:
                     _, base_frame, viser_urdf, joint_indices, _ = viser_state

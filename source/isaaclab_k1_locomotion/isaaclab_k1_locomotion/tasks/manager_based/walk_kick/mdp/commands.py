@@ -39,10 +39,10 @@ class KickDirectionCommand(UniformVelocityCommand):
     * ``kick_elevation_deg``: 射出仰角 φ [deg]。ループシュートが出ているかの直接の指標。
     * ``kick_apex_height``: latch 後にボールが到達した最高高度 [m]。
     * ``ball_touch_count``: エピソード中に足がボールに触れた回数。1.0 が理想。
-    * ``sole_height_at_touch``: 最初の接触が起きた瞬間の足裏高さ [m]。射出仰角を決めて
-      いる唯一の量なので、``kick_elevation_deg`` が出ない原因の切り分けはここを見る。
-      R=0.11 のとき 0.019 で 30°、0.036 で 20°、0.055 で 10°、0.074 で 0°。
-      ``kick_rate`` と違い「接触した env」だけで平均している。
+    * ``sole_height_at_kick``: latch を起こした接触 (= キック本体) の瞬間の足裏高さ [m]。
+      射出仰角を決めている量なので、``kick_elevation_deg`` が出ない原因の切り分けは
+      ここを見る。R=0.11 のとき 0.019 で 30°、0.036 で 20°、0.055 で 10°、0.074 で 0°。
+      「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
 
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
@@ -69,8 +69,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         # エピソード中に足がボールに触れた回数。1.0 が理想 (1 回で蹴り切る)。
         # 未キックの env も含めた全 env 平均なので、kick_rate と併せて読むこと。
         self.metrics["ball_touch_count"] = torch.zeros(self.num_envs, device=self.device)
-        # 最初の接触が起きた瞬間の足裏高さ [m]。射出仰角を決めている唯一の量。
-        self.metrics["sole_height_at_touch"] = torch.zeros(self.num_envs, device=self.device)
+        # latch を起こした接触 (= キック本体) の瞬間の足裏高さ [m]。仰角を決める量。
+        self.metrics["sole_height_at_kick"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -92,12 +92,10 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_elevation_deg"] = torch.rad2deg(state["phi_frozen"]) * kick_done
         self.metrics["kick_apex_height"] = state["apex_height"] * kick_done
         # 接触回数は kick_done でマスクしない。「触ったが蹴れていない」エピソードこそ
-        # 見たい対象なので、未キックの env も含めて数える。
+        # 見たい対象なので、未接触の env も含めて数える。
         self.metrics["ball_touch_count"] = state["touch_count"]
-        # 接触が起きた env だけで平均したいので、touch_count>0 でマスクする。
-        # (未接触を 0 として混ぜると「足が低い」と誤読する)
-        touched_any = (state["touch_count"] > 0).float()
-        self.metrics["sole_height_at_touch"] = state["sole_height_at_touch"] * touched_any
+        # キックが成立した env だけで平均する (未キックを 0 として混ぜると誤読する)。
+        self.metrics["sole_height_at_kick"] = state["sole_height_at_kick"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
