@@ -118,37 +118,63 @@ def compute_target_y(
 
 
 # ---------------------------------------------------------------------------
-# 知覚DR (実機の認識出力を模擬: レイテンシ / 更新レート / ドロップ / 距離依存ノイズ)
+# 知覚DR: 実機カメラ準拠の VirtualPerception (booster_amp_lab の soccer_perception を
+# goalkeeper に複製したもの) でボール位置観測を作る。カメラ仕様 (FOV 150°/80°、
+# レイテンシ 116ms、25Hz、距離依存ノイズ σ(d)=0.124d+0.149、検出率90%/7m、occlusion、
+# dead-zone) は soccer_vision_train_cfg がそのまま持つ。頭は戦略層が常にボールを
+# 追う前提なので head_tracks_ball=True (FOV は実質常にパス、品質劣化のみ効く)。
 #
-# around_ball の ball_pos_rel_perceived と同系の設計だが、頭部が常にボールを追う
-# 前提 (戦略側でボール追従) なので ±60° の FOV マスクと hold-last-seen は入れない。
-# 品質劣化 (遅延・欠損・ノイズ) だけを模擬する。critic は真値を見る (非対称)。
+# 速度は VirtualPerception が出さない (位置・mask・last_seen_dt のみ) ので、ボール速度
+# だけは従来どおり「真値 + エピソード固定バイアス 0.5〜1.0 m/s」で別途作る (実機は
+# 速度を直接測れず推定が一定方向にずれるため)。mask=0 (見えていない) のときは位置も
+# 速度もゼロにして整合を取る。critic は真値を見る (非対称)。
 # ---------------------------------------------------------------------------
 
-_PERC_HIST_LEN = 6  # 履歴長 (最大レイテンシ 5 tick + 現在)
 
+def _gk_perception(env: "ManagerBasedRLEnv"):
+    """VirtualPerception インスタンスを (無ければ生成して) 返す。"""
+    from .perception import VirtualPerception, soccer_vision_train_cfg
 
-def _gk_perc_buffers(env: "ManagerBasedRLEnv") -> None:
-    """知覚DRの per-env バッファを (無ければ) 生成する。"""
-    n = env.num_envs
-    if getattr(env, "_gkp_hist_pos", None) is None or env._gkp_hist_pos.shape[0] != n:
-        dev = env.device
-        env._gkp_hist_pos = torch.zeros(n, _PERC_HIST_LEN, 2, device=dev)   # 真の相対位置履歴 (base frame)
-        env._gkp_hist_vel = torch.zeros(n, _PERC_HIST_LEN, 2, device=dev)   # 真のボール速度履歴 (base frame)
-        env._gkp_out_pos = torch.zeros(n, 2, device=dev)                    # 認識出力 (保持)
-        env._gkp_out_vel = torch.zeros(n, 2, device=dev)
-        env._gkp_latency = torch.ones(n, dtype=torch.long, device=dev)      # per-episode レイテンシ [tick]
-        # 更新周期は **小数 tick** (制御50Hz / ビジョン30Hz = 1.67 tick)。整数だと
-        # 25Hz か 50Hz にしか置けず実測レートを表現できないため float で保持する。
-        env._gkp_period = torch.ones(n, device=dev)                         # per-episode 更新周期 [tick, float]
-        env._gkp_ctr = torch.zeros(n, device=dev)                           # 次回更新までのカウンタ [float]
-        env._gkp_bias = torch.zeros(n, 2, device=dev)                       # per-episode 位置バイアス [m]
-        env._gkp_vel_bias = torch.zeros(n, 2, device=dev)                   # per-episode 速度バイアス [m/s] (x,y 各軸独立)
-        env._gkp_step = -1                                                  # 1 step 1 回ガード
+    vp = getattr(env, "_gk_vp", None)
+    if vp is None or vp.num_envs != env.num_envs:
+        cfg = soccer_vision_train_cfg()
+        # PLAY 用クリーン化: 検出100%・遅延0・ノイズ0・見失い(occlusion/dead-zone/blind)なし・
+        # 50Hz。キーパーの動きそのものを純粋に評価するため (学習では False)。
+        if bool(getattr(env.cfg.goalkeeper, "perception_clean", False)):
+            cfg.detection_prob_in_fov_range = (1.0, 1.0)
+            cfg.blind_prob = 0.0
+            cfg.occlusion_prob = 0.0
+            cfg.deadzone_prob = 0.0
+            cfg.noise_a = 0.0
+            cfg.noise_b = 0.0
+            cfg.latency_mean_range = (0.0, 0.0)
+            cfg.latency_std_s = 0.0
+            cfg.update_hz_mean_range = (1.0 / float(env.step_dt), 1.0 / float(env.step_dt))
+            cfg.update_hz_std = 0.0
+        cfg.head_tracks_ball = True   # 戦略層がボールを追う前提。FOV は実質常にパス
+        # K1_locomotion.urdf では頭リンク (Head_2→Head_1→Trunk) が全て Trunk にマージされ、
+        # 独立した頭 body が存在しない (import 警告あり)。カメラは Trunk にマウントする。
+        # head_tracks_ball=True でカメラ向きはボール方向に上書きするので、マウント先が頭でも
+        # 胴体でも FOV 判定への影響はない (カメラ位置がわずかに下がるだけ)。
+        # 実機の頭の高さに寄せるため、Trunk 原点からの上方オフセットを頭部相当に上げる。
+        cfg.camera_body_name = "Trunk"
+        cfg.camera_offset_pos = (0.06, 0.0, 0.45)  # 胴体原点からカメラ (頭部高さ相当) まで
+        vp = VirtualPerception(
+            cfg=cfg,
+            robot=env.scene["robot"],
+            num_envs=env.num_envs,
+            dt=float(env.step_dt),
+            device=env.device,
+        )
+        env._gk_vp = vp
+        env._gkp_vel_bias = torch.zeros(env.num_envs, 2, device=env.device)  # 速度バイアス
+        env._gkp_out_vel = torch.zeros(env.num_envs, 2, device=env.device)   # 誤差付き速度 (保持)
+        env._gkp_step = -1
+    return vp
 
 
 def _gk_true_rel_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor]:
-    """真のボール相対位置とボール速度 (base yaw frame, 各 (N,2)) を返す。"""
+    """真のボール相対位置とボール速度 (base yaw frame, 各 (N,2)) を返す。critic 用。"""
     ball: RigidObject = env.scene["soccer_ball"]
     robot: Articulation = env.scene["robot"]
     q = yaw_quat(robot.data.root_quat_w)
@@ -158,72 +184,38 @@ def _gk_true_rel_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Te
 
 
 def _gk_perception_tick(env: "ManagerBasedRLEnv") -> None:
-    """知覚DRの状態を 1 制御ステップ 1 回だけ更新する (冪等)。
+    """VirtualPerception を 1 制御ステップ 1 回だけ進める (冪等)。
 
-    毎ステップ: 真値を履歴に積む → 更新周期が来た env だけ「レイテンシ分過去の真値
-    + 距離依存ノイズ + 系統バイアス」を認識出力に反映。ドロップ発生時は出力を
-    据え置く (実機の検出取りこぼし)。パラメータは GoalkeeperParamsCfg の perc_*。
+    位置・mask は VirtualPerception が担当 (レイテンシ・ノイズ・検出率・occlusion)。
+    速度は真値 (base yaw frame) にエピソード固定バイアスを乗せ、mask=0 でゼロにする。
     """
-    _gk_perc_buffers(env)
+    vp = _gk_perception(env)
     step = int(env.common_step_counter)
     if env._gkp_step == step:
         return
     env._gkp_step = step
 
-    p = env.cfg.goalkeeper
-    pos_b, vel_b = _gk_true_rel_state(env)
+    ball: RigidObject = env.scene["soccer_ball"]
+    vp.update(env.scene["robot"], ball.data.root_pos_w[:, :3])
 
-    # 履歴を 1 tick 進める (index 0 が現在)
-    env._gkp_hist_pos = torch.roll(env._gkp_hist_pos, shifts=1, dims=1)
-    env._gkp_hist_vel = torch.roll(env._gkp_hist_vel, shifts=1, dims=1)
-    env._gkp_hist_pos[:, 0] = pos_b
-    env._gkp_hist_vel[:, 0] = vel_b
-
-    # 更新周期の到来した env を選ぶ。カウンタは float で、到来時に周期を **加算** する
-    # (代入ではない)。こうすると小数周期の位相が保たれ、1.67 tick 周期なら
-    # 2,2,1,2,2,1... と実測 30Hz の更新間隔を平均的に再現できる。
-    env._gkp_ctr -= 1.0
-    due = env._gkp_ctr <= 0.0
-    env._gkp_ctr[due] += env._gkp_period[due]
-    # ドロップ: due のうち一部は更新をスキップ (出力据え置き)
-    keep = torch.rand(env.num_envs, device=env.device) < float(p.perc_dropout_prob)
-    update = due & ~keep
-    if not bool(update.any()):
-        return
-
-    idx = torch.arange(env.num_envs, device=env.device)
-    lat = env._gkp_latency.clamp(max=_PERC_HIST_LEN - 1)
-    delayed_pos = env._gkp_hist_pos[idx, lat]
-    delayed_vel = env._gkp_hist_vel[idx, lat]
-
-    dist = torch.norm(delayed_pos, dim=1, keepdim=True)
-    sigma = float(p.perc_noise_sigma) + float(p.perc_noise_per_m) * dist
-    noisy_pos = delayed_pos + torch.randn_like(delayed_pos) * sigma + env._gkp_bias
-    # 速度: 小さな毎フレームジッタ (perc_vel_noise_sigma) に加えて、エピソード固定の
-    # 系統バイアス (_gkp_vel_bias, x/y 各軸独立で大きさ 0.5〜1.0 m/s) を乗せる。
-    # 実機のボール速度推定は遅延で一定方向にずれるため、毎フレーム暴れるジッタではなく
-    # 「そのエピソードでは +0.7, 別のエピソードでは -0.6」といった系統誤差で模擬する。
-    noisy_vel = (
-        delayed_vel
-        + torch.randn_like(delayed_vel) * float(p.perc_vel_noise_sigma)
-        + env._gkp_vel_bias
-    )
-
-    env._gkp_out_pos[update] = noisy_pos[update]
-    env._gkp_out_vel[update] = noisy_vel[update]
+    # 速度: 真値 (base yaw frame) + エピソード固定バイアス。見えていない (mask=0) 間は 0。
+    _, vel_b = _gk_true_rel_state(env)
+    mask = vp.ball_mask.unsqueeze(1)
+    env._gkp_out_vel = (vel_b + env._gkp_vel_bias) * mask
 
 
 def _gk_perceived_goal_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor]:
     """知覚DR後のボール位置・速度をゴール座標系 (N,3) で返す (z は 0 埋め)。
 
-    認識出力は base frame の相対値なので、ロボットの真の姿勢 (自己位置推定は
+    VirtualPerception の相対位置 (base yaw frame) を、ロボットの真の姿勢 (自己位置推定は
     別系統で十分正確とみなす) でゴール座標系へ戻す。到達予測 (policy 用) が使う。
     """
+    vp = _gk_perception(env)
     _gk_perception_tick(env)
     robot: Articulation = env.scene["robot"]
     heading = robot.data.heading_w
     c, s = torch.cos(heading), torch.sin(heading)
-    rel = env._gkp_out_pos
+    rel = vp.ball_pos_b
     off_x = c * rel[:, 0] - s * rel[:, 1]
     off_y = s * rel[:, 0] + c * rel[:, 1]
     rpos = robot_pos_goal(env)
@@ -258,24 +250,29 @@ def gk_ball_vel(
 
 
 def gk_ball_pos_rel_perceived(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """知覚DR後のボール相対位置 (base yaw frame, 2D)。policy 用。非アクティブ時はダミー 0。"""
-    bufs = gk_buffers(env)
+    """VirtualPerception のボール相対位置 (base yaw frame, 2D)。policy 用。
+
+    見えていない (mask=0) / 非アクティブ時は VirtualPerception が 0 を返す
+    (hold_last_on_miss=False なので miss 時ゼロ)。ボールが park (非アクティブ) の
+    ときは検出範囲外なので自然に 0 になる。"""
     _gk_perception_tick(env)
-    out = env._gkp_out_pos
-    return torch.where(bufs["ball_active"].unsqueeze(1), out, torch.zeros_like(out))
+    return _gk_perception(env).ball_pos_b
 
 
 def gk_ball_vel_perceived(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """知覚DR後のボール速度 (base yaw frame, 2D)。policy 用。非アクティブ時はダミー 0。"""
-    bufs = gk_buffers(env)
+    """誤差付きボール速度 (base yaw frame, 2D)。policy 用。mask=0 でゼロ (tick で連動済み)。"""
     _gk_perception_tick(env)
-    out = env._gkp_out_vel
-    return torch.where(bufs["ball_active"].unsqueeze(1), out, torch.zeros_like(out))
+    return env._gkp_out_vel
 
 
 def gk_ball_active(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """ボールがアクティブ (発射済み) かのフラグ (N, 1)。ステージ1 では常に 0。"""
-    return gk_buffers(env)["ball_active"].float().unsqueeze(1)
+    """ボールが **今カメラで見えているか** のフラグ (N, 1) = VirtualPerception の mask。
+
+    従来は「発射済みか (真値)」だったが、実機に寄せて「検出できているか」に変更。
+    occlusion・検出漏れ・range 外では 0 になり、ポリシーが「今ボールを見失っている」
+    ことを認識できる。ステージ1 (ボールなし) では観測スロット自体が zeros_obs で 0。"""
+    _gk_perception_tick(env)
+    return _gk_perception(env).ball_mask.unsqueeze(1)
 
 
 def gk_target_y(

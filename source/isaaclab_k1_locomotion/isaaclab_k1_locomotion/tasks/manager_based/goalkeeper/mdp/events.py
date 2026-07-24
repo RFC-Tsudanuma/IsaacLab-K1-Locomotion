@@ -240,42 +240,33 @@ def reset_ball_perception(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
 ):
-    """知覚DR (観測側の遅延・更新レート・ノイズ) の per-episode パラメータを採番し、
-    履歴・認識出力バッファを現在の真値で初期化する (起動時トランジェント回避)。
+    """VirtualPerception のリングバッファ/per-env パラメータをリセットし、速度バイアスを
+    採番する。
 
-    ★ reset_ball (ボール配置イベント) より後に登録すること (配置後の真値で初期化)。
-    パラメータは GoalkeeperParamsCfg の perc_*。PLAY 環境ではこれらを 0 / (1,1) に
-    上書きすればクリーン観測になる。
+    位置・遅延・ノイズ・検出率・occlusion は VirtualPerception (実機カメラ準拠) が担当。
+    速度バイアス (0.5〜1.0 m/s のエピソード固定系統誤差) だけは goalkeeper 側で持つので
+    ここで採番する。
+    ★ reset_ball (ボール配置イベント) より後に登録すること。
     """
-    from .observations import _gk_perc_buffers, _gk_true_rel_state
+    from .observations import _gk_perception
 
     p = _gk_params(env)
-    _gk_perc_buffers(env)
+    vp = _gk_perception(env)
+    vp.reset(env_ids)
     n = len(env_ids)
 
-    lo, hi = int(p.perc_latency_range[0]), int(p.perc_latency_range[1])
-    env._gkp_latency[env_ids] = torch.randint(lo, hi + 1, (n,), device=env.device)
-    # ビジョンの更新レート [Hz] → 制御 tick 単位の周期 (小数)。
-    # 例: 制御 50Hz・ビジョン 30Hz なら 50/30 = 1.67 tick。
-    control_hz = 1.0 / float(env.step_dt)
-    lo2, hi2 = float(p.perc_update_rate_hz[0]), float(p.perc_update_rate_hz[1])
-    rate = torch.empty(n, device=env.device).uniform_(lo2, hi2).clamp(min=1e-3)
-    env._gkp_period[env_ids] = (control_hz / rate).clamp(min=1.0)
-    env._gkp_ctr[env_ids] = 0.0  # 次 tick を更新 tick にする
-    env._gkp_bias[env_ids] = torch.randn(n, 2, device=env.device) * float(p.perc_bias_sigma)
     # 速度バイアス: x, y 各軸独立。大きさを perc_vel_bias_range から一様サンプルし、
-    # 符号はランダム。エピソード中は固定 (遅延由来の系統誤差)。
-    vlo, vhi = float(p.perc_vel_bias_range[0]), float(p.perc_vel_bias_range[1])
-    vmag = torch.empty(n, 2, device=env.device).uniform_(vlo, vhi)
-    vsign = torch.where(
-        torch.rand(n, 2, device=env.device) < 0.5,
-        torch.ones(n, 2, device=env.device),
-        -torch.ones(n, 2, device=env.device),
-    )
-    env._gkp_vel_bias[env_ids] = vmag * vsign
-
-    pos_b, vel_b = _gk_true_rel_state(env)
-    env._gkp_hist_pos[env_ids] = pos_b[env_ids].unsqueeze(1)  # (n, H, 2) にブロードキャスト
-    env._gkp_hist_vel[env_ids] = vel_b[env_ids].unsqueeze(1)
-    env._gkp_out_pos[env_ids] = pos_b[env_ids]
-    env._gkp_out_vel[env_ids] = vel_b[env_ids]
+    # 符号はランダム。エピソード中は固定 (実機のボール速度推定が一定方向にずれる模擬)。
+    # PLAY のクリーン化 (perception_clean) 時はゼロ (真値の速度をそのまま出す)。
+    if bool(getattr(p, "perception_clean", False)):
+        env._gkp_vel_bias[env_ids] = 0.0
+    else:
+        vlo, vhi = float(p.perc_vel_bias_range[0]), float(p.perc_vel_bias_range[1])
+        vmag = torch.empty(n, 2, device=env.device).uniform_(vlo, vhi)
+        vsign = torch.where(
+            torch.rand(n, 2, device=env.device) < 0.5,
+            torch.ones(n, 2, device=env.device),
+            -torch.ones(n, 2, device=env.device),
+        )
+        env._gkp_vel_bias[env_ids] = vmag * vsign
+    env._gkp_out_vel[env_ids] = 0.0

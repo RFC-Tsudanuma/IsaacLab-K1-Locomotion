@@ -436,14 +436,9 @@ def _make_play_clean(cfg: K1GKDirectEnvCfg) -> None:
     cfg.observations.policy.enable_corruption = False
     cfg.events.base_external_force_torque = None
     cfg.events.push_robot = None
-    cfg.goalkeeper.perc_latency_range = (1, 1)
-    cfg.goalkeeper.perc_update_rate_hz = (50.0, 50.0)  # 制御と同レート = 遅延なし
-    cfg.goalkeeper.perc_dropout_prob = 0.0
-    cfg.goalkeeper.perc_noise_sigma = 0.0
-    cfg.goalkeeper.perc_noise_per_m = 0.0
-    cfg.goalkeeper.perc_vel_noise_sigma = 0.0
-    cfg.goalkeeper.perc_bias_sigma = 0.0
-    cfg.goalkeeper.perc_vel_bias_range = (0.0, 0.0)
+    # VirtualPerception + 速度バイアスをクリーン化 (真値・遅延なし・見失いなし)。
+    # キーパーの動きそのものを純粋に確認するため。
+    cfg.goalkeeper.perception_clean = True
 
 
 @configclass
