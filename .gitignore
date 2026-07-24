@@ -22,6 +22,13 @@ logs/rsl_rl/k1_walk_kick_walk_phase/*
 logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/*
 !logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/model_4999.pt
 
+# loop_shoot の起点 checkpoint（vz_sat=3.7 / 速度帯 (5.5,7.0) の再学習の --load_pretrained 元）。
+!logs/rsl_rl/k1_walk_loop_shoot/
+logs/rsl_rl/k1_walk_loop_shoot/*
+!logs/rsl_rl/k1_walk_loop_shoot/2026-07-23_00-44-11/
+logs/rsl_rl/k1_walk_loop_shoot/2026-07-23_00-44-11/*
+!logs/rsl_rl/k1_walk_loop_shoot/2026-07-23_00-44-11/model_10700.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
