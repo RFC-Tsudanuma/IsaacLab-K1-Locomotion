@@ -33,12 +33,15 @@
 
 Walk-Loop-Pass からの変更点
 ---------------------------
-1. ``kick_elevation`` (角度ベース) を ``kick_loft`` (**vz ベースの片側飽和**) に
-   差し替える（最重要）。頂点高さは vz²/2g で vz = v·sinφ だけで決まる。角度ベースは
-   速度に無関心なため「速度帯の下限で角度だけ付ける」解を許し、初版 (角度片側飽和 +
-   速度帯 3.0-4.0) は実測 φ≈1.4° のほぼ水平な蹴りに収束した。
-2. 目標ボール速度を (5.5, 7.0) に上げる。実測 φ≈32° の下で vz=3.7 に届かせるには
-   v ≈ 6.9 m/s が要るため。v3d は指令帯に忠実に追従するので、帯を上げないと伸びない。
+1. キック高さの報酬を 2 本立てにする。頂点高さは vz²/2g で vz = v·sinφ だけで決まるので、
+   vz を上げる = v と φ の両方を押し上げる必要がある。
+   a. ``kick_loft`` (vz ベースの片側飽和) … vz を直接狙う。初版の角度ベース
+      ``kick_elevation`` 単独は速度に無関心で φ≈1.4° の水平蹴りに収束したため導入。
+   b. ``kick_elevation`` (φ の片側飽和, φ_sat=40°) … 角度に下限を課す。kick_loft 単独だと
+      ポリシーが速度側に逃げて φ が 28° で頭打ちになり loft が 0.47 m で寝たため、
+      角度も明示的に押し上げる。
+2. 目標ボール速度を (5.5, 7.0) に上げる。vz を稼ぐには速度も要るため。v3d は指令帯に
+   忠実に追従するので帯を上げないと伸びない (ただし実測では ~6.5 m/s で頭打ち)。
 
 NOTE: feet_phase / feet_slide は緩めない (詳細は __post_init__ の NOTE 参照)。
       当初 (幾何モデルに基づき「足を低く通す探索を塞いでいる」と考えて) 緩めたところ、
@@ -89,6 +92,23 @@ _SHOOT_SPEED_RANGE = (5.5, 7.0)
 # 厳しくシェイプすると、届きにくい高速域で勾配が薄くなるため。
 _SHOOT_SIGMA_VELOCITY = 1.2
 
+# --------------------------------------------------------------------------- #
+# 角度の片側飽和 φ_sat [rad]（kick_loft と併用する kick_elevation 用）
+#
+# kick_loft (vz) だけだと、ポリシーは φ を上げるより v を上げる方を選ぶ。しかし
+# v は ~6.5 m/s で頭打ちになり、φ は 27-28° で固着して loft が 0.47 m で寝た
+# (vz=6.5·sin28°=3.05)。φ=38° まで上がれば同じ v=6.5 で vz=4.0 (loft 0.8m) 出るのに、
+# 速度側に逃げて角度を探索しない。そこで角度にも下限を要求する項を戻す。
+#
+# 0.70 rad ≈ 40°。実測上限らしき 28° より十分上に置いて「もっと角度を」の勾配を残す。
+# 片側飽和 (kick_elevation の phi_sat モード) なので 40° 以上で頭打ち、
+# r_direction 乗算で踏みつけ exploit も塞がれたまま。
+#
+# NOTE: これで φ が 28° から動かなければ、28° がこの箱足コライダー + スイングで出せる
+#       角度の物理上限。その場合は目標高さを下げる判断になる (報酬では上がらない)。
+# --------------------------------------------------------------------------- #
+_SHOOT_PHI_SAT = 0.70
+
 
 @configclass
 class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
@@ -97,11 +117,13 @@ class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. 仰角報酬 (kick_elevation) を Loft 報酬 (kick_loft) に差し替える（最重要）
+        # -- 1a. Loft 報酬 (kick_loft, vz ベース)
         #
-        # 角度ベースの報酬は速度に無関心で、「速度帯の下限でわずかに角度を付ける」
-        # 水平蹴り (実測 φ≈1.4°) に収束した。頂点高さを決める vz を直接狙わせる。
-        self.rewards.kick_elevation = None
+        # 角度ベースの旧 kick_elevation は速度に無関心で「速度帯の下限で角度だけ付ける」
+        # 水平蹴り (φ≈1.4°) に収束したため、頂点高さを決める vz を直接狙う項に置換した。
+        # ただし vz 単独だと逆にポリシーが速度側 (v) に逃げて φ が 28° で頭打ちになった
+        # ので、下の 1b で角度にも下限を課す。両輪で vz を押し上げる。
+        self.rewards.kick_elevation = None  # デフォルト定義 (Gaussian) を一度消す
         self.curriculum.kick_elevation_weight = None
         self.rewards.kick_loft = RewTerm(
             func=mdp.kick_loft,
@@ -116,6 +138,31 @@ class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
             func=mdp.linear_reward_weight,
             params={
                 "term_name": "kick_loft",
+                "start_weight": 0.0,
+                "end_weight": 5.0 * _KICK_W_SCALE,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
+
+        # -- 1b. 角度報酬 (kick_elevation, φ の片側飽和) を kick_loft と併用で復活
+        #
+        # phi_sat を渡すと kick_elevation は Gaussian ではなく clamp(φ/φ_sat, 0, 1) を使う。
+        # 「速度は十分・角度が足りない」現状で、φ を 40° まで押し上げる勾配を足す。
+        self.rewards.kick_elevation = RewTerm(
+            func=mdp.kick_elevation,
+            weight=0.0,
+            params={
+                **_KICK_STATE_PARAMS,
+                "sigma_direction": _SIGMA_DIRECTION,
+                "phi_sat": _SHOOT_PHI_SAT,
+            },
+        )
+        self.curriculum.kick_elevation_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "kick_elevation",
                 "start_weight": 0.0,
                 "end_weight": 5.0 * _KICK_W_SCALE,
                 "start_step": 0,
