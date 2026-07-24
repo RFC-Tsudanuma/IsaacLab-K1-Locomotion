@@ -42,14 +42,20 @@ Walk-Loop-Pass からの変更点
       角度も明示的に押し上げる。
 2. 目標ボール速度を (5.5, 7.0) に上げる。vz を稼ぐには速度も要るため。v3d は指令帯に
    忠実に追従するので帯を上げないと伸びない (ただし実測では ~6.5 m/s で頭打ち)。
+3. ボール物性 (摩擦・反発・質量) を env ごとにランダム化する。すくい上げ型のキックは
+   ボール物性への依存が強く、固定値で学習すると接触モデルに overfit する。実際
+   IsaacLab で十分浮くポリシーが MuJoCo では 3-5 回に 1 回しか浮かなかった。
 
 NOTE: feet_phase / feet_slide は緩めない (詳細は __post_init__ の NOTE 参照)。
       当初 (幾何モデルに基づき「足を低く通す探索を塞いでいる」と考えて) 緩めたところ、
       歩行を再獲得できず一度も歩けなかった。しかも上記のとおり狙い自体が的外れだった。
 """
 
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from ..walk_kick import mdp
@@ -108,6 +114,34 @@ _SHOOT_SIGMA_VELOCITY = 1.2
 #       角度の物理上限。その場合は目標高さを下げる判断になる (報酬では上がらない)。
 # --------------------------------------------------------------------------- #
 _SHOOT_PHI_SAT = 0.70
+
+# --------------------------------------------------------------------------- #
+# ボール物性のドメインランダマイゼーション範囲
+#
+# すくい上げ型のキックは vz を 2 経路で稼ぐ:
+#   * 接線方向 (摩擦)   … 足がボールを上へ「引きずり上げる」
+#   * 法線方向 (反発)   … 足がボールの下側を叩いた瞬間の跳ね返り
+# どちらもボール物性に強く依存するため、単一の値で学習すると **その物理エンジンの
+# 接触モデルに overfit する**。実際、IsaacLab (摩擦 1.0/0.8, restitution 0.6) で
+# 十分浮くポリシーが MuJoCo (摩擦 0.4, solref dampratio=1 ⇒ 反発ほぼ 0) では
+# 3-5 回に 1 回しか浮かなかった。
+#
+# 範囲は **両シミュレータの値を内包する** ように取る:
+#   静摩擦 0.3-1.0  (MuJoCo 0.4 / IsaacLab 1.0 の両方を含む)
+#   動摩擦 0.2-0.8  (同上)
+#   反発   0.0-0.7  (MuJoCo ~0 / IsaacLab 0.6 の両方を含む)
+# これで「どの物性でも浮く蹴り方」に寄せる。実機がどちら寄りかは不明なので、
+# どちらか一方に合わせるのではなく両方をカバーする方針を取っている。
+#
+# NOTE: 半径だけは spawn 後に env ごとへ変えられないので固定 (0.11 m)。
+# NOTE: mode="startup" なので env ごとに固定値が 1 回だけ割り当てられる。4096 env
+#       あれば分布としては十分。エピソードごとに振りたい場合は mode="reset"。
+# --------------------------------------------------------------------------- #
+_BALL_STATIC_FRICTION_RANGE = (0.3, 1.0)
+_BALL_DYNAMIC_FRICTION_RANGE = (0.2, 0.8)
+_BALL_RESTITUTION_RANGE = (0.0, 0.7)
+# 質量 [kg] のスケール範囲。既定 0.45 kg に対して 0.40-0.52 kg。
+_BALL_MASS_SCALE_RANGE = (0.9, 1.15)
 
 
 @configclass
@@ -174,6 +208,31 @@ class K1WalkLoopShootEnvCfg(K1WalkLoopPassEnvCfg):
         # -- 2. 目標ボール速度をシュートの帯へ
         self.commands.kick_direction.target_speed_range = _SHOOT_SPEED_RANGE
         self.rewards.kick_velocity_scaled.params["sigma_velocity"] = _SHOOT_SIGMA_VELOCITY
+
+        # -- 3. ボール物性のドメインランダマイゼーション（sim2sim / sim2real 対策）
+        #
+        # loop_pass が spawn で固定していた physics_material (摩擦 1.0/0.8・反発 0.6) を
+        # env ごとに上書きする。範囲の根拠は _BALL_*_RANGE のコメント参照。
+        self.events.ball_physics_material = EventTerm(
+            func=loco_mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "static_friction_range": _BALL_STATIC_FRICTION_RANGE,
+                "dynamic_friction_range": _BALL_DYNAMIC_FRICTION_RANGE,
+                "restitution_range": _BALL_RESTITUTION_RANGE,
+                "num_buckets": 64,
+            },
+        )
+        self.events.ball_mass = EventTerm(
+            func=loco_mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "mass_distribution_params": _BALL_MASS_SCALE_RANGE,
+                "operation": "scale",
+            },
+        )
 
         # NOTE: feet_phase / feet_slide は **緩めない**。
         #
