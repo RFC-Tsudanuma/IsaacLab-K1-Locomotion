@@ -255,10 +255,24 @@ def reset_ball_perception(
 
     lo, hi = int(p.perc_latency_range[0]), int(p.perc_latency_range[1])
     env._gkp_latency[env_ids] = torch.randint(lo, hi + 1, (n,), device=env.device)
-    lo2, hi2 = int(p.perc_update_period_range[0]), int(p.perc_update_period_range[1])
-    env._gkp_period[env_ids] = torch.randint(lo2, hi2 + 1, (n,), device=env.device)
-    env._gkp_ctr[env_ids] = 0  # 次 tick を更新 tick にする
+    # ビジョンの更新レート [Hz] → 制御 tick 単位の周期 (小数)。
+    # 例: 制御 50Hz・ビジョン 30Hz なら 50/30 = 1.67 tick。
+    control_hz = 1.0 / float(env.step_dt)
+    lo2, hi2 = float(p.perc_update_rate_hz[0]), float(p.perc_update_rate_hz[1])
+    rate = torch.empty(n, device=env.device).uniform_(lo2, hi2).clamp(min=1e-3)
+    env._gkp_period[env_ids] = (control_hz / rate).clamp(min=1.0)
+    env._gkp_ctr[env_ids] = 0.0  # 次 tick を更新 tick にする
     env._gkp_bias[env_ids] = torch.randn(n, 2, device=env.device) * float(p.perc_bias_sigma)
+    # 速度バイアス: x, y 各軸独立。大きさを perc_vel_bias_range から一様サンプルし、
+    # 符号はランダム。エピソード中は固定 (遅延由来の系統誤差)。
+    vlo, vhi = float(p.perc_vel_bias_range[0]), float(p.perc_vel_bias_range[1])
+    vmag = torch.empty(n, 2, device=env.device).uniform_(vlo, vhi)
+    vsign = torch.where(
+        torch.rand(n, 2, device=env.device) < 0.5,
+        torch.ones(n, 2, device=env.device),
+        -torch.ones(n, 2, device=env.device),
+    )
+    env._gkp_vel_bias[env_ids] = vmag * vsign
 
     pos_b, vel_b = _gk_true_rel_state(env)
     env._gkp_hist_pos[env_ids] = pos_b[env_ids].unsqueeze(1)  # (n, H, 2) にブロードキャスト

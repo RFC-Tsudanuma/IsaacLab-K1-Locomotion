@@ -45,6 +45,17 @@ parser.add_argument(
 parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
+parser.add_argument(
+    "--override_json",
+    type=str,
+    default=None,
+    help=(
+        "JSON file with dot-path overrides for env_cfg / agent_cfg (same format as train.py). "
+        "Needed to replay a checkpoint whose network shape differs from the task's default agent "
+        "cfg, e.g. a ballkick Stage 1 walk trained with actor [256,128,128] via "
+        "ball_kick_stage1_overrides.json."
+    ),
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -217,6 +228,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
+
+    # apply Optuna-style JSON overrides (must match what train.py used, so the network
+    # shape lines up with the checkpoint; e.g. ballkick Stage 1 actor [256,128,128]).
+    if args_cli.override_json is not None:
+        from config_overrides import apply_overrides_from_file
+
+        apply_overrides_from_file(args_cli.override_json, env_cfg=env_cfg, agent_cfg=agent_cfg)
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here

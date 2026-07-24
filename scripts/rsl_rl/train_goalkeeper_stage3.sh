@@ -6,7 +6,7 @@
 # 使い方 (コンテナ内):
 #   1. eval_goalkeeper_speed.py で Stage 1 の実効横移動速度を計測し、提案された
 #      ball_speed_cap を goalkeeper_stage3_overrides.json に書く
-#   2. STAGE2_CKPT=logs/rsl_rl/k1_goalkeeper/<run>/model_XXXX.pt \
+#   2. STAGE2_CKPT=logs/rsl_rl/k1_goalkeeper_stage2/<run>/model_XXXX.pt \
 #          ./scripts/rsl_rl/train_goalkeeper_stage3.sh
 #
 # 遷移条件・初速レンジは goalkeeper_stage3_overrides.json で制御する
@@ -21,7 +21,7 @@ OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/goalkeeper_stage3_overrides.json}
 
 if [[ -z "${STAGE2_CKPT}" ]]; then
     echo "STAGE2_CKPT に Stage 2 のチェックポイントを指定してください。" >&2
-    echo "例: STAGE2_CKPT=logs/rsl_rl/k1_goalkeeper/<run>/model_9999.pt $0" >&2
+    echo "例: STAGE2_CKPT=logs/rsl_rl/k1_goalkeeper_stage2/<run>/model_9999.pt $0" >&2
     exit 1
 fi
 

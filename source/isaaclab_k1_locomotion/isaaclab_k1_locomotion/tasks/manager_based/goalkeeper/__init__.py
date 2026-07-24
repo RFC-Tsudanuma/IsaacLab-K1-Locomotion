@@ -73,3 +73,60 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GoalkeeperPPORunnerCfg",
     },
 )
+
+##
+# 直接制御版 (goalkeeper_direct_env_cfg.py)
+#   12 関節を直接制御する単一ポリシー。凍結歩行の横移動 (0.66 m/s) が
+#   セーブ率の頭打ちだったため、横移動そのものを学習対象にした後継。
+#   学習は通常の train.py を使う (階層版の train_goalkeeper.py ではない)。
+##
+
+gym.register(
+    id="Isaac-GoalkeeperDirect-Stage1-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectStage1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperDirect-Stage1-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectStage1EnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperDirect-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage2PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperDirect-Stage3-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectStage3EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage3PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperDirect-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage2PPORunnerCfg",
+    },
+)

@@ -38,6 +38,17 @@ parser.add_argument(
     help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint (resume only).",
 )
 parser.add_argument(
+    "--warmstart_actor",
+    type=str,
+    default=None,
+    help=(
+        "Path to a walking checkpoint (e.g. logs/rsl_rl/k1_flat/main_walk/0524_walk.pt). "
+        "Partially initializes the actor (first-layer column mapping + obs-normalizer stats) "
+        "for tasks whose observation extends the walking layout (see scripts/rsl_rl/warmstart.py). "
+        "Ignored when --resume is set."
+    ),
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 parser.add_argument(
@@ -291,6 +302,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         f"        before std: {before.tolist()}\n"
                         f"        after  std: {policy.log_std.data.exp().tolist()}"
                     )
+
+    # 歩行 ckpt からの actor ウォームスタート (B-Human 方式 Stage 2 用)。
+    # --resume (完全な再開) とは排他: resume が優先。
+    if args_cli.warmstart_actor is not None:
+        if agent_cfg.resume:
+            print("[WARN] --warmstart_actor は --resume と併用できないため無視します。")
+        else:
+            from warmstart import warmstart_actor_from_checkpoint
+
+            warmstart_actor_from_checkpoint(runner.alg.policy, args_cli.warmstart_actor)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

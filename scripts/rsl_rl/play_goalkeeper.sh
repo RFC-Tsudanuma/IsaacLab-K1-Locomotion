@@ -4,7 +4,7 @@
 # 再生スクリプト本体は goalkeeper 専用の play_goalkeeper.py (階層再生エンジン)。
 #
 # 使い方 (コンテナ内):
-#   ./scripts/rsl_rl/play_goalkeeper.sh --checkpoint logs/rsl_rl/k1_goalkeeper/<run>/model_XXXX.pt
+#   ./scripts/rsl_rl/play_goalkeeper.sh --checkpoint logs/rsl_rl/k1_goalkeeper_stage2/<run>/model_XXXX.pt
 #   TASK=Isaac-Goalkeeper-Stage1-K1-Play-v0 ./scripts/rsl_rl/play_goalkeeper.sh \
 #       --checkpoint logs/rsl_rl/k1_goalkeeper_stage1/<run>/model_XXXX.pt   # Stage1 の確認
 set -e

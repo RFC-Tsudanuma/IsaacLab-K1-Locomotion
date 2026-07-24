@@ -138,9 +138,12 @@ def _gk_perc_buffers(env: "ManagerBasedRLEnv") -> None:
         env._gkp_out_pos = torch.zeros(n, 2, device=dev)                    # 認識出力 (保持)
         env._gkp_out_vel = torch.zeros(n, 2, device=dev)
         env._gkp_latency = torch.ones(n, dtype=torch.long, device=dev)      # per-episode レイテンシ [tick]
-        env._gkp_period = torch.ones(n, dtype=torch.long, device=dev)       # per-episode 更新周期 [tick]
-        env._gkp_ctr = torch.zeros(n, dtype=torch.long, device=dev)         # 次回更新までのカウンタ
-        env._gkp_bias = torch.zeros(n, 2, device=dev)                       # per-episode 系統バイアス [m]
+        # 更新周期は **小数 tick** (制御50Hz / ビジョン30Hz = 1.67 tick)。整数だと
+        # 25Hz か 50Hz にしか置けず実測レートを表現できないため float で保持する。
+        env._gkp_period = torch.ones(n, device=dev)                         # per-episode 更新周期 [tick, float]
+        env._gkp_ctr = torch.zeros(n, device=dev)                           # 次回更新までのカウンタ [float]
+        env._gkp_bias = torch.zeros(n, 2, device=dev)                       # per-episode 位置バイアス [m]
+        env._gkp_vel_bias = torch.zeros(n, 2, device=dev)                   # per-episode 速度バイアス [m/s] (x,y 各軸独立)
         env._gkp_step = -1                                                  # 1 step 1 回ガード
 
 
@@ -176,10 +179,12 @@ def _gk_perception_tick(env: "ManagerBasedRLEnv") -> None:
     env._gkp_hist_pos[:, 0] = pos_b
     env._gkp_hist_vel[:, 0] = vel_b
 
-    # 更新周期の到来した env を選ぶ
-    env._gkp_ctr -= 1
-    due = env._gkp_ctr <= 0
-    env._gkp_ctr[due] = env._gkp_period[due]
+    # 更新周期の到来した env を選ぶ。カウンタは float で、到来時に周期を **加算** する
+    # (代入ではない)。こうすると小数周期の位相が保たれ、1.67 tick 周期なら
+    # 2,2,1,2,2,1... と実測 30Hz の更新間隔を平均的に再現できる。
+    env._gkp_ctr -= 1.0
+    due = env._gkp_ctr <= 0.0
+    env._gkp_ctr[due] += env._gkp_period[due]
     # ドロップ: due のうち一部は更新をスキップ (出力据え置き)
     keep = torch.rand(env.num_envs, device=env.device) < float(p.perc_dropout_prob)
     update = due & ~keep
@@ -194,7 +199,15 @@ def _gk_perception_tick(env: "ManagerBasedRLEnv") -> None:
     dist = torch.norm(delayed_pos, dim=1, keepdim=True)
     sigma = float(p.perc_noise_sigma) + float(p.perc_noise_per_m) * dist
     noisy_pos = delayed_pos + torch.randn_like(delayed_pos) * sigma + env._gkp_bias
-    noisy_vel = delayed_vel + torch.randn_like(delayed_vel) * float(p.perc_vel_noise_sigma)
+    # 速度: 小さな毎フレームジッタ (perc_vel_noise_sigma) に加えて、エピソード固定の
+    # 系統バイアス (_gkp_vel_bias, x/y 各軸独立で大きさ 0.5〜1.0 m/s) を乗せる。
+    # 実機のボール速度推定は遅延で一定方向にずれるため、毎フレーム暴れるジッタではなく
+    # 「そのエピソードでは +0.7, 別のエピソードでは -0.6」といった系統誤差で模擬する。
+    noisy_vel = (
+        delayed_vel
+        + torch.randn_like(delayed_vel) * float(p.perc_vel_noise_sigma)
+        + env._gkp_vel_bias
+    )
 
     env._gkp_out_pos[update] = noisy_pos[update]
     env._gkp_out_vel[update] = noisy_vel[update]
@@ -276,6 +289,51 @@ def gk_target_y(
     critic には既定の真値版を使う。
     """
     return compute_target_y(env, max_y=max_y, use_perceived=use_perceived).unsqueeze(1)
+
+
+def zeros_obs(env: "ManagerBasedRLEnv", dim: int = 1) -> torch.Tensor:
+    """常にゼロを返すダミー観測 (N, dim)。
+
+    直接制御版のステージ1 (ボール不在) でボール系スロットの次元を確保するために使う。
+    ゼロ入力の列には勾配が流れないので、該当する重みは初期値のままステージ2 へ渡る
+    (ball_kick と同じ「次元一致方式」)。
+    """
+    return torch.zeros(env.num_envs, int(dim), device=env.device)
+
+
+def task_drive_vector(
+    env: "ManagerBasedRLEnv",
+    max_y: float = 1.25,
+    vx_scale: float = 1.0,
+    vy_scale: float = 1.5,
+    use_perceived: bool = True,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ステージ2/3 で ``velocity_commands`` スロットに入れる「移動要求」ベクトル (N, 3)。
+
+    ステージ1 では同じスロットに locomotion の速度コマンド (vx, vy, wz) が入る。
+    ステージ2/3 には外部から与えられるコマンドが無いので、タスク状態から等価な
+    「どちらへどれだけ動きたいか」を作って同じスロットに入れる:
+
+        [0] = 守備面 (guard_x) までの前後ずれ   → ステージ1 の vx と同じ意味
+        [1] = 目標 y (ボール到達予測点) までの横ずれ → ステージ1 の vy と同じ意味
+        [2] = 向きの誤差 (フィールド正面からのずれ)  → ステージ1 の wz と同じ意味
+
+    位置誤差をステージ1 のコマンド範囲へクリップして渡すので、ステージ1 で獲得した
+    「このスロットが大きい方向へ速く動く」という対応がそのまま流用でき、
+    ステージ遷移が滑らかになる。ボールの到達予測を先読みして動く/構えるといった
+    タスク固有の判断は、別スロットのボール観測から学習される。
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    guard_x = float(env.cfg.goalkeeper.guard_x)
+    pos = robot_pos_goal(env, asset_cfg)
+    dx = (guard_x - pos[:, 0]).clamp(-vx_scale, vx_scale)
+    dy = (compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]).clamp(
+        -vy_scale, vy_scale
+    )
+    # heading_w は +x を 0 とする world yaw。フィールド正面へ戻す向きを渡す。
+    dyaw = (-robot.data.heading_w).clamp(-1.0, 1.0)
+    return torch.stack([dx, dy, dyaw], dim=1)
 
 
 def gk_self_state(

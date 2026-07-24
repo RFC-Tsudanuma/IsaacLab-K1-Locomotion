@@ -12,17 +12,73 @@ exp 型の距離報酬は σ を 1 本にすると「遠い目標で勾配が消
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
+from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import euler_xyz_from_quat, wrap_to_pi
 
 from ...around_ball.mdp.observations import _high_action_cmd
+from ...locomotion.mdp.events import get_phase_freq
 from .observations import compute_target_y, gk_buffers, robot_pos_goal
 from .terminations import update_save_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+def stance_foot_flat(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+    force_threshold: float = 1.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names=".*_foot_link"),
+) -> torch.Tensor:
+    """**実際に接地している足だけ** の足裏の傾き (pitch² + roll²) を返すペナルティ (weight<0)。
+
+    つま先立ち = 足首が底屈して足裏が前傾した状態。既存の
+    ``feet_parallel_to_ground`` はポテンシャル形式 (差分報酬) なので定常的なつま先立ちに
+    勾配が出ず効かなかった。本項は **状態ペナルティ** なので傾いている限り毎ステップ罰す。
+
+    接地判定は **接触センサ (接触力 > force_threshold)** で行う。旧実装は位相ベースの
+    接地推定を使っていたが、位相モデルは前進歩行前提で、速い横移動では実際の足の動きと
+    合わず「移動方向と反対の足がずっとつま先立ち」なのに位相上は swing 扱いされて
+    罰を逃れていた (実測で判明)。接触力ベースなら、つま先だけで接地している足も
+    「接地中」と正しく判定でき、その傾きを直接罰せる。遊脚 (完全に浮いている足) は
+    接触力が無いので自動的に対象外になり、足上げ (foot_clearance) と干渉しない。
+
+    Returns:
+        接地脚の (pitch² + roll²) の和 [(rad)²], shape (N,)。weight を負にして使う。
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+
+    # 傾き (robot 側) と接触 (sensor 側) は別コンテナから body_ids を解決するため、
+    # 左右の並び順が一致している保証が構造的には無い。初回だけ名前で突き合わせて
+    # 検証し、不一致なら即座に落とす (黙って左右を取り違えると症状の悪化に気づけない)。
+    if getattr(env, "_gk_stance_flat_order_ok", None) is None:
+        asset_names = [asset.body_names[i] for i in asset_cfg.body_ids]
+        sensor_names = [contact_sensor.body_names[i] for i in sensor_cfg.body_ids]
+        if asset_names != sensor_names:
+            raise RuntimeError(
+                f"stance_foot_flat: 足の並び順が robot={asset_names} / sensor={sensor_names} "
+                "で一致しません。body_names の指定を見直してください。"
+            )
+        env._gk_stance_flat_order_ok = True
+
+    foot_quat = asset.data.body_quat_w[:, asset_cfg.body_ids, :]  # [N, F, 4]
+    n_env, n_foot = foot_quat.shape[0], foot_quat.shape[1]
+    roll, pitch, _ = euler_xyz_from_quat(foot_quat.reshape(-1, 4))
+    err = (torch.square(wrap_to_pi(pitch)) + torch.square(wrap_to_pi(roll))).reshape(n_env, n_foot)
+
+    # 接触判定は履歴の最大値で取る (touchdown 直後のチャタリングに強い)。
+    # NOTE: net_forces_w_history は index 0 が最新・末尾が最古。[:, -1] は最古サンプル
+    #       なので使わない (feet_slide がそう書いているが、あれは 10ms 古い値を見ている)。
+    forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1)  # [N, hist, F]
+    in_contact = (forces.max(dim=1)[0] > float(force_threshold)).float()  # [N, F]
+
+    return (err * in_contact).sum(dim=1)
 
 
 def _target_y_error(env: "ManagerBasedRLEnv", max_y: float) -> torch.Tensor:
@@ -113,6 +169,59 @@ def hold_at_target(
     stop_body = torch.exp(-torch.square(motion) / lin_vel_std**2)
 
     return gate * stop_cmd * stop_body
+
+
+def track_lin_vel_y_exp(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """横方向 (base yaw frame の y) の速度コマンド追従だけを見るガウス報酬 [0, 1]。
+
+    直接制御版ステージ1 の「横移動特化」を担う項。locomotion の
+    ``track_lin_vel_xy_yaw_frame_exp`` は前後と左右を合算して評価するため、
+    前進で誤差を稼いでも横で損してもトータルが同じになり、横方向へ学習圧が
+    集中しない。本項を上乗せして、横の追従だけを追加で報酬する。
+
+    y 成分のみを評価する以外は locomotion の追従報酬と同じ規約
+    (base の yaw frame で評価、σ はガウス幅)。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    err = torch.square(cmd[:, 1] - vel_b[:, 1])
+    return torch.exp(-err / std**2)
+
+
+def lateral_speed_bonus(
+    env: "ManagerBasedRLEnv",
+    v_ref: float = 1.3,
+    command_name: str = "base_velocity",
+    min_cmd: float = 0.6,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """「速い横移動コマンドが出ているとき、実際に何 m/s 出せたか」に比例する報酬 [0, 1]。
+
+    追従報酬 (ガウス) だけだと、コマンドが実現不可能に速い領域では誤差が大きすぎて
+    勾配がほぼ消え、「どうせ届かないから諦める」局所解に落ちやすい (exp 報酬の
+    諦め問題)。本項は指令と実速度の一致ではなく **実速度そのもの** を線形に報酬する
+    ので、上限付近でも「1cm/s でも速く」の勾配が残る。
+
+    ``min_cmd`` 以上の横コマンドが出ている env でのみ有効 (低速時に暴れないため)。
+    ``v_ref`` は正規化の基準速度で、目標とする横移動速度を入れる。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    # コマンド方向に沿った横速度 (逆方向に動いていれば負)
+    toward = torch.sign(cmd[:, 1]) * vel_b[:, 1]
+    gate = cmd[:, 1].abs() > min_cmd
+    return (toward / v_ref).clamp(0.0, 1.0) * gate.float()
 
 
 def save_touch_bonus(env: "ManagerBasedRLEnv") -> torch.Tensor:

@@ -98,12 +98,13 @@ from .mdp.rewards import (
 )
 from .mdp.terminations import goal_conceded, robot_out_of_bounds, save_success
 
-# --- ゴール・ボールの幾何パラメータ (ルールブック Middle ディビジョン) ---
+# --- ゴール・ボールの幾何パラメータ (ルールブック Middle ディビジョン = M-Field) ---
 GOAL_HALF_WIDTH = 1.25     # ゴール幅 2.5m の半分 (ポスト内側)
 POST_RADIUS = 0.05         # ポスト/クロスバー太さ 0.10m (許容 0.07〜0.12)
 CROSSBAR_HEIGHT = 1.7      # クロスバー下端の目安 (許容 1.5〜1.9。横セーブのみなので判定未使用)
 BALL_RADIUS = 0.10         # FIFA サイズ4相当 (直径約 0.20m)
 BALL_MASS = 0.37           # 同 (質量 0.35〜0.39 kg)
+LINE_WIDTH = 0.05          # ゴールライン白線の幅 (ルールブック 0.05〜0.12m の下限)
 
 
 @configclass
@@ -120,7 +121,7 @@ class GoalkeeperParamsCfg:
     # ボールをゴールの外側で止めるための余裕 (弾いた球がライン手前に落ちる) と、
     # 前に出ることによるシュートコースの圧縮の両取り。定位置報酬・到達予測面・
     # 初期スポーンがこの値を参照する。
-    guard_x: float = 0.3
+    guard_x: float = 0.4
 
     # ステージ1: ボールのパーク位置 (ゴール座標系 x, y) とランダム目標
     park_pos: tuple = (5.0, 0.0)
@@ -135,7 +136,10 @@ class GoalkeeperParamsCfg:
     stage1_far_zone: tuple = (0.9, 1.25)  # ポスト際ゾーンの |y| 範囲 [m]。ポスト間 ~2.5m の往復を練習させる
 
     # ステージ2/3: ボールのスポーンと初速
-    spawn_dist_range: tuple = (0.8, 5.0)   # ゴール中央からの距離 [m] (至近〜遠距離まで)
+    # ボールが蹴られる位置の距離 [m] (ゴール中央基準)。ペナルティエリア (奥行き 3.0m)
+    # の外からのシュートを主対象とするが、近距離 (1.5m〜、ペナルティマーク 2.0m 前後) も
+    # 混ぜて幅広く経験させる。近距離×高速の取れない球は min_time_to_line で自動除外。
+    spawn_dist_range: tuple = (1.5, 5.0)
     spawn_half_angle: float = 1.1          # スポーン方位 ±[rad] (+x 正面基準, ≈63°)
     aim_y_range: float = 1.1               # 狙い先 y ∈ ±この値 [m] (ポスト内側)
     ball_speed_min: float = 0.5            # 初速下限 [m/s]
@@ -152,13 +156,22 @@ class GoalkeeperParamsCfg:
     #   実機ビジョンの想定 = レイテンシ 20〜60ms、更新 25〜50Hz、検出ドロップ 10%、
     #   距離依存ノイズ、エピソード固定バイアス。頭部が常にボールを追う前提なので
     #   FOV マスクは入れない (around_ball の知覚DRから品質劣化のみ移植)。
-    perc_latency_range: tuple = (1, 3)        # レイテンシ [制御tick] (20〜60ms @ 50Hz)
-    perc_update_period_range: tuple = (1, 2)  # 認識の更新周期 [tick] (50〜25Hz)
+    # レイテンシ [制御tick] (1 tick = 20ms @ 50Hz)。30Hz ビジョンでは「最新フレームが
+    # 最大1フレーム古い (33ms)」+ 検出処理の遅れを見込んで 40〜80ms とする。
+    perc_latency_range: tuple = (2, 4)
+    # ビジョンの更新レート [Hz]。実測 30Hz を中心にジッタを持たせる。
+    # 制御 50Hz に対し 30Hz は 1.67 tick 周期と **小数** になるため、内部では
+    # float のアキュムレータで扱う (整数 tick だと 25Hz か 50Hz にしか置けない)。
+    perc_update_rate_hz: tuple = (25.0, 35.0)
     perc_dropout_prob: float = 0.1            # 更新tickでの検出ドロップ確率
     perc_noise_sigma: float = 0.03            # 位置ノイズの基本 σ [m]
     perc_noise_per_m: float = 0.02            # 距離 1m あたりの追加 σ [m]
-    perc_vel_noise_sigma: float = 0.1         # 速度ノイズ σ [m/s]
-    perc_bias_sigma: float = 0.03             # エピソード固定の系統バイアス σ [m]
+    perc_vel_noise_sigma: float = 0.1         # 速度の毎フレームジッタ σ [m/s]
+    perc_bias_sigma: float = 0.03             # 位置のエピソード固定バイアス σ [m]
+    # 速度のエピソード固定バイアス (x, y 各軸独立)。遅延由来の系統誤差を模擬。
+    # 大きさをこの範囲から一様サンプルし符号ランダム。実機はボール速度を直接測れず
+    # 推定が一定方向にずれるため、毎フレーム暴れるジッタではなく系統誤差で表現する。
+    perc_vel_bias_range: tuple = (0.5, 1.0)
 
     # セーブ判定
     touch_force_threshold: float = 0.1  # 足-ボール接触力のしきい値 [N]
@@ -256,7 +269,7 @@ class K1GoalkeeperSceneCfg(MySceneCfg):
     goal_line: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/envs/env_.*/GoalLine",
         spawn=sim_utils.CuboidCfg(
-            size=(0.05, 2 * (GOAL_HALF_WIDTH + 2 * POST_RADIUS), 0.002),
+            size=(LINE_WIDTH, 2 * (GOAL_HALF_WIDTH + 2 * POST_RADIUS), 0.002),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0), roughness=0.8),
         ),
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, 0.001)),
@@ -437,10 +450,10 @@ class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
         # 報酬はゴールキーパー用に丸ごと置き換える。
         self.rewards = K1GoalkeeperRewardsCfg()
 
-        # ロボットは守備面 (ゴールラインの guard_x=0.3m 前) 付近・フィールド側 (+x)
+        # ロボットは守備面 (ゴールラインの guard_x=0.4m 前) 付近・フィールド側 (+x)
         # 向きでスポーン。y の幅を広めに取り「中央以外から始まる不利な状況」も
         # 学習分布に入れる (前のセーブ直後に横へずれたまま次の球が来る状況の再現)。
-        self.events.reset_base.params["pose_range"]["x"] = (0.2, 0.4)
+        self.events.reset_base.params["pose_range"]["x"] = (0.3, 0.5)
         self.events.reset_base.params["pose_range"]["y"] = (-0.5, 0.5)
         self.events.reset_base.params["pose_range"]["yaw"] = (-0.3, 0.3)
         # 静止に近い状態から開始 (キーパーは構えて待つ)。
@@ -545,12 +558,13 @@ def _make_play_clean(cfg: K1GoalkeeperEnvCfg) -> None:
     cfg.events.base_external_force_torque = None
     cfg.events.push_robot = None
     cfg.goalkeeper.perc_latency_range = (1, 1)
-    cfg.goalkeeper.perc_update_period_range = (1, 1)
+    cfg.goalkeeper.perc_update_rate_hz = (50.0, 50.0)  # 制御と同レート = 遅延なし
     cfg.goalkeeper.perc_dropout_prob = 0.0
     cfg.goalkeeper.perc_noise_sigma = 0.0
     cfg.goalkeeper.perc_noise_per_m = 0.0
     cfg.goalkeeper.perc_vel_noise_sigma = 0.0
     cfg.goalkeeper.perc_bias_sigma = 0.0
+    cfg.goalkeeper.perc_vel_bias_range = (0.0, 0.0)
 
 
 @configclass
