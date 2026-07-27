@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -42,6 +43,12 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
     - ``_gk_touch_rewarded``: save_touch_bonus を既に払ったか (一回限りの報酬用)
     - ``_gk_save_cd``       : セーブ成功終了までのカウントダウン [-1=非発火]
     - ``_gk_hold_ctr``      : ステージ1 の目標保持カウンタ
+    - ``_gk_respawn_cd``    : 次のボール発射までのカウントダウン [-1=非発火]。
+                              エピソード継続モード (relaunch_ball_after_save) 用。
+    - ``_gk_save_count``    : このエピソードでセーブした球数。適応カリキュラムが
+                              **1 球あたり** の成功率を出すのに使う。
+    - ``_gk_save_quality``  : 未払いのセーブ品質報酬 [0,1]。セーブ確定時にイベントが
+                              書き、報酬 (save_clearance_bonus) が読んでゼロに戻す。
     """
     n = env.num_envs
     if getattr(env, "_gk_target_y", None) is None or env._gk_target_y.shape != (n,):
@@ -51,6 +58,9 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         env._gk_touch_rewarded = torch.zeros(n, dtype=torch.bool, device=env.device)
         env._gk_save_cd = torch.full((n,), -1, dtype=torch.long, device=env.device)
         env._gk_hold_ctr = torch.zeros(n, dtype=torch.long, device=env.device)
+        env._gk_respawn_cd = torch.full((n,), -1, dtype=torch.long, device=env.device)
+        env._gk_save_count = torch.zeros(n, dtype=torch.long, device=env.device)
+        env._gk_save_quality = torch.zeros(n, device=env.device)
     return {
         "target_y": env._gk_target_y,
         "ball_active": env._gk_ball_active,
@@ -58,6 +68,9 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "touch_rewarded": env._gk_touch_rewarded,
         "save_cd": env._gk_save_cd,
         "hold_ctr": env._gk_hold_ctr,
+        "respawn_cd": env._gk_respawn_cd,
+        "save_count": env._gk_save_count,
+        "save_quality": env._gk_save_quality,
     }
 
 
@@ -302,7 +315,10 @@ def task_drive_vector(
     env: "ManagerBasedRLEnv",
     max_y: float = 1.25,
     vx_scale: float = 1.0,
-    vy_scale: float = 1.5,
+    # ★ vy_scale はステージ1 のコマンド範囲 (commands.base_velocity.ranges.lin_vel_y)
+    #   と必ず一致させること。ステージ1 は「スロットの値 = 出すべき速度」を学ぶので、
+    #   ステージ2/3 でスロットの取りうる範囲が違うと対応がズレる。
+    vy_scale: float = 1.3,
     use_perceived: bool = True,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
@@ -331,6 +347,63 @@ def task_drive_vector(
     # heading_w は +x を 0 とする world yaw。フィールド正面へ戻す向きを渡す。
     dyaw = (-robot.data.heading_w).clamp(-1.0, 1.0)
     return torch.stack([dx, dy, dyaw], dim=1)
+
+
+def task_drive_phase_obs(
+    env: "ManagerBasedRLEnv",
+    phase_freq: float = 1.6,
+    # ★ しきい値の単位に注意。locomotion の phase_obs は **速度 [m/s]** のノルムを
+    #   0.05 と比べるが、task_drive_vector は **位置ずれ [m]** なので同じ 0.05 を
+    #   流用する根拠が無い (5cm 以内に入らないと止まれず、実質ほぼ止まらない)。
+    #   本タスクが「到達した」とみなす尺度に合わせる:
+    #   GoalkeeperParamsCfg.stage1_reach_tol = 0.15 / target_reach_velocity の
+    #   deadband = 0.12。その下限側の 0.12 を既定にする。
+    cmd_threshold: float = 0.12,
+    max_y: float = 1.25,
+    vx_scale: float = 1.0,
+    vy_scale: float = 1.3,
+    use_perceived: bool = True,
+) -> torch.Tensor:
+    """ステージ2/3 の ``gait_phase`` スロット (4 次元)。**タスク駆動**の歩行位相。
+
+    locomotion の :func:`phase_obs` と同一フォーマット・同一規約 (左右 sin/cos、
+    停止時はゼロ埋め) だが、**停止判定の駆動元が違う**。
+
+    なぜ必要か:
+        ``phase_obs`` は停止判定に ``base_velocity`` コマンドのノルムを使う。
+        ステージ1 ではそれが実際の指令なので正しいが、ステージ2/3 では
+        ``velocity_commands`` **スロットの中身**だけを :func:`task_drive_vector` に
+        差し替えており、``base_velocity`` コマンド項自体はステージ1 の設定
+        (10 秒ごとにランダム再サンプル) のまま残っている。その結果、位相が
+        **タスクと無関係なランダムコマンド**で駆動され、ボールを止めた後も
+        「歩き続けろ」という位相が入り続けて足踏みが止まらなかった。
+        (階層版は同じ問題を ``high_action_phase_obs`` で解決済み。直接制御版に
+        移植されていなかった。)
+
+    本関数は観測スロットに入るのと同じ :func:`task_drive_vector` のノルムでゲートする。
+    「動く必要がない = スロットが小さい = 位相ゼロ = その場で立つ」となり、
+    ステージ1 で学んだ停止の仕方がそのまま流用できる。
+
+    位相周波数はステージ1 と同じ ``get_phase_freq`` 経由なので、
+    ``randomize_phase_freq`` による env ごとの ±0.05Hz ランダム化に自動追従する。
+    """
+    from ...locomotion.mdp.events import get_phase_freq
+
+    t = env.episode_length_buf * env.step_dt
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = 2.0 * math.pi * pf * t
+    phase_right = phase_left + math.pi
+
+    phase = torch.stack([
+        torch.sin(phase_left), torch.cos(phase_left),
+        torch.sin(phase_right), torch.cos(phase_right),
+    ], dim=1)
+
+    drive = task_drive_vector(
+        env, max_y=max_y, vx_scale=vx_scale, vy_scale=vy_scale, use_perceived=use_perceived
+    )
+    drive_norm = torch.norm(drive, dim=1, keepdim=True)
+    return torch.where(drive_norm < cmd_threshold, torch.zeros_like(phase), phase)
 
 
 def gk_self_state(

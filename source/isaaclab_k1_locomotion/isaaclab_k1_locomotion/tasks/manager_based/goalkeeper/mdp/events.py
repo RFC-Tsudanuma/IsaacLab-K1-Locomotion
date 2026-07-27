@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 
 from ...around_ball.mdp.observations import _high_action_cmd
-from .observations import gk_buffers, robot_pos_goal
+from .observations import ball_pos_goal, gk_buffers, robot_pos_goal
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -39,6 +39,9 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["touch_rewarded"][env_ids] = False
     bufs["save_cd"][env_ids] = -1
     bufs["hold_ctr"][env_ids] = 0
+    bufs["respawn_cd"][env_ids] = -1
+    bufs["save_count"][env_ids] = 0
+    bufs["save_quality"][env_ids] = 0.0
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:
@@ -270,3 +273,106 @@ def reset_ball_perception(
         )
         env._gkp_vel_bias[env_ids] = vmag * vsign
     env._gkp_out_vel[env_ids] = 0.0
+
+
+def _save_clearance_quality(
+    env: "ManagerBasedEnv",
+    safe_dist: float = 1.5,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """セーブ品質 [0, 1]: ボールを「ゴール枠」からどれだけ遠ざけたか (N,)。
+
+    「止めた」と「危険を除去した」を区別するための指標。ゴール正面 0.3m に
+    ボールを止めただけでも従来はセーブ成功扱いだったが、実戦ではそのまま
+    押し込まれる。ゴール枠 (x=0, |y| <= goal_half_width) の矩形からの
+    ユークリッド距離で測り、``safe_dist`` [m] 離れれば満点とする。
+
+        * 前方へ押し出した  → dx が伸びる
+        * ポストの外へ弾いた → dy が伸びる (枠外に出た球もここで加点される)
+
+    明示的なキック方向は与えない。「なるべく外へ弾け」という圧力だけを与え、
+    体の当て方はポリシーに任せる (キック技術は ball_kick タスクの担当)。
+    """
+    p = _gk_params(env)
+    pos = ball_pos_goal(env, ball_cfg)
+    dx = pos[:, 0].clamp(min=0.0)                                       # ライン前方への距離
+    dy = (pos[:, 1].abs() - float(p.goal_half_width)).clamp(min=0.0)    # ポスト外へのはみ出し
+    dist = torch.sqrt(dx * dx + dy * dy)
+    return (dist / max(float(safe_dist), 1e-3)).clamp(0.0, 1.0)
+
+
+def relaunch_ball_after_save(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None = None,
+    respawn_delay_steps: int = 50,
+    clearance_safe_dist: float = 1.5,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+):
+    """**エピソード継続モード**: セーブが確定した env に、次のボールを撃ち直す。
+
+    ``EventTerm(mode="interval", interval_range_s=(dt, dt), is_global_time=True)`` で
+    毎制御ステップ呼ぶ。ステージ1 の :func:`resample_stage1_target` と同じ思想で、
+    「成功したらエピソードを切らずに次の課題を出す」。
+
+    なぜ継続にするか:
+        従来は ``save_success`` が ``DoneTerm`` で、**セーブ成功＝エピソード終了**
+        だった。そのため
+          * 1 エピソード (10s) に報酬イベントが 1 回しか無く、ただでさえスパースな
+            セーブ報酬がさらに希薄になっていた。
+          * ``return_to_center_after_save`` が発火する間もなく終了するため、
+            「弾いた後に定位置へ戻る」がほぼ学習されていなかった。
+        継続にすると 1 エピソードに複数回のセーブが入り、単位時間あたりの学習信号が
+        増える。さらに「セーブ後すぐ中央へ戻らないと次が取れない」という圧力が
+        自然に生まれる (実機の連続シュート対応に近い)。
+
+    失敗 (失点・転倒・場外) は従来通り ``DoneTerm`` でエピソードを切る。
+    ロボットの位置はリセットせず、**セーブした場所からそのまま次の球に備える**。
+
+    Args:
+        respawn_delay_steps: セーブ確定から次の発射までの待ちステップ数。
+            弾いたボールが転がりきる前に撃つと接触判定が混線するので間を置く。
+            50 step = 1.0s @ 50Hz。
+    """
+    bufs = gk_buffers(env)
+    cd = bufs["respawn_cd"]
+
+    # --- 1. セーブ確定を検知して待ちカウンタを開始する ---
+    # update_save_state は save_cd を進め、確定時に 0 になる (冪等なので多重呼び出し可)。
+    from .terminations import update_save_state
+
+    update_save_state(env)
+    newly_saved = (bufs["save_cd"] == 0) & (cd < 0)
+    if bool(newly_saved.any()):
+        cd[newly_saved] = int(respawn_delay_steps)
+        # 適応カリキュラムが「1 球あたりの成功率」を出すための実績カウント
+        bufs["save_count"][newly_saved] += 1
+        # セーブ品質 (どれだけ危険圏から遠ざけたか) を記録する。
+        # 報酬 (save_clearance_bonus) が次の計算タイミングで読み取ってゼロに戻す。
+        # ★ ここで直接報酬を返さずバッファ越しにするのは実行順への依存を断つため。
+        #   IsaacLab の step は termination → reward → reset → interval イベント の順で、
+        #   interval イベントは報酬より後に走る。同一ステップで報酬に伝えようとすると
+        #   この順序に暗黙依存する実装になる。
+        q = _save_clearance_quality(env, safe_dist=float(clearance_safe_dist))
+        bufs["save_quality"][newly_saved] = q[newly_saved]
+        # 確定済みとして save_cd を無効化 (save_success と同じ後始末)
+        bufs["save_cd"][newly_saved] = -1
+        # ボールを非アクティブにして観測をダミーに戻す (次の発射までは「脅威なし」)
+        bufs["ball_active"][newly_saved] = False
+
+    # --- 2. 待ちカウンタを進め、0 になった env に次の球を撃つ ---
+    waiting = cd > 0
+    cd[waiting] -= 1
+    fire = cd == 0
+    if not bool(fire.any()):
+        return
+
+    fire_ids = torch.nonzero(fire).flatten()
+    # ボール 1 球ぶんの状態をリセットしてから再発射する (touched/touch_rewarded を
+    # 残すと 2 球目以降の save_touch_bonus が払われない)。
+    bufs["touched"][fire_ids] = False
+    bufs["touch_rewarded"][fire_ids] = False
+    bufs["save_cd"][fire_ids] = -1
+    cd[fire_ids] = -1
+
+    reset_ball_shot(env, fire_ids, ball_cfg=ball_cfg)
+    reset_ball_perception(env, fire_ids)

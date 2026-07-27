@@ -70,7 +70,12 @@ from .goalkeeper_env_cfg import (
     K1GoalkeeperSceneCfg,
 )
 from .mdp.curriculums import adaptive_ball_speed
-from .mdp.events import reset_ball_perception, reset_ball_shot, reset_gk_buffers
+from .mdp.events import (
+    relaunch_ball_after_save,
+    reset_ball_perception,
+    reset_ball_shot,
+    reset_gk_buffers,
+)
 from .mdp.observations import (
     gk_ball_active,
     gk_ball_pos_rel,
@@ -79,6 +84,7 @@ from .mdp.observations import (
     gk_ball_vel_perceived,
     gk_self_state,
     gk_target_y,
+    task_drive_phase_obs,
     task_drive_vector,
     zeros_obs,
 )
@@ -86,12 +92,14 @@ from .mdp.rewards import (
     face_field,
     lateral_speed_bonus,
     return_to_center_after_save,
+    save_clearance_bonus,
     save_touch_bonus,
     stance_foot_flat,
     stay_on_goal_line,
+    target_reach_velocity_direct,
     track_lin_vel_y_exp,
 )
-from .mdp.terminations import goal_conceded, robot_out_of_bounds, save_success
+from .mdp.terminations import goal_conceded, robot_out_of_bounds
 
 # 横移動の目標速度 [m/s]。lateral_speed_bonus の正規化基準。
 # ユーザー要件 (2026-07-21): 実効 1.0 m/s 必須・1.2 m/s あると理想。
@@ -153,6 +161,25 @@ class K1GKDirectPolicyCfg(K1GKDirectStage1PolicyCfg):
         params={"max_y": GOAL_HALF_WIDTH, "use_perceived": True},
         noise=Unoise(n_min=-0.02, n_max=0.02),
     )
+    # ★ gait_phase もタスク駆動に差し替える (2026-07-24)。
+    #   既定の phase_obs は停止判定に base_velocity コマンドのノルムを使うが、
+    #   Stage 2/3 では velocity_commands "スロットの中身" だけを task_drive_vector に
+    #   差し替えており、base_velocity コマンド項自体は Stage 1 の設定
+    #   (10 秒ごとにランダム再サンプル) のまま生き残っている。その結果、位相が
+    #   タスクと無関係なランダムコマンドで駆動され、ボールを止めた後も
+    #   「歩き続けろ」という位相が入り続けて **足踏みが止まらなかった**。
+    #   階層版は high_action_phase_obs で解決済みだったが、直接制御版に
+    #   移植されていなかった。観測スロットと同じ task_drive_vector でゲートする。
+    gait_phase = ObsTerm(
+        func=task_drive_phase_obs,
+        params={
+            "phase_freq": _PHASE_FREQ,
+            # cmd_threshold は関数側の既定 (0.12 [m]) を使う。_COMMAND_THRESHOLD
+            # (0.05) は速度 [m/s] 用のしきい値なので、位置ずれには流用しない。
+            "max_y": GOAL_HALF_WIDTH,
+            "use_perceived": True,
+        },
+    )
     # ボール系は知覚DR (レイテンシ/更新レート/ドロップ/距離依存ノイズ) 付きの実値。
     # ノイズは関数内で付加するので ObsTerm 側の noise は付けない。
     ball_pos_rel = ObsTerm(func=gk_ball_pos_rel_perceived)
@@ -168,6 +195,18 @@ class K1GKDirectCriticCfg(K1GKDirectStage1CriticCfg):
 
     velocity_commands = ObsTerm(
         func=task_drive_vector, params={"max_y": GOAL_HALF_WIDTH, "use_perceived": False}
+    )
+    # policy と同じくタスク駆動位相 (真値版)。actor/critic で位相の定義がズレると
+    # 価値推定が actor の見ている状態と食い違うので必ず揃える。
+    gait_phase = ObsTerm(
+        func=task_drive_phase_obs,
+        params={
+            "phase_freq": _PHASE_FREQ,
+            # cmd_threshold は関数側の既定 (0.12 [m]) を使う。_COMMAND_THRESHOLD
+            # (0.05) は速度 [m/s] 用のしきい値なので、位置ずれには流用しない。
+            "max_y": GOAL_HALF_WIDTH,
+            "use_perceived": False,
+        },
     )
     ball_pos_rel = ObsTerm(func=gk_ball_pos_rel)
     ball_vel = ObsTerm(func=gk_ball_vel)
@@ -265,12 +304,31 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
         #        外股矯正で股関節の可動を縛った分、遊脚を持ち上げる余地も削られた。
         #        5cm 回復のため 2.5 へ増強 (股関節制約と綱引きになるので旧値 2.0 より上)。
         #        ★ 外股・つま先立ちの再発と速度 (1.0 必須) を学習後に必ず確認すること。
+        #      2.5 (2026-07-27 実測, 8000iter): 持ち上げ 3.9〜4.4cm と再び 5cm 割れ。
+        #        つま先立ち対策で足首を 2 方向から締めた (stance_foot_flat -3.0→-8.0 +
+        #        feet_parallel_to_ground を状態報酬化) ぶん、遊脚を持ち上げる余地が
+        #        削られた。同じ綱引きが股関節制約で起きたのが上の 07-23 の記録。
+        #        つま先立ち自体は目視で解消し、横速度も 1.19 m/s (指令1.2) と要件に
+        #        余裕があるため、その余力を足上げに回して 3.5 へ増強する。
+        #        ★ 学習後に eval_gk_direct_lateral.py の「足の持ち上げ高さ」で 5cm に
+        #          届いたか、速度が 1.0 m/s を割っていないかを必ず確認すること。
+        #      ★ 目標値 0.085 → 0.095 (持ち上げ 5cm → 6cm) に引き上げ (2026-07-27)。
+        #        理由: 本項は exp(-(目標−実際)²/σ²) で **目標ちょうどで最大** になるため、
+        #        「足を上げると損」な項 (dof_vel_limits / energy / 足首の締め付け) と
+        #        釣り合う平衡点は **必ず目標より下** に来る。実際 weight 2.5・目標 5cm で
+        #        平衡は 4.0cm だった。つまり目標 5cm のままでは weight をいくら上げても
+        #        **平均 5cm には原理的に到達しない**。要件 (平均 5cm 以上) を満たすには
+        #        目標自体を上に置く必要がある。
+        #        6cm にするのは、現在地 4cm からの誤差 2cm がガウス勾配の最大点
+        #        (σ/√2 = 2.1cm, σ=0.03) にほぼ一致するため。7cm 以上にすると誤差が
+        #        ピークを過ぎて勾配が落ち始め、かつピーク持ち上げが 9〜10cm と
+        #        身長 0.6m のロボットには過大になる。
         self.rewards.foot_clearance = RewTerm(
             func=foot_clearance_ji,
-            weight=2.5,
+            weight=3.5,
             params={
                 "command_name": "base_velocity",
-                "target_clearance": 0.085,
+                "target_clearance": 0.095,
                 "phase_freq": _PHASE_FREQ,
                 "stance_ratio": _STANCE_RATIO,
                 "cmd_threshold": _COMMAND_THRESHOLD,
@@ -380,7 +438,10 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 10.0
+        # エピソード継続モードなので長めに取る。ボール到達に最長 10s かかる
+        # (spawn 最遠 5.0m / 初速下限 0.5 m/s) ため、10s のままだと 1 球で
+        # 終わってしまい継続にする意味が出ない。25s なら平均 3〜5 球入る。
+        self.episode_length_s = 25.0
 
         # 完全平面に戻す (凹凸の上ではボールが勝手に転がり判定を汚す)
         self.scene.terrain.terrain_type = "plane"
@@ -399,6 +460,16 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.events.reset_gk_buffers = EventTerm(func=reset_gk_buffers, mode="reset")
         self.events.reset_ball = EventTerm(func=reset_ball_shot, mode="reset")
         self.events.reset_ball_perception = EventTerm(func=reset_ball_perception, mode="reset")
+        # エピソード継続モード: セーブ確定から 1.0s 後に次の球を撃つ (毎ステップ判定)。
+        # ステージ1 の resample_stage1_target と同じ「成功したら切らずに次の課題」方式。
+        _dt = self.sim.dt * self.decimation
+        self.events.relaunch_ball = EventTerm(
+            func=relaunch_ball_after_save,
+            mode="interval",
+            interval_range_s=(_dt, _dt),
+            is_global_time=True,
+            params={"respawn_delay_steps": 50},
+        )
         self.events.ball_material = EventTerm(
             func=mdp.randomize_rigid_body_material,
             mode="startup",
@@ -418,7 +489,40 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.rewards.track_lin_vel_y = None
         self.rewards.lateral_speed_bonus = None
 
+        # ★ y 方向の dense 報酬 (2026-07-24 追加)。
+        #   上の 4 項を無効化した結果、**横位置 (y) を評価する密報酬が一つも無く**、
+        #   残る速度関連の項が feet_slide / dof_vel_limits / action_smoothness /
+        #   energy という **ペナルティだけ** になっていた。つまり「速く動く」ことは
+        #   それ自体が純損で、見返りは 3〜5 秒先の save_touch_bonus (+100) /
+        #   termination_penalty (-200) のみ。gamma=0.99 @ 50Hz では 0.99^250 ≈ 0.08
+        #   まで減衰するため、走り出す判断の時点でほぼ見えていない。
+        #   → 「必要最小限しか動かない」が最適解になり、Stage 1 で獲得した
+        #      横移動 (実測 1.49 m/s) が Stage 2/3 で使われず忘却されていた。
+        #   weight は Stage 1 の速度報酬合計 (track_lin_vel_y 2.5 +
+        #   lateral_speed_bonus 2.0 = 4.5) と同オーダーにして、ステージ遷移で
+        #   「動く価値」が急落しないようにする。
+        #   ★ 階層版の target_reach_velocity ではなく _direct 版を使うこと
+        #     (階層版は停止判定に上位アクションを見るため、直接制御版では
+        #      常に満額になり足踏みを許してしまう)。
+        self.rewards.target_reach_velocity = RewTerm(
+            func=target_reach_velocity_direct,
+            weight=4.0,
+            params={
+                "deadband": 0.12,
+                "v_cap": LATERAL_TARGET_SPEED,
+                "stop_speed": 0.5,
+                "max_y": GOAL_HALF_WIDTH,
+            },
+        )
+
         self.rewards.save_touch_bonus = RewTerm(func=save_touch_bonus, weight=100.0)
+        # セーブの「質」への上乗せ (2026-07-24)。触れただけで満額だと、ゴール正面に
+        # 転がったまま止めた結末と完全に弾き出した結末が同じ扱いになる (実戦では
+        # 前者はそのまま押し込まれる)。ゴール枠から 1.5m 離せば満点。
+        # weight は touch の 50% を上限とし、「まず届くこと」の優先度を崩さない
+        # (質を重く見すぎると、確実に触れる球を丁寧に処理する方が得になり、
+        #  遠い球へ飛びつかなくなる)。
+        self.rewards.save_clearance = RewTerm(func=save_clearance_bonus, weight=50.0)
         self.rewards.return_to_center = RewTerm(
             func=return_to_center_after_save, weight=1.0, params={"std": 0.5}
         )
@@ -426,8 +530,13 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.rewards.face_field = RewTerm(func=face_field, weight=1.0, params={"std": 0.5})
 
         # --- 終了条件 ---
+        # ★ エピソード継続モード (2026-07-24): save_success は DoneTerm にしない。
+        #   従来は「セーブ成功＝エピソード終了」だったため、1 エピソードに報酬
+        #   イベントが 1 回しか無く、return_to_center_after_save は発火する間も
+        #   なく終了していた。成功時は relaunch_ball_after_save が次の球を撃ち、
+        #   ロボットはセーブした場所からそのまま次に備える。
+        #   失敗 (失点・転倒・場外) だけがエピソードを切る。
         self.terminations.goal_conceded = DoneTerm(func=goal_conceded)
-        self.terminations.save_success = DoneTerm(func=save_success, time_out=True)
         self.terminations.out_of_bounds = DoneTerm(
             func=robot_out_of_bounds,
             params={"x_range": (-0.1, 2.5), "y_abs_max": 2.2},

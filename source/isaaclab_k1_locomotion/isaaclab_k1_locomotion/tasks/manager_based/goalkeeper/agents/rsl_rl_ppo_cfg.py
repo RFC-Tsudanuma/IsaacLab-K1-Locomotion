@@ -139,7 +139,14 @@ class K1GKDirectStage2PPORunnerCfg(K1GKDirectPPORunnerCfg):
 
 @configclass
 class K1GKDirectStage3PPORunnerCfg(K1GKDirectPPORunnerCfg):
-    """Stage 3 (適応初速カリキュラム)。Stage 2 ckpt から --resume。"""
+    """適応初速カリキュラムでセーブを学習する本編。**Stage 1 ckpt から直接 --resume**。
 
-    max_iterations = 8000
+    ★ 2026-07-24: 旧 Stage2 (固定レンジ 12000) → Stage3 (適応 8000) の 2 段構成を
+      廃止し 1 段に統合した (train_gk_direct_stage2.sh 参照)。適応カリキュラムは
+      初速上限の初期値が ball_speed_max = 1.0 で下限もそこでクランプされるため、
+      旧 Stage2 の固定レンジから始まって段々速くなる挙動を単体で内包している。
+      統合したぶん反復数は旧 2 段の合計 (12000 + 8000) を引き継ぐ。
+    """
+
+    max_iterations = 20000
     experiment_name = "k1_gk_direct_stage3"

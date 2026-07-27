@@ -61,15 +61,45 @@ def adaptive_ball_speed(
         return float(env._gk_speed_hi.item())
 
     tm = env.termination_manager
-    success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
-    for name in ("time_out", "save_success"):
-        if name in tm.active_terms:
-            success |= tm.get_term(name)
-    if "goal_conceded" in tm.active_terms:
-        success &= ~tm.get_term("goal_conceded")
+    conceded = (
+        tm.get_term("goal_conceded")
+        if "goal_conceded" in tm.active_terms
+        else torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    )
 
-    batch = success[env_ids].float()
-    n = batch.numel()
+    # --- 成功率の測り方はエピソードの構成で切り替える ---
+    # ★ 2026-07-24: 直接制御版にエピソード継続モード (relaunch_ball_after_save) を
+    #   入れたため、1 エピソードに複数球が入るようになった。エピソード単位の
+    #   終了フラグで測ると「全球セーブできたか」になり、1 球あたりのセーブ率 p に
+    #   対して成功率 ≈ p^(球数) と極端に厳しくなる (p=0.96 でも 4 球なら 0.85)。
+    #   閾値 0.85 では初速がまず上がらないので、継続モードでは 1 球あたりで測る。
+    #
+    #   モード判定は ``save_success`` が終了条件に登録されているかで行う
+    #   (階層版と直接制御版の旧設定はこれを DoneTerm に持つ = 1 球 1 エピソード)。
+    if "save_success" in tm.active_terms:
+        # 従来モード: 1 球 = 1 エピソード。終了フラグがそのまま成否。
+        success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        for name in ("time_out", "save_success"):
+            if name in tm.active_terms:
+                success |= tm.get_term(name)
+        success &= ~conceded
+        batch = success[env_ids].float()
+        n = batch.numel()
+    else:
+        # 継続モード: セーブ実績カウントと失点フラグから 1 球あたりの率を出す。
+        from .observations import gk_buffers
+
+        bufs = gk_buffers(env)
+        saved = bufs["save_count"][env_ids].float()   # このエピソードでセーブした球数
+        lost = conceded[env_ids].float()              # 失点は 1 エピソードにつき最大 1
+        faced = saved + lost                          # 対峙した球数
+        # 1 球も対峙していない env (転倒・場外で即終了など) は証拠にならないので除外。
+        valid = faced > 0
+        n = int(valid.sum().item())
+        if n == 0:
+            return float(env._gk_speed_hi.item())
+        batch = saved[valid] / faced[valid]
+
     env._gk_episode_count += n
 
     alpha = min(1.0, float(p.adaptive_ema_alpha) * n)

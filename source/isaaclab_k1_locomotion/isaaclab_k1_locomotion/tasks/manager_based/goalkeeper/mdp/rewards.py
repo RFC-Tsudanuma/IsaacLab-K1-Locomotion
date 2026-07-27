@@ -100,6 +100,54 @@ def track_target_y(
     return torch.exp(-torch.square(err) / std**2)
 
 
+def target_reach_velocity_direct(
+    env: "ManagerBasedRLEnv",
+    deadband: float = 0.12,
+    v_cap: float = 1.3,
+    stop_speed: float = 0.5,
+    max_y: float = 1.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """目標 y 方向への横移動速度に比例する密報酬 ∈ [-1, 1] (**直接制御版**)。
+
+    :func:`target_reach_velocity` (階層版) の単一ポリシー版。直接制御版の
+    ステージ2/3 には y 方向の dense 報酬が一つも無く、``save_touch_bonus`` (+100) と
+    ``termination_penalty`` (-200) というスパース報酬しか無かった。しかもそれらは
+    ボール到達まで 3〜5 秒先で、gamma=0.99 @ 50Hz では 0.99^250 ≈ 0.08 まで減衰する。
+    一方で動けば energy / feet_slide / dof_vel の減点が即座に確定するため、
+    「必要最小限しか動かない」が最適解になっていた。本項がその穴を埋める。
+
+    exp 型 (:func:`track_target_y`) ではなく速度の線形報酬にしてあるのは、目標が
+    遠いと exp が数値的にゼロになり勾配が消えるため (諦め問題)。線形ならどれだけ
+    離れていても「目標方向へ速く動けば得」という勾配が残る。
+
+    ★ 階層版との違い: 階層版は deadband 内の停止判定に ``_high_action_cmd``
+      (上位ポリシーが frozen に渡すコマンド) を使う。直接制御版にそのバッファは
+      存在せず **常にゼロが返る** ため、そのまま流用すると「deadband 内なら何を
+      していても満額 1.0」という抜け道になる (足踏みしたまま満額取り = 階層版
+      Stage1 の既知の失敗そのもの)。本関数は実ベース速度で停止を判定する。
+
+    Args:
+        deadband: この誤差 [m] 以内を「到達済み」とみなし、停止報酬に切り替える。
+        v_cap: 満額とみなす横移動速度 [m/s]。LATERAL_TARGET_SPEED と揃える。
+        stop_speed: 停止報酬がゼロになるベース速度 [m/s]。
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    err = _target_y_error(env, max_y)
+
+    # 誤差を減らす向きの横速度 (world y = ゴールライン方向)。逆方向なら負。
+    v_y = robot.data.root_lin_vel_w[:, 1]
+    toward = -torch.sign(err) * v_y
+    r_move = (toward / v_cap).clamp(-1.0, 1.0)
+
+    # 到達済みの区間は「止まっているほど高い」に切り替える。無条件で満額にすると
+    # 目標付近で足踏みするだけで報酬を取り切れ、停止方向の勾配が消える。
+    speed = torch.norm(robot.data.root_lin_vel_w[:, :2], dim=1)
+    r_stop = (1.0 - speed / stop_speed).clamp(0.0, 1.0)
+
+    return torch.where(err.abs() <= deadband, r_stop, r_move)
+
+
 def target_reach_velocity(
     env: "ManagerBasedRLEnv",
     deadband: float = 0.12,
@@ -225,7 +273,7 @@ def lateral_speed_bonus(
 
 
 def save_touch_bonus(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """ボールに触れて弾いた瞬間の一回限りのボーナス (エピソードにつき 1 回)。"""
+    """ボールに触れて弾いた瞬間の一回限りのボーナス (ボール 1 球につき 1 回)。"""
     newly = update_save_state(env)
     bufs = gk_buffers(env)
     fire = newly & (~bufs["touch_rewarded"])
@@ -233,15 +281,44 @@ def save_touch_bonus(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return fire.float()
 
 
+def save_clearance_bonus(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """セーブ確定時に、危険圏からの遠ざけ具合に応じて払う一回限りの報酬 [0, 1]。
+
+    「止めた」と「危険を除去した」を区別する。従来はゴール正面 0.3m に転がったまま
+    止めても ``save_touch_bonus`` (+100) が満額で、実戦なら即座に押し込まれる結末と
+    完全に弾き出した結末が同じ扱いだった。
+
+    値は :func:`~..events._save_clearance_quality` がセーブ確定時にバッファへ書き、
+    本関数が読み取ってゼロに戻す (読み捨て)。イベントと報酬の実行順に依存しないよう
+    バッファ越しにしてあるので、最大 1 ステップ (20ms) 遅れて払われることがある。
+
+    明示的なキック方向は教えない。「なるべく外へ弾け」という圧力だけを与え、
+    どう当てるかはポリシーに任せる (キック技術は ball_kick タスクの担当)。
+    """
+    bufs = gk_buffers(env)
+    q = bufs["save_quality"].clone()
+    bufs["save_quality"].zero_()
+    return q
+
+
 def return_to_center_after_save(
     env: "ManagerBasedRLEnv",
     std: float = 0.5,
 ) -> torch.Tensor:
-    """ボールを弾いた後、ゴール中央 (y=0) へ戻るほど高い報酬 (タッチ後のみ有効)。"""
+    """ボールを弾いた後、ゴール中央 (y=0) へ戻るほど高い報酬 (タッチ後のみ有効)。
+
+    ★ ゲートは ``touched`` のみで判定する (2026-07-24)。以前は
+      ``ball_active & touched`` だったが、エピソード継続モードでは
+      :func:`~..events.relaunch_ball_after_save` がセーブ確定時に ``ball_active``
+      を False にするため、**まさに中央へ戻るべき「次の球までの空き時間」に
+      ゲートが閉じてしまう** という取り違えになっていた。
+      ``touched`` は次の球の発射時にリセットされるので、
+      「弾いた後〜次の球が来るまで」を正しく覆う。
+    """
     bufs = gk_buffers(env)
     y = robot_pos_goal(env)[:, 1]
     r = torch.exp(-torch.square(y) / std**2)
-    gate = bufs["ball_active"] & bufs["touched"]
+    gate = bufs["touched"]
     return r * gate.float()
 
 
