@@ -276,13 +276,24 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
                 "cmd_threshold": _COMMAND_THRESHOLD,
             },
         )
-        # 足裏を地面と平行に保つ報酬を強化 (locomotion は 3.0)。
+        # 足裏を地面と平行に保つ報酬。**状態報酬に切り替える** (locomotion は差分形式 3.0)。
         # 上の足上げ報酬は「足リンク原点の高さ」しか見ないので、足首を背屈させて
         # つま先を上げるだけで高さを稼ぐ抜け道がある (実際に発生し、足裏が接地しなくなった)。
-        # 平行維持を強めてこの逃げ道を塞ぐ。
-        # NOTE: この報酬はポテンシャル形式 (差分報酬) なので「つま先立ちを維持し続ける」
-        #       定常状態には勾配が出ない。定常的なつま先立ちは下の ankle_deviation が担当。
-        self.rewards.feet_parallel_to_ground.weight = 6.0
+        #
+        # ★ 2026-07-24: 既定の enable_potential=True はポテンシャル差分 (γΦ' − Φ) を返す。
+        #   これはエピソード積算で Φ(終) − Φ(始) に畳まれるため、歩行のような**周期運動**では
+        #   「傾く」と「戻る」が毎歩打ち消し合い、正味の圧力がほぼゼロになる。weight を
+        #   3.0 → 6.0 に上げても効かなかったのはこのため。
+        #   結果として **遊脚 (空中の足) の姿勢を罰する項が実質存在しない** 状態だった。
+        #   着地時の足の向きは遊脚期に決まるので、接地後にしか効かない stance_foot_flat
+        #   では「つま先から着地する」歩容を直せない (4000iter 時点で既に発生)。
+        #   enable_potential=False で素の exp(-誤差/σ) を返す状態報酬にし、遊脚を含めて
+        #   常時「足裏が水平なら得」という圧力をかける。
+        #   ★ weight は 6.0 → 1.5 に下げること。定常報酬化すると常時最大 6.0 が入り、
+        #     速度報酬 (2.5 + 2.0) を上回って「その場で足を水平にして立つ」諦め解に
+        #     落ちる危険がある。1.5 なら水平/つま先立ちの差が約 1.2 で、速度を殺さずに効く。
+        self.rewards.feet_parallel_to_ground.params["enable_potential"] = False
+        self.rewards.feet_parallel_to_ground.weight = 1.5
         # 4) 足首 (Ankle_Pitch) の基準姿勢からの逸脱ペナルティ。
         #    ±1.5 学習で「支持脚がつま先立ちのまま横移動する」歩容が出た (かかとが浮き、
         #    つま先だけで接地)。つま先立ち = 足首の底屈なので、関節角の逸脱を直接罰する。
@@ -314,9 +325,16 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
         #   下がらず (-0.047→-0.060)、ポリシーが「ペナルティを払ってでもつま先立ちの方が
         #   得」と判断していた。速度 1.23 m/s と要件に余裕があるため -3.0 へ増強
         #   (foot_clearance を 2.0→1.5 に下げた分の圧をこちらに回す)。
+        #   2026-07-24 実測 (weight=-3.0, 10000iter): 依然として単調悪化
+        #   (-0.09 → -0.19)。4000iter 時点では着地で足裏が接地していたが、以降
+        #   「進行方向と逆の足 (蹴り出し脚) だけがつま先立ち」に退行 (ユーザー目視)。
+        #   横移動の蹴り出しは足首の底屈そのものなので速度報酬 (2.5+2.0) と正面衝突する。
+        #   実測 1.49 m/s と要件 (1.0 必須 / 1.3 目標) に余裕があるぶんを姿勢に回し
+        #   -8.0 へ増強する。★ 学習後に必ず eval_gk_direct_lateral.py で速度を再測し、
+        #   1.0 m/s を割ったら -5.0 付近へ戻すこと。曲線が単調悪化のままならまだ不足。
         self.rewards.stance_foot_flat = RewTerm(
             func=stance_foot_flat,
-            weight=-3.0,
+            weight=-8.0,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
