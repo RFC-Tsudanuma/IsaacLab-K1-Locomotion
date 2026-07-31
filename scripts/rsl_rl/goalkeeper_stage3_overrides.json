@@ -1,6 +1,8 @@
 {
-  "_comment": "ゴールキーパー Stage 3 の設定上書き (train_goalkeeper.py --override_json)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。ball_speed_cap は eval_goalkeeper_speed.py の提案値に差し替えること。min_time_to_line は近距離×高速の不可能球を防ぐ下限到達時間で、詰めるほど難しくなる。",
+  "_comment": "ゴールキーパー Stage 2 (統合版) の設定上書き (train_gk_direct_stage2.sh --override_json)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。ball_speed_cap は eval_goalkeeper_speed.py の提案値に差し替えること。min_time_to_line は近距離×高速の不可能球を防ぐ下限到達時間で、詰めるほど難しくなる。",
+  "_comment_perc_vel_bias": "★ 2026-07-31: 速度バイアスを cfg 既定の 0.5〜1.0 から 0.05〜0.15 に下げる。既定値は実測に基づかない設定で、ボールの横方向速度 (中央値 0.41 m/s) の 1.8 倍という『信号より大きいノイズ』だった。到達点は位置+速度×到達時間で外挿するため、速度の符号が反転すると (実測 43%) 予測が逆側の端へ飛ぶ。結果、キーパーへの指令の 38% が逆方向を向き、Stage 1 で獲得した 1.18 m/s の横移動能力が使われず指令中央値 0.35 m/s に留まっていた。0.05〜0.15 なら到達点の予測誤差は 1.04m→0.39m、接近判定の失敗は 33%→0% に改善する。実機のビジョン精度を実測したらその値に置き換えること。",
   "env": {
+    "goalkeeper.perc_vel_bias_range": [0.05, 0.15],
     "goalkeeper.ball_speed_min": 0.5,
     "goalkeeper.ball_speed_max": 1.0,
     "goalkeeper.ball_speed_cap": 3.0,

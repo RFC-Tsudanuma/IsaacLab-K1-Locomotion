@@ -306,9 +306,54 @@ def _save_clearance_quality(
     return (dist / max(float(safe_dist), 1e-3)).clamp(0.0, 1.0)
 
 
+def sync_task_command(
+    env: "ManagerBasedEnv",
+    # ★ env_ids にデフォルト値を付けないこと (理由は relaunch_ball_after_save 参照)。
+    env_ids: torch.Tensor | None,
+    command_name: str = "base_velocity",
+):
+    """``base_velocity`` コマンドをタスク由来の移動要求で上書きする毎ステップイベント。
+
+    ``EventTerm(mode="interval", interval_range_s=(dt, dt), is_global_time=True)`` で
+    毎制御ステップ呼ぶ。
+
+    なぜ必要か:
+        ステージ2/3 では ``velocity_commands`` **観測スロットの中身** だけを
+        :func:`~.observations.task_drive_vector` に差し替えていたが、
+        ``base_velocity`` コマンド項そのものはステージ1 の設定
+        (10 秒ごとにランダム再サンプル) のまま生き残っていた。
+        その結果、コマンドを参照する **報酬** がタスクと無関係なランダム値で動く:
+
+          * ``feet_phase`` (weight 1.4): コマンドノルムが閾値未満なら「両足接地」を
+            期待するが、ランダムコマンドはほぼ常に閾値超え → **常に歩けと要求**
+          * ``foot_clearance`` (weight 2.5): 同じ判定で遊脚を上げ続けろと要求
+
+        合計 weight 3.9 が「1.6Hz のリズムで足を動かせ」と言い続けるので、
+        ボールを止めた後も、まだ来ていない開始直後も **足踏みが止まらなかった**。
+        観測側 (task_drive_phase_obs) だけを直しても、報酬がこう言っている限り
+        ポリシーは足踏みを続ける。
+
+    本イベントでコマンド自体を差し替えることで、観測・報酬・位相のすべてが
+    同一のタスク信号で駆動され、「動く必要が無い ⇒ コマンド小 ⇒ その場で立つ」
+    が一貫する。
+
+    ★ 併せて cfg 側で ``heading_command`` / ``rel_standing_envs`` /
+      ``resampling_time_range`` を無効化すること。有効なままだと
+      コマンドマネージャが次のステップで書き戻してしまう。
+    """
+    from .observations import task_drive_vector
+
+    cmd_term = env.command_manager.get_term(command_name)
+    buf = getattr(cmd_term, "vel_command_b", None)
+    if buf is None:
+        return
+    # 報酬・位相が見るのは真値ベースの移動要求 (観測スロット側は知覚DR版を使う)。
+    buf[:] = task_drive_vector(env, use_perceived=False)
+
+
 def relaunch_ball_after_save(
     env: "ManagerBasedEnv",
-    # ★ env_ids にデフォルト値を付けないこと。EventManager の引数検証
+    # ★ env_ids にデフォルト値を付けないこと (理由は下記)。EventManager の引数検証
     #   (manager_base._resolve_common_term_cfg) は「デフォルト有りの引数」を
     #   term の params 候補として扱うため、env_ids に = None を付けると
     #   検証の集合比較が合わずに ValueError になる。

@@ -75,6 +75,7 @@ from .mdp.events import (
     reset_ball_perception,
     reset_ball_shot,
     reset_gk_buffers,
+    sync_task_command,
 )
 from .mdp.observations import (
     gk_ball_active,
@@ -555,6 +556,43 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
                 "num_buckets": 64,
             },
         )
+
+        # --- base_velocity コマンドをタスク由来の移動要求に置き換える (2026-07-31) ---
+        # ★ 足踏みが止まらなかった根本原因への対処。
+        #   従来は velocity_commands **観測スロットの中身** だけを task_drive_vector に
+        #   差し替えており、コマンド項自体は Stage 1 の設定 (10 秒ごとにランダム再サンプル)
+        #   のまま残っていた。コマンドを参照する **報酬** — feet_phase (1.4) と
+        #   foot_clearance (2.5) — はその判定に「コマンドノルム < 閾値なら両足接地でよい」
+        #   を使うため、ランダムコマンドがほぼ常に閾値を超えて **合計 weight 3.9 が
+        #   「1.6Hz のリズムで足を動かせ」と要求し続けていた**。
+        #   その結果、ボールを止めた後も開始直後も足踏みが止まらなかった。
+        #   コマンド自体を差し替えれば観測・報酬・位相が同じ信号で駆動され、
+        #   「動く必要が無い ⇒ コマンド小 ⇒ その場で初期姿勢のまま立つ」が一貫する。
+        self.events.sync_task_command = EventTerm(
+            func=sync_task_command,
+            mode="interval",
+            interval_range_s=(_dt, _dt),
+            is_global_time=True,
+        )
+        # 上書きした値をコマンドマネージャに戻されないよう、再計算・再サンプルを止める。
+        #   heading_command   : wz を向き誤差から毎ステップ再計算して上書きする
+        #   rel_standing_envs : 一部 env のコマンドを丸ごとゼロにする
+        #   resampling        : 10 秒ごとにランダムな値を引き直す
+        self.commands.base_velocity.heading_command = False
+        self.commands.base_velocity.rel_standing_envs = 0.0
+        self.commands.base_velocity.resampling_time_range = (1.0e9, 1.0e9)
+
+        # 停止判定のしきい値を 3 箇所で揃える。
+        # locomotion 既定の _COMMAND_THRESHOLD は 0.05 [m/s] (速度コマンド用) だが、
+        # Stage 2 のコマンドはタスク由来の移動要求で、脅威が無いときは
+        # 「位置ずれ [m]」とほぼ同じ数値になる。5cm 以内でしか止まれないのは厳しく、
+        # 位相観測 (task_drive_phase_obs, 既定 0.12) とも食い違って
+        # 「位相はゼロなのに foot_clearance は足を上げろ」という中間帯 (5〜12cm) が
+        # 生じる。本タスクが「到達した」とみなす尺度 0.12 に統一する。
+        _STOP_TOL = 0.12
+        self.rewards.foot_clearance.params["cmd_threshold"] = _STOP_TOL
+        if self.rewards.feet_phase is not None:
+            self.rewards.feet_phase.params["cmd_threshold"] = _STOP_TOL
 
         # --- タスク報酬を上乗せ (歩容まわりの locomotion 報酬はそのまま残す) ---
         # 速度コマンドはもう外部から来ないので、コマンド追従系は無効化する。
