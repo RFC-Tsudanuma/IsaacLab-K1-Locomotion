@@ -20,7 +20,7 @@ from ...locomotion.mdp.rewards import (
 )
 
 # goalkeeper 固有の項
-from .curriculums import adaptive_ball_speed
+from .curriculums import adaptive_ball_speed, adaptive_difficulty
 from .events import (
     reset_ball_perception,
     reset_ball_shot,

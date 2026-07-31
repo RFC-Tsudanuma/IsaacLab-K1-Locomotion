@@ -101,23 +101,18 @@ gym.register(
     },
 )
 
+# ★ 2026-07-31: 旧 "Isaac-GoalkeeperDirect-K1-v0" (初速固定レンジの旧 Stage2) と
+#   "Isaac-GoalkeeperDirect-Stage3-K1-v0" (適応カリキュラムの旧 Stage3) を、
+#   Stage2 統合後の実態に合わせて下の 1 つに集約した。
+#   env cfg 側の K1GKDirectEnvCfg (難易度固定の土台) は Stage2 と Play が継承して
+#   いるのでクラスとしては残っている (タスク登録のみ廃止)。
 gym.register(
-    id="Isaac-GoalkeeperDirect-K1-v0",
+    id="Isaac-GoalkeeperDirect-Stage2-K1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,
     kwargs={
-        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectEnvCfg",
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectStage2EnvCfg",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage2PPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="Isaac-GoalkeeperDirect-Stage3-K1-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.goalkeeper_direct_env_cfg:K1GKDirectStage3EnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage3PPORunnerCfg",
     },
 )
 

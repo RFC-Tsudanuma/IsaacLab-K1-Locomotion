@@ -18,8 +18,8 @@
 #   獲得した横移動 (実測 1.49 m/s) を忘却させる主因になっていた。
 #   ウォームアップぶんは adaptive_warmup_episodes (既定 2000) が担う。
 #
-#   旧 2 段構成に戻したい場合は --task を Isaac-GoalkeeperDirect-K1-v0 (固定レンジ) に
-#   変え、その ckpt から train_gk_direct_stage3.sh を回す。
+#   (旧 2 段構成のタスク登録は 2026-07-31 に廃止済み。難易度固定で回したい場合は
+#    override_json で goalkeeper.aim_y_stages を単一値にすること。)
 set -e
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,7 +34,7 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
 fi
 
 /workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
-    --task Isaac-GoalkeeperDirect-Stage3-K1-v0 \
+    --task Isaac-GoalkeeperDirect-Stage2-K1-v0 \
     --resume --checkpoint "${STAGE1_CKPT}" \
     --override_json "${OVERRIDE_JSON}" \
     --headless --num_envs 4096 "$@"

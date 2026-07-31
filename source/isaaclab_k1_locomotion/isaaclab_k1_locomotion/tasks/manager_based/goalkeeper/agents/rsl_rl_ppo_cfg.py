@@ -131,22 +131,16 @@ class K1GKDirectPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 @configclass
 class K1GKDirectStage2PPORunnerCfg(K1GKDirectPPORunnerCfg):
-    """Stage 2 (ゴール + ボールでセーブ)。Stage 1 ckpt から --resume。"""
+    """Stage 2: ゴール + ボールでセーブを学習する本編。**Stage 1 ckpt から --resume**。
 
-    max_iterations = 12000
-    experiment_name = "k1_gk_direct_stage2"
-
-
-@configclass
-class K1GKDirectStage3PPORunnerCfg(K1GKDirectPPORunnerCfg):
-    """適応初速カリキュラムでセーブを学習する本編。**Stage 1 ckpt から直接 --resume**。
-
-    ★ 2026-07-24: 旧 Stage2 (固定レンジ 12000) → Stage3 (適応 8000) の 2 段構成を
+    ★ 2026-07-24: 旧「Stage2 (初速固定レンジ 12000) → Stage3 (適応 8000)」の 2 段構成を
       廃止し 1 段に統合した (train_gk_direct_stage2.sh 参照)。適応カリキュラムは
-      初速上限の初期値が ball_speed_max = 1.0 で下限もそこでクランプされるため、
-      旧 Stage2 の固定レンジから始まって段々速くなる挙動を単体で内包している。
+      難易度の初期値が最も易しい側から始まるので、固定レンジ専用の段は不要だった。
       統合したぶん反復数は旧 2 段の合計 (12000 + 8000) を引き継ぐ。
+    ★ 2026-07-31: 旧 Stage3 用のクラスをこちらに一本化し、experiment_name も
+      ``k1_gk_direct_stage2`` に統一した (ステージ番号とログ出力先を一致させるため)。
+      統合直後の 3 run 分のログは ``k1_gk_direct_stage3/`` に残っている。
     """
 
     max_iterations = 20000
-    experiment_name = "k1_gk_direct_stage3"
+    experiment_name = "k1_gk_direct_stage2"

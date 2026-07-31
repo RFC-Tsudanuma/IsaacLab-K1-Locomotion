@@ -130,6 +130,48 @@ def compute_target_y(
     return torch.where(bufs["ball_active"], target, bufs["target_y"])
 
 
+_T_IDLE: float = 1.0
+"""脅威が無いときの名目時間 [s]。位置ずれ [m] を速度 [m/s] に換算する除数。
+
+1.0 にしてあるのは意図的: この状況では「ずれ ÷ 1.0」が恒等変換になるので、
+定位置復帰の挙動も :func:`task_drive_phase_obs` の停止しきい値も、
+必要速度化の前後で数値が変わらない (変更の影響をボール接近時だけに限定できる)。
+"""
+
+
+def guard_arrival_horizon(
+    env: "ManagerBasedRLEnv",
+    approach_vx_threshold: float = -0.05,
+    use_perceived: bool = False,
+    t_min: float = 0.25,
+    t_idle: float = _T_IDLE,
+) -> torch.Tensor:
+    """ボールが守備面 (x = guard_x) に到達するまでの猶予時間 [s] (N,)。
+
+    :func:`compute_target_y` が内部で計算しているのと同じ ``t`` を、
+    「あとどれだけ時間があるか」として外に出したもの。
+    :func:`task_drive_vector` が **位置ずれを必要速度に変換する** のに使う。
+
+    Args:
+        t_min: 下限クランプ [s]。到達直前に t→0 となって必要速度が発散するのを防ぐ。
+        t_idle: ボールが脅威でないとき (弾いた後・非アクティブ) に使う名目時間 [s]。
+            この値を 1.0 にしておくと、その状況では「位置ずれ [m] ÷ 1.0」= 従来と
+            同じ数値になるので、定位置復帰の挙動と停止判定のしきい値が変わらない。
+    """
+    bufs = gk_buffers(env)
+    guard_x = float(env.cfg.goalkeeper.guard_x)
+    if use_perceived:
+        pos, vel = _gk_perceived_goal_state(env)
+    else:
+        pos = ball_pos_goal(env)
+        ball: RigidObject = env.scene["soccer_ball"]
+        vel = ball.data.root_com_vel_w[:, :3]
+
+    threat = (vel[:, 0] < approach_vx_threshold) & bufs["ball_active"]
+    t = ((pos[:, 0] - guard_x) / (-vel[:, 0]).clamp(min=1e-3)).clamp(min=0.0)
+    return torch.where(threat, t.clamp(min=float(t_min)), torch.full_like(t, float(t_idle)))
+
+
 # ---------------------------------------------------------------------------
 # 知覚DR: 実機カメラ準拠の VirtualPerception (booster_amp_lab の soccer_perception を
 # goalkeeper に複製したもの) でボール位置観測を作る。カメラ仕様 (FOV 150°/80°、
@@ -326,26 +368,43 @@ def task_drive_vector(
 
     ステージ1 では同じスロットに locomotion の速度コマンド (vx, vy, wz) が入る。
     ステージ2/3 には外部から与えられるコマンドが無いので、タスク状態から等価な
-    「どちらへどれだけ動きたいか」を作って同じスロットに入れる:
+    「どちらへどれだけ速く動きたいか」を作って同じスロットに入れる:
 
-        [0] = 守備面 (guard_x) までの前後ずれ   → ステージ1 の vx と同じ意味
-        [1] = 目標 y (ボール到達予測点) までの横ずれ → ステージ1 の vy と同じ意味
-        [2] = 向きの誤差 (フィールド正面からのずれ)  → ステージ1 の wz と同じ意味
+        [0] = 守備面 (guard_x) へ戻る速度        → ステージ1 の vx と同じ [m/s]
+        [1] = 目標 y へ間に合わせるのに要る横速度 → ステージ1 の vy と同じ [m/s]
+        [2] = 正面へ戻す角速度                   → ステージ1 の wz と同じ [rad/s]
 
-    位置誤差をステージ1 のコマンド範囲へクリップして渡すので、ステージ1 で獲得した
-    「このスロットが大きい方向へ速く動く」という対応がそのまま流用でき、
-    ステージ遷移が滑らかになる。ボールの到達予測を先読みして動く/構えるといった
-    タスク固有の判断は、別スロットのボール観測から学習される。
+    ★ 2026-07-31: [1] を **位置ずれ [m] から必要速度 [m/s] に変更** した。
+      旧実装は ``dy = 目標y − 自分のy`` をそのまま入れていたが、ステージ1 が学んだのは
+      「スロットの値 = 出すべき速度 [m/s]」であり、**単位が違うものを渡していた**。
+      その結果:
+        * 目標までのズレは通常 0.3〜0.8m (ゴール幅 ±1.25m の内側) なので、
+          指令される速度も 0.3〜0.8 m/s にしかならず、ステージ1 で獲得した
+          1.18 m/s の能力を一度も使っていなかった (実測: 横移動が遅い)。
+        * 目標に近づくほどズレが縮んで **さらに減速** し、到達直前が最も遅かった。
+        * 結果としてボールに間に合わず、通過してから追いかける挙動になっていた
+          (通過後は到達時間 t が 0 にクランプされ、予測点＝ボールの現在位置になるため)。
+      距離を到達猶予時間で割れば「間に合わせるのに必要な速度」になり、
+      速い球ほど大きな値 = 全力、遅い球は小さな値 = 落ち着いて、と自然に切り替わる。
+
+    ★ [0] と [2] は従来通り「位置/向きのずれ」を ``t_idle`` (=1.0s) で割る。
+      これは定位置維持の項であり、ボールの到達時間で割ると球が近いときに前後へ
+      突っ込む挙動になる。1.0 で割るので数値は従来と同じまま、単位だけ揃う。
     """
     robot: Articulation = env.scene[asset_cfg.name]
     guard_x = float(env.cfg.goalkeeper.guard_x)
     pos = robot_pos_goal(env, asset_cfg)
-    dx = (guard_x - pos[:, 0]).clamp(-vx_scale, vx_scale)
-    dy = (compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]).clamp(
+
+    # ボール到達までの猶予時間 [s]。脅威が無いときは t_idle=1.0 が返るので、
+    # その状況では下の除算が恒等変換になり従来の挙動と一致する。
+    horizon = guard_arrival_horizon(env, use_perceived=use_perceived)
+
+    dx = ((guard_x - pos[:, 0]) / _T_IDLE).clamp(-vx_scale, vx_scale)
+    dy = ((compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]) / horizon).clamp(
         -vy_scale, vy_scale
     )
     # heading_w は +x を 0 とする world yaw。フィールド正面へ戻す向きを渡す。
-    dyaw = (-robot.data.heading_w).clamp(-1.0, 1.0)
+    dyaw = ((-robot.data.heading_w) / _T_IDLE).clamp(-1.0, 1.0)
     return torch.stack([dx, dy, dyaw], dim=1)
 
 

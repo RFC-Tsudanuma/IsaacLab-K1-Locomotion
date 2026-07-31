@@ -17,18 +17,18 @@
     できればセーブ率は 61% → 85% 相当まで伸びる見込みが立った。
     そこで横移動そのものを学習対象にする。
 
-3 ステージ構成 (観測レイアウトは全ステージ共通 = 59 次元):
+2 ステージ構成 (観測レイアウトは全ステージ共通 = 59 次元):
     * Stage 1 (``Isaac-GoalkeeperDirect-Stage1-K1-v0``)
         locomotion そのままの速度コマンド追従タスク。ただしコマンド範囲を
         横重視 (vx ±1.0 / vy ±1.5) にし、横方向の追従・速度に追加報酬を掛ける。
         ボール系スロットはゼロのダミーで次元だけ確保する。
         ゴール・ボールはシーンに置かない (自由に走り回らせるため)。
-    * Stage 2 (``Isaac-GoalkeeperDirect-K1-v0``)
+    * Stage 2 (``Isaac-GoalkeeperDirect-Stage2-K1-v0``)
         ゴール + ボールを置き、ボール系スロットに実値を入れてセーブを学習。
         ``velocity_commands`` スロットはタスク由来の「移動要求」に差し替える
         (:func:`mdp.task_drive_vector`)。Stage 1 の ckpt から ``--resume``。
-    * Stage 3 (``Isaac-GoalkeeperDirect-Stage3-K1-v0``)
-        セーブ成功率に応じてボール初速上限を上げる適応カリキュラム。
+        セーブ成功率 (EMA) に応じて難易度を段階的に上げる適応カリキュラム付き
+        (:func:`mdp.adaptive_difficulty`: 狙い先の広さ → ボール初速の順)。
 
 観測スロット (順序厳守。変えると warmstart / ステージ間の重み引き継ぎが壊れる):
     先頭 49 = 歩行 K1PolicyCfg と完全同一 (base_ang_vel 3 / projected_gravity 3 /
@@ -69,7 +69,7 @@ from .goalkeeper_env_cfg import (
     GoalkeeperParamsCfg,
     K1GoalkeeperSceneCfg,
 )
-from .mdp.curriculums import adaptive_ball_speed
+from .mdp.curriculums import adaptive_difficulty
 from .mdp.events import (
     relaunch_ball_after_save,
     reset_ball_perception,
@@ -308,10 +308,21 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
         #        つま先立ち対策で足首を 2 方向から締めた (stance_foot_flat -3.0→-8.0 +
         #        feet_parallel_to_ground を状態報酬化) ぶん、遊脚を持ち上げる余地が
         #        削られた。同じ綱引きが股関節制約で起きたのが上の 07-23 の記録。
-        #        つま先立ち自体は目視で解消し、横速度も 1.19 m/s (指令1.2) と要件に
-        #        余裕があるため、その余力を足上げに回して 3.5 へ増強する。
+        #      3.5 + 目標 6cm (2026-07-27 実測, 8000iter): **失敗**。目視で
+        #        「支持脚で地面を蹴って跳び、その間に遊脚を上げる」歩容に退行した。
+        #        実測でも lin_vel_z_l2 -0.028→-0.058 (上下動 2 倍)、
+        #        dof_pos_limits_ankle -0.0027→-0.0085 (足首が可動限界まで底屈)、
+        #        stance_foot_flat -0.10→-0.20 (つま先立ち再発) と裏付けられた。
+        #        原因: foot_clearance_ji が見るのは足リンクの **ワールド z (絶対高さ)**
+        #        なので、「遊脚を股関節・膝で上げる」以外に「体ごと持ち上げる」でも
+        #        達成できてしまう。base_height_penalty は min_height を下回った時だけ
+        #        罰するため体を高く上げるのは無罰で、跳ぶのが最安の解になった。
+        #        weight と目標を同時に上げて現在地での勾配を 2.0 倍にしたのが行き過ぎ。
+        #      → weight は 2.5 に戻し、**目標 6cm だけ**を変更する (勾配 1.43 倍)。
+        #        誤差 2cm はガウス勾配の最大点 (σ/√2 = 2.1cm, σ=0.03) にほぼ一致するので、
+        #        weight を上げずに引き上げ圧力を稼げる。
         #        ★ 学習後に eval_gk_direct_lateral.py の「足の持ち上げ高さ」で 5cm に
-        #          届いたか、速度が 1.0 m/s を割っていないかを必ず確認すること。
+        #          届いたか、速度が 1.0 m/s を割っていないか、跳躍が出ていないかを確認。
         #      ★ 目標値 0.085 → 0.095 (持ち上げ 5cm → 6cm) に引き上げ (2026-07-27)。
         #        理由: 本項は exp(-(目標−実際)²/σ²) で **目標ちょうどで最大** になるため、
         #        「足を上げると損」な項 (dof_vel_limits / energy / 足首の締め付け) と
@@ -325,15 +336,52 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
         #        身長 0.6m のロボットには過大になる。
         self.rewards.foot_clearance = RewTerm(
             func=foot_clearance_ji,
-            weight=3.5,
+            weight=2.5,
             params={
                 "command_name": "base_velocity",
+                # 0.095 (6cm) → 0.105 (7cm) に引き上げ (2026-07-29)。
+                # 実機の人工芝はパイル高さ 20〜30mm。支持脚は荷重でパイルを潰して沈むが、
+                # 遊脚は芝の上を通るので **実効クリアランス ≒ 足上げ − パイル高さ**。
+                # 6cm 目標で得られた実測 4.0〜5.0cm では、指令 1.2 (実用速度)・パイル 30mm
+                # のとき残り 10mm しかなく余裕が無い。
+                # 跳躍で稼ぐ抜け道は lin_vel_z_l2 = -2.5 で塞げることが実証済みなので
+                # (目標 6cm + -0.8 は跳躍、6cm + -2.5 は跳ばず 4.6cm)、その状態で目標だけ上げる。
+                # 2026-07-29: 0.105 (7cm) は跳躍でしか達成できないことが判明したため
+                # 0.095 (6cm) に戻す。7cm 目標では
+                #   跳躍を許すと 6.8cm (体ごと持ち上げているだけ)
+                #   跳躍を封じると 2.6〜3.3cm (脚の関節だけでは届かない)
+                # となり、実測 4.3cm を得られる 6cm 目標が最良だった。
                 "target_clearance": 0.095,
                 "phase_freq": _PHASE_FREQ,
                 "stance_ratio": _STANCE_RATIO,
                 "cmd_threshold": _COMMAND_THRESHOLD,
             },
         )
+        # 上下動 (跳躍) のペナルティを強化する (flat_env_cfg の既定は -0.8)。
+        # ★ 2026-07-27: 目標 6cm にすると weight を 2.5 に戻しても
+        #   「支持脚で地面を蹴って跳び、その間に遊脚を上げる」歩容に退行した。
+        #   実測: lin_vel_z_l2 -0.028 → -0.056 (上下動 2 倍)、
+        #        dof_pos_limits_ankle -0.0027 → -0.0082 (足首が可動限界まで底屈)、
+        #        stance_foot_flat -0.101 → -0.170 (つま先立ち再発)。
+        #   原因: foot_clearance_ji が見るのは足リンクの **ワールド z (絶対高さ)** なので、
+        #   「遊脚を股関節・膝で上げる」以外に「体ごと持ち上げる」でも達成できる。
+        #   さらに base_height_penalty は min_height を **下回った時だけ** 罰するため、
+        #   体を高くするのは無罰。足首を -8.0 で締めて脚だけでの足上げ限界が約 4cm に
+        #   下がった結果、目標 6cm の残り 2cm を稼ぐ最安の手段が跳躍になった。
+        #
+        #   ただし地面は完全な平面なので「絶対高さ = 地面からのクリアランス」であり、
+        #   つまずき防止という目的に対して指標自体は正しい。問題は達成手段が跳躍で
+        #   あることなので、**測り方を変えるのではなく跳躍を直接罰する**。
+        #   ★ 効かなければ (跳躍が止まらなければ) 足上げをベース相対で測る方式へ移行する。
+        #   ★ 強すぎると着地の衝撃吸収や重心の上下動まで殺す。横速度 (1.0 必須) を再測すること。
+        self.rewards.lin_vel_z_l2.weight = -2.5
+        # ★ 2026-07-29: 跳躍だけを狙い撃つ flight_phase (両足同時浮きのペナルティ、
+        #   mdp/rewards.py に実装あり) を weight -2.0 で試したが **採用しない**。
+        #   跳躍は完全に止まった (上下動 raw 0.052 → 0.023、過去最良) が、
+        #   **足上げが 2.6〜3.3cm まで低下**した (07-28 の 4.3cm より悪化)。
+        #   目標 6cm では lin_vel_z_l2 -2.5 だけで跳躍を抑えられており (07-28 実績)、
+        #   flight_phase を足すと跳躍防止が二重になって足上げだけが削られる。
+        #   → 目標 7cm と併せて 07-28 構成に戻す。使うなら目標を上げた場合のみ。
         # 足裏を地面と平行に保つ報酬。**状態報酬に切り替える** (locomotion は差分形式 3.0)。
         # 上の足上げ報酬は「足リンク原点の高さ」しか見ないので、足首を背屈させて
         # つま先を上げるだけで高さを稼ぐ抜け道がある (実際に発生し、足裏が接地しなくなった)。
@@ -404,6 +452,32 @@ class K1GKDirectStage1EnvCfg(K1FlatEnvCfg):
         #    (3.0) が横移動系報酬 (track_lin_vel_y 2.5 + lateral_speed_bonus 2.0) に
         #    負けていたため 5.0 へ引き上げ、直線的な横移動に矯正する。
         #    → 9000iter 実測で yaw drift 26°→14° に半減 (2026-07-23 確認)。
+        #    2026-07-29: 15000iter 実測でも 10〜12° 残り、目視でも横移動が弧を描く。
+        #      5.0 → 7.0 へさらに引き上げる。
+        #      ★ 上げすぎると「回らないこと」を優先して横移動速度が落ちる
+        #        (横移動系 track_lin_vel_y 2.5 + lateral_speed_bonus 2.0 = 4.5 との綱引き)。
+        #        速度 1.0 m/s を割ったら 6.0 へ戻すこと。
+        #      ★ なお本項が追従するのは角速度 wz であって heading そのものではないため、
+        #        微小なバイアスは積分されてドリフトとして残る。学習時は heading_command=True
+        #        で heading フィードバックが閉じているが、eval / play は wz=0 の開ループで
+        #        駆動しているのでドリフトが補正されない。実タスク (Stage 2/3) では
+        #        task_drive_vector の第3成分が dyaw = -heading を渡すので閉ループになる。
+        #    2026-07-29 実測 (7.0, 4000iter): yaw drift は 10〜12° → 5.7〜8.8° と改善したが
+        #      **代償が大きすぎた**。回転抑制の報酬が 3.78 と横移動系 (1.29 + 0.29 = 1.58) の
+        #      2.4 倍になり、「体を回さずに横へ進む」ため股を開く歩容に流れた:
+        #        joint_deviation_hip -0.147 → -0.445 (外股が 3 倍。weight は据え置きなのに違反増)
+        #        横速度 (指令1.2)    1.182 → 0.628 (要件 1.0 を下回る)
+        #        コマンド範囲カリキュラム stage 3/3 → 2/3 で停滞 (追従誤差が閾値を超えて進めない)
+        #      外股・速度低下・yaw 改善はすべて同じ変更の表裏。外股対策
+        #      (joint_deviation_hip) を強めるのは逆効果で、元の配分を戻すのが正しい。
+        #    2026-07-29 実測 (6.0, 8000iter): 7.0 よりは改善したが **まだ不足**。
+        #      追従誤差 EMA 0.425 で進級閾値 0.400 を越えられず、カリキュラムは
+        #      stage 2/3 (lin_vel_y_max 1.1) で停滞。外股も -0.370 と 2.5 倍のまま、
+        #      横速度も 0.762 と要件 1.0 を下回った。
+        #      → 元の 5.0 に戻す。yaw drift は 10〜12° に悪化するが、実タスク
+        #        (Stage 2/3) では task_drive_vector の第3成分が dyaw = -heading を渡して
+        #        **閉ループで補正される**ため、開ループ計測でのドリフトは実性能への影響が小さい。
+        #        一方 横速度 1.0 m/s はセーブ成否に直結する硬い要件なので、そちらを優先する。
         self.rewards.track_ang_vel_z_exp.weight = 5.0
         # 7) 外股 (ガニ股) の矯正。9000iter 版の目視で「股関節を外に開いたまま横移動する」
         #    歩容が確認された (2026-07-23)。外股は支持基底面が広がり横安定には有利なので
@@ -549,12 +623,25 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
 
 
 @configclass
-class K1GKDirectStage3EnvCfg(K1GKDirectEnvCfg):
-    """Stage 3: セーブ成功率 (EMA) に応じてボール初速上限を引き上げる。"""
+class K1GKDirectStage2EnvCfg(K1GKDirectEnvCfg):
+    """Stage 2 本体: セーブ成功率 (EMA) に応じて難易度を段階的に上げる (2 軸)。
+
+    ★ 2026-07-31: 旧 ``K1GKDirectStage3EnvCfg`` から改名。Stage 2/3 を統合済みで
+      「Stage 3」という段は存在しないため、番号とログ出力先を実態に合わせた。
+      親の :class:`K1GKDirectEnvCfg` は「ゴール + ボールを置くが難易度は固定」の
+      土台で、Play 用 cfg も継承しているので残してある (タスク登録のみ廃止)。
+
+    ★ 2026-07-31: 初速のみを動かす ``adaptive_ball_speed`` から、
+      「狙い先の広さ → 初速」の順で上げる ``adaptive_difficulty`` に変更。
+      難易度の主因は初速ではなく必要横移動量 (実測: 0.7m で成功率半減) であり、
+      その主因を決める aim_y_range が最初から最大値固定だったため、成功率が
+      62% 前後で頭打ちになりカリキュラムが不感帯で休眠していた。
+      (階層版 goalkeeper_env_cfg.py は従来の adaptive_ball_speed のまま。)
+    """
 
     def __post_init__(self):
         super().__post_init__()
-        self.curriculum.ball_speed_adaptive = CurrTerm(func=adaptive_ball_speed)
+        self.curriculum.difficulty = CurrTerm(func=adaptive_difficulty)
 
 
 def _make_play_clean(cfg: K1GKDirectEnvCfg) -> None:

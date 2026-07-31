@@ -195,10 +195,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         cycle_steps = max(1, int(round(1.0 / (max(float(args_cli.gait_hz), 1e-3) * dt))))
         win_max = torch.zeros(n, 2, device=device)
         win_ctr = 0
-        peak_sum = torch.zeros((), device=device)
-        peak_cnt = torch.zeros((), device=device)
-        peak_max = torch.zeros((), device=device)
-        foot_floor = torch.full((), float("inf"), device=device)
+        # 足の高さ統計は **左右別** に取る (列 0 = 左足, 列 1 = 右足)。
+        # 片足だけ跳ぶ/上がらないといった左右非対称な歩容は、両足の平均だと
+        # 打ち消されて見えなくなるため。
+        peak_sum = torch.zeros(2, device=device)
+        peak_cnt = torch.zeros(2, device=device)
+        peak_max = torch.zeros(2, device=device)
+        foot_floor = torch.full((2,), float("inf"), device=device)
 
         for _ in range(n_steps):
             with torch.inference_mode():
@@ -222,16 +225,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             win_max = torch.maximum(win_max, torch.where(steady_mask, foot_h, torch.zeros_like(foot_h)))
             win_ctr += 1
             if win_ctr >= cycle_steps:
-                valid = win_max > 0.0
+                valid = win_max > 0.0                      # (env, 2)
                 if bool(valid.any()):
-                    vals = win_max[valid]
-                    peak_sum += vals.sum()
-                    peak_cnt += vals.numel()
-                    peak_max = torch.maximum(peak_max, vals.max())
+                    # 左右の列ごとに集計する (dim=0 は env 方向)
+                    peak_sum += (win_max * valid).sum(dim=0)
+                    peak_cnt += valid.sum(dim=0)
+                    peak_max = torch.maximum(peak_max, win_max.max(dim=0).values)
                 win_max = torch.zeros_like(win_max)
                 win_ctr = 0
-            if bool((since_flip > settle_steps).any()):
-                foot_floor = torch.minimum(foot_floor, foot_h[since_flip > settle_steps].min())
+            steady = since_flip > settle_steps
+            if bool(steady.any()):
+                foot_floor = torch.minimum(foot_floor, foot_h[steady].min(dim=0).values)
 
             newly_settled = since_flip == settle_steps
             if bool(newly_settled.any()):
@@ -276,10 +280,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             "head_drift": float((head_drift_sum / denom).item()) * 180.0 / math.pi,
             "n": int(cnt.item()),
             "resets": int(resets.item()),
-            "foot_peak": float((peak_sum / peak_cnt.clamp(min=1)).item()),
-            "foot_peak_max": float(peak_max.item()),
-            "foot_floor": float(foot_floor.item()),
-            "foot_n": int(peak_cnt.item()),
+            # 左右別 ([0]=左, [1]=右) と、両足込みの平均を両方持たせる
+            "foot_peak_lr": (peak_sum / peak_cnt.clamp(min=1)).tolist(),
+            "foot_peak_max_lr": peak_max.tolist(),
+            "foot_floor_lr": foot_floor.tolist(),
+            "foot_n_lr": [int(v) for v in peak_cnt.tolist()],
+            "foot_peak": float((peak_sum.sum() / peak_cnt.sum().clamp(min=1)).item()),
+            "foot_floor": float(foot_floor.min().item()),
+            "foot_peak_max": float(peak_max.max().item()),
+            "foot_n": int(peak_cnt.sum().item()),
         })
 
     inner_env.close()
@@ -299,15 +308,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         )
 
     print("\n--- 足の持ち上げ高さ (1 歩ごとのピーク) ---")
-    print(f"{'cmd(vx,vy)':>13} {'持ち上げ平均':>12} {'最大':>9} {'接地時':>9} {'歩数':>7}")
+    print(f"{'cmd(vx,vy)':>13} {'左平均':>9} {'右平均':>9}")
     for r in results:
-        lift = r["foot_peak"] - r["foot_floor"]
-        lift_max = r["foot_peak_max"] - r["foot_floor"]
-        print(
-            f"{r['cmd'][0]:6.2f},{r['cmd'][1]:5.2f} {lift:11.3f}m {lift_max:8.3f}m"
-            f" {r['foot_floor']:8.3f}m {r['foot_n']:6d}"
-        )
-    print(" 持ち上げ = スイング時のピーク高さ − 接地時の足リンク高さ。")
+        lift_l = r["foot_peak_lr"][0] - r["foot_floor_lr"][0]
+        lift_r = r["foot_peak_lr"][1] - r["foot_floor_lr"][1]
+        print(f"{r['cmd'][0]:6.2f},{r['cmd'][1]:5.2f} {lift_l:8.3f}m {lift_r:8.3f}m")
+    print(" 持ち上げ = スイング時のピーク高さ − 接地時の足リンク高さ (左右それぞれの接地高さで引く)。")
 
     print("\n--- 体を θ 傾けたときのゴールライン方向 (world-y) 速度 [m/s] ---")
     print("    v_line(θ) = fwd × sin θ + lat × cos θ")

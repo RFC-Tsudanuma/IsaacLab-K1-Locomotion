@@ -81,6 +81,42 @@ def stance_foot_flat(
     return (err * in_contact).sum(dim=1)
 
 
+def flight_phase(
+    env: "ManagerBasedRLEnv",
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+    force_threshold: float = 1.0,
+) -> torch.Tensor:
+    """**両足とも接地していない** ステップを 1 とするペナルティ [0, 1] (weight<0 で使う)。
+
+    跳躍 (hopping) の定義そのもの。歩行は常にどちらかの足が接地しているので、
+    両足が同時に浮くのは「跳んだ」ときだけ。
+
+    なぜこれが要るか:
+        足上げ報酬 ``foot_clearance_ji`` が見るのは足リンクの **ワールド z (絶対高さ)**
+        なので、「遊脚を股関節・膝で上げる」以外に「体ごと持ち上げる」でも達成できる。
+        目標 7cm + 高速 (カリキュラム stage 3) の組み合わせで、後者 = 跳躍が
+        最安の解として選ばれた (2026-07-29 実測: 上下動 raw 0.028 → 0.052)。
+
+        従来は ``lin_vel_z_l2`` (上下動全般のペナルティ) で抑えようとしたが、
+        あれは歩行に必要な重心の上下動まで巻き添えにするため、強めると横速度が落ちる。
+        -2.5 まで上げても目標 7cm + 高速では跳躍を止められなかった。
+        本項は「両足浮き」だけを罰するので、**片足を高く上げること自体は無罰**であり、
+        足上げにも横速度にも干渉しない。
+
+    ★ locomotion 側に同名の ``both_feet_not_in_contact`` があるが使わない:
+        1. あちらは -1.0 を返すので weight を **正** にしないとペナルティにならない
+           (負にすると跳躍を報酬してしまう)。本関数は他の項と揃えて正値を返す。
+        2. あちらは ``[:, -1, ...]`` = 履歴の **最古** サンプルを見ている
+           (net_forces_w_history は index 0 が最新)。本関数は最新を見る。
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    # index 0 が最新。跳躍は数十 ms 続くので履歴の最大値ではなく最新値で判定する
+    # (最大値だと「直前まで接地していた」だけで接地扱いになり、浮きを取りこぼす)。
+    forces = contact_sensor.data.net_forces_w_history[:, 0, sensor_cfg.body_ids, :].norm(dim=-1)  # [N, F]
+    in_contact = forces > float(force_threshold)
+    return (~in_contact.any(dim=1)).float()
+
+
 def _target_y_error(env: "ManagerBasedRLEnv", max_y: float) -> torch.Tensor:
     """robot_y − target_y (ゴール座標系) の符号付き誤差 (N,)。"""
     return robot_pos_goal(env)[:, 1] - compute_target_y(env, max_y=max_y)

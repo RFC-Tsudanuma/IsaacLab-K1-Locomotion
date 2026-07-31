@@ -175,7 +175,7 @@ def reset_ball_shot(
           (< 0.6m) はロボットから見て radial に押し出して重なりを防ぐ。
         * 狙い先: ゴールライン上の y_aim ∈ ±aim_y_range (ポスト内側)
         * 初速: v ∈ [ball_speed_min, hi]。hi は通常 ball_speed_max だが、
-          ステージ3 の適応カリキュラム (adaptive_ball_speed) が ``_gk_speed_hi``
+          適応カリキュラム (adaptive_difficulty) が ``_gk_speed_hi``
           バッファを持っている場合はそちらを使う (成功率に応じて連続的に引き上げ)。
         * 実現可能性クランプ: ゴールライン到達までの時間が min_time_to_line [s] を
           下回らないよう初速に上限を掛ける (近距離×高速の「原理的にセーブ不可能な
@@ -205,7 +205,12 @@ def reset_ball_shot(
     spawn_x = robot_xy[:, 0] + d_rel_x * scale
     spawn_y = robot_xy[:, 1] + d_rel_y * scale
 
-    aim_y = torch.empty(n, device=env.device).uniform_(-float(p.aim_y_range), float(p.aim_y_range))
+    # 狙い先 y の範囲。適応カリキュラム (adaptive_difficulty) が段階的に広げるので、
+    # そのバッファがあればそちらを優先する (無ければ cfg の固定値 = 従来の挙動)。
+    # 初速 (_gk_speed_hi) と同じフォールバック方式。
+    aim_buf = getattr(env, "_gk_aim_y", None)
+    aim_range = float(aim_buf.item()) if aim_buf is not None else float(p.aim_y_range)
+    aim_y = torch.empty(n, device=env.device).uniform_(-aim_range, aim_range)
 
     hi_buf = getattr(env, "_gk_speed_hi", None)
     hi = float(hi_buf.item()) if hi_buf is not None else float(p.ball_speed_max)
@@ -303,7 +308,12 @@ def _save_clearance_quality(
 
 def relaunch_ball_after_save(
     env: "ManagerBasedEnv",
-    env_ids: torch.Tensor | None = None,
+    # ★ env_ids にデフォルト値を付けないこと。EventManager の引数検証
+    #   (manager_base._resolve_common_term_cfg) は「デフォルト有りの引数」を
+    #   term の params 候補として扱うため、env_ids に = None を付けると
+    #   検証の集合比較が合わずに ValueError になる。
+    #   (引数がちょうど 2 個の関数は検証自体がスキップされるので気づきにくい)
+    env_ids: torch.Tensor | None,
     respawn_delay_steps: int = 50,
     clearance_safe_dist: float = 1.5,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
