@@ -17,7 +17,7 @@ import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset
 from .mdp.commands import ExtremeVelocityCommandCfg
-from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
+from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2, base_ang_acc_l2
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -59,7 +59,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         params={
             "command_name": "base_velocity",
             "resampling_time_range": (1.0, 7.0),
-            "num_steps": 8000,
+            "num_steps": 8000 * 48,
         },
     )
 
@@ -69,7 +69,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         params={
             "command_name": "base_velocity",
             "resampling_time_range": (0.5, 7.0),
-            "num_steps": 14000,
+            "num_steps": 14000 * 48,
         },
     )
 
@@ -83,7 +83,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
             # 歩容で物理的に届かず、「位相を無視した速い足踏み」で追従する崩れた歩容を
             # 誘発していた。±1.5 に抑えることで位相ロック (一致率 0.78) と速度追従が両立。
             "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
-            "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.8, 0.8)],
+            "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.9, 0.9)],
             # 各ステージを「本物の関門」にするための閾値。広い範囲ほど絶対誤差は出やすいので
             # わずかに緩めるが、緩めすぎると「狭い範囲を習得した時点で広い範囲のゆるい閾値も
             # 満たしてしまい」0→1→2 と一気に遷移する。実測では stage0(±0.6)の到達誤差が ~0.30、
@@ -109,23 +109,24 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         },
     )
 
-    # 学習後半 (10000 iter 以降) に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
+    # 学習後半に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
     # 上位の最適制御プランナはコマンド範囲の上限付近を多用するが、一様サンプリングでは
     # vx・vy 同時上限 + 大旋回のような corner がほぼ出ず、その領域や極端なコマンド間の
     # 遷移で転倒していた。extreme_prob の確率で「|v| ∈ [0.7*max, max] (符号ランダム) +
     # 飽和 yaw を作る heading」を引かせ、ランプ完了後はリサンプリングも速めて
     # 極端コマンド間の遷移にも晒す (ExtremeVelocityCommand 参照)。
-    # NOTE: step 数は common_step_counter 基準 (iteration × num_steps_per_env=48)。
-    #       resume 時は 0 から数え直すので、即時有効化するなら start_step を override で 0 に。
+    # num_steps / ramp_steps は「学習イテレーション数」基準 (--max_iterations と同じ単位)。
+    # 関数内部で common_step_counter ÷ 48 (rsl_rl_ppo_cfg の num_steps_per_env) で換算する。
+    # NOTE: resume 時は 0 から数え直すので、即時有効化するなら num_steps を override で 0 に。
     extreme_commands = CurrTerm(
         func=extreme_command_curriculum,
         params={
             "command_name": "base_velocity",
-            "start_step": 480_000,   # 10000 iter × 48 steps/iter
-            "ramp_steps": 96_000,    # 2000 iter かけて 0 → extreme_prob へ線形導入
+            "num_steps": 10000,    # このイテレーション数を超えたら extreme 導入開始
+            "ramp_steps": 2000,    # このイテレーション数かけて 0 → extreme_prob へ線形導入
             "extreme_prob": 0.35,
             "extreme_frac": 0.7,
-            "resampling_time_range": (0.5, 4.0),
+            "resampling_time_range": (0.8, 8.0),
         },
     )
 
@@ -135,7 +136,7 @@ class K1FlatCurriculumCfg(CurriculumCfg):
         func=modify_push_robot,
         params={
             "term_name": "push_robot",
-            "num_steps": 6000,
+            "num_steps": 6000 * 48,
             "interval_range_s": (4.0, 8.0),
             "velocity_range": {"x": (-0.5, 0.5), "y": (-0.5, 0.5), "roll": (-0.02, 0.02), "pitch": (-0.02, 0.02)},
         },
@@ -213,7 +214,21 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 4.2→4.8 (2026-07-21 h06): 旋回重視の要望に伴い増量。±1.5 キャップ+位相 w1.5 の
         # 構成では lin と競合せず err_yaw 0.82→0.76 に改善。
         self.rewards.track_ang_vel_z_exp.weight = 4.8
-        self.rewards.ang_vel_xy_l2.weight = -0.25
+        # 上体の傾き抑制 (2026-07-28〜29 l/m系列): flat_orientation_l2 はデフォルト -20
+        # (rough_env_cfg) のまま。-40 をフルパイプラインに入れると extreme 期に lin 追従が
+        # 崩壊する (m01: -40固定, m02: extreme期に-20へ緩和するカリキュラム、いずれも失敗)。
+        # 実証済みレシピは「フルパイプライン 20000it (このconfigのまま) → extreme無効の
+        # 通常分布で flat_orientation_l2=-40 を override して +2500it の仕上げ学習」(m04):
+        #   傾き -34%、lin/位相/振動/extreme頑健性は全て維持。詳細は
+        #   scripts/rsl_rl/phase_freq_weight_tuning.md の l/m 系列を参照。
+
+        # 上体(頭部)振動抑制 (2026-07-24〜25 j/k系列): 頭は Trunk 剛結合のため、Trunk の
+        # roll/pitch 回転が頭の振動の支配項 (振動proxy 0.51 (rad/s)² で lin_vel_z の20倍)。
+        # NOTE: -0.75 (j02) は 5000it 検証では追従低下ノイズ内だったが、フルパイプライン
+        # (k01) では extreme 期に corner コマンドの激しい体幹運動とペナルティが競合し、
+        # lin 追従が漸減崩壊 (0.74→0.53)。-0.5 + base_ang_acc_l2 の組み合わせ (j03 相当)
+        # に緩めて追従と両立させる。
+        self.rewards.ang_vel_xy_l2.weight = -0.5
         self.rewards.lin_vel_z_l2.weight = -0.8
         self.rewards.action_rate_l2.weight = -0.5
         self.rewards.dof_acc_l2.weight = -1.0e-6
@@ -230,6 +245,26 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.rewards.com_jerk_l2 = RewTerm(
             func=com_jerk_l2,
             weight=-1.0e-6,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        # base 高さの目標追従ペナルティ (上下動抑制, 2026-08-01 q系列)。
+        # lin_vel_z (速度ペナルティ) は歩容の構造的下限 0.0226 で飽和し増量無効だったため、
+        # 高さ「位置」の偏差を直接罰して vaulting の振幅自体を縮める。
+        # weight=0.0 でパイプラインでは無効。仕上げ resume で override して使う
+        # (その際 minimum_height の閾値 0.54 が目標 0.53 と干渉するので
+        #  rewards.base_height_penalty.params.min_height=0.48 も同時に override すること)。
+        self.rewards.base_height_track = RewTerm(
+            func=mdp.base_height_l2,
+            weight=0.0,
+            params={"target_height": 0.53},
+        )
+        # Trunk 角加速度ペナルティ (頭部振動抑制)。頭は Trunk 剛結合なので、頭の振動 =
+        # Trunk の回転ジッタ。ang_vel_xy_l2 が取りこぼす高周波成分を抑える。
+        # j01 (この項なし) は追従 0.577 まで低下、j02 (あり) は 0.591 と同じ振動低減で
+        # 追従を保った → 減衰を「角加速度側」で受け持たせる方が追従と両立する。
+        self.rewards.base_ang_acc_l2 = RewTerm(
+            func=base_ang_acc_l2,
+            weight=-1.0e-5,
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
         # ガニ股対策 (2026-07-13): 左右 Hip_Yaw が外向きに開いた歩容になったため、

@@ -104,3 +104,19 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
             raise ValueError(
                 "When using recurrent policy, please use RslRlPpoActorCriticRecurrentCfg for policy configuration."
             )
+
+
+@configclass
+class K1GetupPPORunnerCfg(K1RoughPPORunnerCfg):
+    """起き上がり (get-up) 用の PPO 設定。
+
+    K1RoughPPORunnerCfg を継承 (symmetry_cfg 無し)。全身 22 自由度なので、脚 12 自由度前提の
+    mirror loss/対称拡張 (K1FlatPPORunnerCfg 側) は使わない。左右対称性は env の body_symmetry
+    報酬で担保する。ログは experiment_name "k1_getup" に分離する。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10000
+        self.experiment_name = "k1_getup"
+        self.save_interval = 200

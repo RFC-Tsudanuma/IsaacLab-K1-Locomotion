@@ -116,6 +116,9 @@ def setup_viser(env, urdf_path: str, port: int):
     from viser.extras import ViserUrdf
 
     server = viser.ViserServer(port=port)
+    # NOTE: plane_color / plane_opacity / shadow_opacity / infinite_grid は新しめの viser のみ。
+    # isaacsim が websockets==12 を要求するため viser は 0.2.7 (websockets12 互換) を使う必要があり、
+    # そのバージョンの add_grid には無いので基本 kwargs のみにする (新しい viser でも動く)。
     server.scene.add_grid(
         "/ground",
         width=20.0,
@@ -123,10 +126,6 @@ def setup_viser(env, urdf_path: str, port: int):
         cell_size=0.5,
         section_size=2.0,
         plane="xy",
-        plane_color=(0.85, 0.85, 0.85),
-        plane_opacity=1.0,
-        shadow_opacity=0.3,
-        infinite_grid=True,
     )
     server.scene.add_frame("/world", show_axes=True, axes_length=0.3, axes_radius=0.01)
     base_frame = server.scene.add_frame("/base", show_axes=False)

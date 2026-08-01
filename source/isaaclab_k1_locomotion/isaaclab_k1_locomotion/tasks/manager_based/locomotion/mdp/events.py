@@ -11,6 +11,9 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
+import isaaclab.utils.math as math_utils
+from isaaclab.managers import SceneEntityCfg
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
 
@@ -159,6 +162,67 @@ def reset_prev_high_action(
     buf[env_ids] = 0.0
 
 
+def reset_root_state_prone_supine(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    pose_range: dict[str, tuple[float, float]],
+    velocity_range: dict[str, tuple[float, float]],
+    lying_height: float = 0.2,
+    prone_prob: float = 0.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """ロボットを「うつ伏せ (prone)」または「仰向け (supine)」の寝た状態で reset する。
+
+    起き上がり (get-up) 学習用。各 env ごとに確率 ``prone_prob`` でうつ伏せ、残りを仰向けに
+    初期化する。胴体を水平に倒す (pitch ±90°) ため、上向き既定姿勢 (立位) の root を
+    水平に回転させ、高さを ``lying_height`` に下げて地面に寝かせる。
+
+    Args:
+        pose_range: ``x`` / ``y`` / ``z`` (位置オフセット) と ``roll`` / ``yaw`` (向きのばらつき)
+            の ``(min, max)``。``z`` は ``lying_height`` への加算オフセット、``pitch`` は
+            うつ伏せ/仰向けを決めるので無視される。未指定キーは 0。
+        velocity_range: ルート速度の ``(min, max)`` (``x,y,z,roll,pitch,yaw``)。
+        lying_height: 寝たときのルート高さ [m] (胴体半分の厚み程度)。地面貫通を避けるため
+            少し高めから落として静定させる。
+        prone_prob: うつ伏せにする確率。残り (1-prone_prob) は仰向け。
+        asset_cfg: 対象アセット。
+    """
+    asset = env.scene[asset_cfg.name]
+    root_states = asset.data.default_root_state[env_ids].clone()
+    num = len(env_ids)
+    device = asset.device
+
+    # --- 位置: 既定 xy + env 原点 + ランダム xy、高さは lying_height (+ ランダム z) ---
+    pos_range_list = [pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z"]]
+    pos_ranges = torch.tensor(pos_range_list, device=device)
+    rand_pos = math_utils.sample_uniform(pos_ranges[:, 0], pos_ranges[:, 1], (num, 3), device=device)
+    positions = root_states[:, 0:3] + env.scene.env_origins[env_ids] + rand_pos
+    positions[:, 2] = env.scene.env_origins[env_ids, 2] + lying_height + rand_pos[:, 2]
+
+    # --- 向き: pitch ±90° で水平に倒す (prone: +90°, supine: -90°) + yaw/roll のばらつき ---
+    is_prone = torch.rand(num, device=device) < prone_prob
+    pitch = torch.where(
+        is_prone,
+        torch.full((num,), math.pi / 2, device=device),
+        torch.full((num,), -math.pi / 2, device=device),
+    )
+    roll_range = pose_range.get("roll", (0.0, 0.0))
+    yaw_range = pose_range.get("yaw", (0.0, 0.0))
+    roll = math_utils.sample_uniform(roll_range[0], roll_range[1], (num,), device=device)
+    yaw = math_utils.sample_uniform(yaw_range[0], yaw_range[1], (num,), device=device)
+    orientations = math_utils.quat_from_euler_xyz(roll, pitch, yaw)
+
+    # --- 速度 ---
+    vel_range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
+    vel_ranges = torch.tensor(vel_range_list, device=device)
+    rand_vel = math_utils.sample_uniform(vel_ranges[:, 0], vel_ranges[:, 1], (num, 6), device=device)
+    velocities = root_states[:, 7:13] + rand_vel
+
+    # --- 反映 ---
+    asset.write_root_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
+    asset.write_root_velocity_to_sim(velocities, env_ids=env_ids)
+
+
 __all__ = [
     "randomize_phase_freq",
     "get_phase_freq",
@@ -166,4 +230,5 @@ __all__ = [
     "compute_cmd_phase_freq",
     "get_gait_phase",
     "reset_prev_high_action",
+    "reset_root_state_prone_supine",
 ]

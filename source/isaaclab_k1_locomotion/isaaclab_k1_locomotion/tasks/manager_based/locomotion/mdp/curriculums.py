@@ -59,28 +59,39 @@ def extreme_command_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     command_name: str,
-    start_step: int,
+    num_steps: int,
     ramp_steps: int,
     extreme_prob: float,
     extreme_frac: float = 0.7,
     resampling_time_range: tuple[float, float] | None = None,
+    env_steps_per_iteration: int = 48,
 ) -> dict[str, float]:
     """学習後半に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
 
-    ``start_step`` (env.common_step_counter 基準 ≒ num_steps_per_env × iteration) から
-    ``ramp_steps`` かけて ``ExtremeVelocityCommand.cfg.extreme_prob`` を 0 → ``extreme_prob``
-    へ線形に上げる。ランプ完了後、``resampling_time_range`` が指定されていれば
-    リサンプリング間隔も差し替え、極端なコマンド間の速い遷移にも晒す。
+    ``num_steps`` を超えてから ``ramp_steps`` かけて
+    ``ExtremeVelocityCommand.cfg.extreme_prob`` を 0 → ``extreme_prob`` へ線形に上げる。
+    ランプ完了後、``resampling_time_range`` が指定されていればリサンプリング間隔も
+    差し替え、極端なコマンド間の速い遷移にも晒す。
+
+    Note:
+        ``num_steps`` / ``ramp_steps`` は **学習イテレーション数** (train.py の
+        ``--max_iterations`` と同じ単位)。内部で ``env.common_step_counter ÷
+        env_steps_per_iteration`` により現在イテレーションへ換算して比較する
+        (``env_steps_per_iteration`` は rsl_rl_ppo_cfg の ``num_steps_per_env`` に
+        合わせること。既定 48)。
+        他の num_steps 系カリキュラム (``modify_push_robot`` 等) は
+        ``common_step_counter`` と **直接** 比較する (イテレーション換算なし) ため、
+        同じ値でも発動時期が 1/48 になる点に注意。
 
     Note:
         resume 時は ``common_step_counter`` が 0 から数え直される。学習済み
         checkpoint から本カリキュラムを即時有効にしたい場合は override で
-        ``start_step`` を 0 にすること。
+        ``num_steps`` を 0 にすること。
     """
-    s = env.common_step_counter
-    if s <= start_step:
+    it = env.common_step_counter / float(max(1, env_steps_per_iteration))
+    if it <= num_steps:
         return {"extreme_prob": 0.0}
-    alpha = min(1.0, (s - start_step) / max(1, int(ramp_steps)))
+    alpha = min(1.0, (it - num_steps) / max(1, int(ramp_steps)))
     term = env.command_manager.get_term(command_name)
     term.cfg.extreme_prob = float(extreme_prob) * alpha
     term.cfg.extreme_frac = float(extreme_frac)
@@ -675,3 +686,49 @@ class kick_angle_range_curriculum(ManagerTermBase):
     def _apply_stage(self, angle_range: tuple[float, float]) -> None:
         cmd_term = self._env.command_manager.get_term(self._command_name)
         cmd_term.cfg.angle_range = tuple(angle_range)
+
+
+def log_com_height(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] 全身 CoM (重心) の高さ [m] を ``Curriculum/com_height`` として記録する。
+
+    env を一切変更しない純粋なロガー (curriculum 項の戻り値が Curriculum/<name> として
+    TensorBoard に出る仕組みを利用)。curriculum は ``_reset_idx`` で reset イベント適用の
+    「前」に呼ばれる (manager_based_rl_env L356→L362) ため、ここで測る CoM 高さは各 env の
+    「エピソード終了時点」の重心高さ。起き上がり (立位) の進捗を実寸 [m] で確認する用途。
+
+    重心は各リンクの質量で加重平均した z:  z_com = Σ_b m_b z_b / Σ_b m_b。
+    (質量は default_mass を使用。add_base_mass の乱択は無視した近似だが可視化には十分)
+    """
+    robot: Articulation = env.scene["robot"]
+    masses = robot.data.default_mass.to(robot.device)      # [N, B]
+    com_z = robot.data.body_com_pos_w[:, :, 2]             # [N, B]
+    com_height = (masses * com_z).sum(dim=1) / masses.sum(dim=1)  # [N]
+    return torch.mean(com_height[env_ids])
+
+
+def log_mean_body_z(env: "ManagerBasedRLEnv", env_ids: Sequence[int], body_name: str) -> torch.Tensor:
+    """[ロギング専用] 指定 body の world z [m] を平均で記録 (複数マッチ時は全リンク平均)。
+
+    起き上がりの姿勢診断用 (足が接地しているか= foot_link の z、頭・胴体の実高さ等)。env は変更しない。
+    """
+    robot: Articulation = env.scene["robot"]
+    ids, _ = robot.find_bodies(body_name)
+    z = robot.data.body_link_pos_w[:, ids, 2]  # [N, k]
+    return torch.mean(z[env_ids])
+
+
+def log_trunk_tilt_deg(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] Trunk の鉛直からの傾き [deg] を平均で記録。直立=0°、横倒れ=90°。"""
+    robot: Articulation = env.scene["robot"]
+    g = robot.data.projected_gravity_b  # [N,3], 直立で (0,0,-1)
+    cos_tilt = torch.clamp(-g[:, 2], -1.0, 1.0)
+    tilt_deg = torch.acos(cos_tilt) * (180.0 / math.pi)
+    return torch.mean(tilt_deg[env_ids])
+
+
+def log_joint_speed_sq(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] Σ(joint_vel²) の平均を記録 (reset 時=エピソード終端≈立位)。
+    震え (関節速度) の大きさの実スケール把握と stand_still 報酬の std 較正に使う。"""
+    robot: Articulation = env.scene["robot"]
+    motion = torch.sum(torch.square(robot.data.joint_vel), dim=1)
+    return torch.mean(motion[env_ids])

@@ -92,6 +92,27 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Getup-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.getup_env_cfg:K1GetupEnvCfg",
+        # NOTE: 全身 22 自由度用。symmetry (脚 12 自由度前提) 無しの getup 専用 runner。
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GetupPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Getup-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.getup_env_cfg:K1GetupEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GetupPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Dribble-K1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

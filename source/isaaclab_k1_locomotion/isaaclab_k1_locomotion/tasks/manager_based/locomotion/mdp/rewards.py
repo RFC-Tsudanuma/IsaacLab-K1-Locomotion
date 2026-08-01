@@ -711,6 +711,33 @@ def _approach_target_w(
     return ball_pos_w - kick_dir_w * behind_offset
 
 
+def base_ang_acc_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """base (Trunk) の角加速度の L2 二乗をペナルティとして返す (weight < 0 で使う)。
+
+    頭部は Trunk に剛結合されているため、頭の振動 = Trunk の回転ジッタ × レバーアーム。
+    角速度ペナルティ (ang_vel_xy_l2) はゆっくりした揺れを抑えるが、高周波の
+    カタカタしたジッタは「速度は小さいが加速度が大きい」ため取りこぼす。
+    角加速度を直接罰することで頭部の振動を抑える。
+
+    物理エンジンの生の加速度はスパイクを含むため、角速度の有限差分で計算し、
+    リセット直後は無効化する (com_jerk_l2 と同じパターン)。
+    """
+    robot = env.scene[asset_cfg.name]
+    ang_vel = robot.data.root_ang_vel_b  # (N, 3)
+    if not hasattr(env, "_prev_root_ang_vel_b") or env._prev_root_ang_vel_b.shape != ang_vel.shape:
+        env._prev_root_ang_vel_b = ang_vel.clone()
+    prev = env._prev_root_ang_vel_b
+    dt = env.step_dt
+    ang_acc = (ang_vel - prev) / max(dt, 1e-6)
+    env._prev_root_ang_vel_b = ang_vel.clone()
+    penalty = torch.sum(torch.square(ang_acc), dim=1)
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
+
 def com_jerk_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
