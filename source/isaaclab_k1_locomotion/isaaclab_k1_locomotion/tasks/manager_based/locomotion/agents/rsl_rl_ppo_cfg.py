@@ -14,7 +14,7 @@ from isaaclab_rl.rsl_rl import (
 )
 
 from ..mdp.symmetry import compute_symmetric_states
-from ..rough_env_cfg import _USE_RECURRENT_POLICY
+from ..flat_env_cfg import _USE_RECURRENT_POLICY
 
 
 @configclass
@@ -104,3 +104,22 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
             raise ValueError(
                 "When using recurrent policy, please use RslRlPpoActorCriticRecurrentCfg for policy configuration."
             )
+
+
+@configclass
+class K1ZeroGainPPORunnerCfg(K1FlatPPORunnerCfg):
+    """故障 (1関節ゲイン0) 環境 Isaac-Velocity-Flat-ZeroGainJoint 用の PPO ランナー。
+
+    学習設定 (mirror loss / symmetry など) は Flat と共通のまま、ログの保存先だけを
+    Flat (k1_flat) と分けるため experiment_name を上書きする。ログは
+    logs/rsl_rl/k1_zero_gain/ 以下に保存される。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_zero_gain"
+        # 故障環境用にネットワークを小さめ (256/128/128) にする。
+        # 観測次元が Flat より小さい (位相観測を削除して 45 次元) こと、故障歩行という
+        # 限定タスクであることから、Flat の 512/256/128 より軽い MLP で十分と判断。
+        self.policy.actor_hidden_dims = [256, 128, 128]
+        self.policy.critic_hidden_dims = [256, 128, 128]

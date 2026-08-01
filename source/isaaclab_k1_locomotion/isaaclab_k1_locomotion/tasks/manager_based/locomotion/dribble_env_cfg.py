@@ -47,8 +47,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 
-from .flat_env_cfg import K1FlatEnvCfg
-from .rough_env_cfg import K1CriticCfg, K1ObservationsCfg, K1PolicyCfg
+from .flat_env_cfg import K1FlatEnvCfg, K1CriticCfg, K1ObservationsCfg, K1PolicyCfg
 from .velocity_env_cfg import CommandsCfg, MySceneCfg
 from .mdp.commands import KickDirectionCommandCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm

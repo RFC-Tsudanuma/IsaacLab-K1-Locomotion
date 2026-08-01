@@ -54,15 +54,20 @@ _JOINT_MIRROR_SIGN = [
 
 # 観測ベクトル内の各項の区間 (K1PolicyCfg と一致させること)。
 #   base_ang_vel(3) + projected_gravity(3) + velocity_commands(3)
-#   + joint_pos(12) + joint_vel(12) + last_action(12) + gait_phase(4) = 49
+#   + joint_pos(12) + joint_vel(12) + last_action(12) [+ gait_phase(4)]
+# gait_phase は環境によって有無が変わる (故障環境 K1FlatZeroGainJointCfg では削除):
+#   gait_phase あり → 49 次元、なし → 45 次元。先頭 45 次元の並びは両者で共通なので、
+#   末尾の gait_phase ブロックだけを次元数で条件分岐して扱う。
 _ANG_VEL_SLICE = slice(0, 3)
 _PROJ_GRAVITY_SLICE = slice(3, 6)
 _VEL_CMD_SLICE = slice(6, 9)
 _JOINT_POS_SLICE = slice(9, 21)
 _JOINT_VEL_SLICE = slice(21, 33)
 _LAST_ACTION_SLICE = slice(33, 45)
+_POLICY_OBS_DIM_NO_PHASE = 45           # gait_phase を含まない基本次元
 _GAIT_PHASE_SLICE = slice(45, 49)
-_POLICY_OBS_DIM = 49
+_POLICY_OBS_DIM_WITH_PHASE = 49         # gait_phase(4) を含む次元
+_VALID_POLICY_OBS_DIMS = (_POLICY_OBS_DIM_NO_PHASE, _POLICY_OBS_DIM_WITH_PHASE)
 
 # gait_phase = [sin(left), cos(left), sin(right), cos(right)] なので
 # 左右入れ替えはこの並べ替えで実現できる (45+[2,3,0,1])。
@@ -105,10 +110,14 @@ def _mirror_joints(joint_data: torch.Tensor) -> torch.Tensor:
 
 
 def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
-    """ポリシー観測 (N, 49) を矢状面に対して左右反転する。"""
-    if obs.shape[-1] != _POLICY_OBS_DIM:
+    """ポリシー観測 (N, 45 または 49) を矢状面に対して左右反転する。
+
+    末尾の gait_phase(4) は環境により有無が変わる。先頭 45 次元の並びは共通なので、
+    その反転処理は共通化し、49 次元 (gait_phase あり) のときのみ位相ブロックを入れ替える。
+    """
+    if obs.shape[-1] not in _VALID_POLICY_OBS_DIMS:
         raise ValueError(
-            f"symmetry: ポリシー観測の次元が想定 ({_POLICY_OBS_DIM}) と異なります: {obs.shape[-1]}。"
+            f"symmetry: ポリシー観測の次元が想定 {_VALID_POLICY_OBS_DIMS} と異なります: {obs.shape[-1]}。"
             " mdp/symmetry.py のスライス定義を K1PolicyCfg に合わせて更新してください。"
         )
 
@@ -125,8 +134,9 @@ def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     out[:, _JOINT_POS_SLICE] = _mirror_joints(obs[:, _JOINT_POS_SLICE])
     out[:, _JOINT_VEL_SLICE] = _mirror_joints(obs[:, _JOINT_VEL_SLICE])
     out[:, _LAST_ACTION_SLICE] = _mirror_joints(obs[:, _LAST_ACTION_SLICE])
-    # gait_phase: 左右の位相を入れ替え
-    out[:, _GAIT_PHASE_SLICE] = obs[:, _GAIT_PHASE_SWAP]
+    # gait_phase: 左右の位相を入れ替え (gait_phase を含む 49 次元のときのみ)
+    if obs.shape[-1] == _POLICY_OBS_DIM_WITH_PHASE:
+        out[:, _GAIT_PHASE_SLICE] = obs[:, _GAIT_PHASE_SWAP]
 
     return out
 
