@@ -5,14 +5,17 @@
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains import TerrainGeneratorCfg
 
-from .rough_env_cfg import K1RoughEnvCfg, _COMMAND_THRESHOLD
+from .rough_env_cfg import K1RoughEnvCfg, K1PolicyCfg, K1CriticCfg, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
+from .history_layout import HISTORY_LENGTH
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset
@@ -47,6 +50,63 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
         "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.1),
     },
 )
+
+
+# ---------------------------------------------------------------------------
+# Observations (履歴バッファ構成)
+# ---------------------------------------------------------------------------
+# 観測を「最新コマンド」と「コマンドを除いた観測の履歴」に分離する。
+# HistoryActorCritic (agents/history_actor_critic.py) が MLP 入力として
+# command + 履歴の直近 MLP_HISTORY_STEPS ステップ分を取り出す。
+# レイアウト定義は history_layout.py に集約しており、項の追加・削除時は
+# そちらと mdp/symmetry.py も更新すること。
+
+
+@configclass
+class K1FlatCommandCfg(ObsGroup):
+    """最新の歩行コマンドのみを持つグループ (履歴なし)。"""
+
+    velocity_commands = ObsTerm(func=mdp.generated_commands, params={"command_name": "base_velocity"})
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class K1FlatPolicyHistoryCfg(K1PolicyCfg):
+    """Actor 用: コマンドを除いた観測 (ノイズあり) を HISTORY_LENGTH ステップ分バッファする。
+
+    ノイズは ObservationManager が履歴 push 前に適用するため、各ステップの
+    ノイズは 1 度だけ引かれて履歴に固定される。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.velocity_commands = None
+        # グループレベルの履歴設定は全項に適用される
+        self.history_length = HISTORY_LENGTH
+        self.flatten_history_dim = True
+
+
+@configclass
+class K1FlatCriticHistoryCfg(K1CriticCfg):
+    """Critic 用: コマンドを除いた観測 (ノイズなし・特権情報込み) の履歴。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.velocity_commands = None
+        self.history_length = HISTORY_LENGTH
+        self.flatten_history_dim = True
+
+
+@configclass
+class K1FlatObservationsCfg:
+    """K1 Flat 環境の観測グループ (command + actor/critic 履歴)。"""
+
+    policy: K1FlatPolicyHistoryCfg = K1FlatPolicyHistoryCfg()
+    critic: K1FlatCriticHistoryCfg = K1FlatCriticHistoryCfg()
+    command: K1FlatCommandCfg = K1FlatCommandCfg()
 
 
 @configclass
@@ -154,6 +214,8 @@ class K1FlatCurriculumCfg(CurriculumCfg):
 @configclass
 class K1FlatEnvCfg(K1RoughEnvCfg):
     curriculum: K1FlatCurriculumCfg = K1FlatCurriculumCfg()
+    # 観測を「最新コマンド + 履歴バッファ」構成に置き換える (上記参照)
+    observations: K1FlatObservationsCfg = K1FlatObservationsCfg()
 
     def __post_init__(self):
         super().__post_init__()

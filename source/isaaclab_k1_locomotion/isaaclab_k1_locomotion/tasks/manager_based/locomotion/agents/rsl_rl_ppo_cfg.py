@@ -15,6 +15,7 @@ from isaaclab_rl.rsl_rl import (
 
 from ..mdp.symmetry import compute_symmetric_states
 from ..rough_env_cfg import _USE_RECURRENT_POLICY
+from .history_actor_critic import RslRlHistoryActorCriticCfg
 
 
 @configclass
@@ -84,6 +85,28 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
         # self.policy.actor_hidden_dims = [256, 128, 128]
         # self.policy.critic_hidden_dims = [256, 256, 128]
         self.save_interval = 100
+
+        # 観測は「最新コマンド (command) + コマンドを除いた観測の履歴 (policy/critic)」の
+        # 3 グループ構成 (flat_env_cfg.K1FlatObservationsCfg)。HistoryActorCritic が
+        # 履歴グループから直近 mlp_history_steps ステップ分のみを MLP に入力する。
+        self.policy = RslRlHistoryActorCriticCfg(
+            init_noise_std=self.policy.init_noise_std,
+            actor_obs_normalization=True,
+            critic_obs_normalization=True,
+            actor_hidden_dims=[512, 256, 128],
+            critic_hidden_dims=[512, 256, 128],
+            activation="elu",
+        )
+        self.obs_groups = {
+            "policy": ["command", "policy"],
+            "critic": ["command", "critic"],
+        }
+
+        # 履歴観測 (policy 4600 + critic 5100 次元) により rollout storage が ~7.6GB
+        # (4096 env) となり、20GB GPU では num_mini_batches=4 のミニバッチ + mirror loss
+        # の拡張バッチが載らず OOM する。ミニバッチを半分にして更新時のピークを抑える
+        # (データ総量・イテレーション数は不変、KL 適応 LR が勾配ステップ数の変化を吸収)。
+        self.algorithm.num_mini_batches = 8
 
         # 左右対称性を mirror loss として学習に加える (data augmentation は使わない)。
         # policy(mirror(obs)) ≈ mirror(policy(obs)) を促す MSE 損失が PPO 損失に加算される。
