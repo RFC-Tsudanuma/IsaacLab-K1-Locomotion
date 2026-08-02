@@ -42,7 +42,11 @@ from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_he
 #   ||cmd_xy|| <= _PHASE_SPEED_LOW  → _PHASE_FREQ_LOW で固定
 #   それ以上                        → _PHASE_SPEED_HIGH で _PHASE_FREQ_HIGH になる傾きで線形増加
 # per-env の ±0.05 Hz ランダムオフセット (flat_env_cfg の randomize_phase_freq_offset) が加算される。
-_PHASE_FREQ_LOW: float = 1.5    # Hz (低速歩行の基本周波数)
+# 2026-08-02: 低速側を 1.5→1.8 Hz に引き上げ (ユーザー指示)。上下動 (vaulting) は
+# 歩幅で幾何的に決まり報酬では削れないため、ケイデンスを上げて歩幅を短縮する。
+# NOTE: 実機側 (futbol_main の k1_constants_isaaclab.hpp PHASE_FREQ_LOW=1.5) は
+#       このケイデンスで学習した新ポリシーをデプロイするタイミングで 1.8 に揃えること。
+_PHASE_FREQ_LOW: float = 1.8    # Hz (低速歩行の基本周波数)
 _PHASE_FREQ_HIGH: float = 2.0   # Hz (_PHASE_SPEED_HIGH 時の周波数)
 _PHASE_SPEED_LOW: float = 1.0   # m/s (この速度までは _PHASE_FREQ_LOW 固定)
 _PHASE_SPEED_HIGH: float = 1.8  # m/s (この速度で _PHASE_FREQ_HIGH に到達)

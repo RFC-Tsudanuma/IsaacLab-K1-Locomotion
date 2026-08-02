@@ -284,10 +284,11 @@ def feet_close_penalty(env: ManagerBasedRLEnv, feet_distance_threshold = 0.15) -
     return (feet_y_offset < feet_distance_threshold).float()
 
 
-def feet_parallel_to_ground(env: ManagerBasedRLEnv, 
+def feet_parallel_to_ground(env: ManagerBasedRLEnv,
                             sigma: float = 0.3,
-                            enable_potential: bool = True, 
-                            discount_factor: float = 0.99) -> torch.Tensor:
+                            enable_potential: bool = True,
+                            discount_factor: float = 0.99,
+                            gate_behind_com: bool = True) -> torch.Tensor:
     """Reward feet being parallel to the ground.
 
     This function rewards the agent for keeping its feet parallel to the ground.
@@ -297,6 +298,9 @@ def feet_parallel_to_ground(env: ManagerBasedRLEnv,
     Args:
         env: Environment instance
         sigma: Exponential kernel width parameter (default: 0.3)
+        gate_behind_com: True のとき、全身重心 (CoM) より後ろ (base yaw frame の -x 側)
+            にある足を誤差計算から除外する。蹴り出し (toe-off) 中の後ろ足はつま先立ちに
+            なるのが自然な歩容であり、そこに水平化圧を掛けると蹴り出しを阻害するため。
 
     Returns:
         torch.Tensor: Reward value for each environment
@@ -323,6 +327,22 @@ def feet_parallel_to_ground(env: ManagerBasedRLEnv,
     # When feet are parallel to ground, both pitch and roll should be ~0
     left_foot_error = torch.square(left_pitch) + torch.square(left_roll)
     right_foot_error = torch.square(right_pitch) + torch.square(right_roll)
+
+    if gate_behind_com:
+        # 全身重心 (質量加重平均) の world xy
+        m = asset.data.default_mass.to(env.device)               # (E, B)
+        pc = asset.data.body_com_pos_w                            # (E, B, 3)
+        com_xy = (m.unsqueeze(-1) * pc[..., :2]).sum(dim=1) / m.sum(dim=1, keepdim=True)  # (E, 2)
+        # 足 → CoM のオフセットを base yaw frame の前後方向 (+x) に射影
+        _, _, base_yaw = euler_xyz_from_quat(asset.data.root_quat_w)
+        cos_y, sin_y = torch.cos(base_yaw), torch.sin(base_yaw)
+        left_off = asset.data.body_pos_w[:, left_foot_idx, :2] - com_xy    # (E, 2)
+        right_off = asset.data.body_pos_w[:, right_foot_idx, :2] - com_xy  # (E, 2)
+        left_fwd = cos_y * left_off[:, 0] + sin_y * left_off[:, 1]    # 前後成分 [m]
+        right_fwd = cos_y * right_off[:, 0] + sin_y * right_off[:, 1]
+        # CoM より後ろ (前後成分 < 0) の足は水平化誤差から除外する
+        left_foot_error = torch.where(left_fwd < 0.0, torch.zeros_like(left_foot_error), left_foot_error)
+        right_foot_error = torch.where(right_fwd < 0.0, torch.zeros_like(right_foot_error), right_foot_error)
 
     # Total error for both feet
     total_error = left_foot_error + right_foot_error
