@@ -55,8 +55,6 @@ def stance_foot_flat(
     contact_sensor = env.scene.sensors[sensor_cfg.name]
 
     # 傾き (robot 側) と接触 (sensor 側) は別コンテナから body_ids を解決するため、
-    # 左右の並び順が一致している保証が構造的には無い。初回だけ名前で突き合わせて
-    # 検証し、不一致なら即座に落とす (黙って左右を取り違えると症状の悪化に気づけない)。
     if getattr(env, "_gk_stance_flat_order_ok", None) is None:
         asset_names = [asset.body_names[i] for i in asset_cfg.body_ids]
         sensor_names = [contact_sensor.body_names[i] for i in sensor_cfg.body_ids]
@@ -73,8 +71,6 @@ def stance_foot_flat(
     err = (torch.square(wrap_to_pi(pitch)) + torch.square(wrap_to_pi(roll))).reshape(n_env, n_foot)
 
     # 接触判定は履歴の最大値で取る (touchdown 直後のチャタリングに強い)。
-    # NOTE: net_forces_w_history は index 0 が最新・末尾が最古。[:, -1] は最古サンプル
-    #       なので使わない (feet_slide がそう書いているが、あれは 10ms 古い値を見ている)。
     forces = contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1)  # [N, hist, F]
     in_contact = (forces.max(dim=1)[0] > float(force_threshold)).float()  # [N, F]
 

@@ -118,9 +118,6 @@ class GoalkeeperParamsCfg:
     ball_radius: float = BALL_RADIUS
     goal_half_width: float = GOAL_HALF_WIDTH
     # 守備面: ゴールラインから guard_x [m] フィールド側にロボットを置く。
-    # ボールをゴールの外側で止めるための余裕 (弾いた球がライン手前に落ちる) と、
-    # 前に出ることによるシュートコースの圧縮の両取り。定位置報酬・到達予測面・
-    # 初期スポーンがこの値を参照する。
     guard_x: float = 0.4
 
     # ステージ1: ボールのパーク位置 (ゴール座標系 x, y) とランダム目標
@@ -136,41 +133,20 @@ class GoalkeeperParamsCfg:
     stage1_far_zone: tuple = (0.9, 1.25)  # ポスト際ゾーンの |y| 範囲 [m]。ポスト間 ~2.5m の往復を練習させる
 
     # ステージ2/3: ボールのスポーンと初速
-    # ボールが蹴られる位置の距離 [m] (ゴール中央基準)。ペナルティエリア (奥行き 3.0m)
-    # の外からのシュートを主対象とするが、近距離 (1.5m〜、ペナルティマーク 2.0m 前後) も
-    # 混ぜて幅広く経験させる。近距離×高速の取れない球は min_time_to_line で自動除外。
     spawn_dist_range: tuple = (1.5, 5.0)
     spawn_half_angle: float = 1.1          # スポーン方位 ±[rad] (+x 正面基準, ≈63°)
     aim_y_range: float = 1.1               # 狙い先 y ∈ ±この値 [m] (ポスト内側)
     # 適応カリキュラム (mdp.adaptive_difficulty) が段階的に広げる狙い先 y の範囲 [m]。
-    # ★ 難易度の主因は初速ではなく **必要横移動量**。設計時のエンベロープ実測で
-    #   「0.7m で成功率が半減」と分かっている。aim_y_range を ±1.1 固定にすると
-    #   37% の球が初期状態からその領域に入り、成功率が 62% 前後で頭打ちになって
-    #   不感帯 (0.55〜0.85) から出られない = カリキュラムが事実上休眠する
-    #   (2026-07-30 実測: 35000 iter 回して初速が 1.0 → 1.2 しか動かなかった)。
-    #   まず中央付近の球 (±0.4 なら必要移動 0.7m 超はわずか 5%) を確実に止められる
-    #   ようにしてから広げる。**最終段は aim_y_range と一致させること。**
     aim_y_stages: tuple = (0.4, 0.6, 0.8, 1.1)
     ball_speed_min: float = 0.5            # 初速下限 [m/s]
     ball_speed_max: float = 1.0            # 初速上限 [m/s] (ステージ2 固定 / ステージ3 初期値)
     ball_speed_cap: float = 3.0            # 適応カリキュラムの上限 [m/s]。
     #   Stage1 の実効横移動速度 v_lat から eval_goalkeeper_speed.py が逆算した値に
-    #   override_json で設定し直すこと (原理的にセーブ不可能な初速を混ぜない)。
-    # 実現可能性クランプ: どの (距離, 初速) の組でも「ゴールライン到達まで最低この
-    # 時間はかかる」ように初速へ上限を掛ける。近距離の球は自動的に遅くなり、
-    # 遠距離の球だけが速くなれる (距離と速度の自然な相関)。
     min_time_to_line: float = 1.2
 
     # 知覚DR (policy のボール観測に掛かる。critic は真値):
-    #   実機ビジョンの想定 = レイテンシ 20〜60ms、更新 25〜50Hz、検出ドロップ 10%、
-    #   距離依存ノイズ、エピソード固定バイアス。頭部が常にボールを追う前提なので
-    #   FOV マスクは入れない (around_ball の知覚DRから品質劣化のみ移植)。
-    # レイテンシ [制御tick] (1 tick = 20ms @ 50Hz)。30Hz ビジョンでは「最新フレームが
-    # 最大1フレーム古い (33ms)」+ 検出処理の遅れを見込んで 40〜80ms とする。
     perc_latency_range: tuple = (2, 4)
     # ビジョンの更新レート [Hz]。実測 30Hz を中心にジッタを持たせる。
-    # 制御 50Hz に対し 30Hz は 1.67 tick 周期と **小数** になるため、内部では
-    # float のアキュムレータで扱う (整数 tick だと 25Hz か 50Hz にしか置けない)。
     perc_update_rate_hz: tuple = (25.0, 35.0)
     perc_dropout_prob: float = 0.1            # 更新tickでの検出ドロップ確率
     perc_noise_sigma: float = 0.03            # 位置ノイズの基本 σ [m]
@@ -178,13 +154,9 @@ class GoalkeeperParamsCfg:
     perc_vel_noise_sigma: float = 0.1         # 速度の毎フレームジッタ σ [m/s]
     perc_bias_sigma: float = 0.03             # 位置のエピソード固定バイアス σ [m]
     # 速度のエピソード固定バイアス (x, y 各軸独立)。遅延由来の系統誤差を模擬。
-    # 大きさをこの範囲から一様サンプルし符号ランダム。実機はボール速度を直接測れず
-    # 推定が一定方向にずれるため、毎フレーム暴れるジッタではなく系統誤差で表現する。
     perc_vel_bias_range: tuple = (0.5, 1.0)
 
     # 知覚DR (VirtualPerception + 速度バイアス) を全部切ってクリーン観測にするフラグ。
-    # PLAY 環境で挙動を見やすくするため True にする (真値・遅延なし・見失いなし)。
-    # 学習では False (実機カメラ準拠の劣化を効かせる)。
     perception_clean: bool = False
 
     # セーブ判定
@@ -198,10 +170,10 @@ class GoalkeeperParamsCfg:
     adaptive_speed_delta: float = 0.05      # 1 回の調整量 [m/s]
     adaptive_ema_alpha: float = 0.01        # エピソード 1 件あたりの EMA 更新率
     adaptive_warmup_episodes: int = 2000    # 調整開始までのウォームアップ件数
+    # 難易度を 1 段動かした後、次の判定を再開するまでに必要なエピソード件数。
+    adaptive_cooldown_episodes: int = 3000
 
 
-# ---------------------------------------------------------------------------
-# Scene
 # ---------------------------------------------------------------------------
 
 @configclass
@@ -278,8 +250,6 @@ class K1GoalkeeperSceneCfg(MySceneCfg):
         init_state=AssetBaseCfg.InitialStateCfg(pos=(0.0, 0.0, CROSSBAR_HEIGHT + POST_RADIUS)),
     )
     # ゴールライン (視覚のみ・コリジョンなし)。ルールブックの線幅 0.05m・白。
-    # x=0 の失点判定面を GUI で目視できるようにする薄板。コリジョンを付けると
-    # ボールが線に乗り上げて物理が乱れるので、collision_props は意図的に付けない。
     goal_line: AssetBaseCfg = AssetBaseCfg(
         prim_path="/World/envs/env_.*/GoalLine",
         spawn=sim_utils.CuboidCfg(
@@ -307,8 +277,6 @@ class K1GoalkeeperSceneCfg(MySceneCfg):
 
 
 # ---------------------------------------------------------------------------
-# Observations
-# ---------------------------------------------------------------------------
 
 @configclass
 class K1GoalkeeperPolicyCfg(K1PolicyCfg):
@@ -330,8 +298,6 @@ class K1GoalkeeperPolicyCfg(K1PolicyCfg):
     gait_phase = ObsTerm(func=high_action_phase_obs, params={"cmd_threshold": 0.05, "fixed_freq": 1.6})
 
     # ボール観測は知覚DR版 (レイテンシ・更新レート・ドロップ・距離依存ノイズ・バイアス。
-    # パラメータは GoalkeeperParamsCfg の perc_*)。ノイズは関数内で付加するので
-    # ObsTerm 側の noise は付けない。critic は真値を見る (非対称)。
     ball_pos_rel = ObsTerm(func=gk_ball_pos_rel_perceived)
     ball_vel = ObsTerm(func=gk_ball_vel_perceived)
     ball_active = ObsTerm(func=gk_ball_active)
@@ -374,16 +340,12 @@ class K1GoalkeeperObservationsCfg(K1ObservationsCfg):
 
 
 # ---------------------------------------------------------------------------
-# Rewards
-# ---------------------------------------------------------------------------
 
 @configclass
 class K1GoalkeeperRewardsCfg:
     """ゴールキーパー専用の報酬。歩行用 K1Rewards は継承せず丸ごと置き換える。"""
 
     # --- タスク主報酬 ---
-    # 目標 y (ステージ1: ランダム点 / ステージ2+: ボール到達予測点) への接近。
-    # σ の異なる 2 項のマルチスケール (exp 報酬の勾配消失対策)。
     track_target_coarse = RewTerm(
         func=track_target_y, weight=1.5, params={"std": 0.6, "max_y": GOAL_HALF_WIDTH},
     )
@@ -391,19 +353,12 @@ class K1GoalkeeperRewardsCfg:
         func=track_target_y, weight=1.5, params={"std": 0.15, "max_y": GOAL_HALF_WIDTH},
     )
     # 目標方向への横移動速度 (遠くても勾配が一定に出る密報酬)。
-    # v_cap は上位コマンドの vy クリップ (0.8) と同じにして、コマンド上限まで
-    # 速度を出し切る勾配を残す (低くすると途中で報酬が頭打ちになり速度が伸びない)。
-    # deadband 内は「コマンドを 0 に落とすほど高い」線形報酬に切り替わる
-    # (足踏みしたままの満額取りを封じる。cmd_scale=0.5)。
     target_reach_velocity = RewTerm(
         func=target_reach_velocity,
         weight=5.0,
         params={"deadband": 0.12, "v_cap": 0.8, "cmd_scale": 0.5, "max_y": GOAL_HALF_WIDTH},
     )
     # 目標到達後の「コマンド 0 で静止」報酬 (足踏み局所最適対策込み)。
-    # stop_cmd はマルチスケール (σ=0.35/0.1)。単一の細い σ だと歩行コマンド域で
-    # 勾配が数値ゼロになり報酬が発見できない (Stage1 初回学習の失敗要因)。
-    # ステージ1 では weight を上げる (Stage1EnvCfg 参照)。
     hold_at_target = RewTerm(
         func=hold_at_target,
         weight=2.0,
@@ -442,8 +397,6 @@ class K1GoalkeeperRewardsCfg:
 
 
 # ---------------------------------------------------------------------------
-# Env cfg (Stage 2 がベース)
-# ---------------------------------------------------------------------------
 
 @configclass
 class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
@@ -465,8 +418,6 @@ class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
         self.rewards = K1GoalkeeperRewardsCfg()
 
         # ロボットは守備面 (ゴールラインの guard_x=0.4m 前) 付近・フィールド側 (+x)
-        # 向きでスポーン。y の幅を広めに取り「中央以外から始まる不利な状況」も
-        # 学習分布に入れる (前のセーブ直後に横へずれたまま次の球が来る状況の再現)。
         self.events.reset_base.params["pose_range"]["x"] = (0.3, 0.5)
         self.events.reset_base.params["pose_range"]["y"] = (-0.5, 0.5)
         self.events.reset_base.params["pose_range"]["yaw"] = (-0.3, 0.3)
@@ -477,8 +428,6 @@ class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
         }
 
         # リセット時: 上位 action バッファ → goalkeeper 状態バッファ → ボール発射
-        # → 知覚DRの採番 (ボール配置後の真値でバッファ初期化) の順に適用する
-        # (EventManager は cfg の定義順に reset イベントを適用)。
         self.events.reset_prev_high_action = EventTerm(func=reset_prev_high_action, mode="reset")
         self.events.reset_gk_buffers = EventTerm(func=reset_gk_buffers, mode="reset")
         self.events.reset_ball = EventTerm(func=reset_ball_shot, mode="reset")
@@ -514,8 +463,6 @@ class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: ボールなし。ランダム目標 y への到達と停止
-# ---------------------------------------------------------------------------
 
 @configclass
 class K1GoalkeeperStage1EnvCfg(K1GoalkeeperEnvCfg):
@@ -544,8 +491,6 @@ class K1GoalkeeperStage1EnvCfg(K1GoalkeeperEnvCfg):
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: 適応カリキュラム (セーブ成功率 → 初速上限)
-# ---------------------------------------------------------------------------
 
 @configclass
 class K1GoalkeeperStage3EnvCfg(K1GoalkeeperEnvCfg):
@@ -556,8 +501,6 @@ class K1GoalkeeperStage3EnvCfg(K1GoalkeeperEnvCfg):
         self.curriculum.ball_speed_adaptive = CurrTerm(func=adaptive_ball_speed)
 
 
-# ---------------------------------------------------------------------------
-# Play
 # ---------------------------------------------------------------------------
 
 def _make_play_clean(cfg: K1GoalkeeperEnvCfg) -> None:

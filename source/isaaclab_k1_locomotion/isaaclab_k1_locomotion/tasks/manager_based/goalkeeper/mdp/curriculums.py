@@ -68,14 +68,6 @@ def adaptive_ball_speed(
     )
 
     # --- 成功率の測り方はエピソードの構成で切り替える ---
-    # ★ 2026-07-24: 直接制御版にエピソード継続モード (relaunch_ball_after_save) を
-    #   入れたため、1 エピソードに複数球が入るようになった。エピソード単位の
-    #   終了フラグで測ると「全球セーブできたか」になり、1 球あたりのセーブ率 p に
-    #   対して成功率 ≈ p^(球数) と極端に厳しくなる (p=0.96 でも 4 球なら 0.85)。
-    #   閾値 0.85 では初速がまず上がらないので、継続モードでは 1 球あたりで測る。
-    #
-    #   モード判定は ``save_success`` が終了条件に登録されているかで行う
-    #   (階層版と直接制御版の旧設定はこれを DoneTerm に持つ = 1 球 1 エピソード)。
     if "save_success" in tm.active_terms:
         # 従来モード: 1 球 = 1 エピソード。終了フラグがそのまま成否。
         success = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
@@ -200,6 +192,7 @@ def adaptive_difficulty(
         env._gk_episode_count = 0
         env._gk_aim_stage = 0
         env._gk_aim_y = torch.tensor(stages[0], device=env.device)
+        env._gk_cooldown = 0
 
     def _log() -> dict:
         return {
@@ -207,6 +200,7 @@ def adaptive_difficulty(
             "aim_y_range": float(env._gk_aim_y.item()),
             "ball_speed_hi": float(env._gk_speed_hi.item()),
             "success_ema": float(env._gk_success_ema.item()),
+            "cooldown_left": float(max(0, env._gk_cooldown - env._gk_episode_count)),
         }
 
     if env_ids is None or len(env_ids) == 0:
@@ -214,6 +208,10 @@ def adaptive_difficulty(
     if _update_success_ema(env, env_ids, p) == 0:
         return _log()
     if env._gk_episode_count < int(p.adaptive_warmup_episodes):
+        return _log()
+
+    # --- 難易度を変えた直後は、新しい難易度での実績が溜まるまで判定を止める ---
+    if env._gk_episode_count < env._gk_cooldown:
         return _log()
 
     ema = env._gk_success_ema.item()
@@ -230,6 +228,7 @@ def adaptive_difficulty(
                 max=float(p.ball_speed_cap)
             )
         env._gk_success_ema.fill_(neutral)
+        env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
     elif ema < float(p.adaptive_fail_threshold):
         # 難 → 易: 直近に上げた軸 (初速) から戻す
         if env._gk_speed_hi.item() > float(p.ball_speed_max) + 1e-6:
@@ -240,5 +239,6 @@ def adaptive_difficulty(
             env._gk_aim_stage -= 1
             env._gk_aim_y.fill_(stages[env._gk_aim_stage])
         env._gk_success_ema.fill_(neutral)
+        env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
 
     return _log()

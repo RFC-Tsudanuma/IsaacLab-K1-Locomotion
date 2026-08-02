@@ -65,8 +65,6 @@ def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> tor
     y = robot_y.clamp(-r, r)
 
     # --- 一様ランダム枝: [-r, r] から近距離帯 (y ± m) を除いた区間を直接サンプル ---
-    # 除外窓とゴール幅の共通部分 [a, b] を除いた左区間 [-r, a] / 右区間 [b, r] の
-    # 長さ比で振り分ける。m < r なので合計長は必ず正 (最低 2r - 2m)。
     a = (y - m).clamp(min=-r)
     b = (y + m).clamp(max=r)
     left_len = (a + r).clamp(min=0.0)
@@ -206,8 +204,6 @@ def reset_ball_shot(
     spawn_y = robot_xy[:, 1] + d_rel_y * scale
 
     # 狙い先 y の範囲。適応カリキュラム (adaptive_difficulty) が段階的に広げるので、
-    # そのバッファがあればそちらを優先する (無ければ cfg の固定値 = 従来の挙動)。
-    # 初速 (_gk_speed_hi) と同じフォールバック方式。
     aim_buf = getattr(env, "_gk_aim_y", None)
     aim_range = float(aim_buf.item()) if aim_buf is not None else float(p.aim_y_range)
     aim_y = torch.empty(n, device=env.device).uniform_(-aim_range, aim_range)
@@ -264,8 +260,6 @@ def reset_ball_perception(
     n = len(env_ids)
 
     # 速度バイアス: x, y 各軸独立。大きさを perc_vel_bias_range から一様サンプルし、
-    # 符号はランダム。エピソード中は固定 (実機のボール速度推定が一定方向にずれる模擬)。
-    # PLAY のクリーン化 (perception_clean) 時はゼロ (真値の速度をそのまま出す)。
     if bool(getattr(p, "perception_clean", False)):
         env._gkp_vel_bias[env_ids] = 0.0
     else:
@@ -314,32 +308,13 @@ def sync_task_command(
 ):
     """``base_velocity`` コマンドをタスク由来の移動要求で上書きする毎ステップイベント。
 
-    ``EventTerm(mode="interval", interval_range_s=(dt, dt), is_global_time=True)`` で
-    毎制御ステップ呼ぶ。
-
-    なぜ必要か:
-        ステージ2/3 では ``velocity_commands`` **観測スロットの中身** だけを
-        :func:`~.observations.task_drive_vector` に差し替えていたが、
-        ``base_velocity`` コマンド項そのものはステージ1 の設定
-        (10 秒ごとにランダム再サンプル) のまま生き残っていた。
-        その結果、コマンドを参照する **報酬** がタスクと無関係なランダム値で動く:
-
-          * ``feet_phase`` (weight 1.4): コマンドノルムが閾値未満なら「両足接地」を
-            期待するが、ランダムコマンドはほぼ常に閾値超え → **常に歩けと要求**
-          * ``foot_clearance`` (weight 2.5): 同じ判定で遊脚を上げ続けろと要求
-
-        合計 weight 3.9 が「1.6Hz のリズムで足を動かせ」と言い続けるので、
-        ボールを止めた後も、まだ来ていない開始直後も **足踏みが止まらなかった**。
-        観測側 (task_drive_phase_obs) だけを直しても、報酬がこう言っている限り
-        ポリシーは足踏みを続ける。
-
-    本イベントでコマンド自体を差し替えることで、観測・報酬・位相のすべてが
-    同一のタスク信号で駆動され、「動く必要が無い ⇒ コマンド小 ⇒ その場で立つ」
-    が一貫する。
+    ステージ2/3 では観測スロットだけを :func:`~.observations.task_drive_vector` に
+    差し替えていたため、コマンドを参照する報酬 (``feet_phase`` / ``foot_clearance``)
+    がランダムなコマンドを見て常に「歩け」と要求し、足踏みが止まらなかった。
+    コマンド自体を差し替えて観測・報酬・位相を同じ信号で駆動する。
 
     ★ 併せて cfg 側で ``heading_command`` / ``rel_standing_envs`` /
-      ``resampling_time_range`` を無効化すること。有効なままだと
-      コマンドマネージャが次のステップで書き戻してしまう。
+      ``resampling_time_range`` を無効化すること。
     """
     from .observations import task_drive_vector
 
@@ -347,17 +322,15 @@ def sync_task_command(
     buf = getattr(cmd_term, "vel_command_b", None)
     if buf is None:
         return
-    # 報酬・位相が見るのは真値ベースの移動要求 (観測スロット側は知覚DR版を使う)。
-    buf[:] = task_drive_vector(env, use_perceived=False)
+    drive = task_drive_vector(env, use_perceived=False)
+    buf[:, :2] = drive[:, :2]
+    # ★ 向き成分は 0 にする。feet_phase / foot_clearance の停止判定は
+    buf[:, 2] = 0.0
 
 
 def relaunch_ball_after_save(
     env: "ManagerBasedEnv",
     # ★ env_ids にデフォルト値を付けないこと (理由は下記)。EventManager の引数検証
-    #   (manager_base._resolve_common_term_cfg) は「デフォルト有りの引数」を
-    #   term の params 候補として扱うため、env_ids に = None を付けると
-    #   検証の集合比較が合わずに ValueError になる。
-    #   (引数がちょうど 2 個の関数は検証自体がスキップされるので気づきにくい)
     env_ids: torch.Tensor | None,
     respawn_delay_steps: int = 50,
     clearance_safe_dist: float = 1.5,
@@ -402,11 +375,6 @@ def relaunch_ball_after_save(
         # 適応カリキュラムが「1 球あたりの成功率」を出すための実績カウント
         bufs["save_count"][newly_saved] += 1
         # セーブ品質 (どれだけ危険圏から遠ざけたか) を記録する。
-        # 報酬 (save_clearance_bonus) が次の計算タイミングで読み取ってゼロに戻す。
-        # ★ ここで直接報酬を返さずバッファ越しにするのは実行順への依存を断つため。
-        #   IsaacLab の step は termination → reward → reset → interval イベント の順で、
-        #   interval イベントは報酬より後に走る。同一ステップで報酬に伝えようとすると
-        #   この順序に暗黙依存する実装になる。
         q = _save_clearance_quality(env, safe_dist=float(clearance_safe_dist))
         bufs["save_quality"][newly_saved] = q[newly_saved]
         # 確定済みとして save_cd を無効化 (save_success と同じ後始末)

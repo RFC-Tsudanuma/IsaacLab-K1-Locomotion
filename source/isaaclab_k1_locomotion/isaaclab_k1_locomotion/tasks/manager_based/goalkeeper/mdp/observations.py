@@ -30,8 +30,6 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# per-env 状態バッファ (遅延生成)
-# ---------------------------------------------------------------------------
 
 def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
     """goalkeeper タスクの per-env 状態バッファを (無ければ生成して) 返す。
@@ -74,8 +72,6 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
     }
 
 
-# ---------------------------------------------------------------------------
-# 座標ヘルパ
 # ---------------------------------------------------------------------------
 
 def ball_pos_goal(env: "ManagerBasedRLEnv", ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball")) -> torch.Tensor:
@@ -173,17 +169,6 @@ def guard_arrival_horizon(
 
 
 # ---------------------------------------------------------------------------
-# 知覚DR: 実機カメラ準拠の VirtualPerception (booster_amp_lab の soccer_perception を
-# goalkeeper に複製したもの) でボール位置観測を作る。カメラ仕様 (FOV 150°/80°、
-# レイテンシ 116ms、25Hz、距離依存ノイズ σ(d)=0.124d+0.149、検出率90%/7m、occlusion、
-# dead-zone) は soccer_vision_train_cfg がそのまま持つ。頭は戦略層が常にボールを
-# 追う前提なので head_tracks_ball=True (FOV は実質常にパス、品質劣化のみ効く)。
-#
-# 速度は VirtualPerception が出さない (位置・mask・last_seen_dt のみ) ので、ボール速度
-# だけは従来どおり「真値 + エピソード固定バイアス 0.5〜1.0 m/s」で別途作る (実機は
-# 速度を直接測れず推定が一定方向にずれるため)。mask=0 (見えていない) のときは位置も
-# 速度もゼロにして整合を取る。critic は真値を見る (非対称)。
-# ---------------------------------------------------------------------------
 
 
 def _gk_perception(env: "ManagerBasedRLEnv"):
@@ -208,10 +193,6 @@ def _gk_perception(env: "ManagerBasedRLEnv"):
             cfg.update_hz_std = 0.0
         cfg.head_tracks_ball = True   # 戦略層がボールを追う前提。FOV は実質常にパス
         # K1_locomotion.urdf では頭リンク (Head_2→Head_1→Trunk) が全て Trunk にマージされ、
-        # 独立した頭 body が存在しない (import 警告あり)。カメラは Trunk にマウントする。
-        # head_tracks_ball=True でカメラ向きはボール方向に上書きするので、マウント先が頭でも
-        # 胴体でも FOV 判定への影響はない (カメラ位置がわずかに下がるだけ)。
-        # 実機の頭の高さに寄せるため、Trunk 原点からの上方オフセットを頭部相当に上げる。
         cfg.camera_body_name = "Trunk"
         cfg.camera_offset_pos = (0.06, 0.0, 0.45)  # 胴体原点からカメラ (頭部高さ相当) まで
         vp = VirtualPerception(
@@ -280,8 +261,6 @@ def _gk_perceived_goal_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, to
     return pos, vel
 
 
-# ---------------------------------------------------------------------------
-# 観測項
 # ---------------------------------------------------------------------------
 
 def gk_ball_pos_rel(
@@ -358,8 +337,6 @@ def task_drive_vector(
     max_y: float = 1.25,
     vx_scale: float = 1.0,
     # ★ vy_scale はステージ1 のコマンド範囲 (commands.base_velocity.ranges.lin_vel_y)
-    #   と必ず一致させること。ステージ1 は「スロットの値 = 出すべき速度」を学ぶので、
-    #   ステージ2/3 でスロットの取りうる範囲が違うと対応がズレる。
     vy_scale: float = 1.3,
     use_perceived: bool = True,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -411,40 +388,21 @@ def task_drive_vector(
 def task_drive_phase_obs(
     env: "ManagerBasedRLEnv",
     phase_freq: float = 1.6,
-    # ★ しきい値の単位に注意。locomotion の phase_obs は **速度 [m/s]** のノルムを
-    #   0.05 と比べるが、task_drive_vector は **位置ずれ [m]** なので同じ 0.05 を
-    #   流用する根拠が無い (5cm 以内に入らないと止まれず、実質ほぼ止まらない)。
-    #   本タスクが「到達した」とみなす尺度に合わせる:
-    #   GoalkeeperParamsCfg.stage1_reach_tol = 0.15 / target_reach_velocity の
-    #   deadband = 0.12。その下限側の 0.12 を既定にする。
     cmd_threshold: float = 0.12,
     max_y: float = 1.25,
     vx_scale: float = 1.0,
     vy_scale: float = 1.3,
     use_perceived: bool = True,
 ) -> torch.Tensor:
-    """ステージ2/3 の ``gait_phase`` スロット (4 次元)。**タスク駆動**の歩行位相。
+    """ステージ2/3 の ``gait_phase`` スロット (4 次元)。タスク駆動の歩行位相。
 
-    locomotion の :func:`phase_obs` と同一フォーマット・同一規約 (左右 sin/cos、
-    停止時はゼロ埋め) だが、**停止判定の駆動元が違う**。
+    locomotion の :func:`phase_obs` と同一フォーマット (左右 sin/cos、停止時はゼロ埋め)
+    だが、停止判定を ``base_velocity`` コマンドではなく :func:`task_drive_vector` の
+    **並進成分 (dx, dy)** で行う。
 
-    なぜ必要か:
-        ``phase_obs`` は停止判定に ``base_velocity`` コマンドのノルムを使う。
-        ステージ1 ではそれが実際の指令なので正しいが、ステージ2/3 では
-        ``velocity_commands`` **スロットの中身**だけを :func:`task_drive_vector` に
-        差し替えており、``base_velocity`` コマンド項自体はステージ1 の設定
-        (10 秒ごとにランダム再サンプル) のまま残っている。その結果、位相が
-        **タスクと無関係なランダムコマンド**で駆動され、ボールを止めた後も
-        「歩き続けろ」という位相が入り続けて足踏みが止まらなかった。
-        (階層版は同じ問題を ``high_action_phase_obs`` で解決済み。直接制御版に
-        移植されていなかった。)
-
-    本関数は観測スロットに入るのと同じ :func:`task_drive_vector` のノルムでゲートする。
-    「動く必要がない = スロットが小さい = 位相ゼロ = その場で立つ」となり、
-    ステージ1 で学んだ停止の仕方がそのまま流用できる。
-
-    位相周波数はステージ1 と同じ ``get_phase_freq`` 経由なので、
-    ``randomize_phase_freq`` による env ごとの ±0.05Hz ランダム化に自動追従する。
+    ★ 向き成分 (dyaw) は判定に含めない。足踏みでは向きは直らない (その場旋回が要る) のに、
+      yaw drift は実測で恒常的に 7〜12° あり、それだけでしきい値を超えて
+      「定位置にいるのに歩き続ける」状態になっていたため。
     """
     from ...locomotion.mdp.events import get_phase_freq
 
@@ -461,7 +419,7 @@ def task_drive_phase_obs(
     drive = task_drive_vector(
         env, max_y=max_y, vx_scale=vx_scale, vy_scale=vy_scale, use_perceived=use_perceived
     )
-    drive_norm = torch.norm(drive, dim=1, keepdim=True)
+    drive_norm = torch.norm(drive[:, :2], dim=1, keepdim=True)
     return torch.where(drive_norm < cmd_threshold, torch.zeros_like(phase), phase)
 
 
