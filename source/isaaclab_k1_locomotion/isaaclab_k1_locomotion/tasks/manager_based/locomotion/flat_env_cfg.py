@@ -432,6 +432,72 @@ class K1FlatImproveAngTrackingCfg(K1FlatEnvCfg):
 
 
 @configclass
+class K1FlatImprovePostureCfg(K1FlatEnvCfg):
+    """学習済ポリシーに対して上体の傾き・上下動を抑える仕上げ学習用の環境設定。
+
+    2 万イテレーションのフルパイプライン学習済みモデルからの resume を前提とする。
+    checkpoint にはカリキュラムの進捗が保存されないため、resume 時に 0 から
+    再進行しないよう、各カリキュラムを「学習終了時点の状態」に固定する:
+
+    * lin_vel_command: 段階拡張を止め、最終ステージ相当の範囲で固定
+    * extreme_commands: 最初から発動 (num_steps=0, ramp_steps=1 で即 α=1 →
+      extreme_prob=0.35 + resampling (0.8, 8.0))
+    * push_robot: stage1 相当の値を直接設定
+
+    使い方::
+
+        ./train_posture.sh --resume --load_run <既存run名>
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 上体の傾き抑制 ---
+        # m04 レシピ (2026-07-28〜29): フルパイプライン学習後の仕上げ resume で
+        # -20 → -40 に増量すると傾き -34%、追従・位相・振動は維持。
+        # NOTE: m01 (最初から -40 + extreme) はスクラッチ学習では lin 崩壊したが、
+        # 本設定は「習得済みポリシーの仕上げ」なので条件が異なる。lin 追従
+        # (error_vel_xy) が悪化し続ける場合は -30 程度へ緩めること。
+        self.rewards.flat_orientation_l2.weight = -40.0
+
+        # --- 上体の上下動抑制 ---
+        # lin_vel_z_l2 (速度ペナルティ) は歩容の構造的下限で飽和し増量無効 (q系列)。
+        # 高さ「位置」の偏差を直接罰して vaulting の振幅自体を縮める。
+        # 重みは reward logger で他項 (ang_vel_xy_l2 ≈ 0.01〜0.1/step) と桁を
+        # 合わせた初期値。効かなければ増やし、着地が硬くなるなら減らす。
+        self.rewards.base_height_track.weight = -30.0
+        # base_height_penalty (minimum_height, min_height=0.53, weight=-100) が
+        # 目標高さ 0.53 と干渉する (目標付近で常に -100 が出る) ので閾値を下げる。
+        self.rewards.base_height_penalty.params["min_height"] = 0.48
+
+        # --- カリキュラムを学習終了時点の状態に固定 ---
+        # lin_vel_command: 最終ステージ相当で固定 (再進行による "忘れ" を防ぐ)
+        self.curriculum.lin_vel_command = None
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.5, 1.5)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.9, 0.9)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+        # extreme_commands: 最初から発動させる。num_steps=0 で 1 イテレーション目
+        # から有効になり、ramp_steps=1 で即座に α=1 (extreme_prob=0.35 +
+        # resampling_time_range (0.8, 8.0) 差し替え) に達する。
+        self.curriculum.extreme_commands.params["num_steps"] = 0
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1
+        # α=1 到達前の初回分も含め、リサンプリング間隔は最初から本番値にする
+        self.commands.base_velocity.resampling_time_range = (0.8, 8.0)
+        self.curriculum.command_resampling_time_range = None
+
+        # push_robot: stage1 (6000 iter 到達時) 相当を直接設定
+        self.curriculum.push_robot_stage1 = None
+        self.events.push_robot.interval_range_s = (4.0, 8.0)
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "roll": (-0.02, 0.02),
+            "pitch": (-0.02, 0.02),
+        }
+
+
+@configclass
 class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
