@@ -70,6 +70,11 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
+from isaaclab_k1_locomotion.tasks.manager_based.locomotion.agents.history_policy_exporter import (
+    export_history_policy_as_jit,
+    export_history_policy_as_onnx,
+    is_history_policy,
+)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -130,8 +135,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         normalizer = None
 
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    if is_history_policy(policy_nn):
+        # 履歴 + CNN 構成 (K1 Flat): 入力は command(N,3) + obs_history(N,H,C)。
+        # 詳細は agents/history_policy_exporter.py の docstring を参照。
+        export_history_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_history_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
     print(f"[INFO] Exported policy.pt and policy.onnx to: {export_model_dir}")
 
     env.close()
