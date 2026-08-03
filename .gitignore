@@ -34,6 +34,14 @@ logs/rsl_rl/k1_walk_loop_shoot/2026-07-23_00-44-11/*
 logs/rsl_rl/k1_walk_loop_shoot/2026-07-24_13-59-06/*
 !logs/rsl_rl/k1_walk_loop_shoot/2026-07-24_13-59-06/model_14900.pt
 
+# loop_pass の checkpoint。全方位版 (Walk-Loop-Pass-360) の --load_pretrained 元。
+# NOTE: ディレクトリ名は experiment 名を k1_walk_loop_pass にリネームする前の旧名。
+!logs/rsl_rl/k1_walk_loop/
+logs/rsl_rl/k1_walk_loop/*
+!logs/rsl_rl/k1_walk_loop/2026-07-20_10-33-30/
+logs/rsl_rl/k1_walk_loop/2026-07-20_10-33-30/*
+!logs/rsl_rl/k1_walk_loop/2026-07-20_10-33-30/model_4600.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
