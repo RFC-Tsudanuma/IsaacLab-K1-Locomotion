@@ -169,13 +169,18 @@ class K1GKDirectPolicyCfg(K1GKDirectStage1PolicyCfg):
             "use_perceived": True,
         },
     )
-    # ボール系は知覚DR (レイテンシ/更新レート/ドロップ/距離依存ノイズ) 付きの実値。
+    # ボール系は知覚DR (レイテンシ/更新レート/ドロップ/姿勢由来のノイズ) 付きの実値。
     # ノイズは関数内で付加するので ObsTerm 側の noise は付けない。
     ball_pos_rel = ObsTerm(func=gk_ball_pos_rel_perceived)
     ball_vel = ObsTerm(func=gk_ball_vel_perceived)
     ball_active = ObsTerm(func=gk_ball_active)
     target_y = ObsTerm(func=gk_target_y, params={"max_y": GOAL_HALF_WIDTH, "use_perceived": True})
-    self_state = ObsTerm(func=gk_self_state, noise=Unoise(n_min=-0.02, n_max=0.02))
+    # 自己位置は実機の MCL 誤差 (バイアス/ドリフト/跳び) 込み。Unoise は残留ジッタ分。
+    self_state = ObsTerm(
+        func=gk_self_state,
+        params={"use_perceived": True},
+        noise=Unoise(n_min=-0.02, n_max=0.02),
+    )
 
 
 @configclass
@@ -402,9 +407,8 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.rewards.save_touch_bonus = RewTerm(func=save_touch_bonus, weight=100.0)
         # セーブの「質」への上乗せ (2026-07-24)。触れただけで満額だと、ゴール正面に
         self.rewards.save_clearance = RewTerm(func=save_clearance_bonus, weight=50.0)
-        self.rewards.return_to_center = RewTerm(
-            func=return_to_center_after_save, weight=1.0, params={"std": 0.5}
-        )
+        # 中央復帰はさせない (2026-08-03)。セーブ後はその場に留まる。
+        self.rewards.return_to_center = None
         self.rewards.stay_on_goal_line = RewTerm(func=stay_on_goal_line, weight=1.0, params={"std": 0.3})
         self.rewards.face_field = RewTerm(func=face_field, weight=1.0, params={"std": 0.5})
 

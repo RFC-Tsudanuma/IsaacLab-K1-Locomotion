@@ -244,34 +244,52 @@ def reset_ball_perception(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
 ):
-    """VirtualPerception のリングバッファ/per-env パラメータをリセットし、速度バイアスを
-    採番する。
+    """VirtualPerception と α-β フィルタをリセットし、自己位置推定の誤差を採番する。
 
-    位置・遅延・ノイズ・検出率・occlusion は VirtualPerception (実機カメラ準拠) が担当。
-    速度バイアス (0.5〜1.0 m/s のエピソード固定系統誤差) だけは goalkeeper 側で持つので
-    ここで採番する。
+    ボール位置・遅延・検出率・occlusion・姿勢由来のノイズは VirtualPerception が担当。
+    自己位置推定 (実機は MCL) の誤差はここで採番する。速度は観測できないので、
+    α-β フィルタが位置履歴から作る (バイアスを人工的に足す旧方式は廃止)。
     ★ reset_ball (ボール配置イベント) より後に登録すること。
     """
-    from .observations import _gk_perception
+    import math
+
+    from .observations import _gk_loc_buffers, _gk_perception
 
     p = _gk_params(env)
     vp = _gk_perception(env)
     vp.reset(env_ids)
     n = len(env_ids)
 
-    # 速度バイアス: x, y 各軸独立。大きさを perc_vel_bias_range から一様サンプルし、
+    # α-β フィルタの状態を落とす。次の検出で速度ゼロから初期化される。
+    env._gkp_fpos[env_ids] = 0.0
+    env._gkp_fvel[env_ids] = 0.0
+    env._gkp_finit[env_ids] = False
+    env._gkp_dt_meas[env_ids] = 0.0
+
+    # 自己位置推定の誤差: エピソード固定バイアス + ドリフト速度 + 跳びの頻度。
+    _gk_loc_buffers(env)
+    env._gk_loc_err[env_ids] = 0.0
     if bool(getattr(p, "perception_clean", False)):
-        env._gkp_vel_bias[env_ids] = 0.0
-    else:
-        vlo, vhi = float(p.perc_vel_bias_range[0]), float(p.perc_vel_bias_range[1])
-        vmag = torch.empty(n, 2, device=env.device).uniform_(vlo, vhi)
-        vsign = torch.where(
-            torch.rand(n, 2, device=env.device) < 0.5,
-            torch.ones(n, 2, device=env.device),
-            -torch.ones(n, 2, device=env.device),
-        )
-        env._gkp_vel_bias[env_ids] = vmag * vsign
-    env._gkp_out_vel[env_ids] = 0.0
+        env._gk_loc_bias[env_ids] = 0.0
+        env._gk_loc_drift[env_ids] = 0.0
+        env._gk_loc_jump_p[env_ids] = 0.0
+        return
+
+    deg = math.pi / 180.0
+    bias = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
+    bias[:, :2] *= float(p.loc_bias_xy_m)
+    bias[:, 2] *= float(p.loc_bias_yaw_deg) * deg
+    env._gk_loc_bias[env_ids] = bias
+
+    drift = torch.empty(n, 3, device=env.device).uniform_(-1.0, 1.0)
+    drift[:, :2] *= float(p.loc_drift_xy_mps)
+    drift[:, 2] *= float(p.loc_drift_yaw_dps) * deg
+    env._gk_loc_drift[env_ids] = drift
+
+    jlo, jhi = float(p.loc_jump_hz_range[0]), float(p.loc_jump_hz_range[1])
+    env._gk_loc_jump_p[env_ids] = (
+        torch.empty(n, device=env.device).uniform_(jlo, jhi) * float(env.step_dt)
+    )
 
 
 def _save_clearance_quality(
