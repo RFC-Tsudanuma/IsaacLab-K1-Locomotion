@@ -19,11 +19,11 @@
 #   STAGE=3 LOOP_CKPT=logs/rsl_rl/k1_walk_loop_pass/<run>/model_<N>.pt \
 #       ./scripts/rsl_rl/train_walk_loop_pass_360.sh          # 既存 loop_pass から 360 だけ
 #   STAGE=12 ./scripts/rsl_rl/train_walk_loop_pass_360.sh    # loop_pass までで止める
-#   NUM_ENVS=2048 ITER=5000 ./scripts/rsl_rl/train_walk_loop_pass_360.sh
+#   ITER=20000 ./scripts/rsl_rl/train_walk_loop_pass_360.sh  # kick 系を長く回す
 #   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_loop_pass_360.sh   # walk phase だけ延長
 #
-# iteration 数は walk phase (WALK_ITER, 既定 5000) と kick 系 (ITER, 既定 20000) で
-# 別に持つ。walk phase は歩行の獲得だけなので 5000 で足りる。
+# iteration 数は walk phase (WALK_ITER) と kick 系 (ITER) で別に持つ。既定はどちらも
+# 5000 で、まず一通り通して挙動を確認する想定。仕上げるときは ITER を上げること。
 #
 # NOTE: 旧 experiment 名 (logs/rsl_rl/k1_walk_loop) の run から始めるときは
 #       自動検出に乗らないので LOOP_CKPT で明示すること。
@@ -77,9 +77,11 @@ fi
 echo "[INFO] python: $LAB_PY"
 
 NUM_ENVS=${NUM_ENVS:-4096}
-ITER=${ITER:-20000}
+# kick 系 (Stage 2/3) の iteration 数。
+# NOTE: loop_shoot では 10000 以降も apex が伸び続けた実績があるので、詰めたいときは
+#       ITER=20000 などに上げること。5000 は「一通り通して挙動を見る」ための既定値。
+ITER=${ITER:-5000}
 # walk phase (Stage 1) は歩行を獲得するだけなので 5000 で足りる (実績値)。
-# ITER とは別に持ち、通しで実行しても Stage 1 に 20000 かけないようにする。
 WALK_ITER=${WALK_ITER:-5000}
 STAGE=${STAGE:-all}
 
