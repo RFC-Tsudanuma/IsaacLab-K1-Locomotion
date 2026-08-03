@@ -267,6 +267,56 @@ def feet_close_penalty(env: ManagerBasedRLEnv, feet_distance_threshold = 0.15) -
     return (feet_y_offset < feet_distance_threshold).float()
 
 
+_KNEE_IDS_ATTR = "_knee_body_ids"
+
+
+def knee_close_penalty(
+    env: ManagerBasedRLEnv,
+    min_distance: float = 0.13,
+) -> torch.Tensor:
+    """左右の膝が近づく / 交差するほど大きくなる連続ペナルティ。shape: (N,)
+
+    ベースフレームでの左右 Shank (膝) の **符号付き** 横距離 gap を測り、
+    ``clamp(min_distance − gap, 0) / min_distance`` を返す。
+    余裕があれば 0、min_distance まで詰まると 1、交差する (gap < 0) と 1 を超える。
+
+    必要な理由: articulation_props の ``enabled_self_collisions=False`` により、
+    sim では脚同士がすり抜ける。方策は「膝が交差してもコストゼロ」の世界で学習するため、
+    交差する歩容を平気で獲得し、MuJoCo / 実機に持っていくと実際に衝突する。
+    横移動・旋回が多いタスク (全方位の回り込みなど) ほど顕著。
+
+    既存の ``feet_close_penalty`` は足首しか見ておらず、しかも二値 (0/1) なので
+    「あと何 cm で危ないか」の勾配が無い。この項は膝を対象に、連続値で
+    「近づき始めた段階から押し返す」圧力をかける。
+
+    NOTE: 自己衝突を有効化する (``enabled_self_collisions=True``) 方が原理的には正しいが、
+          隣接リンクの誤検出が出やすく、メッシュ同士の自己衝突は計算コストも重い。
+          さらに「衝突してから罰する」形なので不連続で勾配が立たない。
+
+    Args:
+        min_distance: これ未満に詰まると罰が立ち上がる横距離 [m]。
+            膝のコライダーは半径 0.045 m の円柱なので幾何的な接触は約 0.09 m。
+            公称の膝間隔は 0.192 m (股関節が y = ±0.096) なので、0.13 で
+            通常の前進歩行には掛からず、接触の手前に余裕をもって効く。
+    """
+    asset = env.scene["robot"]
+
+    ids = getattr(env, _KNEE_IDS_ATTR, None)
+    if ids is None:
+        ids = (asset.find_bodies("Left_Shank")[0][0], asset.find_bodies("Right_Shank")[0][0])
+        setattr(env, _KNEE_IDS_ATTR, ids)
+    left_id, right_id = ids
+
+    # 左右膝の world 差分をベースの yaw だけ打ち消して横成分 (y) を取る。
+    # get_feet_offset と同じ規約: 左 − 右 なので、正常な姿勢では正、交差すると負。
+    _, _, base_yaw = euler_xyz_from_quat(asset.data.root_quat_w)
+    dx = asset.data.body_pos_w[:, left_id, 0] - asset.data.body_pos_w[:, right_id, 0]
+    dy = asset.data.body_pos_w[:, left_id, 1] - asset.data.body_pos_w[:, right_id, 1]
+    gap = -torch.sin(base_yaw) * dx + torch.cos(base_yaw) * dy
+
+    return torch.clamp(min_distance - gap, min=0.0) / min_distance
+
+
 def feet_parallel_to_ground(env: ManagerBasedRLEnv, 
                             sigma: float = 0.3,
                             enable_potential: bool = True, 

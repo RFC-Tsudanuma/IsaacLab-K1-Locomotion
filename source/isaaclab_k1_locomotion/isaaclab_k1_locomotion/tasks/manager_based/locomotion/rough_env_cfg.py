@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
+from .mdp.rewards import feet_close_penalty, knee_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
 
 ##
 # 基本設定
@@ -323,6 +323,17 @@ class K1Rewards(RewardsCfg):
         weight=-20.0,
         params={
             "feet_distance_threshold": 0.14,
+        },
+    )
+
+    # 膝同士の接近・交差。enabled_self_collisions=False で sim では脚がすり抜けるため、
+    # この項が無いと交差する歩容を獲得して MuJoCo / 実機で実際に衝突する。
+    # feet_close_penalty (足首・二値) では拾えないので別項として持つ。
+    knee_close_penalty = RewTerm(
+        func=knee_close_penalty,
+        weight=-20.0,
+        params={
+            "min_distance": 0.13,
         },
     )
 
