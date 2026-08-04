@@ -14,6 +14,11 @@
 
 :class:`SensorArtifactNoiseModel` は 1 つの観測項に対して次を順に適用する:
 
+0. **センサ遅延** (per-env で delay_range [秒] から抽選、リセット時に再抽選)
+   — 通信・ドライバ由来の伝送遅延相当。制御周期未満の分数ステップ
+   遅延を前ステップ生値との線形補間で近似する:
+   x_delayed = (1-β)·x_t + β·x_{t-1}, β = delay / step_dt。
+   50Hz (step_dt=0.02) では delay_range (0, 0.010) → β ∈ [0, 0.5]。
 1. **定数バイアス** (成分ごと、エピソードリセット時に ±bias_range で再抽選)
    — IMU 取付誤差・姿勢推定器バイアス・エンコーダオフセット相当。
 2. **EMA ローパスフィルタ** (係数 α を per-env で filter_alpha_range から抽選)
@@ -52,10 +57,12 @@ class SensorArtifactNoiseModel(NoiseModel):
         # per-env パラメータ (成分数 D が判明する初回 __call__ まで bias は未確保)
         self._alpha = torch.zeros((num_envs, 1), device=device)
         self._hold_prob = torch.zeros((num_envs, 1), device=device)
+        self._delay_frac = torch.zeros((num_envs, 1), device=device)
         self._bias: torch.Tensor | None = None
         # 時系列状態
         self._ema: torch.Tensor | None = None
         self._prev_out: torch.Tensor | None = None
+        self._prev_raw: torch.Tensor | None = None
         self._initialized = torch.zeros(num_envs, dtype=torch.bool, device=device)
         self._sample_env_params(slice(None))
 
@@ -64,6 +71,10 @@ class SensorArtifactNoiseModel(NoiseModel):
         self._alpha[env_ids] = torch.empty_like(self._alpha[env_ids]).uniform_(lo, hi)
         lo, hi = self._cfg.hold_prob_range
         self._hold_prob[env_ids] = torch.empty_like(self._hold_prob[env_ids]).uniform_(lo, hi)
+        # 遅延 [秒] → 分数ステップ β = delay / step_dt (安全のため [0, 1] に clamp)
+        lo, hi = self._cfg.delay_range
+        delays = torch.empty_like(self._delay_frac[env_ids]).uniform_(lo, hi)
+        self._delay_frac[env_ids] = (delays / max(self._cfg.step_dt, 1e-6)).clamp(0.0, 1.0)
         if self._bias is not None:
             r = self._cfg.bias_range
             self._bias[env_ids] = torch.empty_like(self._bias[env_ids]).uniform_(-r, r)
@@ -85,10 +96,18 @@ class SensorArtifactNoiseModel(NoiseModel):
             ).uniform_(-r, r)
             self._ema = torch.zeros_like(self._bias)
             self._prev_out = torch.zeros_like(self._bias)
+            self._prev_raw = torch.zeros_like(self._bias)
 
-        x = data + self._bias
-        # リセット直後の env は現在値で状態を初期化 (フィルタの過渡を作らない)
+        # リセット直後の env は現在値で状態を初期化 (フィルタ/遅延の過渡を作らない)
         fresh = ~self._initialized
+        if fresh.any():
+            self._prev_raw[fresh] = data[fresh]
+
+        # センサ遅延: 前ステップ生値との線形補間で分数ステップ遅延を近似
+        delayed = (1.0 - self._delay_frac) * data + self._delay_frac * self._prev_raw
+        self._prev_raw = data.clone()
+
+        x = delayed + self._bias
         if fresh.any():
             self._ema[fresh] = x[fresh]
         self._ema = self._alpha * self._ema + (1.0 - self._alpha) * x
@@ -123,3 +142,11 @@ class SensorArtifactNoiseCfg(NoiseModelCfg):
 
     hold_prob_range: tuple[float, float] = (0.0, 0.0)
     """フレームホールド確率の per-env 抽選範囲。"""
+
+    delay_range: tuple[float, float] = (0.0, 0.0)
+    """センサ遅延 [秒] の per-env 抽選範囲 (リセット時に再抽選)。
+    step_dt 未満の分数ステップ遅延を前ステップ生値との線形補間で近似する。
+    (0, 0) で遅延なし。1 ステップ (step_dt) を超える分は clamp される。"""
+
+    step_dt: float = 0.02
+    """制御周期 [秒]。遅延の分数ステップ換算 β = delay / step_dt に使う (50Hz → 0.02)。"""

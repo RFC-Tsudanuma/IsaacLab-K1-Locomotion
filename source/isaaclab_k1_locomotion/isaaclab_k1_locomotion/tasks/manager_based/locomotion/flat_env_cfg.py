@@ -64,6 +64,14 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
 # 範囲に調整して再有効化すること。
 _USE_SENSOR_ARTIFACT_NOISE: bool = False
 
+# センサ遅延 DR (2026-08-05)。通信・ドライバ由来の伝送遅延を per-env 0〜20ms で
+# ランダム化する (SensorArtifactNoiseModel の遅延ステージのみを使用)。
+# _USE_SENSOR_ARTIFACT_NOISE とは独立に有効化でき、対象は joint_pos /
+# projected_gravity / base_ang_vel。アーティファクトノイズ有効時はそちらの cfg に統合される。
+# 上限 20ms = 制御周期 1 ステップ分 (β=1.0 → 丸ごと前ステップ値)。
+_USE_SENSOR_DELAY: bool = True
+_SENSOR_DELAY_RANGE: tuple[float, float] = (0.0, 0.020)
+
 
 # ---------------------------------------------------------------------------
 # Observations (履歴バッファ構成)
@@ -99,6 +107,11 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
     「履歴の質の劣化」に頑健にする (mdp/obs_noise_models.py 参照)。
     actions / gait_phase はデプロイ側でも内部生成の正確な値なので白色ノイズのみ・
     アーティファクトなしのまま。
+
+    センサ遅延 DR (_USE_SENSOR_DELAY) は上記フラグと独立: joint_pos /
+    projected_gravity / base_ang_vel に per-env 0〜10ms の伝送遅延 (分数ステップ線形補間) を
+    入れる。アーティファクト有効時はその cfg に統合、無効時は遅延+白色ノイズ
+    のみの SensorArtifactNoiseCfg でラップする。
     """
 
     def __post_init__(self):
@@ -108,39 +121,58 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
         self.history_length = HISTORY_LENGTH
         self.flatten_history_dim = True
 
-        if not _USE_SENSOR_ARTIFACT_NOISE:
-            # デフォルト: 親 (K1PolicyCfg) の白色ノイズのみ = dual_first と同条件
-            return
+        # 遅延 DR は _USE_SENSOR_ARTIFACT_NOISE と独立に制御する。
+        delay_range = _SENSOR_DELAY_RANGE if _USE_SENSOR_DELAY else (0.0, 0.0)
 
-        # 実機センサのアーティファクトのランダム化。白色ノイズ幅は従来の
-        # K1PolicyCfg の Unoise と同値を内包させる。
-        # - bias_range: 取付誤差・推定器バイアス相当 (gravity ±0.035 ≒ ±2°)
-        # - filter_alpha_range: 内蔵 LPF + デプロイ側移動平均相当 (α=0.6 ≒ 5Hz@50Hz)
-        # - hold_prob_range: 受信タイミングずれによる重複フレーム相当 (最大 10%)
-        self.base_ang_vel.noise = SensorArtifactNoiseCfg(
-            noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
-            bias_range=0.05,
-            filter_alpha_range=(0.0, 0.6),
-            hold_prob_range=(0.0, 0.1),
-        )
-        self.projected_gravity.noise = SensorArtifactNoiseCfg(
-            noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
-            bias_range=0.035,
-            filter_alpha_range=(0.0, 0.6),
-            hold_prob_range=(0.0, 0.1),
-        )
-        self.joint_pos.noise = SensorArtifactNoiseCfg(
-            noise_cfg=Unoise(n_min=-0.03, n_max=0.03),
-            bias_range=0.01,
-            filter_alpha_range=(0.0, 0.4),
-            hold_prob_range=(0.0, 0.1),
-        )
-        self.joint_vel.noise = SensorArtifactNoiseCfg(
-            noise_cfg=Unoise(n_min=-1.5, n_max=1.5),
-            bias_range=0.2,
-            filter_alpha_range=(0.0, 0.6),
-            hold_prob_range=(0.0, 0.1),
-        )
+        if _USE_SENSOR_ARTIFACT_NOISE:
+            # 実機センサのアーティファクトのランダム化。白色ノイズ幅は従来の
+            # K1PolicyCfg の Unoise と同値を内包させる。
+            # - bias_range: 取付誤差・推定器バイアス相当 (gravity ±0.035 ≒ ±2°)
+            # - filter_alpha_range: 内蔵 LPF + デプロイ側移動平均相当 (α=0.6 ≒ 5Hz@50Hz)
+            # - hold_prob_range: 受信タイミングずれによる重複フレーム相当 (最大 10%)
+            # - delay_range: 伝送遅延 (joint_pos / projected_gravity / base_ang_vel、独立フラグ)
+            self.base_ang_vel.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
+                bias_range=0.05,
+                filter_alpha_range=(0.0, 0.6),
+                hold_prob_range=(0.0, 0.1),
+                delay_range=delay_range,
+            )
+            self.projected_gravity.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
+                bias_range=0.035,
+                filter_alpha_range=(0.0, 0.6),
+                hold_prob_range=(0.0, 0.1),
+                delay_range=delay_range,
+            )
+            self.joint_pos.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.03, n_max=0.03),
+                bias_range=0.01,
+                filter_alpha_range=(0.0, 0.4),
+                hold_prob_range=(0.0, 0.1),
+                delay_range=delay_range,
+            )
+            self.joint_vel.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-1.5, n_max=1.5),
+                bias_range=0.2,
+                filter_alpha_range=(0.0, 0.6),
+                hold_prob_range=(0.0, 0.1),
+            )
+        elif _USE_SENSOR_DELAY:
+            # 遅延のみ有効: 白色ノイズは従来の Unoise と同値を内包し、
+            # バイアス/EMA/ホールドは全て無効 (= dual_first + 遅延 のみの差分)。
+            self.base_ang_vel.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
+                delay_range=delay_range,
+            )
+            self.projected_gravity.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
+                delay_range=delay_range,
+            )
+            self.joint_pos.noise = SensorArtifactNoiseCfg(
+                noise_cfg=Unoise(n_min=-0.03, n_max=0.03),
+                delay_range=delay_range,
+            )
 
 
 @configclass
