@@ -55,6 +55,16 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
 )
 
 
+# センサアーティファクト (バイアス/EMA/ホールド) のランダム化スイッチ。
+# 実機 dual_first の後退転倒対策として導入したが、これを入れた頑健化 finetune
+# (2500it) では転倒が改善しなかった (2026-08-04)。原因は別 (深い履歴の内容が
+# CNN の暗黙状態推定を狂わせている疑い、obs_log 解析で調査中) の可能性が高く、
+# 推測ベースのノイズは run 比較の交絡源になるためデフォルト無効にする。
+# analyze_real_obs.py で実機とシミュの分布差が特定できたら、実測に合わせた
+# 範囲に調整して再有効化すること。
+_USE_SENSOR_ARTIFACT_NOISE: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Observations (履歴バッファ構成)
 # ---------------------------------------------------------------------------
@@ -83,9 +93,10 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
     ノイズは ObservationManager が履歴 push 前に適用するため、各ステップの
     ノイズは 1 度だけ引かれて履歴に固定される。
 
-    センサ由来の項 (gyro / gravity / joint_pos / joint_vel) には白色ノイズに加えて
-    SensorArtifactNoiseCfg (定数バイアス + EMA フィルタ + フレームホールド) を適用し、
-    実機で観測される「履歴の質の劣化」に頑健にする (mdp/obs_noise_models.py 参照)。
+    _USE_SENSOR_ARTIFACT_NOISE が有効な場合のみ、センサ由来の項 (gyro / gravity /
+    joint_pos / joint_vel) には白色ノイズに加えて SensorArtifactNoiseCfg (定数
+    バイアス + EMA フィルタ + フレームホールド) を適用し、実機で観測される
+    「履歴の質の劣化」に頑健にする (mdp/obs_noise_models.py 参照)。
     actions / gait_phase はデプロイ側でも内部生成の正確な値なので白色ノイズのみ・
     アーティファクトなしのまま。
     """
@@ -96,6 +107,10 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
         # グループレベルの履歴設定は全項に適用される
         self.history_length = HISTORY_LENGTH
         self.flatten_history_dim = True
+
+        if not _USE_SENSOR_ARTIFACT_NOISE:
+            # デフォルト: 親 (K1PolicyCfg) の白色ノイズのみ = dual_first と同条件
+            return
 
         # 実機センサのアーティファクトのランダム化。白色ノイズ幅は従来の
         # K1PolicyCfg の Unoise と同値を内包させる。
