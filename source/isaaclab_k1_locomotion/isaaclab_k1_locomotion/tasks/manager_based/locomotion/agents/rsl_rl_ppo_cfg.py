@@ -130,6 +130,20 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
 
 
 @configclass
+class K1FlatPosturePPORunnerCfg(K1FlatPPORunnerCfg):
+    """上体の傾き・上下動抑制の仕上げ学習 (Isaac-Velocity-Flat-Posture) 用。
+
+    K1FlatPPORunnerCfg との違いはイテレーション数のみ。仕上げ resume は
+    m04 レシピ (+2500it) を既定とし、引数なしで 2 万イテレーション回って
+    しまう事故を防ぐ。必要なら --max_iterations で上書きできる。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 2500
+
+
+@configclass
 class K1GetupPPORunnerCfg(K1RoughPPORunnerCfg):
     """起き上がり (get-up) 用の PPO 設定。
 
