@@ -13,9 +13,12 @@ from isaaclab.utils import configclass
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains import TerrainGeneratorCfg
 
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
+
 from .rough_env_cfg import K1RoughEnvCfg, K1PolicyCfg, K1CriticCfg, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
 from .history_layout import HISTORY_LENGTH
+from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset
@@ -79,6 +82,12 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
 
     ノイズは ObservationManager が履歴 push 前に適用するため、各ステップの
     ノイズは 1 度だけ引かれて履歴に固定される。
+
+    センサ由来の項 (gyro / gravity / joint_pos / joint_vel) には白色ノイズに加えて
+    SensorArtifactNoiseCfg (定数バイアス + EMA フィルタ + フレームホールド) を適用し、
+    実機で観測される「履歴の質の劣化」に頑健にする (mdp/obs_noise_models.py 参照)。
+    actions / gait_phase はデプロイ側でも内部生成の正確な値なので白色ノイズのみ・
+    アーティファクトなしのまま。
     """
 
     def __post_init__(self):
@@ -87,6 +96,36 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
         # グループレベルの履歴設定は全項に適用される
         self.history_length = HISTORY_LENGTH
         self.flatten_history_dim = True
+
+        # 実機センサのアーティファクトのランダム化。白色ノイズ幅は従来の
+        # K1PolicyCfg の Unoise と同値を内包させる。
+        # - bias_range: 取付誤差・推定器バイアス相当 (gravity ±0.035 ≒ ±2°)
+        # - filter_alpha_range: 内蔵 LPF + デプロイ側移動平均相当 (α=0.6 ≒ 5Hz@50Hz)
+        # - hold_prob_range: 受信タイミングずれによる重複フレーム相当 (最大 10%)
+        self.base_ang_vel.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.2, n_max=0.2),
+            bias_range=0.05,
+            filter_alpha_range=(0.0, 0.6),
+            hold_prob_range=(0.0, 0.1),
+        )
+        self.projected_gravity.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
+            bias_range=0.035,
+            filter_alpha_range=(0.0, 0.6),
+            hold_prob_range=(0.0, 0.1),
+        )
+        self.joint_pos.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.03, n_max=0.03),
+            bias_range=0.01,
+            filter_alpha_range=(0.0, 0.4),
+            hold_prob_range=(0.0, 0.1),
+        )
+        self.joint_vel.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-1.5, n_max=1.5),
+            bias_range=0.2,
+            filter_alpha_range=(0.0, 0.6),
+            hold_prob_range=(0.0, 0.1),
+        )
 
 
 @configclass
