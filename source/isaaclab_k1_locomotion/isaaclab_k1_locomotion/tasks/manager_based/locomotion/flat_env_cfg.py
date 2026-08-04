@@ -21,7 +21,7 @@ from .history_layout import HISTORY_LENGTH
 from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
-from .mdp.events import randomize_phase_freq_offset
+from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
 from .mdp.commands import ExtremeVelocityCommandCfg
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2, base_ang_acc_l2
 from .mdp.curriculums import (
@@ -273,6 +273,42 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # 地面との摩擦ランダム化を広げる (2026-08-04): (0.4-0.8 / 0.2-0.6) → 0.3〜1.5。
+        # 地形マテリアルは摩擦 1.0 × multiply 結合なので、足側マテリアルの値が
+        # そのまま実効摩擦になる。make_consistent=True で dynamic ≤ static を保証。
+        self.events.physics_material.params["static_friction_range"] = (0.3, 1.5)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.3, 1.5)
+        self.events.physics_material.params["make_consistent"] = True
+
+        # --- リンク物性ランダム化 (2026-08-04) ---
+        # 各リンクの質量を 0.5〜1.5 倍でランダム化 (startup で env 毎に1度)。
+        # recompute_inertia=True で慣性も質量比に追従 (default × 質量比)。
+        # NOTE: 標準の randomize_rigid_body_mass は default 値基準で書き直すため、
+        #       Trunk だけの add_base_mass (±1.5kg) はこの全リンクスケールに上書きされて
+        #       意味を失う。×0.5〜1.5 は ±1.5kg より広い DR なので add_base_mass は無効化。
+        self.events.add_base_mass = None
+        self.events.randomize_link_mass = EventTerm(
+            func=mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "mass_distribution_params": (0.5, 1.5),
+                "operation": "scale",
+                "distribution": "uniform",
+                "recompute_inertia": True,
+            },
+        )
+        # 各リンクの慣性を質量とは独立に 0.7〜1.3 倍でランダム化 (自作イベント)。
+        # 上の mass ランダム化の後に実行され合成される (最終慣性 = default × 質量比 × 本倍率)。
+        self.events.randomize_link_inertia = EventTerm(
+            func=randomize_rigid_body_inertia,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "inertia_distribution_params": (0.7, 1.3),
+            },
+        )
 
         # 環境毎に歩行周波数オフセットを ±0.05 Hz の範囲でランダム化 (startup で1度だけ)。
         # 基本周波数はコマンド速度に応じて線形遷移し (rough_env_cfg._PHASE_FREQ_PARAMS 参照)、

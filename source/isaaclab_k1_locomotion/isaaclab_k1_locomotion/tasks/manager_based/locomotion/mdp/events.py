@@ -143,6 +143,41 @@ def get_gait_phase(
     return phase
 
 
+def randomize_rigid_body_inertia(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    inertia_distribution_params: tuple[float, float] = (0.7, 1.3),
+):
+    """各リンクの慣性テンソルをリンク毎の一様乱数倍でスケールする (startup 専用)。
+
+    IsaacLab 標準には質量と独立な慣性ランダム化がないため自作。
+    「現在の」慣性値に倍率を掛けるので、``randomize_rigid_body_mass``
+    (recompute_inertia=True: 慣性 = default × 質量比) の **後** に実行すれば
+    質量ランダム化と合成される (最終慣性 = default × 質量比 × 本倍率)。
+    テンソル全成分に同一スカラを掛けるため正定値性は保たれる。
+
+    Note:
+        現在値に累積で掛かるため mode="startup" (1回のみ) でしか使わないこと。
+        reset モードで使うと呼ばれる度に縮小/拡大が複利で効いてしまう。
+    """
+    asset = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+    else:
+        env_ids = env_ids.cpu()
+    if asset_cfg.body_ids == slice(None):
+        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
+    else:
+        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
+
+    inertias = asset.root_physx_view.get_inertias()  # (E, B, 9), CPU
+    lo, hi = float(inertia_distribution_params[0]), float(inertia_distribution_params[1])
+    ratios = torch.empty((env_ids.numel(), body_ids.numel(), 1)).uniform_(lo, hi)
+    inertias[env_ids[:, None], body_ids] = inertias[env_ids[:, None], body_ids] * ratios
+    asset.root_physx_view.set_inertias(inertias, env_ids)
+
+
 def reset_prev_high_action(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor | None,
@@ -229,6 +264,7 @@ __all__ = [
     "randomize_phase_freq_offset",
     "compute_cmd_phase_freq",
     "get_gait_phase",
+    "randomize_rigid_body_inertia",
     "reset_prev_high_action",
     "reset_root_state_prone_supine",
 ]
