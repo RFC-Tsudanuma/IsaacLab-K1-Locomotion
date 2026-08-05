@@ -45,12 +45,12 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
     curriculum=False,
     sub_terrains={
         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.9,
+            proportion=0.7,
             noise_range=(0.01, 0.04),
             noise_step=0.01,
             border_width=0.25,
         ),
-        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.1),
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.3),
     },
 )
 
@@ -309,8 +309,8 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # 地面との摩擦ランダム化を広げる (2026-08-04): (0.4-0.8 / 0.2-0.6) → 0.3〜1.5。
         # 地形マテリアルは摩擦 1.0 × multiply 結合なので、足側マテリアルの値が
         # そのまま実効摩擦になる。make_consistent=True で dynamic ≤ static を保証。
-        self.events.physics_material.params["static_friction_range"] = (0.3, 1.5)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.3, 1.5)
+        self.events.physics_material.params["static_friction_range"] = (0.3, 1.0)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.3, 1.0)
         self.events.physics_material.params["make_consistent"] = True
 
         # --- リンク物性ランダム化 (2026-08-04) ---
@@ -325,7 +325,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-                "mass_distribution_params": (0.5, 1.5),
+                "mass_distribution_params": (0.9, 1.1),
                 "operation": "scale",
                 "distribution": "uniform",
                 "recompute_inertia": True,
@@ -338,7 +338,7 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
             mode="startup",
             params={
                 "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
-                "inertia_distribution_params": (0.7, 1.3),
+                "inertia_distribution_params": (0.9, 1.1),
             },
         )
 
@@ -357,9 +357,9 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
         # 軽い凹凸のみの地面 (段差・坂道なし)
-        # self.scene.terrain.terrain_type = "generator"
-        # self.scene.terrain.terrain_generator = NOISY_FLAT_TERRAIN_CFG
-        # self.scene.terrain.max_init_terrain_level = None
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = NOISY_FLAT_TERRAIN_CFG
+        self.scene.terrain.max_init_terrain_level = None
         # No height scan
         self.scene.height_scanner = None
         self.observations.policy.height_scan = None
