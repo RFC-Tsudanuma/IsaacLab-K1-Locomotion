@@ -8,19 +8,22 @@
 K1FlatEnvCfg では観測を 3 グループに分ける:
 
 * ``command``: 最新の歩行コマンドのみ (履歴なし, 3 次元)。
-* ``policy``:  Actor 用観測からコマンドを除いた項を ``HISTORY_LENGTH`` ステップ分
+* ``policy``:  Actor 用観測 (コマンド込み, 2026-08-05〜) を ``HISTORY_LENGTH`` ステップ分
   バッファしたもの (ノイズあり)。ノイズは各ステップで 1 度だけ掛かり、そのまま
   履歴に固定される (IsaacLab の ObservationManager がノイズ適用後に CircularBuffer
   へ push するため)。
-* ``critic``:  Critic 用観測 (特権情報込み・ノイズなし) からコマンドを除いた項の
-  同様の履歴。
+* ``critic``:  Critic 用観測 (特権情報込み・ノイズなし・コマンド込み) の同様の履歴。
+
+NOTE (2026-08-05): 以前は履歴グループからコマンドを除いていたが、
+「4 ステップ MLP 履歴にも 100 ステップ CNN 履歴にもコマンド系列を含める」
+仕様に変更した。command グループ (最新値の直接入力) はそのまま残している。
 
 各グループの flatten 後のレイアウトは「項ごとに (履歴長 × 項次元) のブロック」が
 項の定義順に並ぶ。各ブロック内は 古い → 新しい の順 (CircularBuffer.buffer 準拠)。
 
-このモジュールの項リストは flat_env_cfg の K1PolicyCfg / K1CriticCfg (から
-velocity_commands を除いたもの) と正確に一致させること。HistoryActorCritic と
-mdp/symmetry.py の両方がこのレイアウトを参照する。
+このモジュールの項リストは flat_env_cfg の K1PolicyCfg / K1CriticCfg の
+項定義順と正確に一致させること。HistoryActorCritic と mdp/symmetry.py と
+history_policy_exporter の全てがこのレイアウトを参照する。
 """
 
 # 履歴バッファの長さ (ステップ数)
@@ -37,6 +40,7 @@ COMMAND_DIM = 3
 POLICY_TERM_SPECS = (
     ("base_ang_vel", 3, "ang_vel"),
     ("projected_gravity", 3, "gravity"),
+    ("velocity_commands", 3, "vel_cmd"),
     ("joint_pos", 12, "joint"),
     ("joint_vel", 12, "joint"),
     ("actions", 12, "joint"),

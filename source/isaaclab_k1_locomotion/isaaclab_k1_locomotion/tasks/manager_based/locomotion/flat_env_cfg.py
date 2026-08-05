@@ -76,7 +76,7 @@ _SENSOR_DELAY_RANGE: tuple[float, float] = (0.0, 0.020)
 # ---------------------------------------------------------------------------
 # Observations (履歴バッファ構成)
 # ---------------------------------------------------------------------------
-# 観測を「最新コマンド」と「コマンドを除いた観測の履歴」に分離する。
+# 観測を「最新コマンド」と「観測 (コマンド込み) の履歴」の 3 グループで構成する。
 # HistoryActorCritic (agents/history_actor_critic.py) が MLP 入力として
 # command + 履歴の直近 MLP_HISTORY_STEPS ステップ分を取り出す。
 # レイアウト定義は history_layout.py に集約しており、項の追加・削除時は
@@ -96,7 +96,11 @@ class K1FlatCommandCfg(ObsGroup):
 
 @configclass
 class K1FlatPolicyHistoryCfg(K1PolicyCfg):
-    """Actor 用: コマンドを除いた観測 (ノイズあり) を HISTORY_LENGTH ステップ分バッファする。
+    """Actor 用: 観測 (コマンド込み・ノイズあり) を HISTORY_LENGTH ステップ分バッファする。
+
+    2026-08-05: 履歴グループにも velocity_commands を含める仕様に変更
+    (4 ステップ MLP 履歴・100 ステップ CNN 履歴の両方にコマンド系列が入る)。
+    command グループ (最新値の直接入力) は従来どおり併存する。
 
     ノイズは ObservationManager が履歴 push 前に適用するため、各ステップの
     ノイズは 1 度だけ引かれて履歴に固定される。
@@ -116,7 +120,6 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
 
     def __post_init__(self):
         super().__post_init__()
-        self.velocity_commands = None
         # グループレベルの履歴設定は全項に適用される
         self.history_length = HISTORY_LENGTH
         self.flatten_history_dim = True
@@ -177,11 +180,10 @@ class K1FlatPolicyHistoryCfg(K1PolicyCfg):
 
 @configclass
 class K1FlatCriticHistoryCfg(K1CriticCfg):
-    """Critic 用: コマンドを除いた観測 (ノイズなし・特権情報込み) の履歴。"""
+    """Critic 用: 観測 (コマンド込み・ノイズなし・特権情報込み) の履歴。"""
 
     def __post_init__(self):
         super().__post_init__()
-        self.velocity_commands = None
         self.history_length = HISTORY_LENGTH
         self.flatten_history_dim = True
 
