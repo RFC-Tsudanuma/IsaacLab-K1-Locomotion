@@ -5,6 +5,14 @@
 
 """Script to train RL agent with RSL-RL."""
 
+import os
+
+# PyTorch CUDA アロケータの断片化対策 (2026-08-05)。履歴観測 (100step × 49/81ch) の
+# 巨大ロールアウトストレージでメモリが逼迫した際、断片化による「合計は空いているのに
+# 連続領域不足で OOM」を防ぐ。計算・精度・乱数には一切影響しない (アロケータのみ)。
+# 既にユーザーが環境変数を設定している場合はそちらを優先する。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 """Launch Isaac Sim Simulator first."""
 
 import argparse
