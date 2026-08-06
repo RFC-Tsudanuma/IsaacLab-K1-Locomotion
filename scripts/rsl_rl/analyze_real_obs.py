@@ -34,68 +34,86 @@ import torch
 # history_layout.py (POLICY_TERM_SPECS / HISTORY_LENGTH / COMMAND_DIM) と一致させること
 HISTORY_LENGTH = 100
 COMMAND_DIM = 3
+# 現行レイアウト (2026-08-05〜): フレームに velocity_commands を含む 49 次元
 POLICY_TERM_SPECS = (
     ("base_ang_vel", 3),
     ("projected_gravity", 3),
+    ("velocity_commands", 3),
     ("joint_pos", 12),
     ("joint_vel", 12),
     ("last_action", 12),
     ("gait_phase", 4),
 )
-FRAME_DIM = sum(d for _, d in POLICY_TERM_SPECS)  # 46
+# 旧レイアウト (dual_first 等): コマンド無しの 46 次元フレーム
+LEGACY_TERM_SPECS = tuple(
+    (name, dim) for name, dim in POLICY_TERM_SPECS if name != "velocity_commands"
+)
 NORMALIZER_EPS = 1e-2  # rsl_rl EmpiricalNormalization.eps と同値
 
-# フレーム内チャネル名 (f0..f45 に対応)
-CHANNEL_NAMES: list[str] = []
-for _name, _dim in POLICY_TERM_SPECS:
-    for _i in range(_dim):
-        CHANNEL_NAMES.append(f"{_name}[{_i}]")
+
+def frame_dim(specs) -> int:
+    return sum(d for _, d in specs)
 
 
-def load_csv(path: str):
+def channel_names(specs) -> list[str]:
+    return [f"{name}[{i}]" for name, dim in specs for i in range(dim)]
+
+
+def load_csv(path: str, specs):
     data = np.genfromtxt(path, delimiter=",", names=True)
     n_cols = len(data.dtype.names)
-    expected = 2 + 3 + FRAME_DIM + 12
+    fdim = frame_dim(specs)
+    expected = 2 + 3 + fdim + 12
     if n_cols != expected:
-        raise ValueError(f"{path}: 列数 {n_cols} が想定 {expected} と違います")
+        raise ValueError(
+            f"{path}: 列数 {n_cols} が想定 {expected} と違います "
+            f"(checkpoint 由来のフレーム次元 {fdim} と CSV のレイアウトが不一致?)"
+        )
     rows = np.stack([data[name] for name in data.dtype.names], axis=1)
     return {
         "step": rows[:, 0].astype(int),
         "event": rows[:, 1].astype(int),
         "cmd": rows[:, 2:5],
-        "frame": rows[:, 5 : 5 + FRAME_DIM],
-        "action": rows[:, 5 + FRAME_DIM :],
+        "frame": rows[:, 5 : 5 + fdim],
+        "action": rows[:, 5 + fdim :],
     }
 
 
 def load_normalizer_stats(checkpoint_path: str):
     """checkpoint から actor 正規化器の「現在フレーム相当スロット」の mean/std を返す。
 
-    actor 正規化器は [command(3), 項ごとの (H×dim) 履歴ブロック] の 4603 次元。
-    各項の最新スロット (t=H-1) の統計をフレームチャネル順 (46) に並べ替え、
-    command 3 次元の統計と合わせて返す。
+    actor 正規化器は [command(3), 項ごとの (H×dim) 履歴ブロック] の
+    4903 次元 (現行 49 次元フレーム) または 4603 次元 (旧 46 次元フレーム)。
+    次元からレイアウトを自動判別し、各項の最新スロット (t=H-1) の統計を
+    フレームチャネル順に並べ替え、command 3 次元の統計と使用レイアウトを返す。
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model_state_dict", ckpt)
     mean = sd["actor_obs_normalizer._mean"].numpy().reshape(-1)
     std = sd["actor_obs_normalizer._std"].numpy().reshape(-1)
-    expected = COMMAND_DIM + FRAME_DIM * HISTORY_LENGTH
-    if mean.shape[0] != expected:
+    by_dim = {
+        COMMAND_DIM + frame_dim(specs) * HISTORY_LENGTH: specs
+        for specs in (POLICY_TERM_SPECS, LEGACY_TERM_SPECS)
+    }
+    specs = by_dim.get(mean.shape[0])
+    if specs is None:
         raise ValueError(
-            f"正規化器の次元 {mean.shape[0]} が想定 {expected} と違います (モデル構成が異なる?)"
+            f"正規化器の次元 {mean.shape[0]} が想定 {sorted(by_dim)} のどれとも"
+            " 違います (モデル構成が異なる?)"
         )
+    fdim = frame_dim(specs)
     cmd_mean, cmd_std = mean[:COMMAND_DIM], std[:COMMAND_DIM]
-    frame_mean = np.zeros(FRAME_DIM)
-    frame_std = np.zeros(FRAME_DIM)
+    frame_mean = np.zeros(fdim)
+    frame_std = np.zeros(fdim)
     offset = COMMAND_DIM
     ch = 0
-    for _name, dim in POLICY_TERM_SPECS:
+    for _name, dim in specs:
         latest = offset + (HISTORY_LENGTH - 1) * dim
         frame_mean[ch : ch + dim] = mean[latest : latest + dim]
         frame_std[ch : ch + dim] = std[latest : latest + dim]
         offset += HISTORY_LENGTH * dim
         ch += dim
-    return (cmd_mean, cmd_std), (frame_mean, frame_std)
+    return (cmd_mean, cmd_std), (frame_mean, frame_std), specs
 
 
 def zscore_stats(frames: np.ndarray, frame_mean, frame_std):
@@ -107,7 +125,8 @@ def zscore_stats(frames: np.ndarray, frame_mean, frame_std):
     }
 
 
-def print_report(tag: str, log, stats, ref_stats=None):
+def print_report(tag: str, log, stats, specs, ref_stats=None):
+    names = channel_names(specs)
     n = len(log["event"])
     normal = log["event"] == 0
     print(f"\n===== {tag} =====")
@@ -128,12 +147,12 @@ def print_report(tag: str, log, stats, ref_stats=None):
         header += f" {'ref mean|z|':>11s}"
     print(header)
     ch = 0
-    for name, dim in POLICY_TERM_SPECS:
+    for name, dim in specs:
         sl = slice(ch, ch + dim)
         mz = stats["mean_abs_z"][sl]
         worst = int(np.argmax(mz))
         line = (f"{name:22s} {mz.mean():8.3f} {stats['p99_abs_z'][sl].max():8.3f}"
-                f" {CHANNEL_NAMES[ch + worst]:>20s}={mz[worst]:.3f}")
+                f" {names[ch + worst]:>20s}={mz[worst]:.3f}")
         if ref_stats is not None:
             line += f" {ref_stats['mean_abs_z'][sl].mean():11.3f}"
         print(line)
@@ -143,7 +162,7 @@ def print_report(tag: str, log, stats, ref_stats=None):
     order = np.argsort(-stats["mean_abs_z"])
     print(f"\n--- ワーストチャネル (mean|z| 上位 12) ---")
     for i in order[:12]:
-        line = (f"{CHANNEL_NAMES[i]:24s} mean_z={stats['mean_z'][i]:+7.3f}"
+        line = (f"{names[i]:24s} mean_z={stats['mean_z'][i]:+7.3f}"
                 f"  mean|z|={stats['mean_abs_z'][i]:6.3f}  p99|z|={stats['p99_abs_z'][i]:6.3f}")
         if ref_stats is not None:
             line += f"  (ref mean|z|={ref_stats['mean_abs_z'][i]:.3f})"
@@ -155,7 +174,7 @@ def replay_onnx(onnx_path: str, log):
     import onnxruntime as ort
 
     sess = ort.InferenceSession(onnx_path, providers=["CPUExecutionProvider"])
-    hist = np.zeros((HISTORY_LENGTH, FRAME_DIM), dtype=np.float32)
+    hist = np.zeros((HISTORY_LENGTH, log["frame"].shape[1]), dtype=np.float32)
     primed = False
     max_diff = 0.0
     diffs = []
@@ -196,18 +215,22 @@ def main():
     ap.add_argument("--onnx", default=None, help="エクスポート済み policy.onnx (リプレイ検証)")
     args = ap.parse_args()
 
-    (cmd_mean, cmd_std), (frame_mean, frame_std) = load_normalizer_stats(args.checkpoint)
+    (cmd_mean, cmd_std), (frame_mean, frame_std), specs = load_normalizer_stats(
+        args.checkpoint
+    )
+    print(f"frame layout: {frame_dim(specs)} dims "
+          f"({'velocity_commands 込み' if specs is POLICY_TERM_SPECS else '旧コマンド無し'})")
 
-    log = load_csv(args.csv)
+    log = load_csv(args.csv, specs)
     stats = zscore_stats(log["frame"][log["event"] == 0], frame_mean, frame_std)
 
     ref_stats = None
     if args.ref_csv:
-        ref_log = load_csv(args.ref_csv)
+        ref_log = load_csv(args.ref_csv, specs)
         ref_stats = zscore_stats(ref_log["frame"][ref_log["event"] == 0], frame_mean, frame_std)
-        print_report(f"REF: {args.ref_csv}", ref_log, ref_stats)
+        print_report(f"REF: {args.ref_csv}", ref_log, ref_stats, specs)
 
-    print_report(f"TARGET: {args.csv}", log, stats, ref_stats)
+    print_report(f"TARGET: {args.csv}", log, stats, specs, ref_stats)
 
     if args.onnx:
         replay_onnx(args.onnx, log)
