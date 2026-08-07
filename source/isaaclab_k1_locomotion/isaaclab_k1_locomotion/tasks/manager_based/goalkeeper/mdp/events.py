@@ -340,7 +340,15 @@ def sync_task_command(
     buf = getattr(cmd_term, "vel_command_b", None)
     if buf is None:
         return
-    drive = task_drive_vector(env, use_perceived=False)
+    # ★ 推定値を使うこと (2026-08-03)。ここは feet_phase / foot_clearance の停止判定に
+    #   使われる。真値にすると「ポリシーが観測できない情報で足上げ報酬が ON/OFF する」
+    #   状態になり、ポリシーは報酬が付くかを予測できなくなる。実測で 28% 食い違い、
+    #   足上げの期待値が下がって foot_clearance が 0.70 → 0.25 に落ちた。
+    #   自己位置のバイアスは設計上エピソード内で一定なので、真値のままだとロボットが
+    #   正しく定位置へ行くほど食い違いが恒久化する (平均回帰では解消できない)。
+    #   このスイッチは実機に存在しない学習時だけのものなので、推定値にしても
+    #   sim-to-real のリアルさは損なわれない。観測側の誤差はそのまま。
+    drive = task_drive_vector(env, use_perceived=True)
     buf[:, :2] = drive[:, :2]
     # ★ 向き成分は 0 にする。feet_phase / foot_clearance の停止判定は
     buf[:, 2] = 0.0

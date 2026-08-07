@@ -96,6 +96,7 @@ def _gk_loc_buffers(env: "ManagerBasedRLEnv") -> None:
       * ランドマークが見えない間の odometry ドリフト
       * パーティクル群の再収束による**不連続な跳び** (平滑化が意図的に OFF で、
         1 フレームあたり最大 0.5 m / 0.5 rad まで動く)
+      * そして跳んだりドリフトしたりした誤差が、ランドマークを見た時点で**戻る**
     という誤差を出す。跳びは学習中に一度も経験しないと実機で未知入力になるので、
     ここでモデル化する。
     """
@@ -117,8 +118,9 @@ def _gk_loc_tick(env: "ManagerBasedRLEnv") -> None:
     env._gk_loc_step = step
 
     p = env.cfg.goalkeeper
+    dt = float(env.step_dt)
     err = env._gk_loc_err
-    err += env._gk_loc_drift * float(env.step_dt)
+    err += env._gk_loc_drift * dt
 
     jump = torch.rand(env.num_envs, device=env.device) < env._gk_loc_jump_p
     if bool(jump.any()):
@@ -129,7 +131,16 @@ def _gk_loc_tick(env: "ManagerBasedRLEnv") -> None:
         delta[:, 2] *= jyaw
         err = torch.where(jump.unsqueeze(-1), err + delta, err)
 
-    # MCL は最終的に再収束するので誤差は発散しない。上限でクランプして表現する。
+    # ★ 再収束 (2026-08-03)。MCL はランドマークが視野に入った時点で誤差が**戻る**。
+    #   これが無いとドリフトと跳びで誤差が上限に張り付いたままになり、ロボットが
+    #   「自分は 0.8m ずれている」と信じ込んで歩き続ける。実測で out_of_bounds が
+    #   10 倍 (0.004 → 0.040) になったのはこれが原因。誤差のピーク値は変えず、
+    #   「張り付いたまま」を「一時的なズレ」にするだけなので DR は弱まらない。
+    tau = float(getattr(p, "loc_recover_tau_s", 5.0))
+    if tau > 0.0:
+        err *= max(0.0, 1.0 - dt / tau)
+
+    # 再収束が追いつかない場合の保険。跳びの直後だけこの上限に触れる。
     max_xy = float(getattr(p, "loc_max_err_m", 0.6))
     max_yaw = float(getattr(p, "loc_max_err_rad", 0.3))
     err[:, :2] = err[:, :2].clamp(-max_xy, max_xy)

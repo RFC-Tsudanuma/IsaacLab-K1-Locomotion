@@ -186,10 +186,16 @@ class GoalkeeperParamsCfg:
     loc_bias_yaw_deg: float = 6.0      # ヨーバイアスの一様サンプル幅 [±deg]
     loc_drift_xy_mps: float = 0.03     # 位置ドリフト速度 [±m/s]
     loc_drift_yaw_dps: float = 1.0     # ヨードリフト速度 [±deg/s]
-    loc_jump_hz_range: tuple = (0.0, 0.5)  # 跳びの発生頻度 [回/秒]
+    # 跳びの頻度。旧値 (0.0, 0.5) は「毎秒 1 回 0.5m 跳ぶ」で MCL の挙動ではなかった。
+    # 再収束イベントはゴール前でランドマークが見える状況なら数秒〜数十秒に 1 回。
+    loc_jump_hz_range: tuple = (0.0, 0.15)  # 跳びの発生頻度 [回/秒]
     loc_jump_m: float = 0.5            # 跳びの大きさ [±m] (MCL の 1 フレーム補正上限)
     loc_jump_rad: float = 0.2          # 跳びの大きさ [±rad] (同上)
-    loc_max_err_m: float = 0.6         # 累積誤差の上限 [±m] (MCL は最終的に再収束する)
+    # ★ 再収束の時定数。ランドマークが視野に入ると誤差が戻る挙動を表す。0 で無効。
+    #   これが無いと誤差が上限に張り付き、ロボットが誤った自己位置を信じ続けて徘徊する。
+    #   定常誤差 ≈ ドリフト速度 × tau = 0.03 × 5 = 0.15m。跳びは数秒で解消される。
+    loc_recover_tau_s: float = 5.0
+    loc_max_err_m: float = 0.6         # 累積誤差の上限 [±m] (跳びの直後だけ触れる保険)
     loc_max_err_rad: float = 0.3       # 累積誤差の上限 [±rad]
 
     # 知覚DR (VirtualPerception + 自己位置誤差) を全部切ってクリーン観測にするフラグ。
