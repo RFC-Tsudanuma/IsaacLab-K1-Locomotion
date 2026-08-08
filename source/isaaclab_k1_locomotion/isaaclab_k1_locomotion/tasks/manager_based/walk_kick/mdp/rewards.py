@@ -207,6 +207,61 @@ def kick_loft(
     return r_dir * f_loft
 
 
+def kick_plant_foot(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    lon_target: float = -0.03,
+    sigma_lon: float = 0.10,
+    lat_target: float = 0.19,
+    sigma_lat: float = 0.06,
+) -> torch.Tensor:
+    """項9. Plant Foot (軸足配置) = r_direction * f(lon) * f(lat)。shape: (N,)
+
+    latch 時に凍結した軸足 (蹴っていない方の足) のボール相対位置を、キック方向フレームで
+    評価する。狙いは **「蹴る瞬間に軸足がボールの真横に来ている」** こと。
+    軸足がボールの後方にあると蹴り足はボールの向こう側の高い位置に当たるため、足裏を
+    低く潜らせられず仰角が出ない (``sole_height_at_kick`` が下がらない)。
+
+    * f(lon) = exp(−(lon − lon_target)² / 2σ_lon²) : 前後。lon は kick_dir 成分で + が前。
+    * f(lat) = exp(−(lat − lat_target)² / 2σ_lat²) : 左右。lat は絶対値なので左右キック両対応。
+
+    パラメータ既定値は K1 の実寸から決めてある (K1_22dof.xml):
+
+    * ``lat_target = 0.19``: 股関節の横オフセットが ±0.096 なので通常スタンス幅が 0.192。
+      軸足を横 0.19 に置くと蹴り足がちょうどキック線上 (横 0) に来る。無理な姿勢を
+      要求しない自然な値。
+    * ``sigma_lat = 0.06``: 下限側は衝突限界で決まる。ボール半径 0.11 + 足箱の半幅 0.035 =
+      **0.145 より内側は軸足がボールに当たる**。0.19±0.06 なら 0.145 で f=0.66、
+      0.12 まで入ると f=0.29 と十分冷たくなる。
+    * ``lon_target = -0.03``: ``body_pos_w`` が返すのは足リンク原点 (= 足首) だが、足箱の
+      中心はそこから前方 +0.026 にある。**足の中心をボール真横に置くには足首を −0.026**。
+      チップ気味に「やや後ろ」へ寄せたければ −0.08 程度まで下げる。
+    * ``sigma_lon = 0.10``: ±0.1 で半値。歩幅の分解能を考えるとこれ以上締めても追従できない。
+
+    設計上の約束 (kick_elevation / kick_loft と同じ):
+
+    * **r_direction への乗算**であること。加算にすると「方向を無視して軸足だけ置く」で
+      報酬が取れてしまう。乗算なら kick_done ゲート・方向精度・胴体の正対を全て通過した
+      蹴りにしか払われない。
+    * **他のキック報酬とは加算で並べる**。``kick_loft`` に掛けてはいけない。学習初期は
+      軸足配置がまず合わないので、掛けると loft の勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。外した配置は「罰される」のではなく「報われない」に留める。
+      負の dense 払いにすると、_r_direction の NOTE と同じ「外したら早く転んで損切り」の
+      抜け道が復活する。
+
+    NOTE: 軸足がボールに接触してしまう解は、この項の σ_lat に加えて
+          :func:`extra_ball_touch` (2 回目以降の接触を罰する) が既に塞いでいる。
+    """
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+
+    f_lon = torch.exp(-((state["plant_lon_frozen"] - lon_target) ** 2) / (2.0 * sigma_lon**2))
+    f_lat = torch.exp(-((state["plant_lat_frozen"] - lat_target) ** 2) / (2.0 * sigma_lat**2))
+    return r_dir * f_lon * f_lat
+
+
 def walk_speed(
     env: ManagerBasedRLEnv,
     r_stance: float,

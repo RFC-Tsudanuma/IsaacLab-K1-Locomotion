@@ -134,6 +134,10 @@ def kick_state(
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
             "sole_height_last_touch": torch.zeros(env.num_envs, device=device),
             "sole_height_at_kick": torch.zeros(env.num_envs, device=device),
+            # 軸足 (蹴っていない方の足) のボール相対位置。値 latch で凍結する。
+            # plant_lon: キック方向成分 (+ = ボールより前)。plant_lat: 横方向の **絶対値**。
+            "plant_lon_frozen": torch.zeros(env.num_envs, device=device),
+            "plant_lat_frozen": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -176,6 +180,8 @@ def kick_state(
         state["touch_refractory"][just_reset] = 0
         state["sole_height_last_touch"][just_reset] = 0.0
         state["sole_height_at_kick"][just_reset] = 0.0
+        state["plant_lon_frozen"][just_reset] = 0.0
+        state["plant_lat_frozen"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # init_side の確定: ロボットが |s| > 閾値 までどちらかの側へ寄った時点の符号で確定
@@ -238,6 +244,24 @@ def kick_state(
         touched, sole_z, state["sole_height_last_touch"]
     )
 
+    # ------------------------------------------------------------------ #
+    # 軸足 (蹴っていない方の足) のボール相対位置。値 latch で凍結する。
+    #
+    # 「蹴った足」を d_foot_to_ball の argmin で決めているので、軸足はその反対側。
+    # キック方向フレームで測る:
+    #   plant_lon = (p_sup − ball) · kick_dir   前後 (+ = ボールより前)
+    #   plant_lat = |(p_sup − ball) · right_vec| 左右の **絶対値**
+    #
+    # NOTE: 左右は必ず絶対値で持つこと。符号付きにすると「左足キック (軸足は右)」と
+    #       「右足キック (軸足は左)」の鏡像解のうち片方だけが正解になり、報酬側で
+    #       探索空間を半分潰してしまう。どちらの足で蹴るかはポリシーの自由にしておく。
+    # ------------------------------------------------------------------ #
+    support_foot = 1 - kicking_foot
+    p_sup = foot_pos[torch.arange(env.num_envs, device=device), support_foot, :2]
+    d_sup = p_sup - ball_pos
+    plant_lon = (d_sup * kick_dir).sum(dim=-1)
+    plant_lat = torch.abs((d_sup * right_vec).sum(dim=-1))
+
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
     state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
@@ -276,6 +300,11 @@ def kick_state(
         state["sole_height_at_kick"] = torch.where(
             trigger, state["sole_height_last_touch"], state["sole_height_at_kick"]
         )
+        # 軸足の配置も latch と同時に凍結する。sole_height_at_kick と違って
+        # 「最後の接触時」ではなく **latch したステップの現在値** を採る。軸足は接触の
+        # 瞬間に接地しているので、キック本体のステップの値がそのまま構えを表す。
+        state["plant_lon_frozen"] = torch.where(trigger, plant_lon, state["plant_lon_frozen"])
+        state["plant_lat_frozen"] = torch.where(trigger, plant_lat, state["plant_lat_frozen"])
         state["kick_done"] = state["kick_done"] | trigger
 
     kick_done = state["kick_done"]

@@ -56,7 +56,21 @@ Walk-Loop-Shoot からの変更点
          「ボールが上に飛びさえすればよい」になり、sim の接触モデル固有の解に落ちる。
          緩めるのは可、外すのは不可。
 
-5. **アクチュエータを T-N カーブ付きに差し替える (sim2real 転移の本命)。**
+5. **軸足配置の報酬 (kick_plant_foot) を追加する。**
+   「蹴る瞬間に軸足 (蹴っていない方の足) がボールの真横に来ている」ことを狙う項。
+   軸足がボールの後方に残ったまま蹴ると、蹴り足はボールの **向こう側の高い位置** に
+   当たるため足裏を低く潜らせられず、仰角が出ない。ロブは仰角が全てなので、
+   「どう蹴るか」の中でも軸足の前後位置は特に効くはず、というのが仮説。
+
+   既存のキック報酬とは **加算** で並べる (``kick_loft`` に掛けない)。項の内部は
+   他と同じく ``r_direction`` への乗算で、非負 (外した配置は罰さず「報われない」だけ)。
+   目標値の導出は :func:`~..walk_kick.mdp.rewards.kick_plant_foot` の docstring を参照。
+
+   効いているかは ``Metrics/kick_direction/plant_lon`` (→ −0.03 に寄るか) と
+   ``sole_height_at_kick`` (→ 下がるか) の 2 つで見る。前者が動いたのに後者が動かない
+   なら、軸足位置は仰角の律速ではなかったということなので項を落とす判断ができる。
+
+6. **アクチュエータを T-N カーブ付きに差し替える (sim2real 転移の本命)。**
    素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップするだけで、
    「最高速で回りながら最大トルクを出す」という実機に存在しない動作を許してしまう。
    最大出力のキックはその領域を全力で使いに行くため、sim では飛ぶのに実機では飛ばない、
@@ -85,6 +99,8 @@ Walk-Loop-Shoot からの変更点
     ./scripts/rsl_rl/train_walk_lob.sh
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
 from ..locomotion.actuators import (
@@ -92,7 +108,12 @@ from ..locomotion.actuators import (
     K1_LEG_KNEE_POINT_VELOCITY,
     BoosterDelayedPDActuatorCfg,
 )
-from ..walk_kick.walk_kick_env_cfg import K1WalkKickWalkPhaseEnvCfg
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import (
+    _KICK_STATE_PARAMS,
+    _KICK_W_SCALE,
+    K1WalkKickWalkPhaseEnvCfg,
+)
 from ..walk_loop_shoot.walk_loop_shoot_env_cfg import K1WalkLoopShootEnvCfg
 
 # --------------------------------------------------------------------------- #
@@ -144,6 +165,43 @@ _LOB_PHI_SAT = 1.05
 # 踏みつけ / かすらせ exploit を塞ぐ構造そのもの (モジュール docstring の NOTE 参照)。
 # --------------------------------------------------------------------------- #
 _LOB_SIGMA_DIRECTION = 0.6
+
+# --------------------------------------------------------------------------- #
+# 軸足配置 (kick_plant_foot) の目標値
+#
+# 「蹴る瞬間に軸足がボールの真横に来ている」ことを狙う。軸足がボールの後方に残ったまま
+# 蹴ると、蹴り足はボールの向こう側の **高い位置** に当たるため足裏を低く潜らせられず、
+# 仰角が出ない (sole_height_at_kick が下がらない)。ロブは仰角が全てなので、
+# 「どう蹴るか」の中でも軸足の前後位置は特に効くはず、というのがこの項の仮説。
+#
+# 値は K1 の実寸 (K1_22dof.xml) から決めた。導出は
+# :func:`~..walk_kick.mdp.rewards.kick_plant_foot` の docstring に書いてある。
+#
+#   _PLANT_LAT_TARGET = 0.19 : 股関節の横オフセット ±0.096 = 通常スタンス幅 0.192。
+#       軸足を横 0.19 に置くと蹴り足がちょうどキック線上 (横 0) に来る。
+#   _PLANT_SIGMA_LAT  = 0.06 : 下限は衝突限界。ボール半径 0.11 + 足箱の半幅 0.035 =
+#       0.145 より内側は軸足がボールに当たる。
+#   _PLANT_LON_TARGET = -0.03: body_pos_w は足リンク原点 (足首) を返すが足箱の中心は
+#       前方 +0.026。足の **中心** をボール真横に置くには足首を −0.026。
+#   _PLANT_SIGMA_LON  = 0.10 : ±0.1 で半値。歩幅の分解能的にこれ以上は締めない。
+#
+# NOTE: まず学習を回す前に Metrics/kick_direction/plant_lon を見て **現状の軸足位置**を
+#       確認すること。現状が −0.25 のように大きく後方なら、いきなり −0.03 を狙わせるより
+#       カリキュラムで目標を動かす方が素直（今は固定目標で入れてある）。
+# --------------------------------------------------------------------------- #
+_PLANT_LON_TARGET = -0.03
+_PLANT_SIGMA_LON = 0.10
+_PLANT_LAT_TARGET = 0.19
+_PLANT_SIGMA_LAT = 0.06
+
+# --------------------------------------------------------------------------- #
+# kick_plant_foot の最終重み (× _KICK_W_SCALE)
+#
+# 2.0 は direction (6.0) / loft (5.0) / elevation (5.0) より明確に下。この項は目的
+# そのものではなく **「蹴り方」の指定** なので、大きくすると高さより構えの最適化に
+# 学習が引っ張られる。kick_rate と kick_apex_height を見ながら上げること。
+# --------------------------------------------------------------------------- #
+_PLANT_FOOT_WEIGHT = 2.0
 
 
 def _apply_tn_curve_actuators(cfg) -> None:
@@ -245,7 +303,40 @@ class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
         #       になっており、ここには存在しない。これで有効なキック報酬は
         #       kick_direction / kick_loft / kick_elevation の 3 本 (+ ball 追従系)。
 
-        # -- 5. アクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える
+        # -- 5. 軸足配置 (kick_plant_foot) を追加
+        #
+        # 「蹴る瞬間に軸足がボールの真横」を狙う項。既存項とは **加算** で並べる
+        # (kick_loft に掛けてはいけない。学習初期は軸足がまず合わないので loft の勾配が
+        #  ゼロ付近で死ぬ)。項自体は r_direction への乗算なので、方向ゲート・kick_done
+        # ゲート・胴体の正対を通過した蹴りにしか払われない。
+        #
+        # sigma_direction は他の 3 項と必ず揃えること (_LOB_SIGMA_DIRECTION)。
+        # 項ごとに違うと方位を外したときの損得が食い違って何を最適化しているのか読めなくなる。
+        self.rewards.kick_plant_foot = RewTerm(
+            func=mdp.kick_plant_foot,
+            weight=0.0,
+            params={
+                **_KICK_STATE_PARAMS,
+                "sigma_direction": _LOB_SIGMA_DIRECTION,
+                "lon_target": _PLANT_LON_TARGET,
+                "sigma_lon": _PLANT_SIGMA_LON,
+                "lat_target": _PLANT_LAT_TARGET,
+                "sigma_lat": _PLANT_SIGMA_LAT,
+            },
+        )
+        self.curriculum.kick_plant_foot_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "kick_plant_foot",
+                "start_weight": 0.0,
+                "end_weight": _PLANT_FOOT_WEIGHT * _KICK_W_SCALE,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
+
+        # -- 6. アクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える
         _apply_tn_curve_actuators(self)
 
 

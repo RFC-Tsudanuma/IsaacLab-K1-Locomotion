@@ -43,6 +43,12 @@ class KickDirectionCommand(UniformVelocityCommand):
       射出仰角を決めている量なので、``kick_elevation_deg`` が出ない原因の切り分けは
       ここを見る。R=0.11 のとき 0.019 で 30°、0.036 で 20°、0.055 で 10°、0.074 で 0°。
       「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
+    * ``plant_lon`` / ``plant_lat``: 蹴った瞬間の軸足 (蹴っていない方の足) の配置 [m]。
+      キック方向フレームでボール中心から測った前後 (+ = ボールより前) と左右 (絶対値)。
+      「軸足がボールの真横」= plant_lon ≈ −0.03 (足首基準)、plant_lat ≈ 0.19。
+      軸足がボール後方に残っていると蹴り足が高い位置に当たるので、
+      ``sole_height_at_kick`` が下がらない原因の切り分けに使う。
+      これも「キックが成立した env」だけで平均している。
 
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
@@ -71,6 +77,9 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["ball_touch_count"] = torch.zeros(self.num_envs, device=self.device)
         # latch を起こした接触 (= キック本体) の瞬間の足裏高さ [m]。仰角を決める量。
         self.metrics["sole_height_at_kick"] = torch.zeros(self.num_envs, device=self.device)
+        # 蹴った瞬間の軸足の配置 (キック方向フレーム、ボール中心基準) [m]。
+        self.metrics["plant_lon"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["plant_lat"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -96,6 +105,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["ball_touch_count"] = state["touch_count"]
         # キックが成立した env だけで平均する (未キックを 0 として混ぜると誤読する)。
         self.metrics["sole_height_at_kick"] = state["sole_height_at_kick"] * kick_done
+        self.metrics["plant_lon"] = state["plant_lon_frozen"] * kick_done
+        self.metrics["plant_lat"] = state["plant_lat_frozen"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
