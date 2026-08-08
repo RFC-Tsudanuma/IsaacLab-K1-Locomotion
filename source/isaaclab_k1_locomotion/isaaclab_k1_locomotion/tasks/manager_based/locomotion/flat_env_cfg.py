@@ -288,9 +288,9 @@ class K1FlatImproveAngTrackingCfg(K1FlatEnvCfg):
         # せっかく獲得した高速追従を一時的に練習しなくなる。yaw 追従の再学習に
         # 集中するため、lin の段階的拡張は止めて最終ステージ相当の広い範囲で固定する。
         self.curriculum.lin_vel_command = None
-        self.commands.base_velocity.ranges.lin_vel_x = (1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (0.0, 0.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (0.0, 0.0)
+        self.commands.base_velocity.ranges.lin_vel_x = (-0.4, 0.4)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.9, 0.9)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
 
         # 多様な yaw コマンドに頻繁に晒すためリサンプリング間隔を短めに固定する。
         self.commands.base_velocity.resampling_time_range = (1.0, 5.0)

@@ -33,7 +33,7 @@ from .velocity_env_cfg import (
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
 from .mdp import feet_phase, phase_obs
-from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, minimum_height, zmp_support_center, action_smoothness_l2, action_rate_l2, compute_zmp_xy
+from .mdp.rewards import feet_close_penalty, feet_parallel_to_ground, foot_clearance_ji, minimum_height, zmp_support_center, action_smoothness_l2, action_rate_l2, compute_zmp_xy
 
 ##
 # 基本設定
@@ -102,12 +102,12 @@ actuatornet_leg = ActuatorNetMLPCfg(
 
 delayed_pd_leg = DelayedPDActuatorCfg(
             joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
-            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
-            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 80.0},
+            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 5.0},
             # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
             # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
-            stiffness={".*_Hip_.*": 160.0, ".*_Knee_Pitch": 160.0},
-            damping={".*_Hip_.*": 4.0 , ".*_Knee_Pitch": 4.0},
+            stiffness={".*_Hip_.*": 0.0, ".*_Knee_Pitch": 0.0},
+            damping={".*_Hip_.*": 0.0 , ".*_Knee_Pitch": 0.0},
             armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
             min_delay=2,
             max_delay=7,
@@ -169,8 +169,8 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             velocity_limit=17.59,
             # stiffness=17.84601339,
             # damping=53.53804017,
-            stiffness=50.0,
-            damping=2.5,
+            stiffness=0.0,
+            damping=0.0,
             armature=0.0282528,
             min_delay=2,
             max_delay=7,
@@ -267,6 +267,19 @@ class K1Rewards(RewardsCfg):
             "command_name": "base_velocity",
             "stance_ratio": _STANCE_RATIO,
             "cmd_threshold": _COMMAND_THRESHOLD,
+            **_PHASE_FREQ_PARAMS,
+        },
+    )
+
+    foot_clearance = RewTerm(
+        func=foot_clearance_ji,
+        weight=0.5,
+        params={
+            "command_name": "base_velocity",
+            "target_clearance": 0.12,
+            "stance_ratio": _STANCE_RATIO,
+            "cmd_threshold": _COMMAND_THRESHOLD,
+            "sigma": 0.03,
             **_PHASE_FREQ_PARAMS,
         },
     )
@@ -385,7 +398,7 @@ class K1Rewards(RewardsCfg):
 
     zmp_stability = RewTerm(
         func=zmp_support_center,
-        weight=0.20,
+        weight=0.50,
         params={
             "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
             "asset_cfg": SceneEntityCfg("robot"),

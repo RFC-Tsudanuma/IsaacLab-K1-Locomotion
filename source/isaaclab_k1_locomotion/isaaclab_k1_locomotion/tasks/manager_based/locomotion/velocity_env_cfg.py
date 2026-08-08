@@ -131,7 +131,12 @@ class CommandsCfg:
 class ActionsCfg:
     """Action specifications for the MDP."""
 
-    joint_pos = mdp.JointPositionActionCfg(asset_name="robot", joint_names=JOINT_NAMES_K1,preserve_order=True, scale=0.5, use_default_offset=True)
+    joint_effort = mdp.JointEffortActionCfg(
+        asset_name="robot",
+        joint_names=JOINT_NAMES_K1,
+        preserve_order=True,
+        scale=10.0,
+    )
 
 
 @configclass

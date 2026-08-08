@@ -347,10 +347,13 @@ def foot_clearance_ji(
     env: ManagerBasedRLEnv,
     command_name: str,
     target_clearance: float = 0.10,
-    phase_freq: float = 1.5,
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
     sigma: float = 0.03,
+    low_speed: float = 1.0,
+    high_speed: float = 1.8,
+    low_freq: float = 1.5,
+    high_freq: float = 2.0,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -365,9 +368,8 @@ def foot_clearance_ji(
     right_foot_height_err = torch.exp(-torch.square(target_clearance - asset.data.body_pos_w[:, right_foot_idx, 2]) / (sigma **2))
     left_foot_height_err = torch.exp(-torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2]) / (sigma **2))
 
-    # feet_phase と同一の desired-stance 判定
-    t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    # feet_phase / phase_obs と同じ積分位相を使い、コマンド変更時の位相飛びを防ぐ。
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
