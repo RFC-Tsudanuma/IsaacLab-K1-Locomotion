@@ -7,7 +7,7 @@ import os
 import torch
 
 from isaaclab.assets import ArticulationCfg
-from isaaclab.actuators import ActuatorNetMLPCfg, DelayedPDActuatorCfg
+from isaaclab.actuators import ActuatorNetMLPCfg, DelayedPDActuatorCfg  # noqa: F401  (actuatornet_leg 等の互換用)
 import isaaclab.sim as sim_utils
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -32,6 +32,12 @@ from .velocity_env_cfg import (
 
 # K1専用のMDP関数 (位相報酬 + 位相観測)
 # 注意: これらの関数が .mdp フォルダ内に存在することを確認してください
+from .actuators import (
+    K1_ANKLE_KNEE_POINT_VELOCITY,
+    K1_LEG_KNEE_POINT_VELOCITY,
+    BoosterDelayedPDActuatorCfg,
+)
+
 from .mdp import feet_phase, phase_obs
 from .mdp.rewards import feet_close_penalty, knee_close_penalty, feet_parallel_to_ground, minimum_height, foot_clearance_ji_pen, action_smoothness_l2
 
@@ -76,10 +82,23 @@ actuatornet_leg = ActuatorNetMLPCfg(
     input_idx=[2,1,0]
 )
 
-delayed_pd_leg = DelayedPDActuatorCfg(
+# 脚のアクチュエータ。
+# BoosterDelayedPDActuatorCfg = 素の DelayedPDActuatorCfg + トルク-速度カーブ (T-N カーブ)。
+# 素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップするだけなので、
+# 「最高速で回りながら最大トルクを出す」という実機に存在しない動作が sim では許されてしまう。
+# 実機の BLDC は速度が上がると逆起電力でトルクが落ちるため、そのままだとキックのような
+# 最大出力動作が sim 専用の幻の性能に最適化されてしまう。knee_point_velocity を与えることで、
+# |joint_vel| がニー速度を超えた領域のトルク上限が velocity_limit で 0 になるまで線形に減衰する。
+# 値の出典は booster_train の機種定義 (actuators.py の表を参照)。
+# 注意: stiffness / damping / armature / effort_limit / velocity_limit / min_delay / max_delay は
+#       既存の歩行を壊さないため一切変更していない。追加したのは knee_point_velocity のみ。
+delayed_pd_leg = BoosterDelayedPDActuatorCfg(
             joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
             effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
             velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+            # T-N カーブのニー速度 [rad/s]: Hip_Pitch=E6408(1.88), Hip_Roll=E4315(2.62),
+            # Hip_Yaw=E4310(7.85), Knee_Pitch=E6416(2.09)
+            knee_point_velocity=K1_LEG_KNEE_POINT_VELOCITY,
             # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
             # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
             stiffness={".*_Hip_.*": 140.0, ".*_Knee_Pitch": 140.0},
@@ -139,10 +158,16 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     soft_joint_pos_limit_factor=0.9,
     actuators={
         "legs": delayed_pd_leg,
-        "feet": DelayedPDActuatorCfg(
+        # 足首も脚と同じ理由で T-N カーブ付きに差し替え。K1 の Ankle Pitch/Roll は
+        # どちらも E4310 (knee_point_velocity = 7.85 rad/s)。
+        # effort_limit / velocity_limit は booster 公式 (E4310: 38.3 / 17.59) と一致するため
+        # 既存値をそのまま維持。armature だけ公式と食い違う (公式は平行リンク補正で 2倍の
+        # 0.0565056、ここは 1倍の 0.0282528) が、既存の歩行を壊さないため既存値を優先する。
+        "feet": BoosterDelayedPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
             effort_limit=38.3,
             velocity_limit=17.59,
+            knee_point_velocity=K1_ANKLE_KNEE_POINT_VELOCITY,  # E4310 = 7.85
             # stiffness=17.84601339,
             # damping=53.53804017,
             stiffness=50.0,
