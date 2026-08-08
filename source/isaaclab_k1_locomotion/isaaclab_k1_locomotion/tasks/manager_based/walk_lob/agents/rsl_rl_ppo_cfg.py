@@ -23,3 +23,17 @@ class K1WalkLobPPORunnerCfg(K1WalkLoopShootPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_lob"
+
+
+@configclass
+class K1WalkLobWalkPhasePPORunnerCfg(K1WalkLobPPORunnerCfg):
+    """Stage 1 (歩行のみ) 用。観測・ネットワークは stage 2 と同一に保つ。
+
+    walk_kick 系の walk phase とは **アクチュエータが違う** (T-N カーブ付き) ので、
+    checkpoint も別管理にする。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_lob_walk_phase"

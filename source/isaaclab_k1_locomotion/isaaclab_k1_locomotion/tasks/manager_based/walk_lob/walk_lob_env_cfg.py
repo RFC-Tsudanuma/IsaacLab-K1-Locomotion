@@ -92,6 +92,7 @@ from ..locomotion.actuators import (
     K1_LEG_KNEE_POINT_VELOCITY,
     BoosterDelayedPDActuatorCfg,
 )
+from ..walk_kick.walk_kick_env_cfg import K1WalkKickWalkPhaseEnvCfg
 from ..walk_loop_shoot.walk_loop_shoot_env_cfg import K1WalkLoopShootEnvCfg
 
 # --------------------------------------------------------------------------- #
@@ -145,6 +146,61 @@ _LOB_PHI_SAT = 1.05
 _LOB_SIGMA_DIRECTION = 0.6
 
 
+def _apply_tn_curve_actuators(cfg) -> None:
+    """脚・足首のアクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える。
+
+    素の :class:`~isaaclab.actuators.DelayedPDActuator` は ``effort_limit`` と
+    ``velocity_limit`` を *独立に* クリップするだけなので、「最高速で回りながら最大
+    トルクを出す」という実機に存在しない動作が sim では許されてしまう。実機の BLDC は
+    速度が上がると逆起電力でトルクが落ちるため、そのままだと最大出力キックが sim 専用の
+    幻の性能に最適化される (= sim では飛ぶのに実機では全く飛ばない)。
+    値の出典と実装は :mod:`..locomotion.actuators` を参照。
+
+    ``effort_limit`` / ``velocity_limit`` / ``stiffness`` / ``damping`` / ``armature`` /
+    遅延は既存インスタンスの値をそのまま引き継ぎ、**追加するのは knee_point_velocity だけ**。
+
+    **walk_lob 系だけの差し替え。** 共通のロボット定義 (locomotion/rough_env_cfg.py の
+    ``K1_LOCOMOTION_CFG``) は素の ``DelayedPDActuatorCfg`` のままにしてある。
+    既に実機で成果の出ている walk_kick / walk_pass / walk_loop_* の物理を変えないため。
+
+    NOTE: 歩行 (walk phase) とキック (lob 本体) の **両方** に適用すること。
+          歩行を素のアクチュエータで学習してからキックだけ T-N カーブにすると、
+          stage 2 で急にトルクが出なくなって歩けなくなる。Hip_Pitch のニー速度は
+          1.88 rad/s で、通常歩行のスイング期でも普通に超えるため影響は歩容にも及ぶ。
+
+    NOTE: ``ArticulationCfg.replace()`` は ``dataclasses.replace`` = 浅いコピーなので、
+          ``actuators`` dict の実体は ``K1_LOCOMOTION_CFG`` と共有されている。
+          dict の中身を直接書き換えると他タスクにも波及するため、
+          **必ず dict ごと新しいものに差し替える**こと。
+    """
+    act = dict(cfg.scene.robot.actuators)
+    legs, feet = act["legs"], act["feet"]
+
+    act["legs"] = BoosterDelayedPDActuatorCfg(
+        joint_names_expr=legs.joint_names_expr,
+        effort_limit=legs.effort_limit,
+        velocity_limit=legs.velocity_limit,
+        knee_point_velocity=K1_LEG_KNEE_POINT_VELOCITY,
+        stiffness=legs.stiffness,
+        damping=legs.damping,
+        armature=legs.armature,
+        min_delay=legs.min_delay,
+        max_delay=legs.max_delay,
+    )
+    act["feet"] = BoosterDelayedPDActuatorCfg(
+        joint_names_expr=feet.joint_names_expr,
+        effort_limit=feet.effort_limit,
+        velocity_limit=feet.velocity_limit,
+        knee_point_velocity=K1_ANKLE_KNEE_POINT_VELOCITY,
+        stiffness=feet.stiffness,
+        damping=feet.damping,
+        armature=feet.armature,
+        min_delay=feet.min_delay,
+        max_delay=feet.max_delay,
+    )
+    cfg.scene.robot.actuators = act
+
+
 @configclass
 class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
     """高さ特化のロブキック専用。Walk-Loop-Shoot と観測・行動空間は同一。"""
@@ -190,53 +246,49 @@ class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
         #       kick_direction / kick_loft / kick_elevation の 3 本 (+ ball 追従系)。
 
         # -- 5. アクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える
-        #
-        # 素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップする
-        # だけなので、「最高速で回りながら最大トルクを出す」という実機に存在しない動作が
-        # sim では許されてしまう。実機の BLDC は速度が上がると逆起電力でトルクが落ちるため、
-        # そのままだと最大出力キックが sim 専用の幻の性能に最適化される
-        # (= sim では飛ぶのに実機では全く飛ばない)。値の出典と実装は
-        # :mod:`..locomotion.actuators` を参照。
-        #
-        # **このタスクだけの差し替え**。共通のロボット定義 (locomotion/rough_env_cfg.py の
-        # K1_LOCOMOTION_CFG) は素の DelayedPDActuatorCfg のままにしてある。既に実機で
-        # 成果の出ている walk_kick / walk_pass / walk_loop_* の物理を変えないため。
-        #
-        # NOTE: ArticulationCfg.replace() は dataclasses.replace = 浅いコピーなので、
-        #       actuators dict の実体は K1_LOCOMOTION_CFG と共有されている。
-        #       dict の中身を直接書き換えると他タスクにも波及するため、
-        #       **必ず dict ごと新しいものに差し替える**こと。
-        _act = dict(self.scene.robot.actuators)
-        _legs, _feet = _act["legs"], _act["feet"]
-        # effort_limit / velocity_limit / stiffness / damping / armature / 遅延は
-        # 既存値をそのまま引き継ぎ、knee_point_velocity だけを足す。
-        _act["legs"] = BoosterDelayedPDActuatorCfg(
-            joint_names_expr=_legs.joint_names_expr,
-            effort_limit=_legs.effort_limit,
-            velocity_limit=_legs.velocity_limit,
-            knee_point_velocity=K1_LEG_KNEE_POINT_VELOCITY,
-            stiffness=_legs.stiffness,
-            damping=_legs.damping,
-            armature=_legs.armature,
-            min_delay=_legs.min_delay,
-            max_delay=_legs.max_delay,
-        )
-        _act["feet"] = BoosterDelayedPDActuatorCfg(
-            joint_names_expr=_feet.joint_names_expr,
-            effort_limit=_feet.effort_limit,
-            velocity_limit=_feet.velocity_limit,
-            knee_point_velocity=K1_ANKLE_KNEE_POINT_VELOCITY,
-            stiffness=_feet.stiffness,
-            damping=_feet.damping,
-            armature=_feet.armature,
-            min_delay=_feet.min_delay,
-            max_delay=_feet.max_delay,
-        )
-        self.scene.robot.actuators = _act
+        _apply_tn_curve_actuators(self)
 
 
 @configclass
 class K1WalkLobEnvCfg_PLAY(K1WalkLobEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkLobWalkPhaseEnvCfg(K1WalkKickWalkPhaseEnvCfg):
+    """Stage 1 (歩行のみ) の walk_lob 版。**T-N カーブ付きアクチュエータで歩く。**
+
+    walk_kick 系の walk phase (``K1WalkKickWalkPhaseEnvCfg``) との違いは
+    アクチュエータだけで、観測・行動空間・報酬・コマンドは完全に同一。
+
+    なぜ専用の walk phase が要るか
+    ------------------------------
+    共用の walk phase は素の ``DelayedPDActuator`` (T-N カーブ無し) で歩容を獲得する。
+    その checkpoint を T-N カーブ付きの :class:`K1WalkLobEnvCfg` に持ち込むと、
+    **stage 2 で急にトルクが出なくなって歩けなくなる**。Hip_Pitch のニー速度は
+    1.88 rad/s で、通常歩行のスイング期でも普通に超えるため、T-N カーブの影響は
+    キックだけでなく歩容そのものに及ぶ。
+
+    そこで lob は stage 1 から T-N カーブ下で歩行を獲得し、stage 1 → 2 で物理が
+    変わらないようにする。experiment 名も ``k1_walk_lob_walk_phase`` と分けてあるので、
+    既存の ``k1_walk_kick_walk_phase`` の run / checkpoint とは混ざらない。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_tn_curve_actuators(self)
+
+
+@configclass
+class K1WalkLobWalkPhaseEnvCfg_PLAY(K1WalkLobWalkPhaseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 

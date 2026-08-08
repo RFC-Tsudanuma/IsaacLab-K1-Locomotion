@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # walk_lob（高さ特化のロブキック）の 2 段階学習を通しで実行する。
 #
-#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0
-#            ボール無し・通常の歩行コマンドで歩行だけを学習する (walk_kick と共用)。
+#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Lob-Walk-Phase-v0
+#            ボール無し・通常の歩行コマンドで歩行だけを学習する。
+#            **walk_kick 系の walk phase とは別タスク**。lob はアクチュエータに
+#            トルク-速度カーブ (T-N カーブ) を入れているので、素のアクチュエータで
+#            獲得した歩容を持ち込むと stage 2 で急にトルクが出ず歩けなくなる
+#            (Hip_Pitch のニー速度 1.88 rad/s は通常歩行でも超える)。
+#            そのため stage 1 から T-N カーブ下で歩かせる。
 #   Stage 2: Isaac-Velocity-Flat-K1-Walk-Lob-v0
 #            ボール中心が K1 身長 0.9m を超えるロブキックを獲得する。
 #
@@ -20,7 +25,7 @@
 #   ./scripts/rsl_rl/train_walk_lob.sh                     # 通しで実行
 #   STAGE=2 ./scripts/rsl_rl/train_walk_lob.sh             # 歩行学習済みなら stage 2 だけ
 #   STAGE=1 ./scripts/rsl_rl/train_walk_lob.sh             # walk phase だけ
-#   STAGE=2 WALK_CKPT=logs/rsl_rl/k1_walk_kick_walk_phase/<run>/model_<N>.pt \
+#   STAGE=2 WALK_CKPT=logs/rsl_rl/k1_walk_lob_walk_phase/<run>/model_<N>.pt \
 #       ./scripts/rsl_rl/train_walk_lob.sh                 # 継承元を明示
 #   ITER=20000 ./scripts/rsl_rl/train_walk_lob.sh          # ロブを長く回す
 #   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_lob.sh      # walk phase だけ延長
@@ -85,9 +90,9 @@ ITER=${ITER:-5000}
 WALK_ITER=${WALK_ITER:-5000}
 STAGE=${STAGE:-all}
 
-WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
+WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Lob-Walk-Phase-v0"
 LOB_TASK="Isaac-Velocity-Flat-K1-Walk-Lob-v0"
-WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
+WALK_LOG_ROOT="logs/rsl_rl/k1_walk_lob_walk_phase"
 
 should_run() { [[ "$STAGE" == "all" || "$STAGE" == *"$1"* ]]; }
 
