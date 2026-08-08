@@ -583,16 +583,27 @@ class K1FlatImprovePostureCfg(K1FlatEnvCfg):
         # 本設定は「習得済みポリシーの仕上げ」なので条件が異なる。lin 追従
         # (error_vel_xy) が悪化し続ける場合は -30 程度へ緩めること。
         self.rewards.flat_orientation_l2.weight = -40.0
+        self.rewards.ang_vel_xy_l2.weight = -0.85
+
+        # --- feet flat  ---
+        # なんかflatのペナルティがデカすぎるので減らす
+        self.rewards.feet_parallel_to_ground.weight = 19.0
+
+        # --- termination ---
+        # 転倒も減らしたいので、死亡ペナルティを増やす
+        self.rewards.termination_penalty.weight = -600.0
 
         # --- 上体の上下動抑制 ---
         # lin_vel_z_l2 (速度ペナルティ) は歩容の構造的下限で飽和し増量無効 (q系列)。
         # 高さ「位置」の偏差を直接罰して vaulting の振幅自体を縮める。
         # 重みは reward logger で他項 (ang_vel_xy_l2 ≈ 0.01〜0.1/step) と桁を
         # 合わせた初期値。効かなければ増やし、着地が硬くなるなら減らす。
-        self.rewards.base_height_track.weight = -30.0
+        # self.rewards.base_height_track.weight = -30.0
+        # ↑これは正直難しいのでおそらく無しの方が良い。
+
         # base_height_penalty (minimum_height, min_height=0.53, weight=-100) が
         # 目標高さ 0.53 と干渉する (目標付近で常に -100 が出る) ので閾値を下げる。
-        self.rewards.base_height_penalty.params["min_height"] = 0.48
+        # self.rewards.base_height_penalty.params["min_height"] = 0.48
 
         # --- カリキュラムを学習終了時点の状態に固定 ---
         # lin_vel_command: 最終ステージ相当で固定 (再進行による "忘れ" を防ぐ)
@@ -610,14 +621,14 @@ class K1FlatImprovePostureCfg(K1FlatEnvCfg):
         self.commands.base_velocity.resampling_time_range = (0.8, 8.0)
         self.curriculum.command_resampling_time_range = None
 
-        # push_robot: stage1 (6000 iter 到達時) 相当を直接設定
+        # push_robot: いきなり厳しい状態にする
         self.curriculum.push_robot_stage1 = None
-        self.events.push_robot.interval_range_s = (4.0, 8.0)
+        self.events.push_robot.interval_range_s = (0.5, 8.0)
         self.events.push_robot.params["velocity_range"] = {
-            "x": (-0.5, 0.5),
-            "y": (-0.5, 0.5),
-            "roll": (-0.02, 0.02),
-            "pitch": (-0.02, 0.02),
+            "x": (-0.7, 0.7),
+            "y": (-0.7, 0.7),
+            "roll": (-0.06, 0.06),
+            "pitch": (-0.06, 0.06),
         }
 
 
