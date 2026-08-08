@@ -39,7 +39,8 @@ parser.add_argument(
     "--reset_noise_std",
     type=float,
     default=None,
-    help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint (resume only).",
+    help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint "
+    "(--resume or --load_pretrained).",
 )
 parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
@@ -329,6 +330,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[INFO]: Missing keys: {missing}")
             if unexpected:
                 print(f"[INFO]: Unexpected keys: {unexpected}")
+
+        # re-inject action noise std if requested. Unlike the --resume path, load_pretrained
+        # never touches the optimizer (runner.alg was built fresh, we only overwrote policy
+        # weights via state_dict), so there is no stale Adam momentum on std to worry about here.
+        if args_cli.reset_noise_std is not None:
+            import math
+
+            with torch.no_grad():
+                if policy.noise_std_type == "scalar":
+                    before = policy.std.data.clone()
+                    policy.std.data.clamp_(min=args_cli.reset_noise_std)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std}\n"
+                        f"        before: {before.tolist()}\n"
+                        f"        after : {policy.std.data.tolist()}"
+                    )
+                elif policy.noise_std_type == "log":
+                    log_floor = math.log(args_cli.reset_noise_std)
+                    before = policy.log_std.data.exp().clone()
+                    policy.log_std.data.clamp_(min=log_floor)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std} (log_std clamp)\n"
+                        f"        before std: {before.tolist()}\n"
+                        f"        after  std: {policy.log_std.data.exp().tolist()}"
+                    )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
