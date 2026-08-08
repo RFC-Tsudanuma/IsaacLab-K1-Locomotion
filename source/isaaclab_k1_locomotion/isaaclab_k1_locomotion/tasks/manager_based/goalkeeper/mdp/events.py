@@ -50,7 +50,7 @@ def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> tor
     速度学習の圧を保つための分布制御 (パラメータは GoalkeeperParamsCfg):
 
     * 確率 ``stage1_far_prob``: **反対側のポスト際ゾーン** (|y| ∈ stage1_far_zone) から
-      採る。ロボットがポスト際にいるときは逆ポストまでの最大距離 (~2.5m) の
+      採る。ロボットがポスト際にいるときは逆ポストまでの最大距離 (~2.6m) の
       スプリントになる — 「ゴール幅全域をなるべく速く横移動」のワーストケースを
       確実に学習分布へ入れるための枝。
     * それ以外: ゴール幅内の一様ランダム。ただし現在位置 ±``stage1_min_move`` の
@@ -244,11 +244,12 @@ def reset_ball_perception(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor,
 ):
-    """VirtualPerception と α-β フィルタをリセットし、自己位置推定の誤差を採番する。
+    """VirtualPerception のリングバッファ/per-env パラメータをリセットし、速度バイアスを
+    採番する。
 
-    ボール位置・遅延・検出率・occlusion・姿勢由来のノイズは VirtualPerception が担当。
-    自己位置推定 (実機は MCL) の誤差はここで採番する。速度は観測できないので、
-    α-β フィルタが位置履歴から作る (バイアスを人工的に足す旧方式は廃止)。
+    位置・遅延・ノイズ・検出率・occlusion は VirtualPerception (実機カメラ準拠) が担当。
+    速度バイアス (0.5〜1.0 m/s のエピソード固定系統誤差) だけは goalkeeper 側で持つので
+    ここで採番する。自己位置推定 (実機は MCL) の誤差もここで採番する。
     ★ reset_ball (ボール配置イベント) より後に登録すること。
     """
     import math
@@ -260,11 +261,19 @@ def reset_ball_perception(
     vp.reset(env_ids)
     n = len(env_ids)
 
-    # α-β フィルタの状態を落とす。次の検出で速度ゼロから初期化される。
-    env._gkp_fpos[env_ids] = 0.0
-    env._gkp_fvel[env_ids] = 0.0
-    env._gkp_finit[env_ids] = False
-    env._gkp_dt_meas[env_ids] = 0.0
+    # 速度バイアス: x, y 各軸独立。大きさを perc_vel_bias_range から一様サンプルし、
+    if bool(getattr(p, "perception_clean", False)):
+        env._gkp_vel_bias[env_ids] = 0.0
+    else:
+        vlo, vhi = float(p.perc_vel_bias_range[0]), float(p.perc_vel_bias_range[1])
+        vmag = torch.empty(n, 2, device=env.device).uniform_(vlo, vhi)
+        vsign = torch.where(
+            torch.rand(n, 2, device=env.device) < 0.5,
+            torch.ones(n, 2, device=env.device),
+            -torch.ones(n, 2, device=env.device),
+        )
+        env._gkp_vel_bias[env_ids] = vmag * vsign
+    env._gkp_out_vel[env_ids] = 0.0
 
     # 自己位置推定の誤差: エピソード固定バイアス + ドリフト速度 + 跳びの頻度。
     _gk_loc_buffers(env)
@@ -340,14 +349,13 @@ def sync_task_command(
     buf = getattr(cmd_term, "vel_command_b", None)
     if buf is None:
         return
-    # ★ 推定値を使うこと (2026-08-03)。ここは feet_phase / foot_clearance の停止判定に
-    #   使われる。真値にすると「ポリシーが観測できない情報で足上げ報酬が ON/OFF する」
-    #   状態になり、ポリシーは報酬が付くかを予測できなくなる。実測で 28% 食い違い、
-    #   足上げの期待値が下がって foot_clearance が 0.70 → 0.25 に落ちた。
-    #   自己位置のバイアスは設計上エピソード内で一定なので、真値のままだとロボットが
-    #   正しく定位置へ行くほど食い違いが恒久化する (平均回帰では解消できない)。
-    #   このスイッチは実機に存在しない学習時だけのものなので、推定値にしても
-    #   sim-to-real のリアルさは損なわれない。観測側の誤差はそのまま。
+    # ★ 推定値を使うこと。ここは feet_phase / foot_clearance の停止判定に使われる。
+    #   真値にすると「ポリシーが観測できない情報で足上げ報酬が ON/OFF する」状態になり、
+    #   ポリシーは報酬が付くかを予測できなくなる。実測で 28% 食い違い、足上げの期待値が
+    #   下がって foot_clearance が 0.70 → 0.25 に落ちた。自己位置のバイアスは設計上
+    #   エピソード内で一定なので、真値のままだとロボットが正しく定位置へ行くほど
+    #   食い違いが恒久化する (平均回帰では解消できない)。このスイッチは実機に存在しない
+    #   学習時だけのものなので、推定値にしても sim-to-real のリアルさは損なわれない。
     drive = task_drive_vector(env, use_perceived=True)
     buf[:, :2] = drive[:, :2]
     # ★ 向き成分は 0 にする。feet_phase / foot_clearance の停止判定は

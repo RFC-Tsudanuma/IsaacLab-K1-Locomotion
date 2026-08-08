@@ -6,7 +6,7 @@
 """ゴールキーパー (goalkeeper) タスク。
 
 frozen 歩行ポリシー (0524_walk.pt) の上に載せる高レベルポリシーを学習する階層タスク。
-RoboCup HSL 2026 Middle ディビジョン想定。横ステップ移動でゴール (幅 2.5m) を守る。
+RoboCup HSL 2026 Middle ディビジョン想定。横ステップ移動でゴール (幅 2.6m) を守る。
 
 学習/再生は dribble / around_ball と同じ階層スクリプトを task 引数で使い回す:
 

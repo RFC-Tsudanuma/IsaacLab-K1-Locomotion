@@ -121,7 +121,7 @@ def _target_y_error(env: "ManagerBasedRLEnv", max_y: float) -> torch.Tensor:
 def track_target_y(
     env: "ManagerBasedRLEnv",
     std: float = 0.5,
-    max_y: float = 1.25,
+    max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
 ) -> torch.Tensor:
     """目標 y への距離のガウス報酬 exp(-err²/σ²) ∈ [0, 1]。
 
@@ -137,7 +137,7 @@ def target_reach_velocity_direct(
     deadband: float = 0.12,
     v_cap: float = 1.3,
     stop_speed: float = 0.5,
-    max_y: float = 1.25,
+    max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """目標 y 方向への横移動速度に比例する密報酬 ∈ [-1, 1] (**直接制御版**)。
@@ -185,7 +185,7 @@ def target_reach_velocity(
     deadband: float = 0.12,
     v_cap: float = 0.8,
     cmd_scale: float = 0.5,
-    max_y: float = 1.25,
+    max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
 ) -> torch.Tensor:
     """目標方向への横移動速度に比例する密報酬 ∈ [-1, 1]。
 
@@ -216,7 +216,7 @@ def hold_at_target(
     cmd_std_fine: float = 0.1,
     lin_vel_std: float = 0.4,
     yaw_rate_weight: float = 0.25,
-    max_y: float = 1.25,
+    max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """目標に到達した状態で「コマンドを 0 に落として静止」するほど高い報酬 [0, 1]。

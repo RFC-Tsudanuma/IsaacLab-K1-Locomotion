@@ -15,7 +15,7 @@ frozen 歩行ポリシー (0524_walk.pt) の上に載せる高レベルポリシ
     ゴールラインを越える前に横ステップ移動で遮る。ダイブはしない。
 
 フィールド仕様 (ルールブック Table 2/3/4 の Middle 値、シーンは簡易プリミティブ):
-    * ゴール幅 (ポスト内側間) 2.5 m / クロスバー高さ 1.7 m / ポスト太さ 0.10 m
+    * ゴール幅 (ポスト内側間) 2.6 m / クロスバー高さ 1.7 m / ポスト太さ 0.10 m
     * ボール: FIFA サイズ4相当 (直径 0.20 m, 質量 0.37 kg)
     * 失点: ボール全体がポスト間のゴールラインを越えたとき
       (ボール中心 x < −半径)。ポストは物理コリジョン有り (跳ね返りは失点扱いに
@@ -99,7 +99,11 @@ from .mdp.rewards import (
 from .mdp.terminations import goal_conceded, robot_out_of_bounds, save_success
 
 # --- ゴール・ボールの幾何パラメータ (ルールブック Middle ディビジョン = M-Field) ---
-GOAL_HALF_WIDTH = 1.25     # ゴール幅 2.5m の半分 (ポスト内側)
+# ★ 2026-08-08: ゴール幅 2.5m → 2.6m に変更。ポスト位置・クロスバー長・ゴールライン
+#   マーカー・観測のクランプ (max_y) はすべてこの定数から導出されるので、ここだけ直せば
+#   追従する。ただし mdp/observations.py・mdp/rewards.py の引数デフォルト値だけは
+#   import 循環を避けるため直値で持っているので、変えるときは併せて直すこと。
+GOAL_HALF_WIDTH = 1.3      # ゴール幅 2.6m の半分 (ポスト内側)
 POST_RADIUS = 0.05         # ポスト/クロスバー太さ 0.10m (許容 0.07〜0.12)
 CROSSBAR_HEIGHT = 1.7      # クロスバー下端の目安 (許容 1.5〜1.9。横セーブのみなので判定未使用)
 BALL_RADIUS = 0.10         # FIFA サイズ4相当 (直径約 0.20m)
@@ -119,10 +123,15 @@ class GoalkeeperParamsCfg:
     goal_half_width: float = GOAL_HALF_WIDTH
     # 守備面: ゴールラインから guard_x [m] フィールド側にロボットを置く。
     guard_x: float = 0.4
+    # ボール接近中に「位置ずれ [m] → 速度 [m/s]」へ換算する除数 [s]。
+    # ★ 2026-08-08: 到達猶予時間で割る方式をやめ、この固定値にした (最速で向かう)。
+    #   ずれ > drive_t_fast × 1.3 [m] で常に全力。0.15 なら 0.195m 以上で全力になる。
+    #   小さくするほど全力域が広がる。0 にすると停止できず振動するので下げすぎないこと。
+    drive_t_fast: float = 0.15
 
     # ステージ1: ボールのパーク位置 (ゴール座標系 x, y) とランダム目標
     park_pos: tuple = (5.0, 0.0)
-    stage1_target_range: float = 1.25   # 目標 y ∈ ±この値 [m] (ゴール幅内)
+    stage1_target_range: float = 1.3    # 目標 y ∈ ±この値 [m] (= GOAL_HALF_WIDTH)
     stage1_reach_tol: float = 0.15      # 到達判定の許容誤差 [m]
     stage1_cmd_tol: float = 0.08        # 到達判定: 上位コマンドノルム上限 (足踏み対策)
     stage1_speed_tol: float = 0.15      # 到達判定: ベース並進速度上限 [m/s]
@@ -130,7 +139,7 @@ class GoalkeeperParamsCfg:
     # 目標サンプリングの分布制御 (速度学習の圧を保つ):
     stage1_min_move: float = 0.5        # 現在位置からの最低移動距離 [m]。近距離帯は除外して採る
     stage1_far_prob: float = 0.3        # 「反対側ポスト際ゾーン」を目標にする確率 (長距離スプリント保証)
-    stage1_far_zone: tuple = (0.9, 1.25)  # ポスト際ゾーンの |y| 範囲 [m]。ポスト間 ~2.5m の往復を練習させる
+    stage1_far_zone: tuple = (0.95, 1.3)  # ポスト際ゾーンの |y| 範囲 [m]。ポスト間 2.6m の往復を練習させる
 
     # ステージ2/3: ボールのスポーンと初速
     spawn_dist_range: tuple = (1.5, 5.0)
@@ -145,49 +154,46 @@ class GoalkeeperParamsCfg:
     min_time_to_line: float = 1.2
 
     # 知覚DR (policy のボール観測に掛かる。critic は真値):
-    perc_latency_range: tuple = (2, 4)
-    # ビジョンの更新レート [Hz]。実測 30Hz を中心にジッタを持たせる。
-    perc_update_rate_hz: tuple = (25.0, 35.0)
-    perc_dropout_prob: float = 0.1            # 更新tickでの検出ドロップ確率
-    perc_noise_sigma: float = 0.03            # 位置ノイズの基本 σ [m]
-    perc_noise_per_m: float = 0.02            # 距離 1m あたりの追加 σ [m]
-    perc_vel_noise_sigma: float = 0.1         # 速度の毎フレームジッタ σ [m/s]
-    perc_bias_sigma: float = 0.03             # 位置のエピソード固定バイアス σ [m]
+    #
+    # ★ 下記のうち **実際に読まれているのは perc_update_rate_hz と perc_vel_bias_range
+    #   だけ**。位置側のレイテンシ・ノイズ・検出率は VirtualPerception が持っており、
+    #   値は mdp/perception.py の soccer_vision_train_cfg() が決めている
+    #   (レイテンシ 116ms 固定 / σ(d) = 0.124d + 0.149 [m] / 検出率 90%)。
+    #   perc_latency_range 以下の 5 つは **どこからも参照されていない (dead)**。
+    #   触っても効かないので、値を変えたいときは soccer_vision_train_cfg() 側か
+    #   mdp/observations.py の _gk_perception() での上書きを見ること。
+    perc_latency_range: tuple = (2, 4)              # ← dead (未参照)
+    # ビジョンの更新レート [Hz]。_gk_perception() で VirtualPerception に流し込む。
+    # ★ 2026-08-08: 上限を 25Hz に下げた。カメラ自体は 30fps 出るが、実機では
+    #   検出処理の取りこぼしと後段の遅れがあるので、名目 fps ではなく
+    #   「ポリシーに新しい値が届く実効レート」で見る。ここに per-env の
+    #   ガウスジッタ (update_hz_std = 1.06Hz) が乗るので、上端の env は 26Hz 台に届く。
+    perc_update_rate_hz: tuple = (20.0, 25.0)
+    perc_dropout_prob: float = 0.1            # ← dead (未参照)
+    perc_noise_sigma: float = 0.03            # ← dead (未参照)
+    perc_noise_per_m: float = 0.02            # ← dead (未参照)
+    perc_vel_noise_sigma: float = 0.1         # ← dead (未参照)
+    perc_bias_sigma: float = 0.03             # ← dead (未参照)
+    # 速度のエピソード固定バイアス (x, y 各軸独立)。遅延由来の系統誤差を模擬。
+    perc_vel_bias_range: tuple = (0.5, 1.0)
 
-    # ------------------------------------------------------------------ 速度推定
-    # ★ 実機のビジョンはボール速度を出さない。後段の PF も状態が [x, y] だけで、
-    #   時刻すら持たない (2026-08-03 実機コード調査)。そこで位置の時系列から
-    #   α-β フィルタで速度を作る。ビジョン側の改修は不要で、実機では同じ 4 行を
-    #   自分の ROS2 ノードに置けば再現できる:
-    #     pos += vel*dt;  r = z - pos;  pos += alpha*r;  vel += beta*r/dt_meas
-    #   カルマンフィルタでも結果は同じ (セーブ成立 96.5% で一致) なので簡単な方を採る。
-    filter_alpha: float = 0.35   # 位置の補正ゲイン
-    filter_beta: float = 0.05    # 速度の補正ゲイン
-
-    # ------------------------------------------- ボール位置ノイズ (姿勢誤差→地面投影)
-    # 実機は「内部パラメータ + 首の姿勢 + 地面平面」でボール位置を出す。誤差は等方
-    # ガウスではなく姿勢の角度誤差が支配し、奥行きは距離の 2 乗で、横は距離に比例して
-    # 増える。画素ノイズ由来は姿勢誤差の 1/4 程度で実質無視できる。
-    # 下限 0.28° はハンドアイキャリブの再投影残差 1.021px 相当。上限は首のバックラッシュと
-    # 歩行中の胴体傾き (未補正の可能性が高い) を見込んだ保守値。実測が出たら狭めること。
-    perc_attitude_noise: bool = True
-    perc_attitude_bias_deg: tuple = (0.0, 1.2)
-    perc_attitude_osc_deg: tuple = (0.0, 1.5)   # 歩行同期の振動。相関ノイズなので均されない
-    perc_attitude_osc_hz: tuple = (1.2, 2.0)
-
-    # ------------------------------------------------- 自己位置推定 (実機は MCL) の誤差
+    # ------------------------------------------- 自己位置推定 (実機は MCL) の誤差
     # 実機の MCL は白色ノイズではなく「バイアス + ドリフト + 不連続な跳び」を出す。
     # 平滑化は意図的に OFF で、1 フレームあたり 0.5 m / 0.5 rad まで動く設定。
     # キーパーは常時ボールを見て下を向くのでランドマークが入らず、odometry のみに
     # 落ちている時間が長いと想定される。跳びは学習で経験しないと実機で未知入力になる。
-    # 2026-08-03 実測: この範囲でセーブ成立 96.7% → 93.7% に収まる。誤差はボールと
-    # 自分の両方に同じだけ乗って相対関係が保たれるため、思ったより効かない。
+    #
+    # ★ y 方向の誤差はボールと自分の両方に同じだけ乗って相対関係が保たれるため、
+    #   横移動の指令にはほぼ効かない (往復で相殺される)。効くのは
+    #   (a) 守備面までの前後距離 x → 定位置がじわじわずれる
+    #   (b) ヨー → 相対/ゴール座標の変換に残る
+    #   の 2 つ。実測ではセーブ成立 96.7% → 93.7% に収まる。
     loc_bias_xy_m: float = 0.20        # 位置バイアスの一様サンプル幅 [±m]
     loc_bias_yaw_deg: float = 6.0      # ヨーバイアスの一様サンプル幅 [±deg]
     loc_drift_xy_mps: float = 0.03     # 位置ドリフト速度 [±m/s]
     loc_drift_yaw_dps: float = 1.0     # ヨードリフト速度 [±deg/s]
-    # 跳びの頻度。旧値 (0.0, 0.5) は「毎秒 1 回 0.5m 跳ぶ」で MCL の挙動ではなかった。
-    # 再収束イベントはゴール前でランドマークが見える状況なら数秒〜数十秒に 1 回。
+    # 跳びの頻度。再収束イベントはゴール前でランドマークが見える状況なら
+    # 数秒〜数十秒に 1 回 (毎秒 1 回は MCL の挙動ではない)。
     loc_jump_hz_range: tuple = (0.0, 0.15)  # 跳びの発生頻度 [回/秒]
     loc_jump_m: float = 0.5            # 跳びの大きさ [±m] (MCL の 1 フレーム補正上限)
     loc_jump_rad: float = 0.2          # 跳びの大きさ [±rad] (同上)
@@ -198,7 +204,7 @@ class GoalkeeperParamsCfg:
     loc_max_err_m: float = 0.6         # 累積誤差の上限 [±m] (跳びの直後だけ触れる保険)
     loc_max_err_rad: float = 0.3       # 累積誤差の上限 [±rad]
 
-    # 知覚DR (VirtualPerception + 自己位置誤差) を全部切ってクリーン観測にするフラグ。
+    # 知覚DR (VirtualPerception + 速度バイアス) を全部切ってクリーン観測にするフラグ。
     perception_clean: bool = False
 
     # セーブ判定
@@ -508,7 +514,7 @@ class K1GoalkeeperEnvCfg(K1FlatEnvCfg):
 
 @configclass
 class K1GoalkeeperStage1EnvCfg(K1GoalkeeperEnvCfg):
-    """ステージ1: ボールはパーク (観測ダミー 0)。±1.25m のランダム目標への往復。"""
+    """ステージ1: ボールはパーク (観測ダミー 0)。±1.3m のランダム目標への往復。"""
 
     def __post_init__(self):
         super().__post_init__()

@@ -129,31 +129,6 @@ class VirtualPerceptionCfg:
     noise_b: float = 0.08
     """Offset coefficient (m) in sigma(d) = a*d + b."""
 
-    # ------------------------------------------------- attitude-driven noise
-    # 実機のボール位置は「内部パラメータ + 首の姿勢 + 地面平面」で出す (地面投影法)。
-    # この方式の誤差は等方ガウスではなく、姿勢推定の角度誤差が支配する:
-    #   奥行き誤差 = (r^2 + h^2)/h * pitch誤差   ← 距離の 2 乗で増える
-    #   横誤差     = r * yaw誤差                 ← 距離に比例
-    # 画素ノイズ由来は姿勢誤差の 1/4 程度で、実質無視できる (2026-08-03 試算)。
-    # attitude_noise=True でこのモデルを使い、等方 sigma(d) は使わない (二重計上になる)。
-    attitude_noise: bool = False
-    """True: 姿勢誤差→地面投影の誤差モデルを使う。False: 等方 sigma(d)=a*d+b。"""
-
-    attitude_bias_deg_range: tuple[float, float] = (0.0, 1.2)
-    """エピソード固定の姿勢バイアス [deg]。キャリブ残差 0.28° + 首のバックラッシュ相当。"""
-
-    attitude_osc_deg_range: tuple[float, float] = (0.0, 1.5)
-    """歩行同期の姿勢振動の振幅 [deg]。白色でない相関ノイズなので均されない。"""
-
-    attitude_osc_hz_range: tuple[float, float] = (1.2, 2.0)
-    """姿勢振動の周波数 [Hz]。歩行周期 (1.6 Hz) 前後。"""
-
-    pixel_noise_px: float = 2.0
-    """ボール中心の画素ノイズ [px]。"""
-
-    focal_px: float = 208.3
-    """焦点距離 [px] (実機 d-robotics カメラ fx=208.263)。画素ノイズの角度換算に使う。"""
-
     noise_a_range: tuple[float, float] = (0.7, 1.5)
     """Per-env multiplicative range on ``noise_a``."""
 
@@ -326,15 +301,6 @@ class VirtualPerception:
         # Temporal occlusion: steps remaining in the active occlusion event.
         self._occlusion_steps_remaining = torch.zeros(N, dtype=torch.long, device=d)
 
-        # Attitude error state (pitch/yaw): episode-fixed bias + gait-synchronous
-        # oscillation. The oscillation is a correlated disturbance, so downstream
-        # filters cannot average it away — unlike the white pixel noise.
-        self._att_bias = torch.zeros(N, 2, dtype=torch.float32, device=d)
-        self._att_osc_amp = torch.zeros(N, 2, dtype=torch.float32, device=d)
-        self._att_osc_w = torch.zeros(N, dtype=torch.float32, device=d)
-        self._att_osc_phase = torch.zeros(N, 2, dtype=torch.float32, device=d)
-        self._att_t = torch.zeros(N, dtype=torch.float32, device=d)
-
         # Static per-episode FOV dead zone (camera angular frame, radians).
         self._deadzone_active = torch.zeros(N, dtype=torch.bool, device=d)
         self._deadzone_yaw_c = torch.zeros(N, dtype=torch.float32, device=d)
@@ -346,16 +312,6 @@ class VirtualPerception:
         self._buffer_pos = torch.zeros(cfg.buffer_size, N, 2, dtype=torch.float32, device=d)
         self._buffer_mask = torch.zeros(cfg.buffer_size, N, dtype=torch.float32, device=d)
         self._buffer_head = 0
-
-        # Measurement sequence number, pushed through the same latency buffer so
-        # downstream filters can tell a genuinely new detection from a held one.
-        # Updating an alpha-beta / Kalman filter on a held value would over-weight
-        # the same measurement at the control rate (50 Hz) instead of the detector
-        # rate (~25 Hz).
-        self._buffer_seq = torch.zeros(cfg.buffer_size, N, dtype=torch.long, device=d)
-        self._meas_seq = torch.zeros(N, dtype=torch.long, device=d)
-        self._prev_out_seq = torch.zeros(N, dtype=torch.long, device=d)
-        self._fresh = torch.zeros(N, dtype=torch.float32, device=d)
 
         # Most recent (pre-buffer) detection state -------------------------
         self._last_pos = torch.zeros(N, 2, dtype=torch.float32, device=d)
@@ -389,11 +345,6 @@ class VirtualPerception:
         env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
         self._buffer_pos[:, env_ids] = 0.0
         self._buffer_mask[:, env_ids] = 0.0
-        self._buffer_seq[:, env_ids] = 0
-        self._meas_seq[env_ids] = 0
-        self._prev_out_seq[env_ids] = 0
-        self._fresh[env_ids] = 0.0
-        self._att_t[env_ids] = 0.0
         self._steps_since_update[env_ids] = 0
         self._occlusion_steps_remaining[env_ids] = 0
         self._last_pos[env_ids] = 0.0
@@ -423,27 +374,6 @@ class VirtualPerception:
         # Per-env xy-noise coefficients (multiplicative on cfg base values).
         self._noise_a_per_env[env_ids] = cfg.noise_a * _uniform(*cfg.noise_a_range)
         self._noise_b_per_env[env_ids] = cfg.noise_b * _uniform(*cfg.noise_b_range)
-
-        # Attitude error: (pitch, yaw) bias + oscillation. Signs are independent
-        # per axis so a run can bias the projection either near or far.
-        if cfg.attitude_noise:
-            deg = math.pi / 180.0
-            sign = lambda: torch.where(  # noqa: E731
-                torch.rand(n, 2, device=self.device) < 0.5, 1.0, -1.0
-            )
-            bias_lo, bias_hi = cfg.attitude_bias_deg_range
-            osc_lo, osc_hi = cfg.attitude_osc_deg_range
-            self._att_bias[env_ids] = (
-                (torch.rand(n, 2, device=self.device) * (bias_hi - bias_lo) + bias_lo) * deg * sign()
-            )
-            self._att_osc_amp[env_ids] = (
-                torch.rand(n, 2, device=self.device) * (osc_hi - osc_lo) + osc_lo
-            ) * deg
-            self._att_osc_w[env_ids] = 2.0 * math.pi * _uniform(*cfg.attitude_osc_hz_range)
-            self._att_osc_phase[env_ids] = torch.rand(n, 2, device=self.device) * (2.0 * math.pi)
-        else:
-            self._att_bias[env_ids] = 0.0
-            self._att_osc_amp[env_ids] = 0.0
 
         # Per-env in-FOV detection probability (absolute, not multiplicative).
         det_p = _uniform(*cfg.detection_prob_in_fov_range)
@@ -495,42 +425,6 @@ class VirtualPerception:
             self._deadzone_pitch_h[env_ids] = pitch_h
         else:
             self._deadzone_active[env_ids] = False
-
-    # ------------------------------------------------------- projection error
-    def _projection_error(
-        self, cam_pos_w: torch.Tensor, ball_pos_w: torch.Tensor
-    ) -> torch.Tensor:
-        """Ground-projection position error from camera attitude error. Shape (N, 2).
-
-        The ball's world position comes from intersecting the image ray with the
-        z=0 plane. Writing r for the horizontal camera-ball distance and h for the
-        camera height, an elevation error d_pitch moves the intersection along the
-        bearing by (r^2 + h^2)/h * d_pitch, and a bearing error d_yaw moves it
-        sideways by r * d_yaw. The first term is quadratic in distance, which is
-        why far balls are poorly localised in depth but well localised laterally.
-        """
-        self._att_t += self.dt
-        t = self._att_t.unsqueeze(-1)
-        att = self._att_bias + self._att_osc_amp * torch.sin(
-            self._att_osc_w.unsqueeze(-1) * t + self._att_osc_phase
-        )
-        d_pitch, d_yaw = att[:, 0], att[:, 1]
-
-        # Pixel noise enters as an extra angular error on both axes.
-        if self.cfg.pixel_noise_px > 0.0 and self.cfg.focal_px > 0.0:
-            px_ang = self.cfg.pixel_noise_px / self.cfg.focal_px
-            d_pitch = d_pitch + torch.randn_like(d_pitch) * px_ang
-            d_yaw = d_yaw + torch.randn_like(d_yaw) * px_ang
-
-        rel = ball_pos_w[:, :2] - cam_pos_w[:, :2]
-        r = rel.norm(dim=-1).clamp_min(1e-3)
-        h = cam_pos_w[:, 2].clamp_min(0.2)
-        u = rel / r.unsqueeze(-1)
-        v = torch.stack([-u[:, 1], u[:, 0]], dim=-1)
-
-        depth_err = (r * r + h * h) / h * d_pitch
-        lat_err = r * d_yaw
-        return u * depth_err.unsqueeze(-1) + v * lat_err.unsqueeze(-1)
 
     # ----------------------------------------------------------------- update
     @torch.no_grad()
@@ -643,12 +537,9 @@ class VirtualPerception:
         self._raw_detected = detected_f
 
         # ----- xy noise (world frame, then yaw-rotate into body frame) --
-        if cfg.attitude_noise:
-            ball_xy_world = ball_pos_w[:, :2] + self._projection_error(cam_pos_w, ball_pos_w)
-        else:
-            sigma = self._noise_a_per_env * distance + self._noise_b_per_env
-            noise = torch.randn_like(ball_pos_w[:, :2]) * sigma.unsqueeze(-1)
-            ball_xy_world = ball_pos_w[:, :2] + noise
+        sigma = self._noise_a_per_env * distance + self._noise_b_per_env
+        noise = torch.randn_like(ball_pos_w[:, :2]) * sigma.unsqueeze(-1)
+        ball_xy_world = ball_pos_w[:, :2] + noise
 
         robot_pos_w = robot.data.root_pos_w
         robot_quat_w = robot.data.root_quat_w
@@ -676,24 +567,16 @@ class VirtualPerception:
             do_update, torch.zeros_like(self._steps_since_update), self._steps_since_update
         )
 
-        # Bump the sequence number only when a genuinely new detection landed.
-        self._meas_seq = self._meas_seq + (do_update & detected).long()
-
         # ----- Ring buffer write ----------------------------------------
         self._buffer_head = (self._buffer_head + 1) % cfg.buffer_size
         self._buffer_pos[self._buffer_head] = self._last_pos
         self._buffer_mask[self._buffer_head] = self._last_mask
-        self._buffer_seq[self._buffer_head] = self._meas_seq
 
         # ----- Ring buffer read at per-env latency ----------------------
         env_idx = torch.arange(N, device=d)
         read_head = (self._buffer_head - self._latency_steps) % cfg.buffer_size
         out_pos = self._buffer_pos[read_head, env_idx]
         out_mask = self._buffer_mask[read_head, env_idx]
-        out_seq = self._buffer_seq[read_head, env_idx]
-
-        self._fresh = ((out_seq != self._prev_out_seq) & (out_mask > 0.5)).float()
-        self._prev_out_seq = out_seq
 
         if not cfg.hold_last_on_miss:
             out_pos = out_pos * out_mask.unsqueeze(-1)
@@ -719,15 +602,6 @@ class VirtualPerception:
     def ball_mask(self) -> torch.Tensor:
         """Float mask in {0, 1}; 1 when a (delayed) detection is available."""
         return self._ball_mask
-
-    @property
-    def fresh(self) -> torch.Tensor:
-        """1 on the step a *new* detection surfaces from the latency buffer.
-
-        Between detector ticks the buffer keeps emitting the held value, so
-        downstream estimators must gate their measurement update on this flag.
-        """
-        return self._fresh
 
     @property
     def last_seen_dt(self) -> torch.Tensor:
