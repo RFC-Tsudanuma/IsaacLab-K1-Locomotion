@@ -56,6 +56,18 @@ Walk-Loop-Shoot からの変更点
          「ボールが上に飛びさえすればよい」になり、sim の接触モデル固有の解に落ちる。
          緩めるのは可、外すのは不可。
 
+5. **アクチュエータを T-N カーブ付きに差し替える (sim2real 転移の本命)。**
+   素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップするだけで、
+   「最高速で回りながら最大トルクを出す」という実機に存在しない動作を許してしまう。
+   最大出力のキックはその領域を全力で使いに行くため、sim では飛ぶのに実機では飛ばない、
+   という形の転移失敗を招く。Booster 公式の
+   :class:`~..locomotion.actuators.BoosterDelayedPDActuator` に差し替え、
+   速度に応じてトルク上限が落ちる実機同等の制約を入れる。
+
+   NOTE: **この差し替えは walk_lob のみ。** 共通のロボット定義
+         (locomotion/rough_env_cfg.py の K1_LOCOMOTION_CFG) は素のままにしてある。
+         walk_kick / walk_pass / walk_loop_* は既に成果が出ているので物理を変えない。
+
 継承したまま変えないもの
 ------------------------
 * ボール物性の DR (摩擦 0.3-1.0 / 0.2-0.8、反発 0.0-0.7、質量スケール 0.9-1.15)。
@@ -75,6 +87,11 @@ Walk-Loop-Shoot からの変更点
 
 from isaaclab.utils import configclass
 
+from ..locomotion.actuators import (
+    K1_ANKLE_KNEE_POINT_VELOCITY,
+    K1_LEG_KNEE_POINT_VELOCITY,
+    BoosterDelayedPDActuatorCfg,
+)
 from ..walk_loop_shoot.walk_loop_shoot_env_cfg import K1WalkLoopShootEnvCfg
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +188,51 @@ class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
         # NOTE: `kick_velocity_strong` は loop_pass の __post_init__ で None (項ごと撤去)
         #       になっており、ここには存在しない。これで有効なキック報酬は
         #       kick_direction / kick_loft / kick_elevation の 3 本 (+ ball 追従系)。
+
+        # -- 5. アクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える
+        #
+        # 素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップする
+        # だけなので、「最高速で回りながら最大トルクを出す」という実機に存在しない動作が
+        # sim では許されてしまう。実機の BLDC は速度が上がると逆起電力でトルクが落ちるため、
+        # そのままだと最大出力キックが sim 専用の幻の性能に最適化される
+        # (= sim では飛ぶのに実機では全く飛ばない)。値の出典と実装は
+        # :mod:`..locomotion.actuators` を参照。
+        #
+        # **このタスクだけの差し替え**。共通のロボット定義 (locomotion/rough_env_cfg.py の
+        # K1_LOCOMOTION_CFG) は素の DelayedPDActuatorCfg のままにしてある。既に実機で
+        # 成果の出ている walk_kick / walk_pass / walk_loop_* の物理を変えないため。
+        #
+        # NOTE: ArticulationCfg.replace() は dataclasses.replace = 浅いコピーなので、
+        #       actuators dict の実体は K1_LOCOMOTION_CFG と共有されている。
+        #       dict の中身を直接書き換えると他タスクにも波及するため、
+        #       **必ず dict ごと新しいものに差し替える**こと。
+        _act = dict(self.scene.robot.actuators)
+        _legs, _feet = _act["legs"], _act["feet"]
+        # effort_limit / velocity_limit / stiffness / damping / armature / 遅延は
+        # 既存値をそのまま引き継ぎ、knee_point_velocity だけを足す。
+        _act["legs"] = BoosterDelayedPDActuatorCfg(
+            joint_names_expr=_legs.joint_names_expr,
+            effort_limit=_legs.effort_limit,
+            velocity_limit=_legs.velocity_limit,
+            knee_point_velocity=K1_LEG_KNEE_POINT_VELOCITY,
+            stiffness=_legs.stiffness,
+            damping=_legs.damping,
+            armature=_legs.armature,
+            min_delay=_legs.min_delay,
+            max_delay=_legs.max_delay,
+        )
+        _act["feet"] = BoosterDelayedPDActuatorCfg(
+            joint_names_expr=_feet.joint_names_expr,
+            effort_limit=_feet.effort_limit,
+            velocity_limit=_feet.velocity_limit,
+            knee_point_velocity=K1_ANKLE_KNEE_POINT_VELOCITY,
+            stiffness=_feet.stiffness,
+            damping=_feet.damping,
+            armature=_feet.armature,
+            min_delay=_feet.min_delay,
+            max_delay=_feet.max_delay,
+        )
+        self.scene.robot.actuators = _act
 
 
 @configclass
