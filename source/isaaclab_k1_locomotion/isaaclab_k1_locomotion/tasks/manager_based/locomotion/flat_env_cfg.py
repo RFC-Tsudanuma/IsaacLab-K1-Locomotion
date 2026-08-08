@@ -439,11 +439,11 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         # weight=0.0 でパイプラインでは無効。仕上げ resume で override して使う
         # (その際 minimum_height の閾値 0.54 が目標 0.53 と干渉するので
         #  rewards.base_height_penalty.params.min_height=0.48 も同時に override すること)。
-        self.rewards.base_height_track = RewTerm(
-            func=mdp.base_height_l2,
-            weight=0.0,
-            params={"target_height": 0.53},
-        )
+        # self.rewards.base_height_track = RewTerm(
+        #     func=mdp.base_height_l2,
+        #     weight=0.0,
+        #     params={"target_height": 0.53},
+        # )
         # Trunk 角加速度ペナルティ (頭部振動抑制)。頭は Trunk 剛結合なので、頭の振動 =
         # Trunk の回転ジッタ。ang_vel_xy_l2 が取りこぼす高周波成分を抑える。
         # j01 (この項なし) は追従 0.577 まで低下、j02 (あり) は 0.591 と同じ振動低減で
