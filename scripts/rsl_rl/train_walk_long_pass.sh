@@ -9,6 +9,10 @@
 # 潰れていて、4-5 m/s は探索したことのない速度域。std を戻さないと慣れた 2-3 m/s の
 # 蹴り方に貼り付いたまま抜け出せない。
 #
+# ITER は 5000 未満にしないこと。速度帯のカリキュラムが 500 → 3000 iteration で
+# (2.0,3.0) → (3.2,5.0) を動かし、その後の収束に 2000 iteration を見込んでいる。
+# 途中で止めると帯が目標に届いていない中途半端なポリシーになる。
+#
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_long_pass.sh                # 最新の 360 ckpt から
 #   CKPT=logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \

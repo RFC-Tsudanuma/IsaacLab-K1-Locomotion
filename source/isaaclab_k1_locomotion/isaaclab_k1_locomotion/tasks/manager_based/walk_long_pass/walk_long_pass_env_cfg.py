@@ -275,3 +275,14 @@ class K1WalkLongPassEnvCfg_PLAY(K1WalkLongPassEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        # -- 帯カリキュラムを外し、帯を終点に固定する
+        #
+        # CurriculumManager は PLAY でも毎リセットで走る。残しておくと
+        # common_step_counter が 0 から始まるので alpha=0、つまり帯が開始点
+        # (2.0, 3.0) に巻き戻され、**--kick_speed の指定も上書きされる**
+        # (play.py の _apply_kick_speed は env 生成前に cfg を書くだけなので、
+        #  カリキュラムが後から潰してしまう)。学習済みポリシーを見るときに欲しいのは
+        # 終点の帯なので、項ごと外して _LONG_PASS_SPEED_RANGE を直接入れる。
+        self.curriculum.kick_speed_range = None
+        self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
