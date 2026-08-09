@@ -50,6 +50,14 @@ logs/rsl_rl/k1_walk_loop_pass_360/*
 logs/rsl_rl/k1_walk_loop_pass_360/2026-08-03_22-13-23/*
 !logs/rsl_rl/k1_walk_loop_pass_360/2026-08-03_22-13-23/model_4999.pt
 
+# walk_kick_360 の checkpoint。実機で動作確認済み（全力キックで飛距離約 20 m、
+# sim 実測 v_ball ≈ 6.0 m/s）。ミドルキック (Walk-Mid-Kick) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_kick_360/
+logs/rsl_rl/k1_walk_kick_360/*
+!logs/rsl_rl/k1_walk_kick_360/2026-08-08_16-48-06/
+logs/rsl_rl/k1_walk_kick_360/2026-08-08_16-48-06/*
+!logs/rsl_rl/k1_walk_kick_360/2026-08-08_16-48-06/model_2800.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
