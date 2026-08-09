@@ -432,6 +432,32 @@ def gk_target_y(
     return compute_target_y(env, max_y=max_y, use_perceived=use_perceived).unsqueeze(1)
 
 
+def zmp_xy_base(
+    env: "ManagerBasedRLEnv",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ZMP の水平位置を **自機の base yaw frame** で返す (N, 2)。critic 観測用。
+
+    ★ 2026-08-09: locomotion の :func:`compute_zmp_xy` をそのまま critic 観測に
+      入れていたが、あれは **world 絶対座標** を返す。IsaacLab の ``*_w`` は env 原点
+      オフセットを含むため、env_spacing 6.0 × 4096 env では ±190m のレンジになり、
+      本来見たい ±0.3m の ZMP 変位は全体の 0.1% 未満に埋もれる。critic の観測
+      正規化 (critic_obs_normalization) は全 env 共通の統計で割るので、正規化後の
+      有効信号は ~0.003 まで潰れ、実質「env ID を表すだけの定数」になっていた。
+
+      ここでは自機位置を引いて base yaw frame へ回すことで、
+        * env 原点オフセットが消えて信号が本来のスケールに戻る
+        * 左右反転が y の符号反転だけで表せる (mirror / data augmentation が可能になる)
+      の両方を満たす。
+    """
+    from ...locomotion.mdp.rewards import compute_zmp_xy
+
+    robot: Articulation = env.scene[asset_cfg.name]
+    rel = compute_zmp_xy(env, asset_cfg) - robot.data.root_pos_w[:, :2]
+    rel3 = torch.cat([rel, torch.zeros_like(rel[:, :1])], dim=1)
+    return quat_apply_inverse(yaw_quat(robot.data.root_quat_w), rel3)[:, :2]
+
+
 def zeros_obs(env: "ManagerBasedRLEnv", dim: int = 1) -> torch.Tensor:
     """常にゼロを返すダミー観測 (N, dim)。
 

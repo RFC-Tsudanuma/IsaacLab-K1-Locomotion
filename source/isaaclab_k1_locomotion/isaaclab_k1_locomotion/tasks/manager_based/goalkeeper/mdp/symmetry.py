@@ -76,6 +76,74 @@ def _task_sign(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     return sign
 
 
+# ---------------------------------------------------------------------------
+# critic 観測 (64 次元) のレイアウト
+#   K1CriticCfg (rough_env_cfg.py) の定義順 = スロット順:
+#     [ 0: 3] base_lin_vel        (vx, vy, vz)      → y 反転
+#     [ 3: 6] base_ang_vel        (wx, wy, wz)      → roll(x)/yaw(z) 反転
+#     [ 6: 9] projected_gravity   (gx, gy, gz)      → y 反転
+#     [ 9:12] velocity_commands   (vx, vy, wz)      → y/yaw 反転
+#     [12:24] joint_pos                             → 左右入れ替え + roll/yaw 符号
+#     [24:36] joint_vel                             → 同上
+#     [36:48] actions                               → 同上
+#     [48:52] gait_phase (sinL, cosL, sinR, cosR)   → 左右入れ替え
+#     [52:54] zmp_position (base yaw frame の x, y) → y 反転 (zmp_xy_base が前提)
+#   これに goalkeeper のタスク 10 次元 (policy と同じ順序・同じ符号) が続いて 64。
+_CRITIC_OBS_DIM = 64
+_CRITIC_TASK_START = 54
+_CRITIC_GAIT_PHASE_SLICE = slice(48, 52)
+# gait_phase の左右入れ替え (48+[2,3,0,1])。位相が π ずれるので mirror と等価。
+_CRITIC_GAIT_PHASE_SWAP = [50, 51, 48, 49]
+# joint_pos / joint_vel / actions の開始位置
+_CRITIC_JOINT_SLICES = (slice(12, 24), slice(24, 36), slice(36, 48))
+# 先頭 12 次元 (base_lin_vel, base_ang_vel, projected_gravity, velocity_commands) と
+# zmp_position (2) に掛ける符号。
+_CRITIC_HEAD_SIGN = [
+    1.0, -1.0, 1.0,    # base_lin_vel
+    -1.0, 1.0, -1.0,   # base_ang_vel
+    1.0, -1.0, 1.0,    # projected_gravity
+    1.0, -1.0, -1.0,   # velocity_commands (vx, vy, wz)
+]
+_CRITIC_ZMP_SIGN = [1.0, -1.0]
+
+
+def _critic_sign(device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    key = ("critic", device, dtype)
+    consts = _CONST_CACHE.get(key)
+    if consts is None:
+        consts = (
+            torch.tensor(_CRITIC_HEAD_SIGN, device=device, dtype=dtype),
+            torch.tensor(_CRITIC_ZMP_SIGN, device=device, dtype=dtype),
+        )
+        _CONST_CACHE[key] = consts
+    return consts
+
+
+def _mirror_gk_critic_obs(obs: torch.Tensor) -> torch.Tensor:
+    """ゴールキーパーの critic 観測 (N, 64) を矢状面に対して左右反転する。
+
+    data augmentation を使う場合、critic は「反転した観測」と「反転した行動・
+    リターン」の組で学習される必要がある。policy グループだけ反転して critic を
+    複製したままにすると、critic が食い違った組を学習して価値推定が壊れる。
+    """
+    if obs.shape[-1] != _CRITIC_OBS_DIM:
+        raise ValueError(
+            f"symmetry: critic 観測の次元が想定 ({_CRITIC_OBS_DIM}) と異なります: {obs.shape[-1]}。"
+            " goalkeeper/mdp/symmetry.py のスライス定義を K1GKDirectCriticCfg に合わせて"
+            " 更新してください。"
+        )
+
+    head_sign, zmp_sign = _critic_sign(obs.device, obs.dtype)
+    out = obs.clone()
+    out[:, :12] = obs[:, :12] * head_sign
+    for sl in _CRITIC_JOINT_SLICES:
+        out[:, sl] = _mirror_joints(obs[:, sl])
+    out[:, _CRITIC_GAIT_PHASE_SLICE] = obs[:, _CRITIC_GAIT_PHASE_SWAP]
+    out[:, 52:54] = obs[:, 52:54] * zmp_sign
+    out[:, _CRITIC_TASK_START:] = obs[:, _CRITIC_TASK_START:] * _task_sign(obs.device, obs.dtype)
+    return out
+
+
 def _mirror_gk_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     """ゴールキーパーのポリシー観測 (N, 59) を矢状面に対して左右反転する。"""
     if obs.shape[-1] != _POLICY_OBS_DIM:
@@ -119,6 +187,14 @@ def compute_symmetric_states(
         obs_aug = obs.repeat(2)
         obs_aug["policy"][:batch_size] = obs["policy"][:]
         obs_aug["policy"][batch_size:] = _mirror_gk_policy_obs(obs["policy"])
+        # ★ 2026-08-09: critic グループも反転する。
+        #   mirror loss だけなら critic は参照されないので複製のままでよかったが、
+        #   data augmentation を有効にすると critic は拡張バッチ全体で学習される。
+        #   ここを反転しないと、後半のサンプルが「反転していない観測」と
+        #   「反転した行動・リターン」の食い違った組になり価値推定が壊れる。
+        if "critic" in obs_aug.keys():
+            obs_aug["critic"][:batch_size] = obs["critic"][:]
+            obs_aug["critic"][batch_size:] = _mirror_gk_critic_obs(obs["critic"])
     else:
         obs_aug = None
 

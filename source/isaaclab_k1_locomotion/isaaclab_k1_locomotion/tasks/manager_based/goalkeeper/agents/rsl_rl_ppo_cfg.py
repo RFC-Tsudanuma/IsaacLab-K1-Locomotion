@@ -121,11 +121,25 @@ class K1GKDirectPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         #
         # data augmentation は使わない (locomotion と揃える)。actor は MLP なので
         # recurrent 方策で mirror loss が動かない問題 (locomotion のコメント参照) は該当しない。
+        # ★ 2026-08-09: data augmentation を有効化し、mirror loss 係数を 0.5 → 2.0 に上げた。
+        #   34600→54599 iter の run で「右への横移動だけ足が上がらず転びやすい」非対称が
+        #   目視で出た。URDF の関節軸・可動域・質量・関節の並び順はすべて正しくミラーで、
+        #   Loss/symmetry も 0.009 で安定していたので、構造バグではなく学習の残差。
+        #   (mirror loss 導入前は逆に左が悪かった、という記録が上のコメントにある通り、
+        #    どちらが劣るかは run ごとに入れ替わる = 残差の典型的な症状。)
+        #
+        #   mirror loss は「出力」を縛るだけで、critic の価値推定・advantage・観測正規化の
+        #   統計は左右非対称なまま残る。data augmentation はバッチ自体を左右均等にするので
+        #   そちらも揃う。学習時間は collection 1.1s に対し learning 0.1s なので、
+        #   バッチが 2 倍になっても全体では +10% 程度。
+        #
+        #   有効化の前提として compute_symmetric_states に critic 観測の反転を実装した
+        #   (それが無いと critic が食い違った組を学習する)。goalkeeper/mdp/symmetry.py 参照。
         self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=False,
+            use_data_augmentation=True,
             use_mirror_loss=True,
             data_augmentation_func=compute_symmetric_states,
-            mirror_loss_coeff=0.5,
+            mirror_loss_coeff=2.0,
         )
 
 

@@ -88,6 +88,7 @@ from .mdp.observations import (
     task_drive_phase_obs,
     task_drive_vector,
     zeros_obs,
+    zmp_xy_base,
 )
 from .mdp.rewards import (
     face_field,
@@ -129,6 +130,12 @@ class K1GKDirectStage1PolicyCfg(K1PolicyCfg):
 @configclass
 class K1GKDirectStage1CriticCfg(K1CriticCfg):
     """Stage 1 の critic 観測 (歩行 K1CriticCfg + 同じダミースロット)。"""
+
+    # ★ 2026-08-09: world 絶対座標の ZMP を自機基準に差し替える。
+    #   K1CriticCfg の既定 (compute_zmp_xy) は env 原点オフセット込みの world 座標で、
+    #   正規化後に信号が潰れるうえ左右反転もできない。:func:`zmp_xy_base` 参照。
+    #   dataclass の項順は最初の定義位置を保つので、スロット位置は変わらない。
+    zmp_position = ObsTerm(func=zmp_xy_base, params={"asset_cfg": SceneEntityCfg("robot")})
 
     ball_pos_rel = ObsTerm(func=zeros_obs, params={"dim": 2})
     ball_vel = ObsTerm(func=zeros_obs, params={"dim": 2})
