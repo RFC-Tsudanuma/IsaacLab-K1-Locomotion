@@ -70,17 +70,14 @@ Walk-Loop-Shoot からの変更点
    ``sole_height_at_kick`` (→ 下がるか) の 2 つで見る。前者が動いたのに後者が動かない
    なら、軸足位置は仰角の律速ではなかったということなので項を落とす判断ができる。
 
-6. **アクチュエータを T-N カーブ付きに差し替える (sim2real 転移の本命)。**
-   素の DelayedPDActuator は effort_limit と velocity_limit を独立にクリップするだけで、
-   「最高速で回りながら最大トルクを出す」という実機に存在しない動作を許してしまう。
-   最大出力のキックはその領域を全力で使いに行くため、sim では飛ぶのに実機では飛ばない、
-   という形の転移失敗を招く。Booster 公式の
-   :class:`~..locomotion.actuators.BoosterDelayedPDActuator` に差し替え、
-   速度に応じてトルク上限が落ちる実機同等の制約を入れる。
-
-   NOTE: **この差し替えは walk_lob のみ。** 共通のロボット定義
-         (locomotion/rough_env_cfg.py の K1_LOCOMOTION_CFG) は素のままにしてある。
-         walk_kick / walk_pass / walk_loop_* は既に成果が出ているので物理を変えない。
+6. **アクチュエータの T-N カーブ差し替えは撤回した。**
+   sim2real 転移の本命として Booster 公式の
+   :class:`~..locomotion.actuators.BoosterDelayedPDActuator` (速度に応じてトルク上限が
+   落ちる T-N カーブ) を一度導入したが、学習が全く進まなくなったため撤回した。
+   walk_kick / walk_pass / walk_loop_* と同じ素の ``DelayedPDActuator`` に戻している。
+   これにより stage 1 (walk phase) と stage 2 の物理は walk_kick 系と完全に同一になった
+   ので、原理上は ``k1_walk_kick_walk_phase`` の checkpoint をそのまま
+   ``--load_pretrained`` に使い回せる (walk_lob 専用の walk phase を別に回す必要はない)。
 
 継承したまま変えないもの
 ------------------------
@@ -103,11 +100,6 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
-from ..locomotion.actuators import (
-    K1_ANKLE_KNEE_POINT_VELOCITY,
-    K1_LEG_KNEE_POINT_VELOCITY,
-    BoosterDelayedPDActuatorCfg,
-)
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
     _KICK_STATE_PARAMS,
@@ -204,61 +196,6 @@ _PLANT_SIGMA_LAT = 0.06
 _PLANT_FOOT_WEIGHT = 2.0
 
 
-def _apply_tn_curve_actuators(cfg) -> None:
-    """脚・足首のアクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える。
-
-    素の :class:`~isaaclab.actuators.DelayedPDActuator` は ``effort_limit`` と
-    ``velocity_limit`` を *独立に* クリップするだけなので、「最高速で回りながら最大
-    トルクを出す」という実機に存在しない動作が sim では許されてしまう。実機の BLDC は
-    速度が上がると逆起電力でトルクが落ちるため、そのままだと最大出力キックが sim 専用の
-    幻の性能に最適化される (= sim では飛ぶのに実機では全く飛ばない)。
-    値の出典と実装は :mod:`..locomotion.actuators` を参照。
-
-    ``effort_limit`` / ``velocity_limit`` / ``stiffness`` / ``damping`` / ``armature`` /
-    遅延は既存インスタンスの値をそのまま引き継ぎ、**追加するのは knee_point_velocity だけ**。
-
-    **walk_lob 系だけの差し替え。** 共通のロボット定義 (locomotion/rough_env_cfg.py の
-    ``K1_LOCOMOTION_CFG``) は素の ``DelayedPDActuatorCfg`` のままにしてある。
-    既に実機で成果の出ている walk_kick / walk_pass / walk_loop_* の物理を変えないため。
-
-    NOTE: 歩行 (walk phase) とキック (lob 本体) の **両方** に適用すること。
-          歩行を素のアクチュエータで学習してからキックだけ T-N カーブにすると、
-          stage 2 で急にトルクが出なくなって歩けなくなる。Hip_Pitch のニー速度は
-          1.88 rad/s で、通常歩行のスイング期でも普通に超えるため影響は歩容にも及ぶ。
-
-    NOTE: ``ArticulationCfg.replace()`` は ``dataclasses.replace`` = 浅いコピーなので、
-          ``actuators`` dict の実体は ``K1_LOCOMOTION_CFG`` と共有されている。
-          dict の中身を直接書き換えると他タスクにも波及するため、
-          **必ず dict ごと新しいものに差し替える**こと。
-    """
-    act = dict(cfg.scene.robot.actuators)
-    legs, feet = act["legs"], act["feet"]
-
-    act["legs"] = BoosterDelayedPDActuatorCfg(
-        joint_names_expr=legs.joint_names_expr,
-        effort_limit=legs.effort_limit,
-        velocity_limit=legs.velocity_limit,
-        knee_point_velocity=K1_LEG_KNEE_POINT_VELOCITY,
-        stiffness=legs.stiffness,
-        damping=legs.damping,
-        armature=legs.armature,
-        min_delay=legs.min_delay,
-        max_delay=legs.max_delay,
-    )
-    act["feet"] = BoosterDelayedPDActuatorCfg(
-        joint_names_expr=feet.joint_names_expr,
-        effort_limit=feet.effort_limit,
-        velocity_limit=feet.velocity_limit,
-        knee_point_velocity=K1_ANKLE_KNEE_POINT_VELOCITY,
-        stiffness=feet.stiffness,
-        damping=feet.damping,
-        armature=feet.armature,
-        min_delay=feet.min_delay,
-        max_delay=feet.max_delay,
-    )
-    cfg.scene.robot.actuators = act
-
-
 @configclass
 class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
     """高さ特化のロブキック専用。Walk-Loop-Shoot と観測・行動空間は同一。"""
@@ -336,9 +273,6 @@ class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
             },
         )
 
-        # -- 6. アクチュエータをトルク-速度カーブ (T-N カーブ) 付きに差し替える
-        _apply_tn_curve_actuators(self)
-
 
 @configclass
 class K1WalkLobEnvCfg_PLAY(K1WalkLobEnvCfg):
@@ -354,28 +288,15 @@ class K1WalkLobEnvCfg_PLAY(K1WalkLobEnvCfg):
 
 @configclass
 class K1WalkLobWalkPhaseEnvCfg(K1WalkKickWalkPhaseEnvCfg):
-    """Stage 1 (歩行のみ) の walk_lob 版。**T-N カーブ付きアクチュエータで歩く。**
+    """Stage 1 (歩行のみ) の walk_lob 版。
 
-    walk_kick 系の walk phase (``K1WalkKickWalkPhaseEnvCfg``) との違いは
-    アクチュエータだけで、観測・行動空間・報酬・コマンドは完全に同一。
-
-    なぜ専用の walk phase が要るか
-    ------------------------------
-    共用の walk phase は素の ``DelayedPDActuator`` (T-N カーブ無し) で歩容を獲得する。
-    その checkpoint を T-N カーブ付きの :class:`K1WalkLobEnvCfg` に持ち込むと、
-    **stage 2 で急にトルクが出なくなって歩けなくなる**。Hip_Pitch のニー速度は
-    1.88 rad/s で、通常歩行のスイング期でも普通に超えるため、T-N カーブの影響は
-    キックだけでなく歩容そのものに及ぶ。
-
-    そこで lob は stage 1 から T-N カーブ下で歩行を獲得し、stage 1 → 2 で物理が
-    変わらないようにする。experiment 名も ``k1_walk_lob_walk_phase`` と分けてあるので、
-    既存の ``k1_walk_kick_walk_phase`` の run / checkpoint とは混ざらない。
+    T-N カーブ付きアクチュエータを一度導入したが学習が全く進まなくなったため撤回した
+    (walk_lob_env_cfg モジュール docstring の変更点 6 参照)。アクチュエータは
+    ``K1WalkKickWalkPhaseEnvCfg`` から一切変更していないので、**物理は walk_kick の
+    walk phase と完全に同一**。experiment 名 (``k1_walk_lob_walk_phase``) を分けて
+    ログを混ざらせないためだけにクラスを残してあるが、実体は空のサブクラスなので、
+    ``k1_walk_kick_walk_phase`` の既存 checkpoint をそのまま流用しても支障はない。
     """
-
-    def __post_init__(self) -> None:
-        super().__post_init__()
-
-        _apply_tn_curve_actuators(self)
 
 
 @configclass

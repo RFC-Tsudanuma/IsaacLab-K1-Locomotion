@@ -3,11 +3,9 @@
 #
 #   Stage 1: Isaac-Velocity-Flat-K1-Walk-Lob-Walk-Phase-v0
 #            ボール無し・通常の歩行コマンドで歩行だけを学習する。
-#            **walk_kick 系の walk phase とは別タスク**。lob はアクチュエータに
-#            トルク-速度カーブ (T-N カーブ) を入れているので、素のアクチュエータで
-#            獲得した歩容を持ち込むと stage 2 で急にトルクが出ず歩けなくなる
-#            (Hip_Pitch のニー速度 1.88 rad/s は通常歩行でも超える)。
-#            そのため stage 1 から T-N カーブ下で歩かせる。
+#            アクチュエータは walk_kick 系の walk phase と同一 (T-N カーブは
+#            学習が進まなくなったため撤回済み)。experiment 名を分けているだけなので、
+#            k1_walk_kick_walk_phase の checkpoint をそのまま使っても構わない。
 #   Stage 2: Isaac-Velocity-Flat-K1-Walk-Lob-v0
 #            ボール中心が K1 身長 0.9m を超えるロブキックを獲得する。
 #
@@ -15,11 +13,8 @@
 # --resume を使わない理由は train_walk_kick.sh の冒頭コメントと同じ
 # (common_step_counter が同期されてキック報酬カリキュラムがランプしなくなる)。
 #
-# NOTE: **アクチュエータの T-N カーブ導入後は、旧 checkpoint の歩容が前提と合わない。**
-#       トルク上限が速度依存になったため、旧モデルの歩容はそのままでは成立せず、
-#       walk phase から通しで回すのが基本。手元の loop_shoot / loop_pass の
-#       checkpoint から stage 2 だけ始めたくなるが、T-N カーブより前の run なら
-#       素直に stage 1 から回し直すこと。
+# NOTE: 物理は walk_kick / walk_loop_* と共通なので、手元の loop_shoot / loop_pass の
+#       checkpoint から stage 2 だけ始めても問題ない。
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_lob.sh                     # 通しで実行

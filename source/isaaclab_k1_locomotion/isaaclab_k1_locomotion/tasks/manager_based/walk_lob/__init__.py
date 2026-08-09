@@ -31,9 +31,9 @@ gym.register(
     },
 )
 
-# Stage 1: 歩行のみ。**walk_lob 専用**の walk phase で、Walk-Kick 側とは
-# アクチュエータが違う (T-N カーブ付き)。stage 1 → 2 で物理が変わらないようにするため
-# 共用せず別に持つ。詳細は walk_lob_env_cfg.K1WalkLobWalkPhaseEnvCfg の docstring。
+# Stage 1: 歩行のみ。T-N カーブ付きアクチュエータは撤回済みで、物理は walk_kick の
+# walk phase と同一。experiment 名を分けてログを混ぜないためだけに別タスクとして
+# 残してある。詳細は walk_lob_env_cfg.K1WalkLobWalkPhaseEnvCfg の docstring。
 gym.register(
     id="Isaac-Velocity-Flat-K1-Walk-Lob-Walk-Phase-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
