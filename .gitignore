@@ -22,6 +22,14 @@ logs/rsl_rl/k1_walk_kick_walk_phase/*
 logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/*
 !logs/rsl_rl/k1_walk_kick_walk_phase/2026-07-17_12-15-06/model_4999.pt
 
+# 膝同士の接触の罰 (knee_close_penalty, commit 7c3f14d) を入れた後の walk phase。
+# 上の 2026-07-17 の run はこの報酬項が存在しない時代のものなので、膝の接触を
+# 気にするタスク (walk_lob など) の --load_pretrained 元にはこちらを使うこと。
+# 歩行品質自体は 2 つの run でほぼ同等 (episode_length 995 vs 988)。
+!logs/rsl_rl/k1_walk_kick_walk_phase/2026-08-03_11-22-52/
+logs/rsl_rl/k1_walk_kick_walk_phase/2026-08-03_11-22-52/*
+!logs/rsl_rl/k1_walk_kick_walk_phase/2026-08-03_11-22-52/model_4999.pt
+
 # loop_shoot の起点 checkpoint（vz_sat=3.7 / 速度帯 (5.5,7.0) の再学習の --load_pretrained 元）。
 !logs/rsl_rl/k1_walk_loop_shoot/
 logs/rsl_rl/k1_walk_loop_shoot/*
