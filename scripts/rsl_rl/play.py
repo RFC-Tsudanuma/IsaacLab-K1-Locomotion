@@ -272,12 +272,13 @@ def log_kick_metrics(env, step: int, every: int = 100) -> None:
 
     sole_cm = avg("sole_height_at_kick") * 100.0
     phi_deg = math.degrees(avg("phi_frozen"))
+    dir_deg = math.degrees(avg("tau_direction_frozen"))
     v3d = avg("v_ball_3d_frozen")
     # apex は接地時のボール中心 (= 半径) を引いて「浮き」に直す
     loft_cm = (avg("apex_height") - _BALL_RADIUS_FOR_LOG) * 100.0
     print(
         f"[KICK] step {step:6d} | kicked {n_kicked:3d}/{num_envs:3d} "
-        f"| sole {sole_cm:5.1f}cm | phi {phi_deg:5.1f}deg "
+        f"| sole {sole_cm:5.1f}cm | phi {phi_deg:5.1f}deg | dir {dir_deg:5.1f}deg "
         f"| v3d {v3d:4.2f}m/s | loft {loft_cm:5.1f}cm | touches {touches:4.2f}"
     )
 

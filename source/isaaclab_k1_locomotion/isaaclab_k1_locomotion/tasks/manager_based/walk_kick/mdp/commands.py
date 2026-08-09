@@ -36,6 +36,9 @@ class KickDirectionCommand(UniformVelocityCommand):
     * ``kick_vel_ratio``: 指令速度に対する実測ボール速度の追従率 (v_ball / v_target)。
     * ``kick_vel_error``: 同じく絶対誤差 [m/s]。
     * ``kick_rate``: キックが成立した (値 latch した) エピソードの割合。
+    * ``kick_dir_error_deg``: 方向誤差 |τ_direction| [deg]。latch 時に凍結した
+      ボール飛翔方向と指令蹴り方向の水平角度差。「誤差 ±10°」要件の直接の指標。
+      これも「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
     * ``kick_elevation_deg``: 射出仰角 φ [deg]。ループシュートが出ているかの直接の指標。
     * ``kick_apex_height``: latch 後にボールが到達した最高高度 [m]。
     * ``ball_touch_count``: エピソード中に足がボールに触れた回数。1.0 が理想。
@@ -69,6 +72,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_vel_ratio"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_vel_error"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_rate"] = torch.zeros(self.num_envs, device=self.device)
+        # 方向誤差 [deg]。「誤差 ±10°」要件 (walk_long_pass) の直接の指標。
+        self.metrics["kick_dir_error_deg"] = torch.zeros(self.num_envs, device=self.device)
         # ループシュート (walk_loop) 用。他タスクでも「意図せず浮いていないか」の監視に使える。
         self.metrics["kick_elevation_deg"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_apex_height"] = torch.zeros(self.num_envs, device=self.device)
@@ -98,6 +103,7 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_vel_ratio"] = ratio * kick_done
         self.metrics["kick_vel_error"] = torch.abs(v_ball - v_target) * kick_done
         self.metrics["kick_rate"] = kick_done
+        self.metrics["kick_dir_error_deg"] = torch.rad2deg(state["tau_direction_frozen"]) * kick_done
         self.metrics["kick_elevation_deg"] = torch.rad2deg(state["phi_frozen"]) * kick_done
         self.metrics["kick_apex_height"] = state["apex_height"] * kick_done
         # 接触回数は kick_done でマスクしない。「触ったが蹴れていない」エピソードこそ

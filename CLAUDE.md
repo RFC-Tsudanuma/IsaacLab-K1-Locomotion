@@ -9,8 +9,6 @@
 ## 各種実行方法
 
 - python
-  - pythonは、IsaacLab2.3.2のkitを使っている。これは~/.bash_functionsに定義されている、_labpython2からアクセスが可能。
-  - pipなどを参照する際も全てここから参照してください。
+  - pythonは、IsaacLab2.3.2のkitを使っている。
 - rsl_rl
-  - 上記の_labpython2のpipにIsaaclab版のrsl_rlがインストールされています。
   - 基本的な学習は、train.shで実行されるK1FlatEnvCfgタスクによって行われている。
