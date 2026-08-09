@@ -95,3 +95,61 @@ def linear_reward_weight(
     term = env.reward_manager.get_term_cfg(term_name)
     if abs(term.weight - new_weight) > 1e-8:
         term.weight = new_weight
+
+
+def linear_command_speed_range(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    command_name: str,
+    start_range: tuple[float, float],
+    end_range: tuple[float, float],
+    start_step: int,
+    end_step: int,
+    steps_per_iteration: int = 0,
+) -> dict[str, float]:
+    """KickDirectionCommand の ``target_speed_range`` を線形に動かすカリキュラム。
+
+    下限・上限それぞれを ``start_range`` → ``end_range`` へ線形補間する。
+    :func:`linear_reward_weight` と同じく、``steps_per_iteration > 0`` なら
+    start_step/end_step を iteration 単位として解釈する。
+
+    **なぜ必要か（walk_long_pass の失敗記録）**
+
+    キック帯を一段で上げると、fine-tune の出発点となるポリシーの実蹴り速度が新しい帯の
+    下限を大きく下回り、``kick_velocity_scaled`` の Gaussian と ``kick_direction`` の
+    片側速度ゲートが揃って ~0 を返すようになる。一方 ``kick_finished`` は latch の
+    2 秒後にエピソードを終わらせるので、**キックは常に「残りの歩行報酬を捨てる」コストを
+    払っている**。キック報酬が消えるとこの収支が逆転し、ポリシーは「蹴らずに time_out
+    まで歩き回る」に収束する（実測: 帯 (2.0,3.0) → (3.2,5.0) を一段で飛ばしたところ
+    kick_rate 0.997 → 0.037、time_out 0.944、mean_reward はむしろ 12.1 → 21.5 に増加）。
+    しかも探索 std が潰れるため、iteration を増やしても抜けられない局所最適になる。
+
+    帯を滑らかに動かせば、各時点で「今のポリシーがぎりぎり届く速度」が指令され続けるので
+    キック報酬が払われ、収支が逆転しない。``v_gate_frac`` は v_target への相対値なので
+    帯に自動追従する（ゲート側を別途ランプする必要はない）。
+
+    NOTE: ``KickDirectionCommand._resample_command`` は毎回 ``self.cfg.target_speed_range``
+          を読み直すので、cfg を書き換えるだけで次のエピソードから反映される。
+    NOTE: 返り値の dict は ``Curriculum/<term_name>/speed_min`` などとして TensorBoard に
+          出る。帯が今どこまで動いたかを kick_rate と並べて読むこと。ランプ途中で
+          kick_rate が落ち始めたら、その帯の値がそのスイングの実質的な速度上限。
+    """
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
+
+    if step <= start_step:
+        alpha = 0.0
+    elif step >= end_step:
+        alpha = 1.0
+    else:
+        alpha = (step - start_step) / (end_step - start_step)
+
+    speed_min = start_range[0] + (end_range[0] - start_range[0]) * alpha
+    speed_max = start_range[1] + (end_range[1] - start_range[1]) * alpha
+
+    term = env.command_manager.get_term(command_name)
+    term.cfg.target_speed_range = (speed_min, speed_max)
+
+    return {"speed_min": speed_min, "speed_max": speed_max}

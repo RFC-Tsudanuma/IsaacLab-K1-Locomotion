@@ -34,6 +34,29 @@ kick_elevation (φ_target=30°) は sim で φ≈27° を現役で誘導して�
 学習後に kick_vel_ratio が帯上限側だけ垂れるようなら、そのとき初めて elevation の
 weight を下げる等を検討する。
 
+帯は一段で上げてはいけない（失敗記録）
+--------------------------------------
+初版は ``target_speed_range`` をいきなり (2.0, 3.0) → (3.2, 5.0) に張り替えていたが、
+**1200 iteration で「蹴らずに 15 秒歩き回る」に完全収束した**
+(run 2026-08-09_09-56-21: kick_rate 0.997 → 0.037、time_out 0.944、
+ball_touch_count 1.30 → 0.91、Episode_Reward/kick_direction 0.213 → 0.001)。
+
+機序は報酬の収支逆転:
+
+* ``kick_finished`` は latch の 2 秒後にエピソードを終わらせるので、キックは常に
+  **「残りの歩行報酬 (feet_phase など) を捨てる」コスト**を払っている。
+* 継承元の実蹴りは約 2.4 m/s。新しい帯で採点すると、v_gate × f_vel は
+  指令 3.2 で 0.38、4.1 で 0.009、**5.0 で ~0**。帯の大半でキック報酬が消える。
+* 結果、蹴らない方が得になる (mean_reward はむしろ 12.1 → 21.5 に増えた)。
+  探索 std も 0.3 → 0.08 に潰れ、iteration を増やしても抜けられない局所最適。
+
+そこで帯は :func:`~..walk_kick.mdp.curriculums.linear_command_speed_range` で
+継承元が満点を取れる (2.0, 3.0) から目標の (3.2, 5.0) へ滑らかに動かす。各時点で
+「今のポリシーがぎりぎり届く速度」が指令されるのでキック報酬が払われ続ける。
+
+**この構造は帯を触る限り常について回る。** 帯を再調整するときは、必ず
+「継承元の実蹴り速度で採点したときにキック報酬が残るか」を先に検算すること。
+
 学習手順 (loop_pass_360 の checkpoint から fine-tune)::
 
     ./scripts/rsl_rl/train_walk_long_pass.sh
@@ -67,8 +90,29 @@ from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
 #
 # NOTE: a=1.0 は 1 点計測。実機で --kick_speed 3.0 を測って a を確定させたら、
 #       この帯を締め直すこと (a=0.7 なら 10 m に 3.74 m/s で足りる)。
+# NOTE: これは **カリキュラムの終点**。開始時は _LONG_PASS_SPEED_RANGE_START。
+#       一段で張り替えると「蹴らない」に収束する (モジュール docstring の失敗記録参照)。
 # --------------------------------------------------------------------------- #
 _LONG_PASS_SPEED_RANGE = (3.2, 5.0)
+
+# --------------------------------------------------------------------------- #
+# 帯カリキュラムの開始点と区間
+#
+# 開始点は継承元 (loop_pass_360) の帯そのもの。そこでは実蹴り 2.4 m/s に対して
+# kick_vel_ratio 0.866 / kick_rate 0.997 が出ているので、fine-tune の 1 iteration 目から
+# キック報酬が満額で払われ、「蹴る」行動が維持される。
+#
+# 区間 500 → 3000 iteration:
+#   * 500 まで待つのは、キック報酬 weight 自体のランプ (0 → 500) と重ねないため。
+#     weight が立ち上がりきる前に帯まで動かすと、どちらが原因で報酬が動いたのか
+#     読めなくなる。
+#   * 2500 iteration かけるのは、帯の上限が 3.0 → 5.0 と 1.7 倍に伸びるため。
+#     1 iteration あたり 0.0008 m/s ずつで、ポリシーが追従する余裕を取る。
+#   * 終点 3000 の後に仕上げの余地を残す想定なので、ITER は 5000 以上で回すこと。
+# --------------------------------------------------------------------------- #
+_LONG_PASS_SPEED_RANGE_START = (2.0, 3.0)
+_SPEED_RAMP_START_ITER = 500
+_SPEED_RAMP_END_ITER = 3000
 
 # --------------------------------------------------------------------------- #
 # 値 latch のトリガー速度 [m/s]
@@ -152,8 +196,13 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. 目標ボール速度をロングパスの帯に張り替える（このタスクの本体）
-        self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+        # -- 1. 目標ボール速度をロングパスの帯へ（このタスクの本体）
+        #
+        # cfg の初期値は **カリキュラムの開始点** (= 継承元の帯) にしておく。
+        # 終点 _LONG_PASS_SPEED_RANGE へはカリキュラム (下の -- 6) が動かす。
+        # ここに終点を直接書くと、カリキュラムが最初に走るまでの数ステップだけ
+        # 帯が飛んでしまう上、意図が読めなくなる。
+        self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE_START
 
         # -- 2. 速度シェイピングを帯幅に合わせて緩める
         self.rewards.kick_velocity_scaled.params["sigma_velocity"] = _LONG_PASS_SIGMA_VELOCITY
@@ -174,6 +223,11 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
             weight=0.0,
             params={**_KICK_STATE_PARAMS},
         )
+        # ランプは帯カリキュラムの **後** (3000 → 3500 iteration)。
+        # 初版は 0 → 500 で他のキック報酬と同時に立ち上げていたが、「触ると罰される」
+        # 圧力と「蹴っても報酬が出ない」状況が重なると、ポリシーはボールを避ける方向へ
+        # まとめて逃げる (実測 ball_touch_count 1.30 → 0.91)。帯が目標まで動いて
+        # キックが安定してから、最後に多重接触だけを削るのが正しい順序。
         self.curriculum.extra_ball_touch_weight = CurrTerm(
             func=mdp.linear_reward_weight,
             params={
@@ -183,8 +237,8 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
                 # (キック 1 回の収益 ≈ +5 の 2 割)。kick_rate が落ちるようなら
                 # 弱めること (ボールに触ること自体を避け始めるサイン)。
                 "end_weight": -50.0,
-                "start_step": 0,
-                "end_step": 500,
+                "start_step": _SPEED_RAMP_END_ITER,
+                "end_step": _SPEED_RAMP_END_ITER + 500,
                 "steps_per_iteration": 24,
             },
         )
@@ -192,6 +246,23 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # -- 5. latch のトリガー速度を帯に合わせて上げる
         # (全項に一括配布。extra_ball_touch を追加した後に呼ぶこと)
         _apply_v_thresh(self, _LONG_PASS_V_THRESH)
+
+        # -- 6. 目標ボール速度の帯を (2.0,3.0) → (3.2,5.0) へ滑らかに動かす
+        #
+        # このタスクの成否を決めるカリキュラム。一段で張り替えると
+        # 「蹴らずに time_out まで歩く」に収束する (モジュール docstring の失敗記録)。
+        # 進捗は Curriculum/kick_speed_range/speed_{min,max} で追える。
+        self.curriculum.kick_speed_range = CurrTerm(
+            func=mdp.linear_command_speed_range,
+            params={
+                "command_name": "kick_direction",
+                "start_range": _LONG_PASS_SPEED_RANGE_START,
+                "end_range": _LONG_PASS_SPEED_RANGE,
+                "start_step": _SPEED_RAMP_START_ITER,
+                "end_step": _SPEED_RAMP_END_ITER,
+                "steps_per_iteration": 24,
+            },
+        )
 
 
 @configclass
