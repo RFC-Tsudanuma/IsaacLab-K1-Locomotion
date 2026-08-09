@@ -148,7 +148,14 @@ def _update_success_ema(env: "ManagerBasedRLEnv", env_ids, p) -> int:
         n = int(valid.sum().item())
         if n == 0:
             return 0
-        batch = saved[valid] / faced[valid]
+        # ★ 2026-08-09: 「エピソードごとの比率の平均」から「球で重み付けした率」に変更。
+        #   エピソードは初失点で終わるので、前者は 1 球あたりの成功率より系統的に低く出る
+        #   (失点したエピソードは必ず分母が小さい状態で打ち切られるため)。
+        #   実測: 学習ログ EMA 0.755 に対し、同条件の 1 球あたり実測は 0.851 (差 10pt)。
+        #   この 10pt のぶんだけ閾値 adaptive_success_threshold=0.85 が実質 0.915 相当に
+        #   なっており、カリキュラムが不感帯で停止する主因だった (34600 iter 回して
+        #   ball_speed_hi が 1.0→1.55 までしか動かなかった)。
+        batch = saved[valid].sum() / faced[valid].sum()
 
     env._gk_episode_count += n
     alpha = min(1.0, float(p.adaptive_ema_alpha) * n)
