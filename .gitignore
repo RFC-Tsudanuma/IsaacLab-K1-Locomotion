@@ -42,6 +42,14 @@ logs/rsl_rl/k1_walk_loop/*
 logs/rsl_rl/k1_walk_loop/2026-07-20_10-33-30/*
 !logs/rsl_rl/k1_walk_loop/2026-07-20_10-33-30/model_4600.pt
 
+# loop_pass_360 の checkpoint。実機で動作確認済み（指令 2 m/s → 飛距離約 2 m）。
+# ロングパス (Walk-Long-Pass) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_loop_pass_360/
+logs/rsl_rl/k1_walk_loop_pass_360/*
+!logs/rsl_rl/k1_walk_loop_pass_360/2026-08-03_22-13-23/
+logs/rsl_rl/k1_walk_loop_pass_360/2026-08-03_22-13-23/*
+!logs/rsl_rl/k1_walk_loop_pass_360/2026-08-03_22-13-23/model_4999.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
