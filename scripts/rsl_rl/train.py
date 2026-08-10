@@ -13,6 +13,12 @@ import os
 # 既にユーザーが環境変数を設定している場合はそちらを優先する。
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
+# 2 GPU 分散学習の NCCL ハング対策 (2026-08-06)。この PC は GPU 間が PHB 接続 +
+# AMD IOMMU 有効のため、NCCL が PCIe P2P を使うと最初の broadcast で無限に固まる。
+# P2P を無効化しホストメモリ経由にする。同期対象は勾配 (~9MB) のみなので速度影響は
+# 誤差レベル。単一 GPU 学習には無影響。
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+
 """Launch Isaac Sim Simulator first."""
 
 import argparse
