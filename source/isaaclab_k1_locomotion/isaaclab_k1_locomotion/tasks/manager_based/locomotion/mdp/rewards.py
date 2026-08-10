@@ -946,6 +946,34 @@ def base_lin_vel_xy_l2(
     return torch.sum(torch.square(asset.data.root_lin_vel_w[:, :2]), dim=1)
 
 
+def joint_power_l1(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """関節の機械パワー |torque * joint_vel| の総和 [W] をペナルティとして返す。
+
+    トルク単体 (dof_torques_l2) は「支え続けるだけ」の静的な保持トルクも罰してしまうが、
+    パワーは実際に仕事をしている動き (高速に振り回す・拮抗して押し合う) だけを罰する。
+    絶対値和なので回生 (負のパワー) も等しくコストとして扱う。
+    """
+    asset = env.scene[asset_cfg.name]
+    power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.abs(power), dim=1)
+
+
+def joint_power_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """関節の機械パワー (torque * joint_vel) の二乗和をペナルティとして返す。
+
+    joint_power_l1 と違い、大きなパワーのピークを強く罰する。
+    """
+    asset = env.scene[asset_cfg.name]
+    power = asset.data.applied_torque[:, asset_cfg.joint_ids] * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    return torch.sum(torch.square(power), dim=1)
+
+
 def base_ang_vel_z_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

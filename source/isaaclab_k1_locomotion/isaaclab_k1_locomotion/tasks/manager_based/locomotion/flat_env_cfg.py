@@ -23,7 +23,14 @@ import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
 from .mdp.commands import ExtremeVelocityCommandCfg
-from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2, base_ang_acc_l2
+from .mdp.rewards import (
+    feet_landing_impact,
+    feet_landing_vel,
+    feet_heel_strike,
+    com_jerk_l2,
+    base_ang_acc_l2,
+    joint_power_l2,
+)
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
@@ -575,6 +582,28 @@ class K1FlatImprovePostureCfg(K1FlatEnvCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # --- トルク系の抑制 ---
+        self.rewards.dof_torques_l2.weight = -1.5e-5
+
+        # --- 機械パワー (torque * joint_vel) の抑制 ---
+        # dof_torques_l2 は姿勢を「支えているだけ」の静的な保持トルクも罰するため、
+        # 傾き抑制 (flat_orientation_l2) と競合しやすい。パワーは実際に仕事をしている
+        # 動き — 高速な振り回しや拮抗筋的な押し合い — だけを罰するので、姿勢保持を
+        # 犠牲にせずエネルギー効率と滑らかさを促せる。
+        # 絶対値和なので値のスケールは sum|τ·ω| [W] 相当 (数十〜数百 W)。重みは
+        # dof_torques_l2 の寄与と同程度の桁になる初期値なので、reward logger で
+        # 他項と桁を突き合わせて要チューニング (効かなければ増量、追従が落ちるなら減量)。
+        # 重み探索 (2026-08-09, 300it プローブ × {-1e-5, -3e-5, -1e-4, -3e-4}):
+        # -1e-4 で err_vel_xy 1.02→1.28 と追従悪化が進行、-3e-4 は歩行放棄で崩壊。
+        # -3e-5 は追従 +0.04 (seed ノイズ帯上端)・姿勢維持でパワー約 3 割減となり、
+        # 「追従を妨げない範囲の最大」として採用。-1e-5 は無害だが削減効果ほぼ無し。
+        self.rewards.joint_power_l2 = RewTerm(
+            func=joint_power_l2,
+            weight=-3.0e-5,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+
 
         # --- 上体の傾き抑制 ---
         # m04 レシピ (2026-07-28〜29): フルパイプライン学習後の仕上げ resume で
