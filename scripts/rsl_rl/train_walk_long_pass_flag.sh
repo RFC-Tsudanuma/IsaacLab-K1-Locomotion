@@ -27,6 +27,10 @@
 #   SRC=k1_walk_long_pass_dr ./scripts/rsl_rl/train_walk_long_pass_flag.sh  # DR 版から
 #   ITER=5000 ./scripts/rsl_rl/train_walk_long_pass_flag.sh    # 長く回す
 #
+# 途中まで学習した flag run の **続き** を回すとき (詳細は下の RESUME ブロック):
+#   RESUME=1 ITER=3100 ./scripts/rsl_rl/train_walk_long_pass_flag.sh
+# ITER は「追加で回す数」。expand も --load_pretrained も通らない。
+#
 # 見るべきもの (TensorBoard):
 #   Metrics/kick_direction/flag_accuracy        … **まずこれ**。単純な正解率 (1.0 が満点)
 #   Metrics/kick_direction/kick_rate            … 0.99 付近を維持するはず
@@ -91,6 +95,57 @@ FLAG_STD=${FLAG_STD:-0.5}
 
 TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Flag-v0"
 SRC_LOG_ROOT="logs/rsl_rl/$SRC"
+
+# --------------------------------------------------------------------------- #
+# RESUME=1: 既存の k1_walk_long_pass_flag run の続きを学習する。
+#
+# **新規学習の経路 (下の expand → --load_pretrained) を通してはいけない。**
+# あちらは long_pass の checkpoint を 0 埋めし直して出発点にするので、
+# それまでに積んだフラグ学習が丸ごと捨てられる。
+#
+# --load_pretrained ではなく --resume を使う理由:
+#   * experiment_name が同じなので --resume が run を検出できる (他の段と違う点)
+#   * optimizer state (Adam のモーメント、adaptive LR の状態) まで引き継げる
+#   * checkpoint は既に 56/13/69 なので拡張は不要
+#   * このタスクはカリキュラムを全部終値に固定してあるので、--resume が
+#     common_step_counter を同期しても何も変わらない (害も利も無い)
+#
+# **--max_iterations は「追加で回す数」** であって目標値ではない。
+# rsl_rl の learn() は total_it = start_it + num_learning_iterations で回すので、
+# iteration 1900 から ITER=3100 を指定すると 5000 で止まる。
+#
+# --reset_noise_std は **付けないこと**。train.py はこれが指定されると
+# optimizer state のロードを丸ごと飛ばすので、resume の意味が薄れる。
+#
+# 使い方:
+#   RESUME=1 ITER=3100 ./scripts/rsl_rl/train_walk_long_pass_flag.sh
+#   RESUME=1 LOAD_RUN=2026-08-11_03-38-23 ./scripts/rsl_rl/train_walk_long_pass_flag.sh
+#
+# NOTE: resume でも log_dir は新しいタイムスタンプで作られる (IsaacLab の仕様)。
+#       TensorBoard の曲線は run をまたいで分割されるので、まとめて見るときは
+#       logs/rsl_rl/k1_walk_long_pass_flag を丸ごと指定すること。
+# --------------------------------------------------------------------------- #
+RESUME=${RESUME:-0}
+if [[ "$RESUME" != "0" ]]; then
+    RESUME_ARGS=(--resume)
+    if [[ -n "${LOAD_RUN:-}" ]]; then
+        RESUME_ARGS+=(--load_run "$LOAD_RUN")
+    fi
+    echo "=============================================================="
+    echo " walk_long_pass_flag [RESUME]  (task=$TASK, +${ITER} iterations)"
+    echo " load_run: ${LOAD_RUN:-"(最新)"}"
+    echo " NOTE: ITER は追加で回す数。現在の iteration からの相対値です。"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$ITER" \
+        "${RESUME_ARGS[@]}" \
+        "$@"
+    echo "[INFO] done."
+    exit 0
+fi
 
 # 指定 experiment ディレクトリの最新 run から最終 checkpoint を拾う。
 # run 名は YYYY-MM-DD_HH-MM-SS (辞書順=時刻順)、model_*.pt は sort -V で数値順。
