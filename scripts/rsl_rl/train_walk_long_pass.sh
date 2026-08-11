@@ -43,6 +43,12 @@
 #   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_long_pass.sh   # Stage 1 だけ延長
 #   RESET_NOISE_STD= ./scripts/rsl_rl/train_walk_long_pass.sh # Stage 4 の std リセット無効
 #
+# 通しで繋がるかだけ先に確かめる (各段 10 iteration / 64 env):
+#   SMOKE=1 ./scripts/rsl_rl/train_walk_long_pass.sh
+#   SMOKE=1 SMOKE_ITER=20 ./scripts/rsl_rl/train_walk_long_pass.sh
+# 終了時に作られた run の削除コマンドを表示するので、本番の前に必ず消すこと
+# (残すと find_latest_ckpt が 10 iteration の checkpoint を出発点に選んでしまう)。
+#
 # NOTE: 4 段合計 20000 iteration。4096 env で 1 段あたり数時間かかるので、
 #       途中で落ちたときは STAGE で残りだけ再開できるようにしてある。
 
@@ -94,11 +100,32 @@ if [[ -z "$LAB_PY" ]]; then
 fi
 echo "[INFO] python: $LAB_PY"
 
-NUM_ENVS=${NUM_ENVS:-4096}
+# --------------------------------------------------------------------------- #
+# SMOKE モード: 各段を数 iteration だけ回して「4 段が通しで繋がるか」だけ確かめる。
+#
+# rsl_rl は save_interval とは別に **学習終了時に必ず最終 checkpoint を保存する**
+# (max_iterations=5000 の run に model_4999.pt が残っているのがその証拠) ので、
+# 10 iteration でも model_9.pt ができて次の段へ引き継げる。
+#
+# 注意: スモークで作った run も logs/rsl_rl/<experiment>/ に残り、日時順で **最新**
+#       になる。放置すると次に本番を回したとき find_latest_ckpt が 10 iteration の
+#       ゴミを出発点に選んでしまうので、終了時に削除コマンドを表示する。
+# --------------------------------------------------------------------------- #
+SMOKE=${SMOKE:-0}
+if [[ "$SMOKE" != "0" ]]; then
+    _DEF_ITER=${SMOKE_ITER:-10}
+    _DEF_ENVS=64
+    echo "[INFO] SMOKE モード: 各段 ${_DEF_ITER} iteration / ${_DEF_ENVS} env で通し確認します。"
+else
+    _DEF_ITER=5000
+    _DEF_ENVS=4096
+fi
+
+NUM_ENVS=${NUM_ENVS:-$_DEF_ENVS}
 # kick 系 (Stage 2/3/4) の既定 iteration 数。
-ITER=${ITER:-5000}
+ITER=${ITER:-$_DEF_ITER}
 # 段ごとの上書き。指定が無ければ ITER (Stage 1 だけ独立)。
-WALK_ITER=${WALK_ITER:-5000}
+WALK_ITER=${WALK_ITER:-$_DEF_ITER}
 LOOP_ITER=${LOOP_ITER:-$ITER}
 LOOP360_ITER=${LOOP360_ITER:-$ITER}
 LONG_ITER=${LONG_ITER:-$ITER}
@@ -114,8 +141,21 @@ LONG_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0"
 WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
 LOOP_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass"
 LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass_360"
+LONG_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass"
 
 should_run() { [[ "$STAGE" == "all" || "$STAGE" == *"$1"* ]]; }
+
+# --- SMOKE モードで作られた run を記録しておくための小道具 --------------------- #
+_NEW_RUNS=()
+snapshot_runs() { find "$1" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort; }
+record_new_runs() {  # $1 = 実行前のスナップショット, $2 = log root
+    [[ "$SMOKE" == "0" ]] && return 0
+    local d
+    while IFS= read -r d; do
+        [[ -z "$d" ]] && continue
+        grep -qxF -- "$d" <<<"$1" || _NEW_RUNS+=("$d")
+    done <<<"$(snapshot_runs "$2")"
+}
 
 # 指定 experiment ディレクトリの最新 run から最終 checkpoint を拾う。
 # run 名は YYYY-MM-DD_HH-MM-SS (辞書順=時刻順)、model_*.pt は sort -V で数値順。
@@ -136,6 +176,7 @@ find_latest_ckpt() {
 }
 
 if should_run 1; then
+    _snap=$(snapshot_runs "$WALK_LOG_ROOT")
     echo "=============================================================="
     echo " Stage 1/4: walk phase  (task=$WALK_TASK, iters=$WALK_ITER)"
     echo "=============================================================="
@@ -145,10 +186,12 @@ if should_run 1; then
         --num_envs "$NUM_ENVS" \
         --max_iterations "$WALK_ITER" \
         "$@"
+    record_new_runs "$_snap" "$WALK_LOG_ROOT"
 fi
 
 if should_run 2; then
     WALK_CKPT="${WALK_CKPT:-$(find_latest_ckpt "$WALK_LOG_ROOT")}"
+    _snap=$(snapshot_runs "$LOOP_LOG_ROOT")
     echo "=============================================================="
     echo " Stage 2/4: loop_pass  (task=$LOOP_TASK, iters=$LOOP_ITER)"
     echo " pretrained: $WALK_CKPT"
@@ -160,10 +203,12 @@ if should_run 2; then
         --max_iterations "$LOOP_ITER" \
         --load_pretrained "$WALK_CKPT" \
         "$@"
+    record_new_runs "$_snap" "$LOOP_LOG_ROOT"
 fi
 
 if should_run 3; then
     LOOP_CKPT="${LOOP_CKPT:-$(find_latest_ckpt "$LOOP_LOG_ROOT")}"
+    _snap=$(snapshot_runs "$LOOP360_LOG_ROOT")
     echo "=============================================================="
     echo " Stage 3/4: loop_pass_360  (task=$LOOP360_TASK, iters=$LOOP360_ITER)"
     echo " pretrained: $LOOP_CKPT"
@@ -175,9 +220,11 @@ if should_run 3; then
         --max_iterations "$LOOP360_ITER" \
         --load_pretrained "$LOOP_CKPT" \
         "$@"
+    record_new_runs "$_snap" "$LOOP360_LOG_ROOT"
 fi
 
 if should_run 4; then
+    _snap=$(snapshot_runs "$LONG_LOG_ROOT")
     # CKPT は旧インターフェース (Stage 4 単体スクリプトだった頃の名前) の別名として残す。
     LOOP360_CKPT="${LOOP360_CKPT:-${CKPT:-$(find_latest_ckpt "$LOOP360_LOG_ROOT")}}"
 
@@ -199,6 +246,24 @@ if should_run 4; then
         --load_pretrained "$LOOP360_CKPT" \
         "${EXTRA_ARGS[@]}" \
         "$@"
+    record_new_runs "$_snap" "$LONG_LOG_ROOT"
 fi
 
 echo "[INFO] done."
+
+if [[ "$SMOKE" != "0" ]]; then
+    echo
+    echo "=============================================================="
+    echo " SMOKE 完了: 4 段が通しで繋がることを確認しました。"
+    echo "=============================================================="
+    if [[ ${#_NEW_RUNS[@]} -eq 0 ]]; then
+        echo "[WARN] 新しい run が検出できませんでした。checkpoint の保存を確認してください。"
+    else
+        echo " 作られた run (本番の前に消すこと。残すと find_latest_ckpt が"
+        echo " この ${SMOKE_ITER:-10} iteration の checkpoint を出発点に選んでしまいます):"
+        printf '   %s\n' "${_NEW_RUNS[@]}"
+        echo
+        echo " まとめて削除:"
+        echo "   rm -rf ${_NEW_RUNS[*]}"
+    fi
+fi
