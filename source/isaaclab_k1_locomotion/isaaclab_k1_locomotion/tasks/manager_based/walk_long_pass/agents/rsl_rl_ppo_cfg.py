@@ -20,3 +20,17 @@ class K1WalkLongPassPPORunnerCfg(K1WalkLoopPass360PPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_long_pass"
+
+
+@configclass
+class K1WalkLongPassDRPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
+    """ロングパス + ボール物性 DR。long_pass の checkpoint から継続する前提。
+
+    experiment_name を分けるので ``--resume`` は使えない (run を検出できない)。
+    env cfg 側でカリキュラムを終値に固定してあるため ``--load_pretrained`` で安全。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_dr"

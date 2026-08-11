@@ -77,9 +77,21 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import SceneEntityCfg
+
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
+# ボール物性 DR の範囲は walk_loop_shoot の定義をそのまま使う (二重管理を避ける)。
+# 範囲の根拠 (MuJoCo と IsaacLab の両方を内包する) はあちらのコメント参照。
+from ..walk_loop_shoot.walk_loop_shoot_env_cfg import (
+    _BALL_DYNAMIC_FRICTION_RANGE,
+    _BALL_MASS_SCALE_RANGE,
+    _BALL_RESTITUTION_RANGE,
+    _BALL_STATIC_FRICTION_RANGE,
+)
 
 # --------------------------------------------------------------------------- #
 # ロングパス用の目標ボール速度レンジ [m/s]（3D ノルム基準）
@@ -286,3 +298,139 @@ class K1WalkLongPassEnvCfg_PLAY(K1WalkLongPassEnvCfg):
         # 終点の帯なので、項ごと外して _LONG_PASS_SPEED_RANGE を直接入れる。
         self.curriculum.kick_speed_range = None
         self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+
+
+def _freeze_curricula_at_final(cfg) -> None:
+    """継承した全カリキュラムを **終値で固定** する (start = end にする)。
+
+    継続学習用のタスクで必要になる。``--load_pretrained`` は ``common_step_counter`` を
+    0 のままにするので、何もしないと親から継承したランプが全部やり直しになる:
+
+    * キック報酬の weight が 0 から立ち上げ直しになり、その間キックが赤字になる。
+      walk_long_pass の実測では iter 30-700 のあいだ kick_rate が 0.05 付近まで落ちた
+      (weight が満額に戻ってから PPO が蹴りを再発見するまでのラグ)。
+    * 速度帯が開始点 (2.0, 3.0) に巻き戻り、また 1500 iteration かけて上げ直す。
+
+    ``--resume`` なら ``common_step_counter`` が同期されてこの問題は起きないが、
+    **experiment_name が違うタスクへは --resume できない** (run を検出できない)。
+    そこで cfg 側でランプを潰し、「iter 0 = 親タスクの収束状態」にして
+    ``--load_pretrained`` を安全にする。
+
+    ``linear_reward_weight`` の ``start/end_weight`` と
+    ``linear_command_speed_range`` の ``start/end_range`` を名前で拾う汎用実装なので、
+    親に項が増えても自動で追従する。
+
+    NOTE: locomotion 由来の ``lin_vel_command`` (段階カリキュラム) は対象外。こちらは
+          stage 0 から進み直すが、``base_velocity`` は follow_ball=True でボール追従に
+          置き換わっており ``ranges`` は使われないため実害が無い。
+    """
+    for _term in vars(cfg.curriculum).values():
+        if _term is None or not hasattr(_term, "params"):
+            continue
+        params = _term.params
+        if "start_weight" in params and "end_weight" in params:
+            params["start_weight"] = params["end_weight"]
+        if "start_range" in params and "end_range" in params:
+            params["start_range"] = params["end_range"]
+
+
+@configclass
+class K1WalkLongPassDREnvCfg(K1WalkLongPassEnvCfg):
+    """ロングパス + ボール物性のドメインランダマイゼーション。
+
+    :class:`K1WalkLongPassEnvCfg` の **継続学習用** バリアント。学習済みの
+    long_pass ポリシー (run 2026-08-09_11-03-31: kick_rate 0.998 / kick_vel_ratio 0.921 /
+    kick_dir_error 4.1°) を出発点に、ボール物性への頑健性だけを足す。
+
+    なぜ DR が要るか
+    ----------------
+    long_pass のボールは固定物性 (静摩擦 1.0 / 動摩擦 0.8 / 反発 0.6) で、
+    ``walk_loop_pass`` が spawn で決め打ちした値をそのまま使っている。しかし
+    long_pass のキックは仰角 21.8° の **すくい気味** で、接触時の接線インパルス (摩擦)
+    と反発が射出速度・射出方向の両方に効く。単一物性で学習すると、その物理エンジンの
+    接触モデルに overfit する。
+
+    loop_shoot に実測がある: IsaacLab (摩擦 1.0/0.8・反発 0.6) で十分浮いたポリシーが
+    MuJoCo (摩擦 0.4・反発ほぼ 0) では 3-5 回に 1 回しか浮かなかった。
+
+    DR を足しても「蹴らない」に落ちない理由
+    --------------------------------------
+    帯の変更と違い、DR は **報酬の採点式もコマンド分布も変えない**。物性が振れて実速度が
+    3.8 → 3.2-4.2 くらいにばらついたとしても、帯の中央 4.1 に対して:
+
+    * ``kick_direction`` (weight 6.0, 片側ゲート): sigmoid((3.2−2.46)/0.3) ≈ 0.92 → ほぼ満額
+    * ``kick_velocity_scaled`` (weight 4.0): exp(−((3.2−4.1)/0.9)²) ≈ 0.37 → 下がるが 0 ではない
+
+    最大の項が生き残るので、「蹴らずに time_out まで歩く」への収束経路ができない。
+
+    学習手順 (long_pass の checkpoint から継続)::
+
+        ./scripts/rsl_rl/train_walk_long_pass_dr.sh
+
+    カリキュラムは :func:`_freeze_curricula_at_final` で全部終値に固定してあるので、
+    ``--load_pretrained`` でも iter 0 から親タスクの収束状態で始まる。
+    ``--reset_noise_std`` は **付けないこと**。
+
+    見るべきもの
+    ------------
+    * ``kick_rate`` … 0.99 付近を維持するはず。落ちたら想定外なので止めて報告する。
+    * ``kick_vel_ratio`` … ばらつきが増えて一時的に下がるのは想定内 (DR の代償)。
+      0.85 を下回ったまま戻らないなら DR の範囲が広すぎる。
+    * ``kick_dir_error_deg`` / ``kick_dir_error_signed_deg`` … 方向精度が DR で改善するか。
+      これが本来の狙いのひとつ。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. カリキュラムを終値で固定する（継続学習タスクなので必須）
+        _freeze_curricula_at_final(self)
+
+        # -- 2. ボール物性のドメインランダマイゼーション
+        #
+        # 親 (walk_loop_pass) が spawn で固定した physics_material を env ごとに上書きする。
+        # mode="startup" なので env ごとに固定値が 1 回だけ割り当てられる (4096 env あれば
+        # 分布としては十分)。半径だけは spawn 後に env ごとへ変えられないので 0.11 m 固定。
+        self.events.ball_physics_material = EventTerm(
+            func=loco_mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "static_friction_range": _BALL_STATIC_FRICTION_RANGE,
+                "dynamic_friction_range": _BALL_DYNAMIC_FRICTION_RANGE,
+                "restitution_range": _BALL_RESTITUTION_RANGE,
+                "num_buckets": 64,
+            },
+        )
+        self.events.ball_mass = EventTerm(
+            func=loco_mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "mass_distribution_params": _BALL_MASS_SCALE_RANGE,
+                "operation": "scale",
+            },
+        )
+
+
+@configclass
+class K1WalkLongPassDREnvCfg_PLAY(K1WalkLongPassDREnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        # 親 (_PLAY ではない K1WalkLongPassDREnvCfg) を継承しているので、
+        # K1WalkLongPassEnvCfg_PLAY の帯固定は効いていない。ここで同じ処理を行う。
+        # (CurriculumManager は PLAY でも毎リセットで走り、common_step_counter=0 から
+        #  始まるため、残すと --kick_speed の指定が上書きされる。)
+        self.curriculum.kick_speed_range = None
+        self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+
+        # NOTE: ボール物性 DR は **残す**。実機に近い条件でのばらつきを見たいので、
+        #       PLAY で消してしまうと DR を入れた意味の確認ができない。
+        #       固定物性で見たいときは events.ball_physics_material = None にすること。
