@@ -144,7 +144,7 @@ class K1WalkKickPolicyCfg(ObsGroup):
         params={"command_name": "kick_direction"},
     )
     # 11. Ball 2D Velocity (2) — base 相対
-    ball_vel = ObsTerm(func=mdp.ball_vel_b, noise=Unoise(n_min=-0.1, n_max=0.1))
+    ball_vel = ObsTerm(func=mdp.ball_vel_b, noise=Unoise(n_min=-0.4, n_max=0.4))
     # 12. Previous Ball 2D Position (2) — base 相対
     prev_ball_pos = ObsTerm(func=mdp.prev_ball_pos_b, noise=Unoise(n_min=-0.02, n_max=0.02))
 
