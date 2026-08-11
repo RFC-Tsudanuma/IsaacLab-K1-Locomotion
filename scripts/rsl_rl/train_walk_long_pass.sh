@@ -1,18 +1,27 @@
 #!/usr/bin/env bash
 # walk_long_pass (5-10 m の強い転がしパス) を **歩行から通しで** 学習する。
 #
-#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0
-#            ボール無し・通常の歩行コマンドで歩行だけを学習する (walk_kick と共用)。
-#   Stage 2: Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0
+#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Long-Pass-Walk-Phase-v0
+#            ボール無し・通常の歩行コマンドで歩行だけを学習する。
+#   Stage 2: Isaac-Velocity-Flat-K1-Walk-Long-Pass-Loop-Pass-v0
 #            限定レンジ (ボール±60°/蹴り±45°, 0.5-0.8m) で浮かせる蹴りを獲得する。
-#   Stage 3: Isaac-Velocity-Flat-K1-Walk-Loop-Pass-360-v0
+#   Stage 3: Isaac-Velocity-Flat-K1-Walk-Long-Pass-Loop-Pass-360-v0
 #            全方位 (360°/360°, 0.5-1.5m) + 回り込み。
 #   Stage 4: Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0
 #            速度帯を (2.0,3.0) → (3.2,5.0) へ引き上げる。
 #
-# Stage 1-3 は train_walk_loop_pass_360.sh と同一の内容。このスクリプトはそこに
-# Stage 4 を継ぎ足して 1 本にしたもの。全 stage とも観測 55 次元・行動 12 次元・
-# 同じ並びなので、--load_pretrained でそのまま引き継げる。
+# Stage 1-3 の中身は train_walk_loop_pass_360.sh (共用タスク) と同一だが、
+# **policy 観測を 50 フレームの履歴にした専用タスク**を使う。actor は
+# 「直近 5 フレームそのまま + 50 フレームの 1D-CNN 潜在」を入力に取るので、
+# 前段が 1 フレーム観測だと actor の重みが 1 つも引き継げない (train.py が形の
+# 合わないテンソルを黙って捨てる)。共用タスクに履歴を足すと walk_kick /
+# walk_pass / walk_lob / walk_mid_kick / loop_shoot まで道連れになるため、
+# long_pass 系列だけ別 ID に分けてある
+# (source/.../walk_long_pass/walk_long_pass_stages_env_cfg.py 参照)。
+#
+# 全 stage とも観測 (50, 55)・行動 12 次元・同じ並びなので、--load_pretrained で
+# そのまま引き継げる。段が繋がったかは起動ログの "Skipped N tensors" で確認する
+# (0 本なら全部引き継げている)。
 #
 # 各段の checkpoint 継承が実質カリキュラム:
 #   歩行 → (蹴り方を覚える) → (回り込みを覚える) → (強く蹴れるようになる)
@@ -35,8 +44,8 @@
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_long_pass.sh                  # 4 段を通しで実行
 #   STAGE=34 ./scripts/rsl_rl/train_walk_long_pass.sh         # loop_pass まで済みなら 3,4 だけ
-#   STAGE=4 ./scripts/rsl_rl/train_walk_long_pass.sh          # 最新の 360 ckpt から Stage 4 だけ
-#   STAGE=4 LOOP360_CKPT=logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \
+#   STAGE=4 ./scripts/rsl_rl/train_walk_long_pass.sh          # Stage 3 が済んでいれば Stage 4 だけ
+#   STAGE=4 LOOP360_CKPT=logs/rsl_rl/k1_walk_long_pass_loop_360/<run>/model_<N>.pt \
 #       ./scripts/rsl_rl/train_walk_long_pass.sh              # ckpt を明示
 #   ITER=10000 ./scripts/rsl_rl/train_walk_long_pass.sh       # 全 kick 段を長く回す
 #   LONG_ITER=10000 ./scripts/rsl_rl/train_walk_long_pass.sh  # Stage 4 だけ延長
@@ -45,6 +54,12 @@
 #
 # NOTE: 4 段合計 20000 iteration。4096 env で 1 段あたり数時間かかるので、
 #       途中で落ちたときは STAGE で残りだけ再開できるようにしてある。
+#
+# NOTE: STAGE で途中から始められるのは **前段をこのスクリプトで回してある場合だけ**。
+#       各段は直前の段の log ルート (k1_walk_long_pass_*) から checkpoint を拾うので、
+#       共用タスクの既存 run (k1_walk_kick_walk_phase / k1_walk_loop_pass_360 など) は
+#       引き継ぎ元にならない。1 フレーム観測で学習されていて actor の形が違うため
+#       (無理に渡しても actor が初期化されたまま学習が始まる)。
 
 set -euo pipefail
 
@@ -106,33 +121,64 @@ LONG_ITER=${LONG_ITER:-$ITER}
 RESET_NOISE_STD=${RESET_NOISE_STD-0.3}
 STAGE=${STAGE:-all}
 
-WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
-LOOP_TASK="Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0"
-LOOP360_TASK="Isaac-Velocity-Flat-K1-Walk-Loop-Pass-360-v0"
+WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Walk-Phase-v0"
+LOOP_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Loop-Pass-v0"
+LOOP360_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Loop-Pass-360-v0"
 LONG_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0"
 
-WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
-LOOP_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass"
-LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass_360"
+# 履歴入力版の log ルート。共用タスク (k1_walk_kick_walk_phase /
+# k1_walk_loop_pass / k1_walk_loop_pass_360) とは別ディレクトリなので、
+# 既存 run が誤って引き継ぎ元に選ばれることはない。
+WALK_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass_walk_phase"
+LOOP_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass_loop_pass"
+LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass_loop_360"
 
 should_run() { [[ "$STAGE" == "all" || "$STAGE" == *"$1"* ]]; }
 
 # 指定 experiment ディレクトリの最新 run から最終 checkpoint を拾う。
 # run 名は YYYY-MM-DD_HH-MM-SS (辞書順=時刻順)、model_*.pt は sort -V で数値順。
 # 直前の stage をこの実行で回した場合、その run が最新になるので自動で繋がる。
+#
+# 第 2 引数は「見つからなかったときに何をすればいいか」のヒント。STAGE=<n> で
+# 途中の段だけを回そうとして前段が無いのが唯一の失敗パターンなので、素の
+# 「run が見つかりません」だけ出して終わると原因が読めない。
 find_latest_ckpt() {
-    local latest_run ckpt
-    latest_run=$(find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
-    if [[ -z "$latest_run" ]]; then
-        echo "[ERROR] run が見つかりません: $1" >&2
+    local root="$1" hint="${2:-}" latest_run ckpt
+    if [[ ! -d "$root" ]]; then
+        echo "[ERROR] 前段の run がありません: $root" >&2
+        [[ -n "$hint" ]] && echo "[ERROR] $hint" >&2
         return 1
     fi
-    ckpt=$(find "$latest_run" -maxdepth 1 -name 'model_*.pt' | sort -V | tail -n 1)
+    latest_run=$(find "$root" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1)
+    if [[ -z "$latest_run" ]]; then
+        echo "[ERROR] 前段の run がありません: $root" >&2
+        [[ -n "$hint" ]] && echo "[ERROR] $hint" >&2
+        return 1
+    fi
+    ckpt=$(find "$latest_run" -maxdepth 1 -name 'model_*.pt' 2>/dev/null | sort -V | tail -n 1)
     if [[ -z "$ckpt" ]]; then
         echo "[ERROR] checkpoint が見つかりません: $latest_run" >&2
+        echo "[ERROR] (run はあるが model_*.pt が無い。前段が起動直後に落ちた可能性)" >&2
+        [[ -n "$hint" ]] && echo "[ERROR] $hint" >&2
         return 1
     fi
     echo "$ckpt"
+}
+
+# 引き継ぎ元が long_pass 系列 (履歴入力) の run かどうかを見て警告する。
+#
+# 共用タスクの run (k1_walk_kick_walk_phase / k1_walk_loop_pass*) は 1 フレーム
+# 観測で学習されており、actor の重みが 1 つも引き継がれない (critic と正規化統計と
+# std だけが載る)。--load_pretrained は形の合わないテンソルを黙って捨てるので、
+# 明示指定でうっかり混ぜたときに気づけるようにしておく。
+warn_if_foreign_ckpt() {
+    local ckpt="$1" expected_root="$2"
+    if [[ "$ckpt" != "$expected_root"/* ]]; then
+        echo "[WARN] 引き継ぎ元が $expected_root の run ではありません:" >&2
+        echo "[WARN]   $ckpt" >&2
+        echo "[WARN] 共用タスク (1 フレーム観測) の checkpoint なら actor は引き継がれません。" >&2
+        echo "[WARN] 起動ログの 'Skipped N tensors' を必ず確認すること (0 本なら問題なし)。" >&2
+    fi
 }
 
 if should_run 1; then
@@ -148,7 +194,10 @@ if should_run 1; then
 fi
 
 if should_run 2; then
-    WALK_CKPT="${WALK_CKPT:-$(find_latest_ckpt "$WALK_LOG_ROOT")}"
+    WALK_CKPT="${WALK_CKPT:-$(find_latest_ckpt "$WALK_LOG_ROOT" \
+        "先に Stage 1 を回すこと: STAGE=1 ./scripts/rsl_rl/train_walk_long_pass.sh
+[ERROR] (checkpoint を明示するなら WALK_CKPT=<path> を渡す)")}"
+    warn_if_foreign_ckpt "$WALK_CKPT" "$WALK_LOG_ROOT"
     echo "=============================================================="
     echo " Stage 2/4: loop_pass  (task=$LOOP_TASK, iters=$LOOP_ITER)"
     echo " pretrained: $WALK_CKPT"
@@ -163,7 +212,10 @@ if should_run 2; then
 fi
 
 if should_run 3; then
-    LOOP_CKPT="${LOOP_CKPT:-$(find_latest_ckpt "$LOOP_LOG_ROOT")}"
+    LOOP_CKPT="${LOOP_CKPT:-$(find_latest_ckpt "$LOOP_LOG_ROOT" \
+        "先に Stage 2 を回すこと: STAGE=2 ./scripts/rsl_rl/train_walk_long_pass.sh
+[ERROR] (checkpoint を明示するなら LOOP_CKPT=<path> を渡す)")}"
+    warn_if_foreign_ckpt "$LOOP_CKPT" "$LOOP_LOG_ROOT"
     echo "=============================================================="
     echo " Stage 3/4: loop_pass_360  (task=$LOOP360_TASK, iters=$LOOP360_ITER)"
     echo " pretrained: $LOOP_CKPT"
@@ -179,7 +231,16 @@ fi
 
 if should_run 4; then
     # CKPT は旧インターフェース (Stage 4 単体スクリプトだった頃の名前) の別名として残す。
-    LOOP360_CKPT="${LOOP360_CKPT:-${CKPT:-$(find_latest_ckpt "$LOOP360_LOG_ROOT")}}"
+    #
+    # 引き継ぎ元は **履歴入力版の Stage 3** ($LOOP360_LOG_ROOT)。共用の
+    # logs/rsl_rl/k1_walk_loop_pass_360 は 1 フレーム観測で学習されているので、
+    # ここに渡しても actor が引き継がれない (それが欲しいなら明示指定 + 上の警告を了承)。
+    LOOP360_CKPT="${LOOP360_CKPT:-${CKPT:-$(find_latest_ckpt "$LOOP360_LOG_ROOT" \
+        "先に Stage 3 を回すこと: STAGE=3 ./scripts/rsl_rl/train_walk_long_pass.sh
+[ERROR] 共用の logs/rsl_rl/k1_walk_loop_pass_360 は使えない: 1 フレーム観測で学習された
+[ERROR] checkpoint なので actor の重みが 1 つも引き継がれない (履歴入力版が必要)。
+[ERROR] (checkpoint を明示するなら LOOP360_CKPT=<path> を渡す)")}}"
+    warn_if_foreign_ckpt "$LOOP360_CKPT" "$LOOP360_LOG_ROOT"
 
     EXTRA_ARGS=()
     if [[ -n "$RESET_NOISE_STD" ]]; then

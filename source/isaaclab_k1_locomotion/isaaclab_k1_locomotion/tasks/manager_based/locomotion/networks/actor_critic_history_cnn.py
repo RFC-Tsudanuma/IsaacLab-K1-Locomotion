@@ -46,18 +46,19 @@ ONNX の "obs" に渡す。エピソード開始直後はバッファを現在�
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import io
 import os
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
 
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg
 
 from rsl_rl.modules import ActorCritic
-from rsl_rl.networks import MLP, EmpiricalNormalization
+from rsl_rl.networks import MLP
 from rsl_rl.utils import resolve_nn_activation
 
 
@@ -151,7 +152,7 @@ class HistoryCnnActor(nn.Module):
         self,
         obs_dim: int,
         history_length: int,
-        num_actions: int,
+        output_dim: int | list[int],
         hidden_dims: list[int],
         activation: str,
         num_recent_frames: int,
@@ -169,7 +170,10 @@ class HistoryCnnActor(nn.Module):
             strides=strides,
             activation=activation,
         )
-        self.mlp = MLP(self.encoder.output_dim, num_actions, hidden_dims, activation)
+        # output_dim は素の num_actions か、state_dependent_std のときの
+        # [2, num_actions] (平均と標準偏差)。親の ActorCritic が actor に期待する形を
+        # そのまま渡す。
+        self.mlp = MLP(self.encoder.output_dim, output_dim, hidden_dims, activation)
 
     def forward(self, obs_history: torch.Tensor) -> torch.Tensor:
         return self.mlp(self.encoder(obs_history))
@@ -179,8 +183,18 @@ class ActorCriticHistoryCNN(ActorCritic):
     """Actor が観測履歴を、critic が 1 フレームの特権観測を見る ActorCritic。
 
     分布まわり (act / act_inference / evaluate / entropy など) は
-    :class:`~rsl_rl.modules.ActorCritic` の実装をそのまま使う。``__init__`` だけは
-    親が「観測は 2 次元」を assert するので通さず、ここで組み直す。
+    :class:`~rsl_rl.modules.ActorCritic` の実装をそのまま使う。
+
+    ``__init__`` も **親をそのまま通す**。親は「観測は 2 次元」を assert するので、
+    履歴の最新フレームだけを取り出した proxy を食わせて初期化し、actor だけを後から
+    履歴版に差し替える。critic・観測正規化・action noise・分布まわりは親の初期化を
+    そのまま使う。
+
+    親を通さず自前で組み直すと、rsl_rl が ``__init__`` で増やした属性を取りこぼす。
+    実際 rsl-rl-lib 3.1 で入った ``state_dependent_std`` を落として
+    ``AttributeError: 'ActorCriticHistoryCNN' object has no attribute
+    'state_dependent_std'`` で学習が起動しなくなった (3.0 系では同名の属性が無いので
+    再現せず、バージョン差で片方だけ壊れる)。属性の面倒は親に見させること。
     """
 
     is_recurrent = False
@@ -203,16 +217,6 @@ class ActorCriticHistoryCNN(ActorCritic):
         cnn_strides: list[int] = [3, 2],
         **kwargs,
     ):
-        if kwargs:
-            print(
-                "ActorCriticHistoryCNN.__init__ got unexpected arguments, which will be ignored: "
-                + str([key for key in kwargs.keys()])
-            )
-        # 親の __init__ は 2 次元観測を前提にしているので飛ばす
-        nn.Module.__init__(self)
-
-        self.obs_groups = obs_groups
-
         # -- actor 側: 履歴付きの 1 グループだけを受け付ける
         policy_groups = obs_groups["policy"]
         if len(policy_groups) != 1:
@@ -220,32 +224,68 @@ class ActorCriticHistoryCNN(ActorCritic):
                 "ActorCriticHistoryCNN は履歴付きの観測グループ 1 つだけを actor 入力として扱う。"
                 f" 受け取ったグループ: {policy_groups}"
             )
-        actor_obs = obs[policy_groups[0]]
+        policy_group = policy_groups[0]
+        actor_obs = obs[policy_group]
         if actor_obs.dim() != 3:
             raise ValueError(
-                f"actor の観測 '{policy_groups[0]}' は (N, history, dim) の 3 次元である必要がある"
+                f"actor の観測 '{policy_group}' は (N, history, dim) の 3 次元である必要がある"
                 f" (受け取った形状: {tuple(actor_obs.shape)})。環境側で"
                 " observations.policy.history_length を設定し、flatten_history_dim = False に"
                 " すること。"
             )
-        self.history_length = int(actor_obs.shape[1])
-        self.obs_dim = int(actor_obs.shape[2])
+        history_length = int(actor_obs.shape[1])
+        obs_dim = int(actor_obs.shape[2])
 
-        # -- critic 側: 従来どおり 1 フレームの平坦な観測
-        num_critic_obs = 0
-        for obs_group in obs_groups["critic"]:
-            if obs[obs_group].dim() != 2:
+        # -- 親の __init__ を通す
+        #
+        # 履歴の最新フレームだけにした proxy を渡す。親はここから
+        #   * actor MLP (入力 obs_dim) … 後で履歴版に差し替えるので捨てる
+        #   * actor_obs_normalizer (obs_dim 次元) … **これはそのまま使える**
+        #     (統計は 1 フレーム分。(N, H, D) には最終軸でブロードキャストされる)
+        #   * critic / critic_obs_normalizer / std / distribution / その他の属性
+        # を作る。捨てる actor の構成を print されるとログが読めなくなるので、
+        # 親の出力は飲み込んで下で本物を出し直す。
+        proxy_obs = {
+            key: (value[:, -1, :] if key == policy_group else value) for key, value in obs.items()
+        }
+        with contextlib.redirect_stdout(io.StringIO()):
+            super().__init__(
+                proxy_obs,
+                obs_groups,
+                num_actions,
+                actor_obs_normalization=actor_obs_normalization,
+                critic_obs_normalization=critic_obs_normalization,
+                actor_hidden_dims=actor_hidden_dims,
+                critic_hidden_dims=critic_hidden_dims,
+                activation=activation,
+                init_noise_std=init_noise_std,
+                noise_std_type=noise_std_type,
+                **kwargs,
+            )
+
+        self.history_length = history_length
+        self.obs_dim = obs_dim
+
+        # rsl_rl のバージョン差の吸収。3.1 以降の ActorCritic は
+        # state_dependent_std を __init__ で生やし、update_distribution / act_inference が
+        # それを読む。3.0 系には無いので、無ければ False を入れておく。
+        if not hasattr(self, "state_dependent_std"):
+            if kwargs.get("state_dependent_std"):
                 raise ValueError(
-                    f"critic の観測 '{obs_group}' は 2 次元である必要がある"
-                    f" (受け取った形状: {tuple(obs[obs_group].shape)})。"
+                    "state_dependent_std=True が指定されたが、この rsl_rl の ActorCritic は"
+                    " 対応していない (親の __init__ が属性を作らなかった)。"
                 )
-            num_critic_obs += obs[obs_group].shape[-1]
+            self.state_dependent_std = False
 
-        # actor
+        # -- actor を履歴版に差し替える
+        #
+        # 出力の形は親に合わせる: state_dependent_std なら [2, num_actions]
+        # (平均と標準偏差)、そうでなければ num_actions。
+        actor_output_dim = [2, num_actions] if self.state_dependent_std else num_actions
         self.actor = HistoryCnnActor(
-            obs_dim=self.obs_dim,
-            history_length=self.history_length,
-            num_actions=num_actions,
+            obs_dim=obs_dim,
+            history_length=history_length,
+            output_dim=actor_output_dim,
             hidden_dims=actor_hidden_dims,
             activation=activation,
             num_recent_frames=num_recent_frames,
@@ -253,44 +293,15 @@ class ActorCriticHistoryCNN(ActorCritic):
             filters=cnn_filters,
             strides=cnn_strides,
         )
-        # actor observation normalization
-        # 統計は「1 フレームの観測次元」に対して持つ。(N, H, D) には最後の軸で
-        # ブロードキャストされるので、全フレームが同じ統計で正規化される。
-        self.actor_obs_normalization = actor_obs_normalization
-        if actor_obs_normalization:
-            self.actor_obs_normalizer = EmpiricalNormalization(self.obs_dim)
-        else:
-            self.actor_obs_normalizer = torch.nn.Identity()
+
         print(f"Actor history encoder: {self.actor.encoder.cnn}")
         print(
-            f"Actor input: {num_recent_frames} x {self.obs_dim} (recent frames)"
-            f" + {self.actor.encoder.latent_dim} (CNN latent over {self.history_length} frames)"
+            f"Actor input: {num_recent_frames} x {obs_dim} (recent frames)"
+            f" + {self.actor.encoder.latent_dim} (CNN latent over {history_length} frames)"
             f" = {self.actor.encoder.output_dim}"
         )
         print(f"Actor MLP: {self.actor.mlp}")
-
-        # critic
-        self.critic = MLP(num_critic_obs, 1, critic_hidden_dims, activation)
-        self.critic_obs_normalization = critic_obs_normalization
-        if critic_obs_normalization:
-            self.critic_obs_normalizer = EmpiricalNormalization(num_critic_obs)
-        else:
-            self.critic_obs_normalizer = torch.nn.Identity()
         print(f"Critic MLP: {self.critic}")
-
-        # Action noise
-        self.noise_std_type = noise_std_type
-        if self.noise_std_type == "scalar":
-            self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        elif self.noise_std_type == "log":
-            self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
-        else:
-            raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-
-        # Action distribution (populated in update_distribution)
-        self.distribution = None
-        # disable args validation for speedup
-        Normal.set_default_validate_args(False)
 
     def update_normalization(self, obs):
         """観測統計の更新。
