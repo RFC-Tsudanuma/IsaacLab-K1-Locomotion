@@ -1,24 +1,50 @@
 #!/usr/bin/env bash
-# walk_long_pass (5-10 m の強い転がしパス) の学習を実行する。
+# walk_long_pass (5-10 m の強い転がしパス) を **歩行から通しで** 学習する。
 #
-# loop_pass_360 の checkpoint からの fine-tune 一段のみ。歩行 → loop_pass → 360 の
-# 3 段はすでに済んでいる前提で、その最終 checkpoint を出発点に速度帯 (3.2-5.0 m/s)
-# だけを新しく学習する (蹴り方・回り込みは既知)。
+#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0
+#            ボール無し・通常の歩行コマンドで歩行だけを学習する (walk_kick と共用)。
+#   Stage 2: Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0
+#            限定レンジ (ボール±60°/蹴り±45°, 0.5-0.8m) で浮かせる蹴りを獲得する。
+#   Stage 3: Isaac-Velocity-Flat-K1-Walk-Loop-Pass-360-v0
+#            全方位 (360°/360°, 0.5-1.5m) + 回り込み。
+#   Stage 4: Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0
+#            速度帯を (2.0,3.0) → (3.2,5.0) へ引き上げる。
 #
-# --reset_noise_std を既定で入れる理由: 収束済みの 360 ポリシーは action std が
+# Stage 1-3 は train_walk_loop_pass_360.sh と同一の内容。このスクリプトはそこに
+# Stage 4 を継ぎ足して 1 本にしたもの。全 stage とも観測 55 次元・行動 12 次元・
+# 同じ並びなので、--load_pretrained でそのまま引き継げる。
+#
+# 各段の checkpoint 継承が実質カリキュラム:
+#   歩行 → (蹴り方を覚える) → (回り込みを覚える) → (強く蹴れるようになる)
+# 一段飛ばすと前段が獲得した挙動を再発見するところからになるので、順番は変えないこと。
+#
+# --resume ではなく --load_pretrained を使う理由: experiment_name が段ごとに違うので
+# --resume では前段の run を検出できない。加えて --resume は common_step_counter を
+# 同期してしまい、各段のキック報酬カリキュラムがランプしなくなる
+# (詳細は train_walk_kick.sh の冒頭コメント)。
+#
+# --reset_noise_std は **Stage 4 だけ** に入れる。収束済みの 360 ポリシーは action std が
 # 潰れていて、4-5 m/s は探索したことのない速度域。std を戻さないと慣れた 2-3 m/s の
-# 蹴り方に貼り付いたまま抜け出せない。
+# 蹴り方に貼り付いたまま抜け出せない。Stage 2/3 では不要 (むしろ蹴り方を壊す)。
 #
-# ITER は 5000 未満にしないこと。速度帯のカリキュラムが 500 → 3000 iteration で
-# (2.0,3.0) → (3.2,5.0) を動かし、その後の収束に 2000 iteration を見込んでいる。
-# 途中で止めると帯が目標に届いていない中途半端なポリシーになる。
+# ITER は 5000 未満にしないこと。特に Stage 4 は速度帯のカリキュラムが
+# 500 → 3000 iteration で (2.0,3.0) → (3.2,5.0) を動かし、その後の収束に
+# 2000 iteration を見込んでいる。途中で止めると帯が目標に届いていない中途半端な
+# ポリシーになる。
 #
 # 使い方:
-#   ./scripts/rsl_rl/train_walk_long_pass.sh                # 最新の 360 ckpt から
-#   CKPT=logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \
-#       ./scripts/rsl_rl/train_walk_long_pass.sh            # ckpt を明示
-#   ITER=10000 ./scripts/rsl_rl/train_walk_long_pass.sh     # 長く回す
-#   RESET_NOISE_STD= ./scripts/rsl_rl/train_walk_long_pass.sh   # std リセット無効
+#   ./scripts/rsl_rl/train_walk_long_pass.sh                  # 4 段を通しで実行
+#   STAGE=34 ./scripts/rsl_rl/train_walk_long_pass.sh         # loop_pass まで済みなら 3,4 だけ
+#   STAGE=4 ./scripts/rsl_rl/train_walk_long_pass.sh          # 最新の 360 ckpt から Stage 4 だけ
+#   STAGE=4 LOOP360_CKPT=logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \
+#       ./scripts/rsl_rl/train_walk_long_pass.sh              # ckpt を明示
+#   ITER=10000 ./scripts/rsl_rl/train_walk_long_pass.sh       # 全 kick 段を長く回す
+#   LONG_ITER=10000 ./scripts/rsl_rl/train_walk_long_pass.sh  # Stage 4 だけ延長
+#   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_long_pass.sh   # Stage 1 だけ延長
+#   RESET_NOISE_STD= ./scripts/rsl_rl/train_walk_long_pass.sh # Stage 4 の std リセット無効
+#
+# NOTE: 4 段合計 20000 iteration。4096 env で 1 段あたり数時間かかるので、
+#       途中で落ちたときは STAGE で残りだけ再開できるようにしてある。
 
 set -euo pipefail
 
@@ -69,15 +95,31 @@ fi
 echo "[INFO] python: $LAB_PY"
 
 NUM_ENVS=${NUM_ENVS:-4096}
+# kick 系 (Stage 2/3/4) の既定 iteration 数。
 ITER=${ITER:-5000}
-# 空文字を渡すと --reset_noise_std を付けない。
+# 段ごとの上書き。指定が無ければ ITER (Stage 1 だけ独立)。
+WALK_ITER=${WALK_ITER:-5000}
+LOOP_ITER=${LOOP_ITER:-$ITER}
+LOOP360_ITER=${LOOP360_ITER:-$ITER}
+LONG_ITER=${LONG_ITER:-$ITER}
+# Stage 4 のみ。空文字を渡すと --reset_noise_std を付けない。
 RESET_NOISE_STD=${RESET_NOISE_STD-0.3}
+STAGE=${STAGE:-all}
 
-TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0"
-SRC_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass_360"
+WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
+LOOP_TASK="Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0"
+LOOP360_TASK="Isaac-Velocity-Flat-K1-Walk-Loop-Pass-360-v0"
+LONG_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0"
+
+WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
+LOOP_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass"
+LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_loop_pass_360"
+
+should_run() { [[ "$STAGE" == "all" || "$STAGE" == *"$1"* ]]; }
 
 # 指定 experiment ディレクトリの最新 run から最終 checkpoint を拾う。
 # run 名は YYYY-MM-DD_HH-MM-SS (辞書順=時刻順)、model_*.pt は sort -V で数値順。
+# 直前の stage をこの実行で回した場合、その run が最新になるので自動で繋がる。
 find_latest_ckpt() {
     local latest_run ckpt
     latest_run=$(find "$1" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)
@@ -93,25 +135,70 @@ find_latest_ckpt() {
     echo "$ckpt"
 }
 
-CKPT="${CKPT:-$(find_latest_ckpt "$SRC_LOG_ROOT")}"
-
-EXTRA_ARGS=()
-if [[ -n "$RESET_NOISE_STD" ]]; then
-    EXTRA_ARGS+=(--reset_noise_std "$RESET_NOISE_STD")
+if should_run 1; then
+    echo "=============================================================="
+    echo " Stage 1/4: walk phase  (task=$WALK_TASK, iters=$WALK_ITER)"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$WALK_TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$WALK_ITER" \
+        "$@"
 fi
 
-echo "=============================================================="
-echo " walk_long_pass  (task=$TASK, iters=$ITER)"
-echo " pretrained: $CKPT"
-echo " reset_noise_std: ${RESET_NOISE_STD:-"(off)"}"
-echo "=============================================================="
-$LAB_PY scripts/rsl_rl/train.py \
-    --task "$TASK" \
-    --headless \
-    --num_envs "$NUM_ENVS" \
-    --max_iterations "$ITER" \
-    --load_pretrained "$CKPT" \
-    "${EXTRA_ARGS[@]}" \
-    "$@"
+if should_run 2; then
+    WALK_CKPT="${WALK_CKPT:-$(find_latest_ckpt "$WALK_LOG_ROOT")}"
+    echo "=============================================================="
+    echo " Stage 2/4: loop_pass  (task=$LOOP_TASK, iters=$LOOP_ITER)"
+    echo " pretrained: $WALK_CKPT"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$LOOP_TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$LOOP_ITER" \
+        --load_pretrained "$WALK_CKPT" \
+        "$@"
+fi
+
+if should_run 3; then
+    LOOP_CKPT="${LOOP_CKPT:-$(find_latest_ckpt "$LOOP_LOG_ROOT")}"
+    echo "=============================================================="
+    echo " Stage 3/4: loop_pass_360  (task=$LOOP360_TASK, iters=$LOOP360_ITER)"
+    echo " pretrained: $LOOP_CKPT"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$LOOP360_TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$LOOP360_ITER" \
+        --load_pretrained "$LOOP_CKPT" \
+        "$@"
+fi
+
+if should_run 4; then
+    # CKPT は旧インターフェース (Stage 4 単体スクリプトだった頃の名前) の別名として残す。
+    LOOP360_CKPT="${LOOP360_CKPT:-${CKPT:-$(find_latest_ckpt "$LOOP360_LOG_ROOT")}}"
+
+    EXTRA_ARGS=()
+    if [[ -n "$RESET_NOISE_STD" ]]; then
+        EXTRA_ARGS+=(--reset_noise_std "$RESET_NOISE_STD")
+    fi
+
+    echo "=============================================================="
+    echo " Stage 4/4: long_pass  (task=$LONG_TASK, iters=$LONG_ITER)"
+    echo " pretrained: $LOOP360_CKPT"
+    echo " reset_noise_std: ${RESET_NOISE_STD:-"(off)"}"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$LONG_TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$LONG_ITER" \
+        --load_pretrained "$LOOP360_CKPT" \
+        "${EXTRA_ARGS[@]}" \
+        "$@"
+fi
 
 echo "[INFO] done."
