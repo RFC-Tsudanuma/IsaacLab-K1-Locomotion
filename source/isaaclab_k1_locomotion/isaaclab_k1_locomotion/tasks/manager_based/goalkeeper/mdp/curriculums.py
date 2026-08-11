@@ -144,7 +144,13 @@ def _update_success_ema(env: "ManagerBasedRLEnv", env_ids, p) -> int:
         saved = bufs["save_count"][env_ids].float()
         lost = conceded[env_ids].float()
         faced = saved + lost
-        valid = faced > 0
+        # ★ 2026-08-11: 「到達不能球」(hard_ball_prob で混ぜたもの) で失点したエピソードは
+        #   丸ごと集計から除外する。取れない球はほぼ確実に失点するので、含めると
+        #   success_ema が恒常的に下がり、適応カリキュラムが「難しすぎる」と誤判定して
+        #   難易度を下げ続けてしまう (混入率 15% なら成功率が 15pt 目減りする)。
+        #   除外すれば、到達不能球はカリキュラムに対して中立になる。
+        hard_lost = conceded[env_ids] & bufs["hard_ball"][env_ids]
+        valid = (faced > 0) & (~hard_lost)
         n = int(valid.sum().item())
         if n == 0:
             return 0

@@ -354,6 +354,30 @@ def return_to_center_after_save(
     return r * gate.float()
 
 
+def hold_default_pose_after_save(
+    env: "ManagerBasedRLEnv",
+    std: float = 0.35,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """★ 2026-08-11 追加: セーブ後の保持区間だけ、初期姿勢に近いほど高い報酬 [0, 1]。
+
+    ユーザー指示により :func:`return_to_center_after_save` を廃止し、代わりに
+    「止めた地点で数秒間、初期姿勢のまま立つ」を学習させる。転倒しないかを
+    切り分けて確認するのが目的。
+
+    区間は :func:`~.observations.post_save_hold` (タッチ〜次の球、約3.0秒)。
+    その間 :func:`~.observations.task_drive_vector` が指令をゼロにするので歩容は
+    停止し、この報酬が関節を既定姿勢へ引き戻す。
+    """
+    from .observations import post_save_hold
+
+    robot: Articulation = env.scene[asset_cfg.name]
+    dev = robot.data.joint_pos - robot.data.default_joint_pos
+    # 関節数で正規化して std の意味を関節あたりの平均ずれ [rad] に揃える
+    err2 = torch.square(dev).mean(dim=1)
+    return torch.exp(-err2 / std**2) * post_save_hold(env).float()
+
+
 def stay_on_goal_line(
     env: "ManagerBasedRLEnv",
     std: float = 0.3,
@@ -365,11 +389,19 @@ def stay_on_goal_line(
     ゴールの外側で止めるため + 前に出るほどシュートコースが狭まる)。
     ``x_offset`` を省略すると GoalkeeperParamsCfg.guard_x を使う (JSON で変更可能)。
     ガウス (σ=0.3) の緩い誘導なので、ボールに合わせた前後の微調整は妨げない。
+
+    ★ 2026-08-11: セーブ後の保持区間 (:func:`~.observations.post_save_hold`) では
+      ゲートを閉じる。指令はゼロにして「止めた地点で立つ」ようにしたのに、この報酬が
+      守備面へ引き戻すと指令と報酬が食い違うため。向き (face_field) は初期姿勢の一部
+      なので保持区間でも有効なまま残す。
     """
+    from .observations import post_save_hold
+
     if x_offset is None:
         x_offset = float(env.cfg.goalkeeper.guard_x)
     x = robot_pos_goal(env)[:, 0]
-    return torch.exp(-torch.square(x - x_offset) / std**2)
+    r = torch.exp(-torch.square(x - x_offset) / std**2)
+    return r * (~post_save_hold(env)).float()
 
 
 def face_field(

@@ -1,0 +1,26 @@
+{
+  "_comment": "goalkeeper_stage3_overrides.json の派生 (2026-08-11)。(a) ボール速度誤差を ±0.15 → ±0.5 m/s、(b) 到達不能球を 15% 混ぜる。",
+
+  "_comment_vel_bias": "perc_vel_bias_range は『大きさを一様サンプル → 符号をランダム』に使われるので [0.0, 0.5] は各軸 -0.5〜+0.5 の一様分布になる (実測で min=-0.500 / max=+0.500 / 度数フラット)。実機ビジョンの速度精度が未測定のため保守的に取る。",
+
+  "_comment_hard_ball": "★ 15% の球を到達不能にする。初速は上限 3.0 の 1.6倍 = 4.8 m/s まで、実現可能性クランプは 1.2s → 0.5s に緩和。3.5m から 4.0 m/s (到達 0.875s) という MuJoCo で転倒した球が訓練分布に入る。狙いは『届かない球で自壊しない』の学習で、新しい報酬は足していない (既存の転倒ペナルティ -200 が効く)。到達不能球での失点は curriculums._update_success_ema が集計から除外するので、カリキュラムの難易度判定は歪まない。",
+
+  "_comment_watch": "★ 見るべき指標: Episode_Termination/base_contact が下がること (これが目的)。goal_conceded は 15% ぶん上がるのが正常で、success_ema は除外により据え置きになるはず。混入率が高すぎるとセーブ学習が薄まるので、0.15 は上げすぎないこと。",
+
+  "env": {
+    "goalkeeper.perc_vel_bias_range": [0.0, 0.5],
+    "goalkeeper.hard_ball_prob": 0.15,
+    "goalkeeper.hard_ball_speed_mult": 1.6,
+    "goalkeeper.hard_ball_min_time": 0.5,
+
+    "goalkeeper.ball_speed_min": 0.5,
+    "goalkeeper.ball_speed_max": 1.0,
+    "goalkeeper.ball_speed_cap": 3.0,
+    "goalkeeper.min_time_to_line": 1.2,
+    "goalkeeper.adaptive_success_threshold": 0.85,
+    "goalkeeper.adaptive_fail_threshold": 0.55,
+    "goalkeeper.adaptive_speed_delta": 0.05,
+    "goalkeeper.adaptive_ema_alpha": 0.01,
+    "goalkeeper.adaptive_warmup_episodes": 2000
+  }
+}

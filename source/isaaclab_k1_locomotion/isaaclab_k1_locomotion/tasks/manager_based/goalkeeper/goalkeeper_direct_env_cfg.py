@@ -92,8 +92,8 @@ from .mdp.observations import (
 )
 from .mdp.rewards import (
     face_field,
+    hold_default_pose_after_save,
     lateral_speed_bonus,
-    return_to_center_after_save,
     save_clearance_bonus,
     save_touch_bonus,
     stance_foot_flat,
@@ -414,8 +414,14 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.rewards.save_touch_bonus = RewTerm(func=save_touch_bonus, weight=100.0)
         # セーブの「質」への上乗せ (2026-07-24)。触れただけで満額だと、ゴール正面に
         self.rewards.save_clearance = RewTerm(func=save_clearance_bonus, weight=50.0)
-        self.rewards.return_to_center = RewTerm(
-            func=return_to_center_after_save, weight=1.0, params={"std": 0.5}
+        # ★ 2026-08-11 (ユーザー指示): セーブ後にゴール中央へ戻る動作を廃止し、
+        #   **止めた地点で初期姿勢のまま数秒間立つ** に差し替えた。転倒しないかを
+        #   切り分けて確認するのが目的。
+        #   保持区間 (touched〜次の球、約3.0s) では task_drive_vector が指令をゼロに
+        #   するので歩容が止まり、この報酬が関節を既定姿勢へ引き戻す。
+        self.rewards.return_to_center = None
+        self.rewards.hold_pose_after_save = RewTerm(
+            func=hold_default_pose_after_save, weight=1.0, params={"std": 0.35}
         )
         self.rewards.stay_on_goal_line = RewTerm(func=stay_on_goal_line, weight=1.0, params={"std": 0.3})
         self.rewards.face_field = RewTerm(func=face_field, weight=1.0, params={"std": 0.5})

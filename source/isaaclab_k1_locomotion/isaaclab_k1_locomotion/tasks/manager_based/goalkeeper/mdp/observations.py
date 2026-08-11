@@ -59,6 +59,9 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         env._gk_respawn_cd = torch.full((n,), -1, dtype=torch.long, device=env.device)
         env._gk_save_count = torch.zeros(n, dtype=torch.long, device=env.device)
         env._gk_save_quality = torch.zeros(n, device=env.device)
+        # 今飛んでいる球が「到達不能球」(hard_ball_prob で混ぜたもの) か。
+        # 適応カリキュラムはこの球での失点を成功率の集計から除外する。
+        env._gk_hard_ball = torch.zeros(n, dtype=torch.bool, device=env.device)
     return {
         "target_y": env._gk_target_y,
         "ball_active": env._gk_ball_active,
@@ -69,6 +72,7 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "respawn_cd": env._gk_respawn_cd,
         "save_count": env._gk_save_count,
         "save_quality": env._gk_save_quality,
+        "hard_ball": env._gk_hard_ball,
     }
 
 
@@ -165,6 +169,25 @@ def robot_pose_est(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor
     return robot_pos_goal(env)[:, :2] + e[:, :2], robot.data.heading_w + e[:, 2]
 
 
+def post_save_hold(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """「セーブ後の静止保持中」を表す bool マスク (N,)。
+
+    ★ 2026-08-11 追加 (ユーザー指示): セーブ後に中央へ戻る動作をやめ、**止めた地点で
+      初期姿勢のまま数秒間立たせる**ためのゲート。転倒しないかを目視・数値で確認する
+      のが目的。
+
+    区間は ``touched`` (ボールに触れた) が立ってから次の球が発射されるまで:
+
+        タッチ → (save_delay_steps = 100 step = 2.0s) → セーブ確定
+              → (respawn_delay_steps = 50 step = 1.0s) → 次の球
+
+    合計 約3.0秒。``touched`` は :func:`~.events.relaunch_ball_after_save` が
+    次の球の発射時に False へ戻すので、この 1 つのフラグで区間全体を覆える
+    (``ball_active`` はセーブ確定時に False になってしまうので区間の途中で切れる)。
+    """
+    return gk_buffers(env)["touched"]
+
+
 def compute_target_y(
     env: "ManagerBasedRLEnv",
     max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
@@ -202,7 +225,17 @@ def compute_target_y(
     y_pred = (pos[:, 1] + vel[:, 1] * t).clamp(-max_y, max_y)
 
     target = torch.where(approaching, y_pred, torch.zeros_like(y_pred))
-    return torch.where(bufs["ball_active"], target, bufs["target_y"])
+    out = torch.where(bufs["ball_active"], target, bufs["target_y"])
+
+    # ★ 2026-08-11: セーブ後は中央 (y=0) ではなく **今いる場所** を目標にする。
+    #   従来は接近中でない/非アクティブのとき目標 0 = ゴール中央へ戻る動作になっていた。
+    #   自機の y をそのまま返せば task_drive_vector の dy = (目標 - 現在)/horizon が 0 に
+    #   なり、横指令が出ない = その場に留まる。:func:`post_save_hold` 参照。
+    if use_perceived:
+        self_y = robot_pose_est(env)[0][:, 1]
+    else:
+        self_y = robot_pos_goal(env)[:, 1]
+    return torch.where(post_save_hold(env), self_y, out)
 
 
 _T_IDLE: float = 1.0
@@ -532,7 +565,14 @@ def task_drive_vector(
     )
     # heading は +x を 0 とする world yaw。フィールド正面へ戻す向きを渡す。
     dyaw = ((-heading) / _T_IDLE).clamp(-1.0, 1.0)
-    return torch.stack([dx, dy, dyaw], dim=1)
+    drive = torch.stack([dx, dy, dyaw], dim=1)
+
+    # ★ 2026-08-11: セーブ後の保持区間は指令を完全にゼロにする (ユーザー指示)。
+    #   dy は compute_target_y 側で既に 0 になるが、dx (守備面へ戻る) と dyaw
+    #   (正面へ向き直す) が残ると「止めた地点で立つ」にならないので3成分とも落とす。
+    #   ノルム 0 < cmd_threshold なので task_drive_phase_obs も位相をゼロ埋めし、
+    #   ステージ1 で学習済みの「停止」挙動がそのまま出る。
+    return torch.where(post_save_hold(env).unsqueeze(1), torch.zeros_like(drive), drive)
 
 
 def task_drive_phase_obs(

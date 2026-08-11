@@ -153,6 +153,20 @@ class GoalkeeperParamsCfg:
     #   Stage1 の実効横移動速度 v_lat から eval_goalkeeper_speed.py が逆算した値に
     min_time_to_line: float = 1.2
 
+    # --- 到達不能球 (2026-08-11 追加) ---
+    # ★ min_time_to_line のクランプは「取れない球」を訓練から完全に除外するため、
+    #   ポリシーは **間に合わないときにどう振る舞うか** を一度も学んでいない。実測では
+    #   3.5m から 4.0 m/s (到達 0.875s < 1.2s) の球を与えると転倒が 1 回 → 56 回に増える。
+    #   歩幅も測ったが、転倒直前の踏み出しは通常の全力横移動より **小さく**、歩幅制限では
+    #   直らないことが分かった (eval_gk_stride.py)。素直に「取れない球」を一定割合で混ぜ、
+    #   既存の転倒ペナルティ経由で「届かなくても姿勢を保つ」を学ばせる。
+    #   既定 0.0 なので、override JSON で有効化しない限り従来の挙動は変わらない。
+    hard_ball_prob: float = 0.0        # 到達不能球にする確率
+    hard_ball_speed_mult: float = 1.6  # 初速を上限 hi の何倍まで出すか
+    hard_ball_min_time: float = 0.5    # 到達不能球に適用する緩和クランプ [s]。
+    #   0 にしないのは、到達 0.4s 級だと知覚 (遅延 116ms + 更新 40ms) が間に合わず
+    #   学習信号がゼロのノイズになるため。
+
     # 知覚DR (policy のボール観測に掛かる。critic は真値):
     #
     # ★ 下記のうち **実際に読まれているのは perc_update_rate_hz と perc_vel_bias_range

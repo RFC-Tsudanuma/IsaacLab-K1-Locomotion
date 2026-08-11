@@ -42,6 +42,7 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["respawn_cd"][env_ids] = -1
     bufs["save_count"][env_ids] = 0
     bufs["save_quality"][env_ids] = 0.0
+    bufs["hard_ball"][env_ids] = False
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:
@@ -212,13 +213,30 @@ def reset_ball_shot(
     hi = float(hi_buf.item()) if hi_buf is not None else float(p.ball_speed_max)
     speed = torch.empty(n, device=env.device).uniform_(float(p.ball_speed_min), hi)
 
+    # ★ 2026-08-11: 確率 hard_ball_prob で「到達不能球」にする。実現可能性クランプを
+    #   緩め (hard_ball_min_time)、初速も上限の hard_ball_speed_mult 倍まで出す。
+    #   狙いは「届かない球で自壊しない」を学ばせること (GoalkeeperParamsCfg 参照)。
+    hard_prob = float(getattr(p, "hard_ball_prob", 0.0))
+    hard = torch.rand(n, device=env.device) < hard_prob
+    if hard_prob > 0.0:
+        mult = float(getattr(p, "hard_ball_speed_mult", 1.6))
+        hard_speed = torch.empty(n, device=env.device).uniform_(hi, max(hi * mult, hi + 1e-3))
+        speed = torch.where(hard, hard_speed, speed)
+
     # スポーン点 → 狙い先 (x=0, y=aim_y) の方向単位ベクトル
     dir_x = -spawn_x
     dir_y = aim_y - spawn_y
     norm = torch.sqrt(dir_x**2 + dir_y**2).clamp(min=1e-6)
     # 実現可能性クランプ: 到達時間 = 距離/速度 ≥ min_time_to_line
-    v_feasible = norm / max(float(p.min_time_to_line), 1e-3)
+    # (到達不能球だけ hard_ball_min_time まで緩める)
+    min_t = torch.full((n,), float(p.min_time_to_line), device=env.device)
+    if hard_prob > 0.0:
+        min_t = torch.where(
+            hard, torch.full_like(min_t, float(getattr(p, "hard_ball_min_time", 0.5))), min_t
+        )
+    v_feasible = norm / min_t.clamp(min=1e-3)
     speed = torch.minimum(speed, v_feasible)
+    bufs["hard_ball"][env_ids] = hard
     vx = speed * dir_x / norm
     vy = speed * dir_y / norm
 
