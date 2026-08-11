@@ -50,6 +50,7 @@ import contextlib
 import copy
 import io
 import os
+import re
 import torch
 import torch.nn as nn
 
@@ -316,6 +317,81 @@ class ActorCriticHistoryCNN(ActorCritic):
         if self.critic_obs_normalization:
             critic_obs = self.get_critic_obs(obs)
             self.critic_obs_normalizer.update(critic_obs)
+
+
+def remap_single_frame_actor(state_dict: dict, policy: ActorCriticHistoryCNN) -> tuple[dict, list[str]]:
+    """1 フレーム観測で学習した ActorCritic の重みを、履歴入力の actor へ無損失で移植する。
+
+    ``--load_pretrained`` に素の :class:`~rsl_rl.modules.ActorCritic` の checkpoint を
+    渡すと、actor は入力次元も重みの名前も違うので 1 つも載らない (critic と正規化統計と
+    std だけが残る)。歩行もキックも学び直しになり、Stage 4 の帯カリキュラムが前提に
+    している「継承元が既に蹴れる」が崩れる。
+
+    移植のからくり
+    --------------
+    履歴 actor の 1 層目の入力は ``[直近 K フレーム (古い順), CNN 潜在]`` という並びで、
+    最新フレームはそのうち ``[(K-1)*D : K*D]`` 列にいる。旧 1 層目の重み (h, D) を
+    **その列だけに**置き、他 (過去 K-1 フレームと CNN 潜在) をゼロにすると::
+
+        W_new @ [x_{t-K+1}, ..., x_t, z]ᵀ = W_old @ x_tᵀ
+
+    となり、**初期状態の出力が旧ポリシーと完全に一致する**。観測正規化の統計も
+    1 フレーム 55 次元で同形なのでそのまま載る。CNN の重みは乱数のままでよい
+    (潜在に掛かる列が 0 なので出力に効かない)。
+
+    学習が進むとゼロ初期化した列に勾配が入り、履歴と CNN 潜在を使い始める。
+    つまり「旧ポリシーから出発して、履歴の使い方を追加で覚える」形になる。
+
+    Returns:
+        移植後の state_dict と、何をどう移したかの説明行のリスト。
+    """
+    if not isinstance(policy, ActorCriticHistoryCNN):
+        raise TypeError(
+            "remap_single_frame_actor は ActorCriticHistoryCNN 用。"
+            f" 受け取った policy: {type(policy).__name__}"
+        )
+
+    encoder = policy.actor.encoder
+    obs_dim = encoder.obs_dim
+    # 最新フレームが占める列。encoder.forward が直近 K フレームを古い順に並べるので、
+    # 最後の D 列が現在フレームになる。
+    offset = (encoder.num_recent_frames - 1) * obs_dim
+    live = policy.state_dict()
+
+    remapped: dict = {}
+    notes: list[str] = []
+    for key, value in state_dict.items():
+        matched = re.fullmatch(r"actor\.(\d+)\.(weight|bias)", key)
+        if matched is None:
+            # actor 以外 (critic / normalizer / std) と、既に履歴版の actor.mlp.* はそのまま
+            remapped[key] = value
+            continue
+
+        new_key = f"actor.mlp.{matched.group(1)}.{matched.group(2)}"
+        if new_key not in live:
+            notes.append(f"{key}: 対応する層が無いので捨てた")
+            continue
+
+        target = live[new_key]
+        if value.shape == target.shape:
+            remapped[new_key] = value
+            notes.append(f"{key} -> {new_key} {tuple(value.shape)}")
+            continue
+
+        is_first_weight = matched.group(1) == "0" and matched.group(2) == "weight"
+        if is_first_weight and value.shape[0] == target.shape[0] and value.shape[1] == obs_dim:
+            new_weight = torch.zeros_like(target)
+            new_weight[:, offset : offset + obs_dim] = value.to(device=new_weight.device, dtype=new_weight.dtype)
+            remapped[new_key] = new_weight
+            notes.append(
+                f"{key} -> {new_key} {tuple(value.shape)} を最新フレームの列"
+                f" [{offset}:{offset + obs_dim}] に移植 (残り {target.shape[1] - obs_dim} 列は 0)"
+            )
+            continue
+
+        notes.append(f"{key}: 形が合わないので捨てた {tuple(value.shape)} vs {tuple(target.shape)}")
+
+    return remapped, notes
 
 
 class _HistoryPolicyExporter(nn.Module):

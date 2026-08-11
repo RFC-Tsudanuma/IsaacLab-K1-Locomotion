@@ -52,6 +52,13 @@
 #   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_long_pass.sh   # Stage 1 だけ延長
 #   RESET_NOISE_STD= ./scripts/rsl_rl/train_walk_long_pass.sh # Stage 4 の std リセット無効
 #
+#   # 共用タスク (1 フレーム観測) の Stage 3 checkpoint しか無い場合に、Stage 1-3 を
+#   # 回し直さずに Stage 4 だけ始める。旧 actor を履歴 actor の「最新フレームの列」へ
+#   # 移植するので、学習開始時点の挙動が旧ポリシーと一致する (train.py の
+#   # --warm_start_from_single_frame。仕組みは remap_single_frame_actor の docstring)。
+#   STAGE=4 LOOP360_CKPT=logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \
+#       ./scripts/rsl_rl/train_walk_long_pass.sh --warm_start_from_single_frame
+#
 # NOTE: 4 段合計 20000 iteration。4096 env で 1 段あたり数時間かかるので、
 #       途中で落ちたときは STAGE で残りだけ再開できるようにしてある。
 #

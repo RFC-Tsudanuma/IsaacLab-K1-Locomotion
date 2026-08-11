@@ -32,6 +32,15 @@ parser.add_argument(
     help="Path to a pretrained checkpoint (.pt) to initialize weights (strict=False, for transfer learning)."
 )
 parser.add_argument(
+    "--warm_start_from_single_frame",
+    action="store_true",
+    default=False,
+    help="Treat --load_pretrained as a 1-frame-observation checkpoint and graft its actor onto the "
+    "history-input actor (ActorCriticHistoryCNN). The policy starts out behaving exactly like the "
+    "pretrained one and learns to use the history from there. Without this flag the actor weights "
+    "are silently dropped (shape/name mismatch).",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -302,6 +311,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         state_dict = loaded.get("model_state_dict", loaded)
 
         policy = getattr(runner.alg, 'actor_critic', None) or getattr(runner.alg, 'policy', None)
+
+        # 1 フレーム観測の checkpoint を履歴入力の actor へ移植する。
+        #
+        # 素の ActorCritic の actor は名前 (actor.0.* vs actor.mlp.0.*) も 1 層目の入力次元も
+        # 違うので、何もしないと下のフィルタに全部捨てられ、actor だけゼロから学習になる。
+        # 移植すると初期状態の出力が旧ポリシーと一致するので、歩き方・蹴り方を保ったまま
+        # 履歴の使い方だけを追加で学習できる (詳細は remap_single_frame_actor の docstring)。
+        if args_cli.warm_start_from_single_frame:
+            from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
+                ActorCriticHistoryCNN,
+                remap_single_frame_actor,
+            )
+
+            if not isinstance(policy, ActorCriticHistoryCNN):
+                raise ValueError(
+                    "--warm_start_from_single_frame は履歴入力の policy (ActorCriticHistoryCNN) 専用です。"
+                    f" 現在の policy: {type(policy).__name__}"
+                )
+            state_dict, notes = remap_single_frame_actor(state_dict, policy)
+            if any("->" in note for note in notes):
+                print("[INFO]: Grafting 1-frame actor onto the history actor:")
+                for note in notes:
+                    print(f"          {note}")
+            else:
+                print(
+                    "[WARN]: --warm_start_from_single_frame が指定されましたが、checkpoint に"
+                    " 1 フレーム版の actor (actor.<N>.weight) がありません。"
+                    " 既に履歴入力版の checkpoint の可能性があります (移植は何もしていません)。"
+                )
 
         # 形の合うテンソルだけをロードする。
         # obs次元が違う転移では入力層 (actor.0.weight) と normalizer の形が合わないので

@@ -14,6 +14,7 @@ from .actor_critic_history_cnn import (  # noqa: F401
     RslRlPpoActorCriticHistoryCnnCfg,
     export_history_policy_as_jit,
     export_history_policy_as_onnx,
+    remap_single_frame_actor,
 )
 
 # OnPolicyRunner._construct_algorithm は policy の class_name を
