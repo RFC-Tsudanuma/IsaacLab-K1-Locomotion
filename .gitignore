@@ -66,6 +66,16 @@ logs/rsl_rl/k1_walk_kick_360/*
 logs/rsl_rl/k1_walk_kick_360/2026-08-08_16-48-06/*
 !logs/rsl_rl/k1_walk_kick_360/2026-08-08_16-48-06/model_2800.pt
 
+# long_pass の checkpoint。実機で動作確認済み (5-10 m の転がしパス)。
+# sim 実測 (iter 4000): kick_rate 0.996 / kick_vel_ratio 0.898 / kick_dir_error 3.8°、
+# 速度帯は終点 (3.2, 5.0) に到達済み。
+# ボール物性 DR 版 (Walk-Long-Pass-DR) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_long_pass/
+logs/rsl_rl/k1_walk_long_pass/*
+!logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/
+logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/*
+!logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/model_4000.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
