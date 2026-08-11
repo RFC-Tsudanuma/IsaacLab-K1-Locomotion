@@ -31,6 +31,9 @@ gym.register(
     },
 )
 
-# NOTE: loop_pass_360 の checkpoint から --load_pretrained + --reset_noise_std で
-#       fine-tune する前提 (通し実行は scripts/rsl_rl/train_walk_long_pass.sh)。
-#       観測 55 次元・行動空間は walk_kick 系と同一。
+# NOTE: 観測項 (55 次元) と行動空間は walk_kick 系と同一だが、actor だけは
+#       50 フレームの観測履歴を見る (直近 5 フレームそのまま + 50 フレームの
+#       1D-CNN 潜在)。このため loop_pass_360 の checkpoint からは critic と
+#       action noise std しか引き継げない (walk_long_pass_env_cfg の
+#       「観測を 50 フレームの履歴にする」節を参照)。
+#       通し実行は scripts/rsl_rl/train_walk_long_pass.sh。

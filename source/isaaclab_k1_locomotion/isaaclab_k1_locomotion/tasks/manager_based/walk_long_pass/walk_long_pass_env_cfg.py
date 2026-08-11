@@ -57,6 +57,35 @@ ball_touch_count 1.30 → 0.91、Episode_Reward/kick_direction 0.213 → 0.001)�
 **この構造は帯を触る限り常について回る。** 帯を再調整するときは、必ず
 「継承元の実蹴り速度で採点したときにキック報酬が残るか」を先に検算すること。
 
+観測を 50 フレームの履歴にする
+------------------------------
+policy 観測 (内界センサ + 前ステップの行動 + 受信コマンドの 55 次元) を毎ステップ
+50 フレーム分バッファし、actor には
+
+* 直近 5 フレームをそのまま (5 × 55 = 275)
+* 50 フレーム全部を 1D-CNN で符号化した潜在 (16 × 6 = 96)
+
+を連結して入れる (合計 371 次元)。CNN は隠れ層 2 つで
+[kernel, filter, stride] = [6, 32, 3], [4, 16, 2]。実装は
+:class:`~..locomotion.networks.ActorCriticHistoryCNN`、形の指定は
+``agents/rsl_rl_ppo_cfg.py``。critic はこれまでどおり 1 フレームの特権観測を見る。
+
+**checkpoint の互換性が切れる。** actor の MLP の入力次元と重みの名前が変わるので、
+loop_pass_360 から ``--load_pretrained`` すると引き継がれるのは critic・観測正規化
+の統計・action noise std の 17 テンソルだけで、**actor は初期化されたまま**学習が
+始まる (実測: actor.{0,2,4,6}.{weight,bias} の 8 本が "not in model" で落ちる。
+train.py は形の合わないテンソルを黙って捨てるので、起動ログの
+"Skipped 8 tensors" で確認すること)。
+つまり下の手順は「歩き方もキックも actor は学び直し」になる。帯カリキュラムは
+**継承元が既にキックできる**ことを前提に組んであるので (上の失敗記録参照)、
+actor がゼロからだとカリキュラムの意味が変わる。履歴入力のまま同じ二段構えを
+やるなら、まず walk phase / loop_pass_360 側も履歴入力で学習し直して、その
+checkpoint から fine-tune すること。
+
+ONNX の入力も (1, 50, 55) に変わる。実機側は 55 次元の観測をリングバッファに
+古い順で積んで渡す (詳細は :mod:`..locomotion.networks.actor_critic_history_cnn`
+のモジュール docstring)。
+
 学習手順 (loop_pass_360 の checkpoint から fine-tune)::
 
     ./scripts/rsl_rl/train_walk_long_pass.sh
@@ -158,6 +187,31 @@ _LONG_PASS_SIGMA_VELOCITY = 0.9
 _LONG_PASS_V_GATE_FRAC = 0.6
 _LONG_PASS_SIGMA_GATE = 0.3
 
+# --------------------------------------------------------------------------- #
+# Actor が見る観測履歴の長さ [frames]
+#
+# policy 観測 (55 次元: 内界センサ + 前ステップの行動 + 受信コマンド) を毎ステップ
+# 50 フレーム分バッファし、actor には
+#   * 直近 5 フレームをそのまま
+#   * 50 フレーム全部を 1D-CNN で符号化した潜在 (96 次元)
+# を入れる。ネットワーク側は
+# :class:`~..locomotion.networks.ActorCriticHistoryCNN` (agents/rsl_rl_ppo_cfg.py で
+# 指定) が担当し、直近フレーム数と CNN の形はそちらの定数で決まる。
+#
+# flatten_history_dim = False が必須。True にすると ObservationManager は
+# **項ごとに** (50, d_i) を平坦化してから連結するので、並びが
+# [gravity の 50 フレーム][ang_vel の 50 フレーム]... になり、フレーム単位の
+# (N, 50, 55) には戻せない (CNN のチャンネル = 観測次元にできなくなる)。
+# False なら各項が (N, 50, d_i) のまま最終軸で連結され、(N, 50, 55) が得られる。
+#
+# 履歴は環境リセットで巻き戻り、直後は現在フレームで 50 個すべてが埋まる
+# (IsaacLab の CircularBuffer の仕様)。ゼロ詰めの履歴は入らない。
+#
+# NOTE: critic はこれまでどおり 1 フレーム観測 (特権情報付き) のまま。critic 側にも
+#       履歴を付ける場合は ActorCriticHistoryCNN の critic 側も直す必要がある。
+# --------------------------------------------------------------------------- #
+_OBS_HISTORY_LENGTH = 50
+
 # kick_state を参照する報酬項（v_thresh を配る対象）。
 # この cfg で None の項 (kick_velocity_strong / approach_penalty) も名前だけ挙げて
 # おき、getattr の None ガードで飛ばす (親の構成が変わっても取りこぼさないように)。
@@ -191,10 +245,23 @@ def _apply_v_thresh(cfg: "K1WalkLongPassEnvCfg", v_thresh: float) -> None:
 
 @configclass
 class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
-    """ロングパス専用。Walk-Loop-Pass-360 と観測・行動空間・蹴り方の報酬は同一。"""
+    """ロングパス専用。
+
+    観測項・行動空間・蹴り方の報酬は Walk-Loop-Pass-360 と同一だが、actor だけは
+    50 フレームの観測履歴を見る (モジュール docstring の「観測を 50 フレームの
+    履歴にする」節)。
+    """
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        # -- 0. Actor の観測を 50 フレームの履歴にする
+        #
+        # 項の中身・順序・ノイズは継承元のまま。1 フレーム 55 次元が
+        # (num_envs, 50, 55) になるだけで、切り出し方 (直近 5 + CNN 潜在) は
+        # ネットワーク側の仕事。定数の意図は _OBS_HISTORY_LENGTH のコメント参照。
+        self.observations.policy.history_length = _OBS_HISTORY_LENGTH
+        self.observations.policy.flatten_history_dim = False
 
         # -- 1. 目標ボール速度をロングパスの帯へ（このタスクの本体）
         #
