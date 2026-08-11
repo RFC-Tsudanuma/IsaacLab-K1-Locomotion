@@ -70,30 +70,31 @@ policy 観測 (内界センサ + 前ステップの行動 + 受信コマンド�
 :class:`~..locomotion.networks.ActorCriticHistoryCNN`、形の指定は
 ``agents/rsl_rl_ppo_cfg.py``。critic はこれまでどおり 1 フレームの特権観測を見る。
 
-**checkpoint の互換性が切れる。** actor の MLP の入力次元と重みの名前が変わるので、
-loop_pass_360 から ``--load_pretrained`` すると引き継がれるのは critic・観測正規化
-の統計・action noise std の 17 テンソルだけで、**actor は初期化されたまま**学習が
-始まる (実測: actor.{0,2,4,6}.{weight,bias} の 8 本が "not in model" で落ちる。
-train.py は形の合わないテンソルを黙って捨てるので、起動ログの
-"Skipped 8 tensors" で確認すること)。
-つまり下の手順は「歩き方もキックも actor は学び直し」になる。帯カリキュラムは
-**継承元が既にキックできる**ことを前提に組んであるので (上の失敗記録参照)、
-actor がゼロからだとカリキュラムの意味が変わる。履歴入力のまま同じ二段構えを
-やるなら、まず walk phase / loop_pass_360 側も履歴入力で学習し直して、その
-checkpoint から fine-tune すること。
+**共用タスクの checkpoint とは互換性が無い。** actor の MLP の入力次元と重みの名前が
+変わるので、共用の loop_pass_360 (``k1_walk_loop_pass_360``) から
+``--load_pretrained`` すると引き継がれるのは critic・観測正規化の統計・action noise
+std の 17 テンソルだけで、**actor は初期化されたまま**学習が始まる
+(実測: actor.{0,2,4,6}.{weight,bias} の 8 本が "not in model" で落ちる)。
+帯カリキュラムは **継承元が既にキックできる**ことを前提に組んであるので
+(上の失敗記録参照)、actor がゼロからでは意味が変わる。
+
+そのため Stage 1-3 も履歴入力版を別タスクとして用意し、歩行から通しで学習し直す
+(:mod:`.walk_long_pass_stages_env_cfg`)。段が繋がったかは起動ログの
+"Skipped N tensors" が 0 本かどうかで確認できる (train.py は形の合わないテンソルを
+黙って捨てるので、ログを見ない限り気づけない)。
 
 ONNX の入力も (1, 50, 55) に変わる。実機側は 55 次元の観測をリングバッファに
 古い順で積んで渡す (詳細は :mod:`..locomotion.networks.actor_critic_history_cnn`
 のモジュール docstring)。
 
-学習手順 (loop_pass_360 の checkpoint から fine-tune)::
+学習手順 (Stage 1-4 を通しで)::
 
     ./scripts/rsl_rl/train_walk_long_pass.sh
-    # または直接:
+    # Stage 4 だけやり直す場合 (履歴入力版 Stage 3 の checkpoint から):
     _labpython2 scripts/rsl_rl/train.py \
         --task Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0 \
         --headless --num_envs 4096 \
-        --load_pretrained logs/rsl_rl/k1_walk_loop_pass_360/<run>/model_<N>.pt \
+        --load_pretrained logs/rsl_rl/k1_walk_long_pass_loop_360/<run>/model_<N>.pt \
         --reset_noise_std 0.3
 
 --resume ではなく --load_pretrained を使うこと（理由は walk_pass_env_cfg の
@@ -212,6 +213,19 @@ _LONG_PASS_SIGMA_GATE = 0.3
 # --------------------------------------------------------------------------- #
 _OBS_HISTORY_LENGTH = 50
 
+
+def enable_obs_history(cfg) -> None:
+    """policy 観測グループを 50 フレームの履歴にする。
+
+    Stage 1-3 の履歴入力版 (:mod:`.walk_long_pass_stages_env_cfg`) からも呼ぶので、
+    設定は必ずここに 1 箇所にまとめる。片方だけ履歴長を変えると stage 間で
+    checkpoint が繋がらなくなり、しかも起動時には気づけない
+    (train.py が形の合わないテンソルを黙って捨てるため)。
+    """
+    cfg.observations.policy.history_length = _OBS_HISTORY_LENGTH
+    cfg.observations.policy.flatten_history_dim = False
+
+
 # kick_state を参照する報酬項（v_thresh を配る対象）。
 # この cfg で None の項 (kick_velocity_strong / approach_penalty) も名前だけ挙げて
 # おき、getattr の None ガードで飛ばす (親の構成が変わっても取りこぼさないように)。
@@ -260,8 +274,7 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # 項の中身・順序・ノイズは継承元のまま。1 フレーム 55 次元が
         # (num_envs, 50, 55) になるだけで、切り出し方 (直近 5 + CNN 潜在) は
         # ネットワーク側の仕事。定数の意図は _OBS_HISTORY_LENGTH のコメント参照。
-        self.observations.policy.history_length = _OBS_HISTORY_LENGTH
-        self.observations.policy.flatten_history_dim = False
+        enable_obs_history(self)
 
         # -- 1. 目標ボール速度をロングパスの帯へ（このタスクの本体）
         #
