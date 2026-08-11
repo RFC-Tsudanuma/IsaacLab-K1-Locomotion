@@ -273,12 +273,18 @@ def log_kick_metrics(env, step: int, every: int = 100) -> None:
     sole_cm = avg("sole_height_at_kick") * 100.0
     phi_deg = math.degrees(avg("phi_frozen"))
     dir_deg = math.degrees(avg("tau_direction_frozen"))
+    # 符号付き方向誤差 (正 = ボールが指令より右) と右足で蹴った割合。
+    # dir が小さくても dirs が同じ大きさなら「誤差ではなく片側バイアス」。
+    # Rfoot が 0/1 に張り付いていれば片足でしか蹴っていない。
+    dirs_deg = math.degrees(avg("tau_signed_frozen"))
+    r_foot = avg("kick_foot_frozen")
     v3d = avg("v_ball_3d_frozen")
     # apex は接地時のボール中心 (= 半径) を引いて「浮き」に直す
     loft_cm = (avg("apex_height") - _BALL_RADIUS_FOR_LOG) * 100.0
     print(
         f"[KICK] step {step:6d} | kicked {n_kicked:3d}/{num_envs:3d} "
-        f"| sole {sole_cm:5.1f}cm | phi {phi_deg:5.1f}deg | dir {dir_deg:5.1f}deg "
+        f"| sole {sole_cm:5.1f}cm | phi {phi_deg:5.1f}deg "
+        f"| dir {dir_deg:5.1f}deg (signed {dirs_deg:+6.1f}) | Rfoot {r_foot:4.2f} "
         f"| v3d {v3d:4.2f}m/s | loft {loft_cm:5.1f}cm | touches {touches:4.2f}"
     )
 

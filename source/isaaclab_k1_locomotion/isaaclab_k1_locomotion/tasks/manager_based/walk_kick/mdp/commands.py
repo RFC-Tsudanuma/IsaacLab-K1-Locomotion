@@ -39,6 +39,16 @@ class KickDirectionCommand(UniformVelocityCommand):
     * ``kick_dir_error_deg``: 方向誤差 |τ_direction| [deg]。latch 時に凍結した
       ボール飛翔方向と指令蹴り方向の水平角度差。「誤差 ±10°」要件の直接の指標。
       これも「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
+    * ``kick_dir_error_signed_deg``: 同じ誤差の **符号付き** [deg]。**正 = ボールが
+      指令方向より右**。``kick_dir_error_deg`` は絶対値なので「±4° のランダム誤差」と
+      「常に右へ 4°」を区別できない。系統的な左右バイアスの有無はこちらで見ること。
+      0 付近ならバイアス無し、``kick_dir_error_deg`` と同じ大きさまで振れていれば
+      誤差はほぼ全部が一方向のバイアス。
+    * ``kick_foot_right_frac``: 蹴った足が右足だった割合 (0 = 常に左、1 = 常に右)。
+      観測に左足裏しか入っておらず (``_sole()``)、歩行位相もエピソード開始時に
+      必ず 0 から始まり、さらに mirror loss が無効 (``symmetry_cfg = None``) なので、
+      このタスク群には左右どちらかへ偏る構造的な理由がある。0.5 から大きく外れて
+      いれば片足でしか蹴っていない。
     * ``kick_elevation_deg``: 射出仰角 φ [deg]。ループシュートが出ているかの直接の指標。
     * ``kick_apex_height``: latch 後にボールが到達した最高高度 [m]。
     * ``ball_touch_count``: エピソード中に足がボールに触れた回数。1.0 が理想。
@@ -74,6 +84,10 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_rate"] = torch.zeros(self.num_envs, device=self.device)
         # 方向誤差 [deg]。「誤差 ±10°」要件 (walk_long_pass) の直接の指標。
         self.metrics["kick_dir_error_deg"] = torch.zeros(self.num_envs, device=self.device)
+        # 符号付きの方向誤差 [deg] (正 = 右) と、右足で蹴った割合。
+        # 左右の系統バイアスを切り分けるための 2 つ。
+        self.metrics["kick_dir_error_signed_deg"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_foot_right_frac"] = torch.zeros(self.num_envs, device=self.device)
         # ループシュート (walk_loop) 用。他タスクでも「意図せず浮いていないか」の監視に使える。
         self.metrics["kick_elevation_deg"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_apex_height"] = torch.zeros(self.num_envs, device=self.device)
@@ -104,6 +118,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_vel_error"] = torch.abs(v_ball - v_target) * kick_done
         self.metrics["kick_rate"] = kick_done
         self.metrics["kick_dir_error_deg"] = torch.rad2deg(state["tau_direction_frozen"]) * kick_done
+        self.metrics["kick_dir_error_signed_deg"] = torch.rad2deg(state["tau_signed_frozen"]) * kick_done
+        self.metrics["kick_foot_right_frac"] = state["kick_foot_frozen"] * kick_done
         self.metrics["kick_elevation_deg"] = torch.rad2deg(state["phi_frozen"]) * kick_done
         self.metrics["kick_apex_height"] = state["apex_height"] * kick_done
         # 接触回数は kick_done でマスクしない。「触ったが蹴れていない」エピソードこそ

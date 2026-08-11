@@ -123,6 +123,12 @@ def kick_state(
             "overshoot_fired": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "overshoot_event": torch.zeros(env.num_envs, device=device),
             "tau_direction_frozen": torch.zeros(env.num_envs, device=device),
+            # 符号付きの方向誤差 [rad]。**正 = ボールが指令方向より右**。
+            # tau_direction_frozen は abs なので系統的な左右バイアスが見えない。
+            # 報酬には使わず、メトリクス専用 (walk_kick.mdp.commands 参照)。
+            "tau_signed_frozen": torch.zeros(env.num_envs, device=device),
+            # latch を起こした蹴りの足 (0.0 = 左, 1.0 = 右)。メトリクス専用。
+            "kick_foot_frozen": torch.zeros(env.num_envs, device=device),
             "v_ball_frozen": torch.zeros(env.num_envs, device=device),
             "v_ball_3d_frozen": torch.zeros(env.num_envs, device=device),
             "phi_frozen": torch.zeros(env.num_envs, device=device),
@@ -170,6 +176,8 @@ def kick_state(
         state["kick_done"][just_reset] = False
         state["overshoot_fired"][just_reset] = False
         state["tau_direction_frozen"][just_reset] = 0.0
+        state["tau_signed_frozen"][just_reset] = 0.0
+        state["kick_foot_frozen"][just_reset] = 0.0
         state["v_ball_frozen"][just_reset] = 0.0
         state["v_ball_3d_frozen"][just_reset] = 0.0
         state["phi_frozen"][just_reset] = 0.0
@@ -281,7 +289,11 @@ def kick_state(
         ball_dir = ball_vel / (v_ball.unsqueeze(-1) + 1e-6)
         cos_err = torch.clamp((ball_dir * kick_dir).sum(dim=-1), min=-1.0, max=1.0)
         sin_err = ball_dir[:, 0] * kick_dir[:, 1] - ball_dir[:, 1] * kick_dir[:, 0]
-        tau_direction = torch.abs(torch.atan2(sin_err, cos_err))
+        # 符号付き: **正 = ボールが指令方向より右へ出た**。
+        # sin_err = cross_z(ball_dir, kick_dir) なので、ball_dir を反時計回りに
+        # tau_signed だけ回すと kick_dir に重なる = ボールは kick_dir の時計回り側 = 右。
+        tau_signed = torch.atan2(sin_err, cos_err)
+        tau_direction = torch.abs(tau_signed)
 
         # φ: 仰角 [rad]。水平 = 0、真上 = π/2。負値 (打ち下ろし) もそのまま持つ。
         phi = torch.atan2(ball_vel_z, v_ball + 1e-6)
@@ -289,6 +301,11 @@ def kick_state(
 
         state["tau_direction_frozen"] = torch.where(
             trigger, tau_direction, state["tau_direction_frozen"]
+        )
+        state["tau_signed_frozen"] = torch.where(trigger, tau_signed, state["tau_signed_frozen"])
+        # 蹴った足は d_foot_to_ball の argmin (foot_ids = [left, right]) なので 1 = 右。
+        state["kick_foot_frozen"] = torch.where(
+            trigger, kicking_foot.float(), state["kick_foot_frozen"]
         )
         state["v_ball_frozen"] = torch.where(trigger, v_ball, state["v_ball_frozen"])
         state["v_ball_3d_frozen"] = torch.where(trigger, v_ball_3d, state["v_ball_3d_frozen"])
