@@ -28,10 +28,11 @@
 #   ITER=5000 ./scripts/rsl_rl/train_walk_long_pass_flag.sh    # 長く回す
 #
 # 見るべきもの (TensorBoard):
+#   Metrics/kick_direction/flag_accuracy        … **まずこれ**。単純な正解率 (1.0 が満点)
 #   Metrics/kick_direction/kick_rate            … 0.99 付近を維持するはず
 #   Metrics/kick_direction/flag_pred_final      … kick_rate に追いつけば成功
 #   Metrics/kick_direction/flag_pre_latch_pred  … 誤検出。0 に近いほど良い
-#   Metrics/kick_direction/flag_err_mean        … 0.2-0.3 に張り付いたら「常に 0」に潰れている
+#   Metrics/kick_direction/flag_err_mean        … 確率の絶対誤差 (正解率とは別物)
 
 set -euo pipefail
 

@@ -75,11 +75,14 @@ post-latch の報酬は latch 時の凍結値だけの関数で、猶予窓 (2 �
 
 見るべきもの
 ------------
+* ``Metrics/kick_direction/flag_accuracy`` … **まずこれ**。0.5 で閾値を切った単純な
+  正解率。1.0 が満点、0.5 付近なら何も学習できていない。
 * ``Metrics/kick_direction/kick_rate`` … 0.99 付近を維持するはず。落ちたらフラグ報酬が
   歩行/キックを邪魔している。``kick_flag`` の weight を下げる。
 * ``Metrics/kick_direction/flag_pred_final`` … kick_rate と同じ値に近づけば成功。
 * ``Metrics/kick_direction/flag_pre_latch_pred`` … 誤検出。0 に近いほど良い。
-* ``Metrics/kick_direction/flag_err_mean`` … 総合精度。正例の割合 (0.2-0.3) に
+* ``Metrics/kick_direction/flag_err_mean`` … 確率の絶対誤差 (正解率とは別物で、
+  当たっていても確率が鈍いと大きくなる)。定数出力の下限 (≈ 正例の割合) に
   張り付いたら「常に 0」に潰れているサイン → ``pos_weight`` を上げる。
 * ``Policy/mean_noise_std`` / ``Loss/learning_rate`` … フラグ次元が Gaussian に
   混ざるので、std が暴れないか・adaptive LR が荒れないかを見る。

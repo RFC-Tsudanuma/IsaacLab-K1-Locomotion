@@ -36,7 +36,17 @@ FLAG_ACTION_NAME = "kick_flag"
 class KickFlagDirectionCommand(KickDirectionCommand):
     """親のメトリクスに加えて、フラグ出力の当たり具合を記録する。
 
-    追加されるのは ``Metrics/kick_direction/`` 以下の 3 つ:
+    追加されるのは ``Metrics/kick_direction/`` 以下の 4 つ。**まず見るのは
+    ``flag_accuracy``**、内訳を追うときに残り 3 つを使う。
+
+    ``flag_accuracy``
+      ``(sigmoid(a_flag) > 0.5) == kick_done`` をエピソード平均した **単純な正解率**。
+      0.5 で閾値を切った「何割当たっているか」そのもの。1.0 が満点。
+      正例 (post-latch) の割合が 45-50% 程度でほぼ均衡しているので、素の正解率を
+      そのまま読んで問題ない (「常に 0」でも 50% 程度にしかならない)。
+
+      ``flag_err_mean`` とは別物なので注意。あちらは確率の絶対誤差なので、
+      p=0.8 で正解していても 0.2 の誤差が乗る。**正解率の方が必ず高く出る**。
 
     ``flag_pred_final``
       エピソード最終ステップの ``sigmoid(a_flag)``。**``kick_rate`` と並べて読む**。
@@ -51,7 +61,8 @@ class KickFlagDirectionCommand(KickDirectionCommand):
       latch **前** の ``sigmoid(a_flag)`` の平均 = 誤検出率。0 に近いほど良い。
       ``flag_pred_final`` が高くてもこれが高いなら「常に 1 を出しているだけ」。
 
-    3 つ揃えて初めて「latch を検出できている」と言える。1 つだけでは必ず潰れ方を見逃す。
+    ``flag_accuracy`` だけ見ていると潰れ方を見逃すことがある (例: 正解率は高いが
+    確率が 0.55/0.45 のように鈍い)。鋭さまで見たいときに残り 3 つを併用する。
     """
 
     cfg: KickDirectionCommandCfg
@@ -62,12 +73,14 @@ class KickFlagDirectionCommand(KickDirectionCommand):
         def _z() -> torch.Tensor:
             return torch.zeros(self.num_envs, device=self.device)
 
+        self.metrics["flag_accuracy"] = _z()
         self.metrics["flag_pred_final"] = _z()
         self.metrics["flag_err_mean"] = _z()
         self.metrics["flag_pre_latch_pred"] = _z()
 
         # エピソード内の累積。episode_length_buf == 0 (= 今リセットされた env) で
         # 自動的に巻き戻すので、明示的な reset フックは要らない。
+        self._flag_ok_sum = _z()
         self._flag_err_sum = _z()
         self._flag_pre_sum = _z()
         self._flag_pre_cnt = _z()
@@ -90,6 +103,10 @@ class KickFlagDirectionCommand(KickDirectionCommand):
         just_reset = self._env.episode_length_buf == 0
         zero = torch.zeros_like(p)
 
+        # 0.5 で閾値を切った正誤 (1 = 当たり)。これが flag_accuracy の中身。
+        ok = ((p > 0.5) == (y > 0.5)).float()
+        self._flag_ok_sum = torch.where(just_reset, zero, self._flag_ok_sum + ok)
+
         err = (p - y).abs()
         self._flag_err_sum = torch.where(just_reset, zero, self._flag_err_sum + err)
 
@@ -98,6 +115,7 @@ class KickFlagDirectionCommand(KickDirectionCommand):
         self._flag_pre_cnt = torch.where(just_reset, zero, self._flag_pre_cnt + pre)
 
         n = self._env.episode_length_buf.clamp(min=1).float()
+        self.metrics["flag_accuracy"] = self._flag_ok_sum / n
         self.metrics["flag_pred_final"] = p
         self.metrics["flag_err_mean"] = self._flag_err_sum / n
         self.metrics["flag_pre_latch_pred"] = self._flag_pre_sum / self._flag_pre_cnt.clamp(min=1.0)

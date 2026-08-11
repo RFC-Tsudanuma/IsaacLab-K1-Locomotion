@@ -241,6 +241,50 @@ def log_terminations(env, step: int, counts: dict, episode_start: torch.Tensor) 
         episode_start[fired] = step
 
 
+# キック検出フラグ (walk_long_pass_flag 系) の累計成績。
+# 「エピソード平均」ではなく **セッション全体の全ステップ** を通した累計にしている。
+# CommandTerm 側の flag_accuracy はエピソード内の走査平均で、しかも _reset_idx の直後に
+# 累積器が巻き戻るため、play のループから読むと終了直後の env が 0 に見えてしまう
+# (order: termination -> reward -> _reset_idx -> command_manager.compute -> observation)。
+# ここで生の値から積み直す方が素直で、読み方も「何割当たったか」そのものになる。
+_FLAG_STATS = {"ok": 0.0, "n": 0.0, "pre_sum": 0.0, "pre_n": 0.0, "post_sum": 0.0, "post_n": 0.0}
+_FLAG_ACTION_NAME = "kick_flag"
+
+
+def _accumulate_flag_stats(env, state) -> bool:
+    """フラグ出力の正誤を積む。フラグ行動を持たないタスクでは False を返して何もしない。"""
+    action_mgr = env.unwrapped.action_manager
+    if _FLAG_ACTION_NAME not in action_mgr.active_terms:
+        return False
+
+    p = torch.sigmoid(action_mgr.get_term(_FLAG_ACTION_NAME).raw_actions[:, 0])
+    y = state["kick_done"].float()
+    post = y > 0.5
+    correct = (p > 0.5) == post
+
+    _FLAG_STATS["ok"] += float(correct.sum().item())
+    _FLAG_STATS["n"] += float(correct.numel())
+    _FLAG_STATS["pre_sum"] += float(p[~post].sum().item())
+    _FLAG_STATS["pre_n"] += float((~post).sum().item())
+    _FLAG_STATS["post_sum"] += float(p[post].sum().item())
+    _FLAG_STATS["post_n"] += float(post.sum().item())
+    return True
+
+
+def log_flag_metrics(step: int) -> None:
+    """フラグ検出の累計成績を出す。``[FLAG]`` 行。"""
+    if _FLAG_STATS["n"] == 0:
+        return
+    acc = _FLAG_STATS["ok"] / _FLAG_STATS["n"]
+    pre = _FLAG_STATS["pre_sum"] / max(_FLAG_STATS["pre_n"], 1.0)
+    post = _FLAG_STATS["post_sum"] / max(_FLAG_STATS["post_n"], 1.0)
+    print(
+        f"[FLAG] step {step:6d} | accuracy {acc:5.3f} "
+        f"| pre-latch p {pre:5.3f} (低いほど良い) | post-latch p {post:5.3f} (高いほど良い) "
+        f"| {int(_FLAG_STATS['n']):d} env-steps 累計"
+    )
+
+
 def log_kick_metrics(env, step: int, every: int = 100) -> None:
     """Print kick diagnostics periodically (walk_kick family tasks only).
 
@@ -250,12 +294,21 @@ def log_kick_metrics(env, step: int, every: int = 100) -> None:
     be diagnosed without launching a training run.
 
     Values are averaged over the environments whose kick has latched.
+
+    ``kick_flag`` 行動を持つタスク (walk_long_pass_flag) では、フラグ検出の累計成績を
+    ``[FLAG]`` 行として併せて出す。累計なので毎ステップ積む必要があり、``every`` の
+    間引きより前に集計している。
     """
-    if step % every != 0:
-        return
     state = getattr(env.unwrapped, "_kick_latch_state", None)
     if state is None:  # not a walk_kick family task
         return
+
+    has_flag = _accumulate_flag_stats(env, state)
+
+    if step % every != 0:
+        return
+    if has_flag:
+        log_flag_metrics(step)
 
     done = state["kick_done"]
     n_kicked = int(done.sum().item())
@@ -517,6 +570,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     finally:
         # the play loop normally runs until interrupted, so print the summary on the way out
         print_termination_summary(term_counts)
+        # フラグ検出タスクなら最終成績も出す (Ctrl-C で抜けたときが本番)
+        if _FLAG_STATS["n"] > 0:
+            print("\n[FLAG] ---- kick flag summary ----")
+            log_flag_metrics(step_count)
 
     # Save video from manual frames if RecordVideo wrapper produced no output
     if args_cli.video and _manual_frames:
