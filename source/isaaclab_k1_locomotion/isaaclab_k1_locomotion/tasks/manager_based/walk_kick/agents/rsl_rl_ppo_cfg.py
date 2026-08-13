@@ -73,6 +73,19 @@ class K1WalkKickRoughPPORunnerCfg(K1WalkKickPPORunnerCfg):
 
 
 @configclass
+class K1WalkKick360RoughPPORunnerCfg(K1WalkKick360PPORunnerCfg):
+    """Terrain ablation の Stage 3 (凹凸地形・全方位)。
+
+    ``k1_walk_kick_rough`` の checkpoint から --load_pretrained で始める前提。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_360_rough"
+
+
+@configclass
 class K1WalkKick360MovingBallPPORunnerCfg(K1WalkKick360PPORunnerCfg):
     """Ball velocity ablation。walk_kick_360 の checkpoint から --load_pretrained で始める前提。"""
 

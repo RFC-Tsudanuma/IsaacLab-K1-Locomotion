@@ -15,8 +15,9 @@ locomotion 側には影響しない。
 原典との差分を個別に検証するための ablation タスクを 2 系統持つ。どちらも観測 55 次元・
 同じ並びのままなので、既存の checkpoint をそのまま出発点にできる:
 
-* **地形** (:class:`K1WalkKickWalkPhaseRoughEnvCfg` → :class:`K1WalkKickRoughEnvCfg`):
-  平坦 → 数 cm の凹凸。歩容ごと変わるので 0 から 2 段で学習し直す。
+* **地形** (:class:`K1WalkKickWalkPhaseRoughEnvCfg` → :class:`K1WalkKickRoughEnvCfg`
+  → :class:`K1WalkKick360RoughEnvCfg`): 平坦 → 数 cm の凹凸。歩容ごと変わるので
+  0 から学習し直す。平坦版の 3 段レシピをそのまま rough でなぞる。
 * **転がるボール** (:class:`K1WalkKick360MovingBallEnvCfg`): 地形は平坦のまま、
   リセット時にボールへランダム水平初速を与える。walk_kick_360 からの fine-tune。
 """
@@ -134,9 +135,12 @@ _BALL_SPAWN_CLEARANCE = 0.05
 def _apply_rough_terrain(cfg: "K1WalkKickEnvCfg") -> None:
     """flat 版のタスク cfg を「地形だけ」凹凸に差し替える。
 
-    観測・報酬・コマンド・終了条件には一切触らない。terrain ablation の 2 タスク
-    (walk phase / kick) で共通の処理をここに集約し、二重定義を避ける。
+    観測・報酬・コマンド・終了条件には一切触らない。terrain ablation の 3 タスク
+    (walk phase / kick / 360) で共通の処理をここに集約し、二重定義を避ける。
     ``__post_init__`` の最後 (基底クラスの設定が全部済んだ後) に呼ぶこと。
+
+    ``reset_ball.params`` は差し替えではなくキー追加で触るので、360 版が入れた
+    ``half_angle`` / ``dist_range`` の全方位設定はそのまま生き残る。
     """
     cfg.scene.terrain.terrain_type = "generator"
     cfg.scene.terrain.terrain_generator = WALK_KICK_ROUGH_TERRAIN_CFG
@@ -690,7 +694,7 @@ class K1WalkKick360EnvCfg_PLAY(K1WalkKick360EnvCfg):
 #
 # こちらは fine-tune ではなく **0 から学習し直す**。地形が変わると歩容そのものが
 # 変わるため、平坦で獲得した歩行を出発点にすると「平坦向けの歩容から抜けられない」
-# 交絡が入る。既存の 2 段レシピ (walk phase → kick) をそのまま rough でなぞる。
+# 交絡が入る。既存の 3 段レシピ (walk phase → kick → 360) をそのまま rough でなぞる。
 # --------------------------------------------------------------------------- #
 @configclass
 class K1WalkKickWalkPhaseRoughEnvCfg(K1WalkKickWalkPhaseEnvCfg):
@@ -709,6 +713,14 @@ class K1WalkKickWalkPhaseRoughEnvCfg(K1WalkKickWalkPhaseEnvCfg):
             --task Isaac-Velocity-Rough-K1-Walk-Kick-v0 \
             --headless --num_envs 4096 \
             --load_pretrained logs/rsl_rl/k1_walk_kick_walk_phase_rough/<run>/model_<N>.pt
+        # stage 3 (rough, stage 2 の checkpoint から) → K1WalkKick360RoughEnvCfg
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Rough-K1-Walk-Kick-360-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_kick_rough/<run>/model_<N>.pt
+
+    3 段の通し実行は :file:`scripts/rsl_rl/train_walk_kick_360.sh` を rough 用の
+    タスク名で上書きして回す (同スクリプトの変数定義のコメント参照)。
 
     ``--resume`` ではなく ``--load_pretrained`` を使う理由は平坦版と同じ
     (:file:`scripts/rsl_rl/train_walk_kick.sh` の冒頭コメント参照)。
@@ -759,6 +771,51 @@ class K1WalkKickRoughEnvCfg(K1WalkKickEnvCfg):
 
 @configclass
 class K1WalkKickRoughEnvCfg_PLAY(K1WalkKickRoughEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkKick360RoughEnvCfg(K1WalkKick360EnvCfg):
+    """Stage 3 (rough): 凹凸地形の全方位版。平坦の 3 段レシピを rough でなぞる最終段。
+
+    :class:`K1WalkKick360EnvCfg` との差は地形だけ (:func:`_apply_rough_terrain`)。
+    360 版固有の設定は基底の ``__post_init__`` で全て済んでおり、
+    :func:`_apply_rough_terrain` は地形と ``reset_ball`` の ``spawn_clearance`` しか
+    触らないので、そのまま生き残る:
+
+    * ボール配置の全方位化 (``half_angle=π``) と遠距離化 (``dist_range=(0.5, 1.5)``)
+      — ``reset_ball.params`` を差し替えではなくキー追加で触っているため無傷。
+    * ``approach_penalty`` → ``ball_avoidance`` の差し替えとそのカリキュラム。
+    * 蹴り方向の全方位化 (``kick_direction.ranges.heading``) と ``episode_length_s=15.0``。
+
+    学習は :class:`K1WalkKickRoughEnvCfg` (rough の stage 2) の checkpoint から。
+    平坦版と同じく **checkpoint の継承そのものが実質カリキュラム** で、段階カリキュラムは
+    追加しない (蹴り方は rough で獲得済み・回り込みだけが新規)::
+
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Rough-K1-Walk-Kick-360-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_kick_rough/<run>/model_<N>.pt
+
+    3 段の通し実行は :file:`scripts/rsl_rl/train_walk_kick_360.sh` を rough 用の
+    タスク名で上書きして回す (同スクリプトの変数定義のコメント参照)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_rough_terrain(self)
+
+
+@configclass
+class K1WalkKick360RoughEnvCfg_PLAY(K1WalkKick360RoughEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 

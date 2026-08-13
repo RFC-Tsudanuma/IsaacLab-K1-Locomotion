@@ -79,8 +79,8 @@ gym.register(
 # Ablation 1: 凹凸地形 (terrain ablation)
 #
 # 平坦版との差は地形だけ。歩容ごと変わるので fine-tune ではなく
-# Rough-...-Walk-Phase → Rough-...-Walk-Kick の 2 段で 0 から学習し直す。
-# 観測 55 次元・並びは平坦版と同一。
+# Rough-...-Walk-Phase → Rough-...-Walk-Kick → Rough-...-Walk-Kick-360 の 3 段で
+# 0 から学習し直す。観測 55 次元・並びは平坦版と同一。
 #
 # NOTE: 地形が Flat/Rough を分けるという既存の命名 (Isaac-Velocity-Rough-K1-v0) に
 #       合わせて "Rough" 側に置く。walk_kick 系の他タスクは全て "Flat" 側。
@@ -122,6 +122,28 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKickRoughEnvCfg_PLAY",
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKickRoughPPORunnerCfg",
+    },
+)
+
+# rough の Stage 3 (全方位)。平坦版の 3 段目と同じく、直前の段
+# (k1_walk_kick_rough) の checkpoint から --load_pretrained で始める。
+gym.register(
+    id="Isaac-Velocity-Rough-K1-Walk-Kick-360-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKick360RoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360RoughPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Rough-K1-Walk-Kick-360-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKick360RoughEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360RoughPPORunnerCfg",
     },
 )
 

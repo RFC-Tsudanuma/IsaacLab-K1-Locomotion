@@ -21,6 +21,7 @@
 #       ./scripts/rsl_rl/train_walk_kick_360.sh          # 既存 walk_kick から 360 だけ
 #   ITER=20000 ./scripts/rsl_rl/train_walk_kick_360.sh   # kick 系を長く回す
 #   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_kick_360.sh   # walk phase だけ延長
+#   ./scripts/rsl_rl/train_walk_kick_360_rough.sh        # 地形 ablation (凹凸地形) の通し 3 段
 #
 # iteration 数は walk phase (WALK_ITER) と kick 系 (ITER) で別に持つ。既定はどちらも
 # 5000 で、まず一通り通して挙動を確認する想定。仕上げるときは ITER を上げること。
@@ -82,11 +83,15 @@ ITER=${ITER:-5000}
 WALK_ITER=${WALK_ITER:-5000}
 STAGE=${STAGE:-all}
 
-WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
-KICK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-v0"
-KICK360_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-360-v0"
-WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
-KICK_LOG_ROOT="logs/rsl_rl/k1_walk_kick"
+# 3 段のタスクと、次段が checkpoint を拾う先の log root。全て上書き可能にしてある。
+# 地形 ablation (凹凸地形) は同じ 3 段レシピを rough 版タスクでなぞるので、
+# 5 つまとめて差し替えるだけで通しで回せる (専用ラッパ: train_walk_kick_360_rough.sh)。
+# タスクを差し替えるときは LOG_ROOT (= RunnerCfg の experiment_name) も必ず対で変えること。
+WALK_TASK=${WALK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"}
+KICK_TASK=${KICK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-v0"}
+KICK360_TASK=${KICK360_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-360-v0"}
+WALK_LOG_ROOT=${WALK_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick_walk_phase"}
+KICK_LOG_ROOT=${KICK_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick"}
 
 should_run() { [[ "$STAGE" == "all" || "$STAGE" == *"$1"* ]]; }
 
