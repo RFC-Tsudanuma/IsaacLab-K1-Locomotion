@@ -154,6 +154,7 @@ from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
+from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
@@ -496,6 +497,31 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # 観測の次元も並びも変わらないので checkpoint はそのまま繋がる。
         # 対象と理由は enable_obs_delay / _OBS_DELAY_MAX_S のコメント参照。
         enable_obs_delay(self, _OBS_DELAY_MAX_S)
+
+        # -- 0c. 地面をランダムな軽い凹凸にする
+        #
+        # 継承元 (K1FlatEnvCfg) は terrain_type="plane" の完全平面。実機の床は
+        # わずかに波打っていて、平面だけで学習したポリシーは足裏が想定どおり接地する
+        # 前提に寄りかかる。段差・坂は入れず、±1-4 cm のノイズだけを乗せる
+        # (NOISY_FLAT_TERRAIN_CFG: random_rough 0.7 / plane 0.3)。
+        #
+        # height_scanner は継承元で None のまま = 地形は観測できない (blind)。
+        # 凹凸は「観測できない外乱」として効く。
+        #
+        # 地形カリキュラム (curriculum.terrain_levels) は継承元で None、
+        # TerrainGeneratorCfg 側も curriculum=False なので、5x5 の patch は
+        # 難易度順ではなく単なるバリエーション。max_init_terrain_level=None で
+        # 全 patch に env が散る。
+        #
+        # NOTE: 高さ系のしきい値は絶対 z のまま (base_height_penalty 0.45 /
+        #       base_height 終了 0.35)。地形ノイズは +0.01-0.04 m と上向きだけなので
+        #       判定は緩む方向に動き、誤終了は増えない。
+        # NOTE: kick_apex_height / sole_height_at_kick も絶対 z なので、地形ぶん
+        #       (最大 4 cm) 嵩上げされて見える。報酬には使っていないが、平地の run と
+        #       数値を直接比べるときは注意すること。
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = NOISY_FLAT_TERRAIN_CFG
+        self.scene.terrain.max_init_terrain_level = None
 
         # -- 1. 目標ボール速度をロングパスの帯へ（このタスクの本体）
         #

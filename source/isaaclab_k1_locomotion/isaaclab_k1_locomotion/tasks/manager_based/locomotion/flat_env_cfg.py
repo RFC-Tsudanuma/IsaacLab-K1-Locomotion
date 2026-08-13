@@ -37,12 +37,12 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
     curriculum=False,
     sub_terrains={
         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.9,
+            proportion=0.7,
             noise_range=(0.01, 0.04),
             noise_step=0.01,
             border_width=0.25,
         ),
-        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.1),
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.3),
     },
 )
 

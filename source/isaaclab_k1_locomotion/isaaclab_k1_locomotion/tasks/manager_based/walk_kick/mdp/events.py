@@ -52,7 +52,12 @@ def reset_ball_in_front_of_robot(
     state = ball.data.default_root_state[env_ids].clone()
     state[:, 0] = robot_pos_w[:, 0] + dist * torch.cos(target_angle)
     state[:, 1] = robot_pos_w[:, 1] + dist * torch.sin(target_angle)
-    state[:, 2] = ball_radius
+    # 地面の高さは env ごとに違う (terrain_generator を使うと sub-terrain の原点 z が
+    # 0 ではない)。絶対 z に ball_radius を入れると凹凸地形ではボールが最大で
+    # ノイズ幅ぶん地面に埋まった状態で湧き、PhysX が次のステップで押し出すときに
+    # 弾かれる。env 原点の z を足して、必ず地面の上に置く。
+    # 平地 (terrain_type="plane") では env_origins の z が 0 なので従来と同じ値になる。
+    state[:, 2] = env.scene.env_origins[env_ids, 2] + ball_radius
     state[:, 3:7] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=env.device)
     state[:, 7:] = 0.0
 
