@@ -32,14 +32,20 @@
 # 同期してしまい、各段のキック報酬カリキュラムがランプしなくなる
 # (詳細は train_walk_kick.sh の冒頭コメント)。
 #
-# --reset_noise_std は **Stage 4 だけ** に入れる。収束済みの 360 ポリシーは action std が
-# 潰れていて、4-5 m/s は探索したことのない速度域。std を戻さないと慣れた 2-3 m/s の
-# 蹴り方に貼り付いたまま抜け出せない。Stage 2/3 では不要 (むしろ蹴り方を壊す)。
+# --reset_noise_std は **既定で付けない**。以前は Stage 4 に 0.3 を入れていたが、
+# 継承元の収束 std は 0.06-0.095 で、0.3 はその 3-5 倍。実測ではこれだけで歩行が壊れ、
+# base_height 終了が 12 iteration で 0.82 まで上がって kick_rate は 0.19 止まりだった。
+# std リセットを外すと 14 iteration で kick_rate 0.99 / vel_ratio 0.85 に戻る。
+# 「速度域を探索させたい」意図は帯のゲート付きカリキュラムが代替している (下記)。
+# 足すとしても継承元の 1.5-2 倍 (RESET_NOISE_STD=0.12) から。
 #
-# ITER は 5000 未満にしないこと。特に Stage 4 は速度帯のカリキュラムが
-# 500 → 3000 iteration で (2.0,3.0) → (3.2,5.0) を動かし、その後の収束に
-# 2000 iteration を見込んでいる。途中で止めると帯が目標に届いていない中途半端な
-# ポリシーになる。
+# ITER は 5000 未満にしないこと。Stage 4 の速度帯カリキュラムは公称 500 → 3000
+# iteration で (2.0,3.0) → (3.2,5.0) を動かし、その後の収束に 2000 iteration を
+# 見込んでいる。ただし帯は **kick_rate で開閉するゲート付き** なので、蹴れていない
+# 間は進まない。公称より遅れることがあるため、終了時に
+# Curriculum/kick_speed_range/alpha が 1.0 に達しているかを必ず確認し、
+# 達していなければ LONG_ITER を伸ばすこと (alpha が長く止まったままなら、
+# その speed_max がそのスイングの実質的な上限)。
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_long_pass.sh                  # 4 段を通しで実行
@@ -124,8 +130,24 @@ WALK_ITER=${WALK_ITER:-5000}
 LOOP_ITER=${LOOP_ITER:-$ITER}
 LOOP360_ITER=${LOOP360_ITER:-$ITER}
 LONG_ITER=${LONG_ITER:-$ITER}
-# Stage 4 のみ。空文字を渡すと --reset_noise_std を付けない。
-RESET_NOISE_STD=${RESET_NOISE_STD-0.3}
+# Stage 4 のみ。空文字を渡すと --reset_noise_std を付けない (既定はこちら)。
+#
+# 既定を 0.3 から「付けない」へ変えた理由 (実測):
+#   継承元 (loop_pass_360) の収束 std は 0.06-0.095。0.3 はその 3-5 倍で、
+#   蹴りどころか歩行が保たない。warm start を正しく効かせた状態で 0.3 を入れた run は
+#   base_height 終了が 12 iteration で 0.82 まで上がり、kick_rate は 0.19 を頭打ちに
+#   減り続けた (mean_reward も負のまま)。同じ条件で std リセットだけ外すと
+#   14 iteration で kick_rate 0.99 / vel_ratio 0.85 に戻り、継承元の挙動がそのまま残る。
+#
+# 「速い蹴りは探索したことのない速度域だから std を戻す」という元の意図は、帯を
+# ゲート付きカリキュラム (kick_rate_gated_speed_range) で動かすことで代替している。
+# 帯は蹴れている間しか進まないので、常に「今の実力の少し上」が指令され続ける。
+# std 自体も PPO が学習するパラメータなので、必要なら勝手に上がる (Stage 3 では
+# 0.078 → 0.088 に増えている)。
+#
+# それでも探索を足したいときは、継承元の std の 1.5-2 倍あたりから試すこと:
+#   RESET_NOISE_STD=0.12 ./scripts/rsl_rl/train_walk_long_pass.sh
+RESET_NOISE_STD=${RESET_NOISE_STD-}
 STAGE=${STAGE:-all}
 
 WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Walk-Phase-v0"
@@ -178,6 +200,17 @@ find_latest_ckpt() {
 # 観測で学習されており、actor の重みが 1 つも引き継がれない (critic と正規化統計と
 # std だけが載る)。--load_pretrained は形の合わないテンソルを黙って捨てるので、
 # 明示指定でうっかり混ぜたときに気づけるようにしておく。
+# checkpoint が 1 フレーム観測 (素の ActorCritic) で学習されたものかを判定する。
+# 履歴入力版は actor.mlp.0.weight を、1 フレーム版は actor.0.weight を持つ。
+is_single_frame_ckpt() {
+    $LAB_PY - "$1" <<'PY' >/dev/null 2>&1
+import sys, torch
+sd = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+sd = sd.get("model_state_dict", sd)
+sys.exit(0 if "actor.0.weight" in sd else 1)
+PY
+}
+
 warn_if_foreign_ckpt() {
     local ckpt="$1" expected_root="$2"
     if [[ "$ckpt" != "$expected_root"/* ]]; then
@@ -252,6 +285,18 @@ if should_run 4; then
     EXTRA_ARGS=()
     if [[ -n "$RESET_NOISE_STD" ]]; then
         EXTRA_ARGS+=(--reset_noise_std "$RESET_NOISE_STD")
+    fi
+
+    # 1 フレーム観測の checkpoint なら --warm_start_from_single_frame を自動で付ける。
+    #
+    # 付け忘れると actor が 1 本も引き継がれず、乱数のまま歩行からやり直しになる。
+    # train.py 側でも止まるようにしてあるが (--allow_untransferred_actor)、
+    # 共用タスクの checkpoint から Stage 4 を始めるのは正当な使い方なので、
+    # ここで自動的に正しい引数を組み立てる。
+    if [[ "$*" != *--warm_start_from_single_frame* ]] && is_single_frame_ckpt "$LOOP360_CKPT"; then
+        echo "[INFO] 引き継ぎ元が 1 フレーム観測の checkpoint なので"
+        echo "[INFO] --warm_start_from_single_frame を自動で付けます。"
+        EXTRA_ARGS+=(--warm_start_from_single_frame)
     fi
 
     echo "=============================================================="

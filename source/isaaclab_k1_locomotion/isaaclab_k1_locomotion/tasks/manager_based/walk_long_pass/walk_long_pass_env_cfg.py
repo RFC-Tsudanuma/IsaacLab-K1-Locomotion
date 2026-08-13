@@ -50,12 +50,55 @@ ball_touch_count 1.30 → 0.91、Episode_Reward/kick_direction 0.213 → 0.001)�
 * 結果、蹴らない方が得になる (mean_reward はむしろ 12.1 → 21.5 に増えた)。
   探索 std も 0.3 → 0.08 に潰れ、iteration を増やしても抜けられない局所最適。
 
-そこで帯は :func:`~..walk_kick.mdp.curriculums.linear_command_speed_range` で
-継承元が満点を取れる (2.0, 3.0) から目標の (3.2, 5.0) へ滑らかに動かす。各時点で
+そこで帯は :func:`~..walk_kick.mdp.curriculums.kick_rate_gated_speed_range` で
+継承元が満点を取れる (2.0, 3.0) から目標の (3.2, 5.0) へ動かす。各時点で
 「今のポリシーがぎりぎり届く速度」が指令されるのでキック報酬が払われ続ける。
+
+帯は壁時計ではなく **kick_rate で開閉するゲート** で進める。壁時計の線形ランプ
+(``linear_command_speed_range``) は「ポリシーがこの速さで付いてくる」という賭けで、
+外れたときに自己回復しない: 帯が実力を追い越すとキック報酬が消え、上の収支逆転が
+起きて「蹴らない」に落ちるが、帯はそのまま上がり続けるので戻る道が無い。
+ゲート版は kick_rate が落ちれば帯を止め、崩れ続ければ蹴れていた帯まで戻すので、
+報酬信号が復活してポリシーが自力で戻れる。
 
 **この構造は帯を触る限り常について回る。** 帯を再調整するときは、必ず
 「継承元の実蹴り速度で採点したときにキック報酬が残るか」を先に検算すること。
+
+fine-tune ではキック報酬をフェードインさせてはいけない
+------------------------------------------------------
+継承元は「キック報酬 weight を 0 → 500 iteration で立ち上げる」カリキュラムを
+持っている。ゼロから学習する段では正しい順序だが、**既に蹴れるポリシーから始める
+Stage 4 では最初の 500 iteration がそのまま「蹴らない方が得」の期間になる**
+(歩行報酬は満額・キック報酬は ~0・キックは kick_finished で残りの歩行報酬を捨てる
+コストを払う)。帯ではなく weight 側で同じ収支逆転が起きる。
+
+そのため Stage 4 では :func:`_freeze_fade_in_curricula` でこれらのランプを終値の
+定数に潰し、1 iteration 目から満額のキック報酬を払う。
+
+Stage 4 が「歩くだけ」になったときの切り分け順序 (失敗記録 2026-08-11)
+----------------------------------------------------------------------
+run 2026-08-11_16-31-27 は 5000 iteration を丸ごと潰した。原因は報酬設計ではなく
+**actor が引き継がれていなかった**こと。共用タスク (1 フレーム観測) の
+loop_pass_360 checkpoint を ``--warm_start_from_single_frame`` 無しで渡したため、
+critic と正規化統計と std だけが載り、actor は乱数のまま学習が始まっていた
+(model_0.pt の actor.mlp.0.weight は全列が初期化スケール ±0.053 のまま)。
+歩行からやり直しなので当然キックは出ず、その間に帯のランプだけが壁時計で
+進み切っていた (iteration 1570 で speed_max が 5.0 に到達)。
+
+したがって切り分けは **報酬より先に「本当に継承できているか」** を見ること:
+
+1. 起動ログの ``Loaded N tensors`` / ``Skipped N tensors``。actor.* が Skipped 側に
+   並んでいたら、そこで止めて引数を直す (現在は train.py が例外で止める)。
+2. 最初の 20 iteration の ``Episode_Termination/base_height`` と
+   ``Train/mean_episode_length``。継承できていれば base_height は 0.03 前後、
+   episode length は 200 以上で、kick_rate は 15 iteration ほどで 0.98 に戻る。
+   base_height が 0.8 まで上がるなら、それは「歩けていない」のであって
+   「蹴らない」のではない。
+3. ``Policy/mean_noise_std``。``--reset_noise_std 0.3`` は継承元の収束 std
+   (0.06-0.095) の 3-5 倍で、**これだけで歩行が壊れる**。warm start を正しく効かせた
+   うえで 0.3 を入れた run は 12 iteration で base_height 終了 0.82・kick_rate 0.19
+   止まりだったが、std リセットを外すと 14 iteration で kick_rate 0.99 に戻った。
+   Stage 4 の既定は「std リセットなし」。探索を足すなら 0.12 程度から。
 
 観測を 50 フレームの履歴にする
 ------------------------------
@@ -94,13 +137,17 @@ ONNX の入力も (1, 50, 55) に変わる。実機側は 55 次元の観測を�
     _labpython2 scripts/rsl_rl/train.py \
         --task Isaac-Velocity-Flat-K1-Walk-Long-Pass-v0 \
         --headless --num_envs 4096 \
-        --load_pretrained logs/rsl_rl/k1_walk_long_pass_loop_360/<run>/model_<N>.pt \
-        --reset_noise_std 0.3
+        --load_pretrained logs/rsl_rl/k1_walk_long_pass_loop_360/<run>/model_<N>.pt
+    # 共用タスク (1 フレーム観測) の Stage 3 checkpoint から始める場合:
+    #   --warm_start_from_single_frame を必ず付ける (無いと actor が引き継がれない)。
 
 --resume ではなく --load_pretrained を使うこと（理由は walk_pass_env_cfg の
-docstring 参照）。--reset_noise_std は必須に近い: 収束済みポリシーは action std が
-潰れていて、4-5 m/s は探索したことのない速度域なので、std を戻さないと慣れた
-2-3 m/s の蹴り方に貼り付いたまま抜け出せない。
+docstring 参照）。
+
+``--reset_noise_std`` は **付けない**。以前は「収束済みポリシーは std が潰れていて
+4-5 m/s を探索できないから必須」としていたが、0.3 は継承元の収束 std (0.06-0.095) の
+3-5 倍で、実測ではキック以前に歩行が壊れる (上の切り分け 3.)。速度域の探索は帯の
+ゲート付きカリキュラムが「今の実力の少し上」を指令し続けることで担保している。
 """
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -133,16 +180,53 @@ _LONG_PASS_SPEED_RANGE = (3.2, 5.0)
 # キック報酬が満額で払われ、「蹴る」行動が維持される。
 #
 # 区間 500 → 3000 iteration:
-#   * 500 まで待つのは、キック報酬 weight 自体のランプ (0 → 500) と重ねないため。
-#     weight が立ち上がりきる前に帯まで動かすと、どちらが原因で報酬が動いたのか
-#     読めなくなる。
+#   * 500 まで待つのは、履歴入力 (CNN 潜在の列がゼロから育つ) に慣れるまでの
+#     落ち着き期間。実測では 15 iteration ほどで kick_rate 0.99 に戻るので十分な余裕。
+#     (キック報酬 weight のランプと重ねない、という元の理由は _freeze_fade_in_curricula
+#      でランプ自体を消したので、もう当てはまらない)
 #   * 2500 iteration かけるのは、帯の上限が 3.0 → 5.0 と 1.7 倍に伸びるため。
 #     1 iteration あたり 0.0008 m/s ずつで、ポリシーが追従する余裕を取る。
-#   * 終点 3000 の後に仕上げの余地を残す想定なので、ITER は 5000 以上で回すこと。
+#   * これは **公称** の速さ。実際は kick_rate ゲートが開いている間しか進まないので、
+#     3000 で終点に着くとは限らない。終了時に Curriculum/kick_speed_range/alpha が
+#     1.0 か必ず確認すること。ITER は 5000 以上。
 # --------------------------------------------------------------------------- #
 _LONG_PASS_SPEED_RANGE_START = (2.0, 3.0)
 _SPEED_RAMP_START_ITER = 500
 _SPEED_RAMP_END_ITER = 3000
+
+# --------------------------------------------------------------------------- #
+# 帯ゲートのしきい値 (kick_rate の EMA)
+#
+# 継承元 (loop_pass_360) の収束値は kick_rate ≈ 0.99。帯を進めてよいのは
+# 「今の帯でちゃんと蹴れている」間だけなので、0.80 を上回っている間だけ進める。
+# 0.50 を下回ったら **帯を戻す**: キック報酬が復活するので、蹴らなくなった状態から
+# 自力で戻ってこられる (壁時計の線形ランプにはこの復路が無い)。
+# 間の 0.50-0.80 は据え置き (ヒステリシス。しきい値付近での往復を防ぐ)。
+#
+# retreat_scale = 2.0 は「崩れたら進んだ倍の速さで戻る」。崩れた帯に長く留まるほど
+# 「蹴らない」方の解が固まるので、復路は往路より速くしておく。
+# --------------------------------------------------------------------------- #
+_SPEED_GATE_ADVANCE_ABOVE = 0.80
+_SPEED_GATE_RETREAT_BELOW = 0.50
+_SPEED_GATE_RETREAT_SCALE = 2.0
+
+# --------------------------------------------------------------------------- #
+# カリキュラムが 1 iteration とみなす env step 数
+#
+# curriculums.py の start_step / end_step は
+# ``env.common_step_counter // steps_per_iteration`` で iteration に換算される。
+# common_step_counter は env.step() 1 回で 1 増えるので、この値は PPO の
+# ``num_steps_per_env`` と一致していなければならない
+# (locomotion/agents/rsl_rl_ppo_cfg.py: num_steps_per_env = 48)。
+#
+# NOTE: 継承元 (walk_kick_env_cfg の _spi) は 24 のままで、コメントには
+#       「steps_per_iteration = num_steps_per_env」と書いてあるのに実際の
+#       num_steps_per_env は 48。つまり walk_kick 系のランプは全部、書いてある
+#       iteration 数の **半分** で終わっている (失敗 run で帯が iteration 3000 では
+#       なく 1570 で 5.0 に到達していたのはこれが理由)。既に収束している
+#       Stage 1-3 の挙動を変えないよう継承元は触らず、このタスクの中だけ揃える。
+# --------------------------------------------------------------------------- #
+_STEPS_PER_ITERATION = 48
 
 # --------------------------------------------------------------------------- #
 # 値 latch のトリガー速度 [m/s]
@@ -192,26 +276,47 @@ _LONG_PASS_SIGMA_GATE = 0.3
 # Actor が見る観測履歴の長さ [frames]
 #
 # policy 観測 (55 次元: 内界センサ + 前ステップの行動 + 受信コマンド) を毎ステップ
-# 50 フレーム分バッファし、actor には
-#   * 直近 5 フレームをそのまま
-#   * 50 フレーム全部を 1D-CNN で符号化した潜在 (96 次元)
+# H フレーム分バッファし、actor には
+#   * 直近 5 フレームをそのまま (5 × 55 = 275)
+#   * H フレーム全部を 1D-CNN で符号化した潜在
 # を入れる。ネットワーク側は
 # :class:`~..locomotion.networks.ActorCriticHistoryCNN` (agents/rsl_rl_ppo_cfg.py で
 # 指定) が担当し、直近フレーム数と CNN の形はそちらの定数で決まる。
 #
-# flatten_history_dim = False が必須。True にすると ObservationManager は
-# **項ごとに** (50, d_i) を平坦化してから連結するので、並びが
-# [gravity の 50 フレーム][ang_vel の 50 フレーム]... になり、フレーム単位の
-# (N, 50, 55) には戻せない (CNN のチャンネル = 観測次元にできなくなる)。
-# False なら各項が (N, 50, d_i) のまま最終軸で連結され、(N, 50, 55) が得られる。
+# H を変えると CNN の出力系列長 = 潜在次元 = actor MLP の入力次元が変わる
+# ([kernel, stride] = [6, 3], [4, 2] のとき L1 = (H-6)//3 + 1, L2 = (L1-4)//2 + 1、
+#  潜在 = 16 × L2):
 #
-# 履歴は環境リセットで巻き戻り、直後は現在フレームで 50 個すべてが埋まる
+#   H = 50  → L1 = 15, L2 = 6  → 潜在  96 → actor 入力 371
+#   H = 100 → L1 = 32, L2 = 15 → 潜在 240 → actor 入力 515
+#
+# 0.02 s/step なので H = 100 は 2 秒分の履歴。キックは接近から latch まで 1 秒以上
+# かかるので、1 秒 (H=50) だと踏み込みの序盤がバッファから落ちる。
+#
+# **H を変えた checkpoint 同士は繋がらない。** actor MLP の 1 層目の形が変わるので、
+# --load_pretrained では入力層が黙って捨てられる (train.py が actor を 1 本も
+# 引き継げなければ止めるようになっている)。1 フレーム観測の checkpoint からなら
+# H に関係なく --warm_start_from_single_frame で移植できる (最新フレームの列に
+# 置いて残りをゼロにするだけなので、潜在の次元が変わっても成立する)。
+#
+# flatten_history_dim = False が必須。True にすると ObservationManager は
+# **項ごとに** (H, d_i) を平坦化してから連結するので、並びが
+# [gravity の H フレーム][ang_vel の H フレーム]... になり、フレーム単位の
+# (N, H, 55) には戻せない (CNN のチャンネル = 観測次元にできなくなる)。
+# False なら各項が (N, H, d_i) のまま最終軸で連結され、(N, H, 55) が得られる。
+#
+# 履歴は環境リセットで巻き戻り、直後は現在フレームで H 個すべてが埋まる
 # (IsaacLab の CircularBuffer の仕様)。ゼロ詰めの履歴は入らない。
 #
+# NOTE: ONNX の入力形状も (1, H, 55) になる。H を変えたら実機側のリングバッファ長も
+#       合わせること。
 # NOTE: critic はこれまでどおり 1 フレーム観測 (特権情報付き) のまま。critic 側にも
 #       履歴を付ける場合は ActorCriticHistoryCNN の critic 側も直す必要がある。
+# NOTE: この定数は Stage 1-3 の履歴入力版タスク
+#       (:mod:`.walk_long_pass_stages_env_cfg`) からも読まれる。全 stage で同じ値に
+#       しないと段の間で checkpoint が繋がらないので、ここ 1 箇所で管理している。
 # --------------------------------------------------------------------------- #
-_OBS_HISTORY_LENGTH = 50
+_OBS_HISTORY_LENGTH = 100
 
 
 def enable_obs_history(cfg) -> None:
@@ -240,6 +345,54 @@ _KICK_STATE_REWARD_TERMS = (
     "kick_pose_overshoot",
     "extra_ball_touch",
 )
+
+
+def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
+    """``before_iter`` までに立ち上がりきる報酬重みのランプを、終値の定数に潰す。
+
+    継承元 (walk_kick → walk_loop_pass → 360) では、キック報酬の weight を 0 → 500
+    iteration でフェードインさせている。ゼロから学習する段では「まず歩けるように
+    なってから蹴りを乗せる」ための正しい順序だが、**既に蹴れるポリシーからの
+    fine-tune である Stage 4 では逆に働く**:
+
+    * 歩行報酬 (feet_phase / track_lin_vel など) は 1 iteration 目から満額。
+    * キック報酬は weight ≈ 0 から始まる。
+    * ``kick_finished`` は latch の 2 秒後にエピソードを終わらせるので、キックは
+      「残りの歩行報酬を捨てる」コストだけを払っている。
+
+    つまり最初の 500 iteration は「蹴らない方が得」が明示的に成立していて、PPO は
+    その間ずっと継承したキックを消す方向に更新される。500 iteration 後に weight が
+    戻ってきても、そのときには蹴らなくなった後なので報酬が payout されない
+    (モジュール docstring の失敗記録と同じ収支逆転が、帯ではなく weight 側で起きる)。
+
+    Stage 4 の出発点は「その weight で既に収束したポリシー」なので、終値をそのまま
+    1 iteration 目から掛けるのが正しい。``start_weight`` を ``end_weight`` に揃える
+    ことで、ランプ項を消さずに定数化する (どの項がいくつなのかがログに出たままになる)。
+
+    ``before_iter`` より後にランプする項 (例: extra_ball_touch) は意図的に後段へ
+    置かれているので触らない。
+
+    Returns:
+        定数化した curriculum term の名前 (呼び出し側で表示・検証に使う)。
+    """
+    frozen: list[str] = []
+    for name in dir(cfg.curriculum):
+        if name.startswith("_"):
+            continue
+        term = getattr(cfg.curriculum, name, None)
+        if term is None or getattr(term, "func", None) is not mdp.linear_reward_weight:
+            continue
+        params = term.params
+        # end_step を持たない項 (帯ゲートに紐付いたランプなど) は壁時計で動いて
+        # いないので対象外。get(..., 0) で拾うと「0 → before_iter に収まる」と
+        # 誤判定して潰してしまう。
+        if "end_step" not in params or params["end_step"] > before_iter:
+            continue
+        if params["start_weight"] == params["end_weight"]:
+            continue
+        params["start_weight"] = params["end_weight"]
+        frozen.append(name)
+    return frozen
 
 
 def _apply_v_thresh(cfg: "K1WalkLongPassEnvCfg", v_thresh: float) -> None:
@@ -303,13 +456,18 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
             weight=0.0,
             params={**_KICK_STATE_PARAMS},
         )
-        # ランプは帯カリキュラムの **後** (3000 → 3500 iteration)。
-        # 初版は 0 → 500 で他のキック報酬と同時に立ち上げていたが、「触ると罰される」
-        # 圧力と「蹴っても報酬が出ない」状況が重なると、ポリシーはボールを避ける方向へ
-        # まとめて逃げる (実測 ball_touch_count 1.30 → 0.91)。帯が目標まで動いて
-        # キックが安定してから、最後に多重接触だけを削るのが正しい順序。
+        # ランプは帯カリキュラムの **後**。初版は 0 → 500 で他のキック報酬と同時に
+        # 立ち上げていたが、「触ると罰される」圧力と「蹴っても報酬が出ない」状況が
+        # 重なると、ポリシーはボールを避ける方向へまとめて逃げる
+        # (実測 ball_touch_count 1.30 → 0.91)。帯が目標まで動いてキックが安定してから、
+        # 最後に多重接触だけを削るのが正しい順序。
+        #
+        # 開始時刻は壁時計ではなく **帯が目標に届いた時点** に紐付ける。帯はゲート付き
+        # (下の -- 7) で「蹴れている間しか進まない」ので、目標に届く iteration が
+        # 事前に決まらない。壁時計の 3000 で立ち上げると、帯がまだ途中のポリシーに
+        # 追加の罰を掛けることになる。
         self.curriculum.extra_ball_touch_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
+            func=mdp.linear_reward_weight_after_speed_gate,
             params={
                 "term_name": "extra_ball_touch",
                 "start_weight": 0.0,
@@ -317,9 +475,9 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
                 # (キック 1 回の収益 ≈ +5 の 2 割)。kick_rate が落ちるようなら
                 # 弱めること (ボールに触ること自体を避け始めるサイン)。
                 "end_weight": -50.0,
-                "start_step": _SPEED_RAMP_END_ITER,
-                "end_step": _SPEED_RAMP_END_ITER + 500,
-                "steps_per_iteration": 24,
+                "command_name": "kick_direction",
+                "ramp_iterations": 500,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
             },
         )
 
@@ -327,20 +485,40 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # (全項に一括配布。extra_ball_touch を追加した後に呼ぶこと)
         _apply_v_thresh(self, _LONG_PASS_V_THRESH)
 
-        # -- 6. 目標ボール速度の帯を (2.0,3.0) → (3.2,5.0) へ滑らかに動かす
+        # -- 6. キック報酬のフェードインを潰す (fine-tune では有害)
+        #
+        # 継承した 0 → 500 iteration のランプは「ゼロから学習する段」用の順序で、
+        # 既に蹴れるポリシーから始める Stage 4 では最初の 500 iteration に
+        # 「蹴らない方が得」を明示的に作ってしまう。理由は
+        # :func:`_freeze_fade_in_curricula` の docstring を参照。
+        # 後段でランプする extra_ball_touch (3000 → 3500) は対象外。
+        _freeze_fade_in_curricula(self, before_iter=_SPEED_RAMP_START_ITER)
+
+        # -- 7. 目標ボール速度の帯を (2.0,3.0) → (3.2,5.0) へ動かす
         #
         # このタスクの成否を決めるカリキュラム。一段で張り替えると
         # 「蹴らずに time_out まで歩く」に収束する (モジュール docstring の失敗記録)。
-        # 進捗は Curriculum/kick_speed_range/speed_{min,max} で追える。
+        #
+        # 壁時計の線形ランプ (linear_command_speed_range) ではなく、キック成立率で
+        # 開閉するゲート版を使う。壁時計は「ポリシーがこの速さで付いてくる」という
+        # 賭けで、外れたときに自己回復しない (帯が実力を追い越す → キック報酬が消える →
+        # 蹴らない方が得 → std も潰れて戻れない)。ゲート版なら崩れた時点で帯が止まり、
+        # 崩れ続ければ蹴れていた帯まで戻るので報酬信号が復活する。
+        #
+        # 進捗は Curriculum/kick_speed_range/{speed_min,speed_max,alpha,kick_rate_ema}。
+        # alpha が途中で止まったままなら、その speed_max がこのスイングの実質的な上限。
         self.curriculum.kick_speed_range = CurrTerm(
-            func=mdp.linear_command_speed_range,
+            func=mdp.kick_rate_gated_speed_range,
             params={
                 "command_name": "kick_direction",
                 "start_range": _LONG_PASS_SPEED_RANGE_START,
                 "end_range": _LONG_PASS_SPEED_RANGE,
                 "start_step": _SPEED_RAMP_START_ITER,
                 "end_step": _SPEED_RAMP_END_ITER,
-                "steps_per_iteration": 24,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+                "advance_above": _SPEED_GATE_ADVANCE_ABOVE,
+                "retreat_below": _SPEED_GATE_RETREAT_BELOW,
+                "retreat_scale": _SPEED_GATE_RETREAT_SCALE,
             },
         )
 
