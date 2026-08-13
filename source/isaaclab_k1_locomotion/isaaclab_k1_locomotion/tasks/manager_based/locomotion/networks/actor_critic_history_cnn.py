@@ -5,28 +5,32 @@
 
 """観測履歴を 1D-CNN で符号化する ActorCritic (rsl_rl 用)。
 
-Actor の入力を「1 フレームの観測」から「50 フレーム分の観測バッファ」に差し替える::
+Actor の入力を「1 フレームの観測」から「H フレーム分の観測バッファ」に差し替える::
 
-    obs_history: (N, H=50, D)     ← 古い順。obs_history[:, -1] が現在フレーム
+    obs_history: (N, H, D)        ← 古い順。obs_history[:, -1] が現在フレーム
         ├─ 直近 K=5 フレームをそのまま平坦化      → 5 * D
-        └─ H=50 フレーム全部を 1D-CNN で符号化    → latent
+        └─ H フレーム全部を 1D-CNN で符号化       → latent
                                                     ↓ concat
                                              actor MLP → action
 
 CNN は 1 次元・隠れ層 2 つで、[kernel, filter, stride] = [6, 32, 3], [4, 16, 2]。
-チャンネルが観測次元 D、系列長が履歴長 H になるので (N, D, H) に転置してから通す::
+チャンネルが観測次元 D、系列長が履歴長 H になるので (N, D, H) に転置してから通す。
+walk_long_pass の設定 (H=100 = 2 秒) では::
 
-    L0 = 50 → conv1 (k=6, s=3) → L1 = (50-6)//3 + 1 = 15
-            → conv2 (k=4, s=2) → L2 = (15-4)//2 + 1 = 6
-    latent = 16 * 6 = 96
+    L0 = 100 → conv1 (k=6, s=3) → L1 = (100-6)//3 + 1 = 32
+             → conv2 (k=4, s=2) → L2 = (32-4)//2 + 1 = 15
+    latent = 16 * 15 = 240
 
-D = 55 (walk_kick 系の policy 観測) なら actor MLP の入力は 5*55 + 96 = 371 次元。
+D = 55 (walk_kick 系の policy 観測) なら actor MLP の入力は 5*55 + 240 = 515 次元。
+H はここでは決めず、環境から渡される観測の形 (N, H, D) から読む。潜在の次元が H に
+依存するので、**H を変えると既存 checkpoint の actor.mlp.0.weight は載らなくなる**
+(conv の重みは H に依存しないので載る)。
 
 環境側の要求
 ------------
 policy 観測グループに履歴を持たせ、**平坦化しない**こと::
 
-    self.observations.policy.history_length = 50
+    self.observations.policy.history_length = 100
     self.observations.policy.flatten_history_dim = False
 
 ``flatten_history_dim = True`` にすると ObservationManager は項ごとに (H, d_i) を
@@ -39,7 +43,7 @@ Critic には履歴を付けていない (特権情報付きの 1 フレーム�
 
 実機デプロイ時の入力の作り方
 ----------------------------
-55 次元の観測を毎制御周期リングバッファに積み、古い順に並べた (1, 50, 55) を
+55 次元の観測を毎制御周期リングバッファに積み、古い順に並べた (1, H, 55) を
 ONNX の "obs" に渡す。エピソード開始直後はバッファを現在フレームで埋める
 (IsaacLab の CircularBuffer が reset 後に同じことをする)。
 """

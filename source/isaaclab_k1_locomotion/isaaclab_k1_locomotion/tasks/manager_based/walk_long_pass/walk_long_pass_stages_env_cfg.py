@@ -10,7 +10,7 @@
     Stage 1 walk phase → Stage 2 loop_pass → Stage 3 loop_pass_360 → Stage 4 long_pass
 
 Stage 4 (:class:`~.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg`) の actor は
-50 フレームの観測履歴を見るので、**前段も同じ観測形でないと checkpoint が繋がらない**
+100 フレーム (2 秒) の観測履歴を見るので、**前段も同じ観測形でないと checkpoint が繋がらない**
 (actor の入力次元と重みの名前が変わり、train.py が黙って捨てる)。
 
 一方で Stage 1-3 の元タスク

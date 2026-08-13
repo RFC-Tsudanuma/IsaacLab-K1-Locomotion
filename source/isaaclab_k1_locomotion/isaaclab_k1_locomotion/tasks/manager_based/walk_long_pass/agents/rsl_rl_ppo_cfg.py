@@ -14,7 +14,7 @@ from ...walk_loop_pass.agents.rsl_rl_ppo_cfg import K1WalkLoopPass360PPORunnerCf
 # --------------------------------------------------------------------------- #
 # Actor に「そのまま」入れる直近フレーム数 K
 #
-# 履歴長 H = 50 は環境側 (walk_long_pass_env_cfg._OBS_HISTORY_LENGTH) が決め、
+# 履歴長 H = 100 は環境側 (walk_long_pass_env_cfg._OBS_HISTORY_LENGTH) が決め、
 # ネットワークは観測の形 (N, H, D) から H を読む。ここで持つのは切り出し方だけ。
 # --------------------------------------------------------------------------- #
 _NUM_RECENT_FRAMES = 5
@@ -23,8 +23,12 @@ _NUM_RECENT_FRAMES = 5
 # 履歴符号化 CNN: 1 次元・隠れ層 2 つ
 #
 # [kernel size, filter size, stride size] = [6, 32, 3] と [4, 16, 2]。
-# 系列長は 50 → 15 → 6 と縮み、潜在は 16 * 6 = 96 次元。
-# actor MLP の入力は 5*55 + 96 = 371 次元になる。
+# 系列長は 100 → 32 → 15 と縮み、潜在は 16 * 15 = 240 次元。
+# actor MLP の入力は 5*55 + 240 = 515 次元になる。
+#
+# NOTE: 潜在の次元は履歴長に依存する (H=50 なら 96)。H を変えると
+#       actor.mlp.0.weight の形が変わり、既存 checkpoint の actor が載らなくなる
+#       (conv の重みは H に依存しないので載る)。
 # --------------------------------------------------------------------------- #
 _CNN_KERNEL_SIZES = [6, 4]
 _CNN_FILTERS = [32, 16]
@@ -91,10 +95,10 @@ class K1WalkLongPassLoop360PPORunnerCfg(K1WalkLoopPass360PPORunnerCfg):
 
 @configclass
 class K1WalkLongPassPPORunnerCfg(K1WalkLoopPass360PPORunnerCfg):
-    """Stage 4 (ロングパス本体)。actor は 50 フレームの観測履歴を見る。
+    """Stage 4 (ロングパス本体)。actor は 100 フレーム (2 秒) の観測履歴を見る。
 
     観測の中身 (55 次元) と行動空間は Walk-Kick 系と同じだが、actor の入力だけが
-    「直近 5 フレームそのまま + 50 フレームの CNN 潜在」に変わっている。PPO の
+    「直近 5 フレームそのまま + 100 フレームの CNN 潜在」に変わっている。PPO の
     ハイパラは継承元のまま。experiment_name だけ分けて、他のキック run とログが
     混ざらないようにする。
 

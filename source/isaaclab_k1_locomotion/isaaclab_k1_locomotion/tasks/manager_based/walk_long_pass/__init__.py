@@ -15,7 +15,7 @@ from . import agents
 # Stage 1-3 (履歴入力版)
 #
 # 中身は共用タスク (Walk-Kick-Walk-Phase / Walk-Loop-Pass / Walk-Loop-Pass-360) と
-# 同一で、policy 観測を 50 フレームの履歴にした点だけが違う。共用タスクに履歴を
+# 同一で、policy 観測を 100 フレーム (2 秒) の履歴にした点だけが違う。共用タスクに履歴を
 # 足すと walk_kick / walk_pass / walk_lob / walk_mid_kick / loop_shoot まで
 # 道連れになるので、long_pass 系列だけ別 ID に分けている
 # (詳細は walk_long_pass_stages_env_cfg のモジュール docstring)。
@@ -106,9 +106,9 @@ gym.register(
 )
 
 # NOTE: 観測項 (55 次元) と行動空間は walk_kick 系と同一だが、actor だけは
-#       50 フレームの観測履歴を見る (直近 5 フレームそのまま + 50 フレームの
+#       100 フレームの観測履歴を見る (直近 5 フレームそのまま + 100 フレームの
 #       1D-CNN 潜在)。詳細は walk_long_pass_env_cfg の
-#       「観測を 50 フレームの履歴にする」節を参照。
+#       「観測を 100 フレーム (2 秒) の履歴にする」節を参照。
 #       通し実行 (Stage 1-4) は scripts/rsl_rl/train_walk_long_pass.sh。
 #       **共用タスク側の checkpoint からは actor を引き継げない** ので、
 #       --load_pretrained には上の Stage 1-3 (履歴入力版) の run を使うこと。

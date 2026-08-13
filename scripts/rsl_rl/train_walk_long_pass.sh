@@ -11,15 +11,15 @@
 #            速度帯を (2.0,3.0) → (3.2,5.0) へ引き上げる。
 #
 # Stage 1-3 の中身は train_walk_loop_pass_360.sh (共用タスク) と同一だが、
-# **policy 観測を 50 フレームの履歴にした専用タスク**を使う。actor は
-# 「直近 5 フレームそのまま + 50 フレームの 1D-CNN 潜在」を入力に取るので、
+# **policy 観測を 100 フレーム (2 秒) の履歴にした専用タスク**を使う。actor は
+# 「直近 5 フレームそのまま + 100 フレームの 1D-CNN 潜在」を入力に取るので、
 # 前段が 1 フレーム観測だと actor の重みが 1 つも引き継げない (train.py が形の
 # 合わないテンソルを黙って捨てる)。共用タスクに履歴を足すと walk_kick /
 # walk_pass / walk_lob / walk_mid_kick / loop_shoot まで道連れになるため、
 # long_pass 系列だけ別 ID に分けてある
 # (source/.../walk_long_pass/walk_long_pass_stages_env_cfg.py 参照)。
 #
-# 全 stage とも観測 (50, 55)・行動 12 次元・同じ並びなので、--load_pretrained で
+# 全 stage とも観測 (100, 55)・行動 12 次元・同じ並びなので、--load_pretrained で
 # そのまま引き継げる。段が繋がったかは起動ログの "Skipped N tensors" で確認する
 # (0 本なら全部引き継げている)。
 #
