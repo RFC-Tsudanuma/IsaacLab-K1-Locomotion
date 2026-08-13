@@ -234,6 +234,7 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             alpha=self.cfg.alpha,
             v_thresh=self.cfg.v_thresh,
             command_name=self.cfg.kick_direction_command_name or "kick_direction",
+            track_ball=self.cfg.track_ball,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -294,4 +295,11 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
 
     v_thresh: float = 0.8
     """値 latch のトリガー速度 [m/s]。follow_ball=True のときのみ使用。"""
+
+    track_ball: bool = False
+    """True で latch 前の P_kick をボールに追従させる (転がるボール用)。
+
+    :func:`..kick_state.kick_state` の同名引数を参照。``terminations.kick_finished`` の
+    params にも **同じ値** を渡すこと (先に呼ばれた方でその step の状態が確定するため)。
+    """
 

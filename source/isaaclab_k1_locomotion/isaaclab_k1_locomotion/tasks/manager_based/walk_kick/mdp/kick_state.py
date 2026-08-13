@@ -83,8 +83,27 @@ def kick_state(
     v_thresh: float,
     command_name: str = "kick_direction",
     ball_name: str = "soccer_ball",
+    track_ball: bool = False,
 ) -> dict:
-    """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。"""
+    """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
+
+    Args:
+        track_ball: True にすると、値 latch 前は **P_kick を毎ステップ現在のボール位置から
+            引き直す**。既定 (False) はエピソード開始時のボール位置に固定する従来挙動。
+
+            ボールが動くタスク (リセット時に初速を与える ablation など) では固定できない。
+            P_kick は「理想キック立ち位置」なので、ボールが転がったのに開始位置に残ると、
+            approach_penalty / ball_avoidance が実際のボールとは違う点への整列を要求し、
+            latch 後に G を固定する先も的外れな点になる。
+
+            NOTE: このフラグは **kick_state を最初に呼ぶ項** が渡した値でその step の
+                  状態が確定する (r_stance / alpha / v_thresh と同じ)。ただし P_kick を
+                  計算するのは kick_state 自身だけで、報酬項はどれも出来上がった
+                  ``P_kick`` / ``d_to_P_kick`` / ``G`` を読むだけなので、報酬項の全てに
+                  配る必要はない。毎ステップ最初に走ることが保証されている
+                  :func:`..terminations.kick_finished` (と、同じ値を持つ
+                  :class:`..commands.BallFollowVelocityCommandCfg`) にだけ渡せばよい。
+    """
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
     if state is not None and state["step"] == step:
@@ -169,7 +188,8 @@ def kick_state(
     s = ((robot_pos - ball_pos) * right_vec).sum(dim=-1)
 
     if just_reset.any():
-        # P_kick: R 上、ボールから後方 r_stance の点。エピソード終了まで固定。
+        # P_kick: R 上、ボールから後方 r_stance の点。既定ではエピソード終了まで固定
+        # (track_ball=True のときだけ latch まで下のブロックが引き直す)。
         state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
         # init_side は未確定 (0) に戻す。確定は下の commit ブロックで行う。
         state["init_side"][just_reset] = 0.0
@@ -190,6 +210,19 @@ def kick_state(
         state["sole_height_at_kick"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
+
+    # ------------------------------------------------------------------ #
+    # 転がるボール用: latch 前は P_kick を現在のボール位置から毎ステップ引き直す。
+    #
+    # kick_done は下の値 latch ブロックでこの step ぶんが立つので、ここで読むのは
+    # 前 step までの値。つまり latch したその step も更新対象に入り、P_kick は
+    # 「蹴った瞬間のボール位置 − r_stance·kick_dir」で凍結される。飛翔後に G を戻す先
+    # としてはそれが正しい (開始位置でも飛んでいった先でもない)。
+    # ------------------------------------------------------------------ #
+    if track_ball:
+        state["P_kick"] = torch.where(
+            state["kick_done"].unsqueeze(-1), state["P_kick"], ball_pos - r_stance * kick_dir
+        )
 
     # ------------------------------------------------------------------ #
     # init_side の確定: ロボットが |s| > 閾値 までどちらかの側へ寄った時点の符号で確定
@@ -223,8 +256,9 @@ def kick_state(
     # 接触回数: ボール速度の跳ね上がり (dv > 閾値) の立ち上がりを数える。
     #
     # エピソード開始直後 (just_reset) は prev_v_ball が 0 にリセットされた直後なので、
-    # ボールが既に転がっていると偽の dv が出る。reset_ball は静止状態で置くので実害は
-    # 無いが、念のため just_reset のステップはカウントしない。
+    # ボールが既に転がっていると偽の dv が出る。just_reset のステップをカウントしない
+    # ことでこれを塞いでいる (reset_ball が初速を与えるタスクではこのガードが必須。
+    # 静止配置のタスクでも保険として効く)。
     # ------------------------------------------------------------------ #
     dv = v_ball - state["prev_v_ball"]
     touched = (dv > _TOUCH_DV_THRESH) & (state["touch_refractory"] == 0) & (~just_reset)

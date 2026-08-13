@@ -43,3 +43,40 @@ class K1WalkKick360PPORunnerCfg(K1WalkKickPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick_360"
+
+
+@configclass
+class K1WalkKickWalkPhaseRoughPPORunnerCfg(K1WalkKickWalkPhasePPORunnerCfg):
+    """Terrain ablation の Stage 1 (凹凸地形・歩行のみ)。
+
+    ネットワーク・PPO ハイパラは平坦版と同一に保つ (観測 55 次元も同じ)。
+    experiment_name だけ分けて、平坦版の run とログが混ざらないようにする。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_walk_phase_rough"
+
+
+@configclass
+class K1WalkKickRoughPPORunnerCfg(K1WalkKickPPORunnerCfg):
+    """Terrain ablation の Stage 2 (凹凸地形・キック)。
+
+    ``k1_walk_kick_walk_phase_rough`` の checkpoint から --load_pretrained で始める前提。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_rough"
+
+
+@configclass
+class K1WalkKick360MovingBallPPORunnerCfg(K1WalkKick360PPORunnerCfg):
+    """Ball velocity ablation。walk_kick_360 の checkpoint から --load_pretrained で始める前提。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_360_moving_ball"

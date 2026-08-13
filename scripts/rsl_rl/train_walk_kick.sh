@@ -21,6 +21,9 @@
 #   STAGE=2 WALK_CKPT=logs/.../model_19999.pt ./scripts/rsl_rl/train_walk_kick.sh
 #                                                        # Stage 2 だけ再実行
 #   ./scripts/rsl_rl/train_walk_kick.sh --video          # 追加引数は両 stage に渡る
+#
+# 地形 ablation (凹凸地形で 0 から 2 段) は WALK_TASK / WALK_LOG_ROOT / KICK_TASK を
+# 差し替えて同じレシピで回す。指定例は下の変数定義のコメントを参照。
 
 set -euo pipefail
 
@@ -91,14 +94,22 @@ NUM_ENVS=${NUM_ENVS:-4096}
 ITER=${ITER:-20000}
 STAGE=${STAGE:-all}
 
-WALK_TASK="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"
 # Stage 2 のタスクは差し替え可能。walk phase (Stage 1) は 3 タスク共通なので、
 # パス／ループシュートもこのスクリプトをそのまま使い回せる。
 #   KICK_TASK=Isaac-Velocity-Flat-K1-Walk-Pass-v0 ./scripts/rsl_rl/train_walk_kick.sh
 #   KICK_TASK=Isaac-Velocity-Flat-K1-Walk-Loop-Pass-v0  ./scripts/rsl_rl/train_walk_kick.sh
 #   KICK_TASK=Isaac-Velocity-Flat-K1-Walk-Loop-Shoot-v0 ./scripts/rsl_rl/train_walk_kick.sh
 KICK_TASK=${KICK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-v0"}
-WALK_LOG_ROOT="logs/rsl_rl/k1_walk_kick_walk_phase"
+# Stage 1 も差し替え可能。地形 ablation (rough) は walk phase から地形が違うので、
+# 両段とも rough 版に差し替えて同じ 2 段レシピをなぞる:
+#   WALK_TASK=Isaac-Velocity-Rough-K1-Walk-Kick-Walk-Phase-v0 \
+#   WALK_LOG_ROOT=logs/rsl_rl/k1_walk_kick_walk_phase_rough \
+#   KICK_TASK=Isaac-Velocity-Rough-K1-Walk-Kick-v0 \
+#       ./scripts/rsl_rl/train_walk_kick.sh
+# WALK_TASK を差し替えるときは WALK_LOG_ROOT (Stage 2 が checkpoint を拾う先) も
+# 必ず対で変えること。experiment_name は RunnerCfg 側で決まる。
+WALK_TASK=${WALK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Phase-v0"}
+WALK_LOG_ROOT=${WALK_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick_walk_phase"}
 
 # Stage 1 の最新 run から最終 checkpoint を拾う。
 # run ディレクトリ名は YYYY-MM-DD_HH-MM-SS なので辞書順 = 時刻順。

@@ -11,11 +11,20 @@ K1FlatEnvCfg を継承し、ボール蹴りタスク向けの観測・報酬・�
 Reinforcement Learning" (Reichenberg & Frese) の構成を K1 向けに移植したもの。
 Flags (3次元) は使わない。歩行タスク (K1PolicyCfg) の観測とは独立に定義しており、
 locomotion 側には影響しない。
+
+原典との差分を個別に検証するための ablation タスクを 2 系統持つ。どちらも観測 55 次元・
+同じ並びのままなので、既存の checkpoint をそのまま出発点にできる:
+
+* **地形** (:class:`K1WalkKickWalkPhaseRoughEnvCfg` → :class:`K1WalkKickRoughEnvCfg`):
+  平坦 → 数 cm の凹凸。歩容ごと変わるので 0 から 2 段で学習し直す。
+* **転がるボール** (:class:`K1WalkKick360MovingBallEnvCfg`): 地形は平坦のまま、
+  リセット時にボールへランダム水平初速を与える。walk_kick_360 からの fine-tune。
 """
 
 import math
 
 import isaaclab.sim as sim_utils
+import isaaclab.terrains as terrain_gen
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
 from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -27,6 +36,7 @@ from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.schemas import CollisionPropertiesCfg, MassPropertiesCfg
+from isaaclab.terrains import TerrainGeneratorCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
@@ -72,6 +82,72 @@ _CTRL_DT = 0.02  # decimation(4) * sim.dt(0.005) = 50Hz
 _KICK_DELAY_STEPS = int(_KICK_WINDOW_S / _CTRL_DT)  # 100 steps
 # 仕様書の weight は窓 0.6 秒 (30 steps) 前提の配分なので、その比で割り戻す。
 _KICK_W_SCALE = 0.6 / _KICK_WINDOW_S
+
+# --------------------------------------------------------------------------- #
+# Terrain ablation 用の凹凸地形
+#
+# B-Human のポスターとの差分のうち「bumpy な地面」だけを切り出して検証するためのもの。
+# ``..locomotion.flat_env_cfg.NOISY_FLAT_TERRAIN_CFG`` (段差・坂道なしのランダムノイズ)
+# と同じレシピだが、ablation なので **平坦なサブ地形を混ぜない** (あちらは 10% が plane)。
+#
+# * noise_range=(0.0, 0.04): 起伏は 0-4cm。**下向きの起伏を作らない** ことが重要で、
+#   地面が z=0 以上にしかないので base_height 終了判定 (root z < 0.35m、絶対高さ基準)
+#   が凹凸で誤爆しない。ロボットの立ち高さ 0.6m 台に対して 4cm はキック動作の
+#   軸足接地に効く程度の外乱で、歩行を壊すほどではない。
+# * curriculum=False: 難易度固定・ランダム配置。段階的に難しくするのが目的ではなく、
+#   「常に凹凸がある」条件と平坦条件を比べるのが目的。
+# * num_rows/num_cols=10: サブ地形の実現値を 100 通り用意して、env 間で凹凸パターンが
+#   偏らないようにする。terrain generator を使うと env origin は地形原点になるので、
+#   ``env_spacing`` (walk_kick は 100.0) は無視され、複数 env が同じ原点を共有する。
+#   env 間の衝突は InteractiveScene 側でフィルタされるので物理的な干渉は起きない。
+#
+# height_scanner は **追加しない**。観測 55 次元・並びを walk_kick 系と同一に保ち、
+# 外受容なし (proprioception のみ) で凹凸に対応させるのがこの ablation の趣旨で、
+# checkpoint の相互流用もそのまま効く。
+# --------------------------------------------------------------------------- #
+WALK_KICK_ROUGH_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=5.0,
+    num_rows=10,
+    num_cols=10,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    curriculum=False,
+    sub_terrains={
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=1.0,
+            noise_range=(0.0, 0.04),
+            noise_step=0.01,
+            border_width=0.25,
+        ),
+    },
+)
+
+# ボールを地面から浮かせて落とす量 [m]。凹凸の振幅 (最大 4cm) より上に取る。
+# terrain generator の env origin z は「サブ地形中央付近の最大高さ」なので、そこから
+# 離れた位置では地面がそれより低い。浮かせずに置くとめり込んだ状態から弾かれてしまう。
+_BALL_SPAWN_CLEARANCE = 0.05
+
+
+def _apply_rough_terrain(cfg: "K1WalkKickEnvCfg") -> None:
+    """flat 版のタスク cfg を「地形だけ」凹凸に差し替える。
+
+    観測・報酬・コマンド・終了条件には一切触らない。terrain ablation の 2 タスク
+    (walk phase / kick) で共通の処理をここに集約し、二重定義を避ける。
+    ``__post_init__`` の最後 (基底クラスの設定が全部済んだ後) に呼ぶこと。
+    """
+    cfg.scene.terrain.terrain_type = "generator"
+    cfg.scene.terrain.terrain_generator = WALK_KICK_ROUGH_TERRAIN_CFG
+    # terrain curriculum は使わない (K1FlatEnvCfg が curriculum.terrain_levels を
+    # 既に None にしてある)。max_init_terrain_level=None で全 row を初期から使う。
+    cfg.scene.terrain.max_init_terrain_level = None
+
+    # ボールを置くタスク (kick phase) では、地形の起伏ぶんだけ浮かせてから落とす。
+    # walk phase は reset_ball ごと None なので触らない。
+    if cfg.events.reset_ball is not None:
+        cfg.events.reset_ball.params["spawn_clearance"] = _BALL_SPAWN_CLEARANCE
 
 
 def _leg_joints() -> SceneEntityCfg:
@@ -595,6 +671,173 @@ class K1WalkKick360EnvCfg(K1WalkKickEnvCfg):
 
 @configclass
 class K1WalkKick360EnvCfg_PLAY(K1WalkKick360EnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+# --------------------------------------------------------------------------- #
+# Ablation 1: 凹凸地形 (terrain ablation)
+#
+# B-Human のポスターとの差分のうち「bumpy な地面」だけを検証する系統。地形以外は
+# 元タスクと完全に同一 (観測・報酬・コマンド・終了条件・カリキュラム) なので、
+# 平坦版との比較がそのまま地形の効果になる。
+#
+# こちらは fine-tune ではなく **0 から学習し直す**。地形が変わると歩容そのものが
+# 変わるため、平坦で獲得した歩行を出発点にすると「平坦向けの歩容から抜けられない」
+# 交絡が入る。既存の 2 段レシピ (walk phase → kick) をそのまま rough でなぞる。
+# --------------------------------------------------------------------------- #
+@configclass
+class K1WalkKickWalkPhaseRoughEnvCfg(K1WalkKickWalkPhaseEnvCfg):
+    """Stage 1 (rough): 凹凸地形で通常の歩行だけを学習する。
+
+    :class:`K1WalkKickWalkPhaseEnvCfg` との差は地形だけ。観測は 55 次元・同じ並びのまま
+    なので、この run の checkpoint をそのまま :class:`K1WalkKickRoughEnvCfg` (stage 2)
+    に引き継げる::
+
+        # stage 1 (rough)
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Rough-K1-Walk-Kick-Walk-Phase-v0 \
+            --headless --num_envs 4096
+        # stage 2 (rough, stage 1 の checkpoint から)
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Rough-K1-Walk-Kick-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_kick_walk_phase_rough/<run>/model_<N>.pt
+
+    ``--resume`` ではなく ``--load_pretrained`` を使う理由は平坦版と同じ
+    (:file:`scripts/rsl_rl/train_walk_kick.sh` の冒頭コメント参照)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_rough_terrain(self)
+
+
+@configclass
+class K1WalkKickWalkPhaseRoughEnvCfg_PLAY(K1WalkKickWalkPhaseRoughEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkKickRoughEnvCfg(K1WalkKickEnvCfg):
+    """Stage 2 (rough): 凹凸地形でボール追従とキックを学習する。
+
+    :class:`K1WalkKickEnvCfg` との差は地形だけ (:func:`_apply_rough_terrain`)。
+    ボールのリセット高さだけは terrain generator に合わせて浮かせる必要があるので、
+    ``reset_ball`` の ``spawn_clearance`` が入る。観測・報酬・コマンドは平坦版と同一。
+
+    学習は :class:`K1WalkKickWalkPhaseRoughEnvCfg` の checkpoint から (docstring 参照)。
+    キック報酬のフェードイン (0 → 500 iteration) も平坦版と同じ設定を継承する。
+    出発点が「歩けるだけのポリシー」であることも平坦版と同じなので、流儀を変える理由がない。
+
+    NOTE: 凹凸の上ではボールが自分から転がる余地がある。転がるボールへの対応は
+          :class:`K1WalkKick360MovingBallEnvCfg` が扱う別の ablation なので、
+          こちらは P_kick 固定 (``track_ball=False``) のまま。両者の交絡を避けるため、
+          地形の振幅は「ボールがほぼ止まっている」範囲に収めてある
+          (:data:`WALK_KICK_ROUGH_TERRAIN_CFG` の noise_range)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_rough_terrain(self)
+
+
+@configclass
+class K1WalkKickRoughEnvCfg_PLAY(K1WalkKickRoughEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+# --------------------------------------------------------------------------- #
+# Ablation 2: 転がるボール (ball velocity ablation)
+#
+# ボール初速のサンプリング範囲 [m/s]。方向は 0-2π の一様乱数。
+#
+# 上限 0.5 は kick_state の v_thresh (0.8) より下でなければならない。超えると
+# ロボットが触る前に値 latch が成立し、「蹴っていないのに τ_direction が凍結される」
+# ことになる (reset_ball_in_front_of_robot の NOTE 参照)。
+# 実効的には摩擦で減速するので、ロボットが到達する頃には 0.5 より遅い。
+# --------------------------------------------------------------------------- #
+_MOVING_BALL_SPEED_RANGE = (0.0, 0.5)
+
+
+@configclass
+class K1WalkKick360MovingBallEnvCfg(K1WalkKick360EnvCfg):
+    """転がるボールを蹴る全方位版。地形は平坦のまま、リセット時にボールへ初速を与える。
+
+    B-Human のポスターとの差分のうち「転がるボール」だけを検証する系統。
+    :class:`K1WalkKick360EnvCfg` の checkpoint からの fine-tune 前提で、
+    段階カリキュラムは使わない (360 が walk_kick から fine-tune するのと同じ流儀)::
+
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Flat-K1-Walk-Kick-360-Moving-Ball-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_kick_360/<run>/model_<N>.pt
+
+    観測は 55 次元・同じ並びのまま。ボール速度 (``ball_vel``, 2 次元) は元から観測に
+    入っているので、静止ボールで学習した checkpoint でもそのスロットが「常に 0」から
+    「意味のある値」に変わるだけで、入力層も obs normalizer もそのまま使える。
+
+    P_kick の追従 (このタスクの本体)
+    --------------------------------
+    :mod:`.mdp.kick_state` は「理想キック立ち位置」P_kick をエピソード開始時のボール位置に
+    固定する。ボールが動くとこの点が実際のボールから外れ、``approach_penalty`` /
+    ``ball_avoidance`` (``d_to_P_kick`` を見る) が的外れな点への整列を要求し、
+    latch 後に G を戻す先もずれる。そこで ``track_ball=True`` で **latch 前は P_kick を
+    毎ステップ引き直す**。latch 後の凍結 (飛翔評価) は従来どおり。
+
+    他の項が動くボールで意味を保つかは個別に確認済み:
+
+    * ``walk_speed`` / ``BallFollowVelocityCommand``: 目標終端 G は元から現在のボール位置
+      から計算されており (latch 後だけ P_kick に固定)、追従は既に成立している。
+    * ``kick_direction`` / ``kick_velocity_*``: latch 時のボール飛翔方向と速度で採点する。
+      初速 0.5 m/s が乗るぶん τ_direction / v_ball に誤差が入るが、それは「転がるボールを
+      狙って蹴るのは難しい」という **このタスクが測りたい難しさそのもの**。
+    * ``kick_pose_overshoot``: 判定に使う後方レイ R は元から現在のボール位置を基準に
+      引かれているので、ボールと一緒に平行移動する。追加の対処は不要。
+    * ``extra_ball_touch`` (このタスクでは未使用) が使う接触カウントは、リセット直後の
+      偽の速度跳ね上がりを ``just_reset`` ガードで既に除いてある。
+
+    NOTE: ``track_ball`` は kick_state を **最初に呼ぶ項** の値でその step の状態が確定する
+          (r_stance / alpha / v_thresh と同じ)。P_kick を作るのは kick_state だけで報酬項は
+          結果を読むだけなので、毎ステップ最初に走る ``kick_finished`` と、同じ状態を読む
+          ``base_velocity`` コマンドの 2 か所に配れば足りる。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. リセット時にボールへランダム水平初速を与える
+        self.events.reset_ball.params["speed_range"] = _MOVING_BALL_SPEED_RANGE
+
+        # -- 2. latch までは P_kick をボールに追従させる
+        self.terminations.kick_finished.params["track_ball"] = True
+        self.commands.base_velocity.track_ball = True
+
+
+@configclass
+class K1WalkKick360MovingBallEnvCfg_PLAY(K1WalkKick360MovingBallEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
