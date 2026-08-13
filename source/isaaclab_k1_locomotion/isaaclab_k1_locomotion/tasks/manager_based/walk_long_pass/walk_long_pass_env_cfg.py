@@ -347,6 +347,68 @@ _KICK_STATE_REWARD_TERMS = (
 )
 
 
+# --------------------------------------------------------------------------- #
+# センサ遅延 DR の上限 [s]
+#
+# 制御周期 dt = 0.02 s に対して 1 ステップぶん。実機は IMU も関節エンコーダも
+# 「測ってから policy に届くまで」に遅れがあり、sim で遅延ゼロのまま学習すると
+# 遅れた観測に対して過剰に反応する (特に base_ang_vel は歩行の安定化に直結する)。
+#
+# 遅延量は env ごと・エピソードごとに [0, この値] から一様サンプリングし、
+# 過去フレームの線形補間で連続値として与える (整数ステップだと 0/1 の 2 値に
+# なってしまう)。詳細は :func:`~..walk_kick.mdp.observations._delayed_signal`。
+# --------------------------------------------------------------------------- #
+_OBS_DELAY_MAX_S = 0.02
+
+# 遅延を掛ける policy 観測項と、遅延量を共有するセンサ (group)。
+#
+# group が同じ項は同じ遅延量を引く。projected_gravity と base_ang_vel は同じ IMU、
+# joint_pos と joint_vel は同じエンコーダ読み出しから来るので、独立に遅れることは
+# 物理的にあり得ない (重力は最新なのに角速度だけ 1 ステップ古い、など)。
+_DELAYED_OBS_TERMS = (
+    ("projected_gravity", "imu", "delayed_projected_gravity"),
+    ("base_ang_vel", "imu", "delayed_base_ang_vel"),
+    ("joint_pos", "encoder", "delayed_joint_pos_rel"),
+    ("joint_vel", "encoder", "delayed_joint_vel_rel"),
+)
+
+
+def enable_obs_delay(cfg, max_delay_s: float = _OBS_DELAY_MAX_S) -> list[str]:
+    """policy 観測の IMU / エンコーダ由来の項にセンサ遅延 DR を掛ける。
+
+    既存の ObsTerm の ``func`` と ``params`` だけを差し替える。項を作り直さないのは
+
+    * ノイズ設定 (Unoise) と asset_cfg をそのまま引き継ぐため
+    * 観測の **並び順を絶対に変えない** ため (policy 観測 55 次元は順序が
+      実機側の詰め方と 1 対 1 で対応している。configclass のフィールド順で
+      連結されるので代入では順序は変わらないが、項を消して足し直すと変わる)
+
+    観測次元は変わらないので、遅延を入れる前後で checkpoint はそのまま繋がる。
+
+    critic には掛けない。特権情報から価値を推定させる側なので、遅延させても
+    学習が難しくなるだけで得るものが無い。
+
+    Stage 1-3 (:mod:`.walk_long_pass_stages_env_cfg`) から呼ぶこともできるが、
+    その場合は全 stage で同じ ``max_delay_s`` にすること (遅延の有無で歩き方が
+    変わるので、段の間で条件が変わると引き継ぎの意味が薄れる)。
+
+    Returns:
+        遅延を掛けた観測項の名前。
+    """
+    applied: list[str] = []
+    for term_name, group, func_name in _DELAYED_OBS_TERMS:
+        term = getattr(cfg.observations.policy, term_name, None)
+        if term is None:
+            raise AttributeError(
+                f"policy 観測に '{term_name}' がありません。遅延 DR の対象項名が"
+                " 継承元の観測構成と食い違っています。"
+            )
+        term.func = getattr(mdp, func_name)
+        term.params = {**term.params, "max_delay_s": max_delay_s, "group": group}
+        applied.append(term_name)
+    return applied
+
+
 def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
     """``before_iter`` までに立ち上がりきる報酬重みのランプを、終値の定数に潰す。
 
@@ -428,6 +490,12 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # (num_envs, 50, 55) になるだけで、切り出し方 (直近 5 + CNN 潜在) は
         # ネットワーク側の仕事。定数の意図は _OBS_HISTORY_LENGTH のコメント参照。
         enable_obs_history(self)
+
+        # -- 0b. IMU / エンコーダ由来の観測にセンサ遅延 DR を掛ける
+        #
+        # 観測の次元も並びも変わらないので checkpoint はそのまま繋がる。
+        # 対象と理由は enable_obs_delay / _OBS_DELAY_MAX_S のコメント参照。
+        enable_obs_delay(self, _OBS_DELAY_MAX_S)
 
         # -- 1. 目標ボール速度をロングパスの帯へ（このタスクの本体）
         #

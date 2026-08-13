@@ -16,6 +16,7 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
+import isaaclab.envs.mdp as base_mdp
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
@@ -226,3 +227,150 @@ def prev_ball_pos_b(
     state["cur"][just_reset] = cur[just_reset]
 
     return state["prev"]
+
+
+# --------------------------------------------------------------------------- #
+# センサ遅延の domain randomization
+#
+# 実機では IMU も関節エンコーダも「測ってから policy に届くまで」に遅れがある
+# (バス転送・フィルタ・制御ループの位相)。sim で遅延ゼロのまま学習すると、実機の
+# 遅れた観測に対して過剰に反応する (特に base_ang_vel は歩行の安定化に直結する)。
+#
+# 実装は「過去フレームの線形補間」。制御周期 dt = 0.02 s に対して遅延 0.02 s は
+# ちょうど 1 ステップなので、整数ステップの遅延だと 0 か 1 の 2 値にしかならない。
+# hist[i0] と hist[i0+1] を補間することで [0, max_delay_s] の連続値を表現する。
+#
+#   lag [steps] = delay_s / dt,  i0 = floor(lag),  w = lag - i0
+#   out = (1 - w) * hist[i0] + w * hist[i0 + 1]
+#
+# 遅延量は **env ごと・エピソードごと** に一様サンプリングする (エピソード内では
+# 一定)。実機のレイテンシは機体・起動ごとにほぼ一定で、ステップ単位で揺れるもの
+# ではないため。ジッタまでは模擬していない。
+#
+# ``group`` が同じ項は **同じ遅延量を共有する**。projected_gravity と base_ang_vel は
+# どちらも同じ IMU から来るので独立に遅れることはなく、joint_pos と joint_vel も
+# 同じエンコーダ読み出しから来る。独立に引くと物理的にあり得ない組み合わせ
+# (重力は最新・角速度だけ 1 ステップ古い) を学習させることになる。
+#
+# NOTE: policy 観測にだけ掛けること。critic は特権情報なので遅延させない
+#       (遅延した観測から価値を推定させる理由が無く、学習が難しくなるだけ)。
+# NOTE: ObservationManager のノイズはこの関数の **後** に乗る。実機の
+#       「遅れて届いた値にセンサノイズが乗る」順序と一致する。
+# --------------------------------------------------------------------------- #
+_OBS_DELAY_STATE_ATTR = "_obs_delay_state"
+
+
+def _delayed_signal(
+    env: ManagerBasedRLEnv,
+    key: str,
+    group: str,
+    value: torch.Tensor,
+    max_delay_s: float,
+) -> torch.Tensor:
+    """``value`` を [0, max_delay_s] の範囲でランダムに遅延させて返す。
+
+    Args:
+        key: 項ごとの履歴バッファを引くキー (項ごとに一意にすること)。
+        group: 遅延量を共有するセンサ名 ("imu" / "encoder" など)。
+        value: 今ステップの生の観測 (num_envs, dim)。
+        max_delay_s: 遅延の上限 [s]。0 以下なら素通し。
+    """
+    if max_delay_s <= 0.0:
+        return value
+
+    dt = env.step_dt
+    max_lag = max_delay_s / dt
+    # 補間には hist[i0] と hist[i0+1] が要るので、最大遅延ぶん + 1 フレーム持つ。
+    n_frames = int(math.ceil(max_lag)) + 1
+    step = int(env.common_step_counter)
+    num_envs = value.shape[0]
+
+    root = getattr(env, _OBS_DELAY_STATE_ATTR, None)
+    if root is None:
+        root = {"groups": {}, "terms": {}}
+        setattr(env, _OBS_DELAY_STATE_ATTR, root)
+
+    # prev_ball_pos_b と同じ判定: episode_length_buf は step() 内で加算された後に
+    # _reset_idx で 0 に戻るので、「今このステップでリセットされた env」だけが 0 になる。
+    just_reset = env.episode_length_buf == 0
+
+    # -- 1. グループ単位の遅延量。エピソード開始時に引き直す。
+    gate = root["groups"].get(group)
+    if gate is None or gate["lag"].shape[0] != num_envs:
+        gate = {"lag": torch.rand(num_envs, device=value.device) * max_lag, "step": step}
+        root["groups"][group] = gate
+    elif gate["step"] != step:
+        # 同じグループの 2 項目以降が同じステップで引き直さないよう step で守る。
+        gate["step"] = step
+        n_reset = int(just_reset.sum())
+        if n_reset > 0:
+            gate["lag"][just_reset] = torch.rand(n_reset, device=value.device) * max_lag
+    lag = gate["lag"]
+
+    # -- 2. 項ごとの履歴。hist[0] が現在フレーム、hist[k] が k ステップ前。
+    hist_state = root["terms"].get(key)
+    if hist_state is None or hist_state["hist"].shape[1:] != value.shape:
+        hist_state = {"hist": value.unsqueeze(0).repeat(n_frames, 1, 1), "step": step}
+        root["terms"][key] = hist_state
+    elif hist_state["step"] != step:
+        hist_state["hist"] = torch.roll(hist_state["hist"], shifts=1, dims=0)
+        hist_state["hist"][0] = value
+        hist_state["step"] = step
+    else:
+        # 同一ステップ内で 2 回呼ばれても履歴をずらさない (先頭を上書きするだけ)。
+        hist_state["hist"][0] = value
+    hist = hist_state["hist"]
+
+    # リセット直後は前エピソードの値を引きずらせない (全フレームを現在値で埋める)。
+    if bool(just_reset.any()):
+        hist[:, just_reset] = value[just_reset].unsqueeze(0)
+
+    # -- 3. 線形補間
+    i0 = torch.floor(lag).long().clamp_(min=0, max=n_frames - 2)
+    weight = (lag - i0.to(lag.dtype)).unsqueeze(-1)
+    env_idx = torch.arange(num_envs, device=value.device)
+    return (1.0 - weight) * hist[i0, env_idx] + weight * hist[i0 + 1, env_idx]
+
+
+def delayed_projected_gravity(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "imu",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """IMU 由来の重力方向を遅延させたもの。"""
+    value = base_mdp.projected_gravity(env, asset_cfg=asset_cfg)
+    return _delayed_signal(env, "projected_gravity", group, value, max_delay_s)
+
+
+def delayed_base_ang_vel(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "imu",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """IMU 由来の base 角速度を遅延させたもの。"""
+    value = base_mdp.base_ang_vel(env, asset_cfg=asset_cfg)
+    return _delayed_signal(env, "base_ang_vel", group, value, max_delay_s)
+
+
+def delayed_joint_pos_rel(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "encoder",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """エンコーダ由来の関節角 (デフォルト姿勢からの相対) を遅延させたもの。"""
+    value = base_mdp.joint_pos_rel(env, asset_cfg=asset_cfg)
+    return _delayed_signal(env, "joint_pos_rel", group, value, max_delay_s)
+
+
+def delayed_joint_vel_rel(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "encoder",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """エンコーダ由来の関節速度 (デフォルトからの相対) を遅延させたもの。"""
+    value = base_mdp.joint_vel_rel(env, asset_cfg=asset_cfg)
+    return _delayed_signal(env, "joint_vel_rel", group, value, max_delay_s)
