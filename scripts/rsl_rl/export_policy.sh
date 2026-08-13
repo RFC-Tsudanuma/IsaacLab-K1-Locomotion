@@ -5,7 +5,7 @@
 # if the time pattern is absent (e.g. "0504_best").
 
 set -e
-source /home/satoshi/.bash_functions
+source /root/.bash_functions
 
 _labpython2 export_policy.py \
     --task Isaac-Velocity-Flat-K1-v0 \
