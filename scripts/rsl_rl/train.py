@@ -41,6 +41,15 @@ parser.add_argument(
     "are silently dropped (shape/name mismatch).",
 )
 parser.add_argument(
+    "--allow_untransferred_actor",
+    action="store_true",
+    default=False,
+    help="Allow --load_pretrained to proceed even when no actor tensor could be transferred "
+    "(the actor stays randomly initialized). Off by default because a silently random actor "
+    "looks like a normal run in the logs but restarts locomotion from scratch, which quietly "
+    "invalidates every fine-tuning curriculum. Only pass this when critic-only transfer is intended.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -360,6 +369,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO]: Skipped {len(skipped)} tensors (shape mismatch / unknown key):")
             for s in skipped:
                 print(f"          {s}")
+
+        # actor が 1 本も引き継げていないなら止める。
+        #
+        # このフィルタは形の合わないテンソルを黙って捨てるので、1 フレーム観測の
+        # checkpoint を履歴入力タスクへ --warm_start_from_single_frame 無しで渡すと
+        # 「critic と正規化統計と std だけ載って actor は乱数のまま」で学習が始まる。
+        # ログ上は正常な起動に見えるうえ、歩けないところからのやり直しなので
+        # fine-tune 前提のカリキュラム (キック報酬のランプ / 帯のランプ) が全部空振りする。
+        # 実際 k1_walk_long_pass/2026-08-11_16-31-27 はこれで 5000 iteration を潰した
+        # (base_height 終了 99.9%、kick_rate ≈ 0 のまま歩行だけを再獲得)。
+        actor_loaded = [k for k in filtered if k.startswith("actor.")]
+        if not actor_loaded:
+            message = (
+                "[ERROR]: 引き継いだテンソルに actor が 1 本も含まれていません"
+                " (critic / 正規化統計 / std だけがロードされました)。\n"
+                "         このまま学習すると actor は乱数初期化のままなので、歩行から"
+                " やり直しになります。\n"
+                "         1 フレーム観測の checkpoint を履歴入力タスクへ渡した場合は"
+                " --warm_start_from_single_frame を付けてください。\n"
+                "         critic だけを引き継ぐのが意図どおりなら"
+                " --allow_untransferred_actor を付けてください。"
+            )
+            if not args_cli.allow_untransferred_actor:
+                raise RuntimeError(message)
+            print(message.replace("[ERROR]", "[WARN] "))
 
         result = policy.load_state_dict(filtered, strict=False)
         if isinstance(result, tuple):
