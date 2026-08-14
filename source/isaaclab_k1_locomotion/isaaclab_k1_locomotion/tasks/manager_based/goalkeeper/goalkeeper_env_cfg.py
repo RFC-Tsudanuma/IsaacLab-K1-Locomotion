@@ -122,7 +122,12 @@ class GoalkeeperParamsCfg:
     ball_radius: float = BALL_RADIUS
     goal_half_width: float = GOAL_HALF_WIDTH
     # 守備面: ゴールラインから guard_x [m] フィールド側にロボットを置く。
-    guard_x: float = 0.4
+    # ★ 2026-08-12: 0.4 → 0.9 (ユーザー指示)。前に出るほどシュートコースが狭まるが、
+    #   ボールが守備面に届くまでの距離が 0.5m 縮むぶん反応時間も減る。
+    #   ※ 初期配置 (K1GKDirectEnvCfg.__post_init__) はこの値から導出しているが、
+    #     導出は cfg 構築時に走るので **override JSON で guard_x を変えても
+    #     初期配置は追従しない**。JSON で変える場合は初期配置がずれる点に注意。
+    guard_x: float = 0.9
     # ボール接近中に「位置ずれ [m] → 速度 [m/s]」へ換算する除数 [s]。
     # ★ 2026-08-08: 到達猶予時間で割る方式をやめ、この固定値にした (最速で向かう)。
     #   ずれ > drive_t_fast × 1.3 [m] で常に全力。0.15 なら 0.195m 以上で全力になる。
@@ -164,6 +169,26 @@ class GoalkeeperParamsCfg:
     hard_ball_prob: float = 0.0        # 到達不能球にする確率
     hard_ball_speed_mult: float = 1.6  # 初速を上限 hi の何倍まで出すか
     hard_ball_min_time: float = 0.5    # 到達不能球に適用する緩和クランプ [s]。
+
+    # --- 到達不能球の自動有効化 (mdp.adaptive_hard_ball、2026-08-13 追加) ---
+    # ★ 到達不能球は「初速上限 hi が十分上がってから」でないと意味がない。hard ball の
+    #   初速は ball_speed_cap ではなく **その時点の hi の hard_ball_speed_mult 倍** から
+    #   引かれるので、学習初期 (hi=1.0) に有効化しても 1.0〜1.6 m/s = 全然「不能」に
+    #   ならず、立ち上がりを遅くするだけになる。かといって手動で有効化する運用は、
+    #   忘れると「取れない球を一度も経験していないポリシー」がそのまま実機へ行く
+    #   (実測: そのポリシーに到達不能球を与えると転倒が 1 回 → 56 回)。
+    #   そこで難易度カリキュラムの進行を監視して自動で入れる。
+    hard_ball_auto: bool = False           # 自動有効化を使うか (既定 OFF = 従来の挙動)
+    hard_ball_prob_max: float = 0.1        # 最終的に到達させる混入率
+    hard_ball_step: float = 0.02           # 1 段の増分
+    hard_ball_ramp_episodes: int = 3000    # 段を 1 つ上げる間隔 [エピソード]
+    # 有効化のトリガ (いずれかを満たしたら開始):
+    #   1. ball_speed_hi が cap に到達した (これ以上難しくならない)
+    #   2. ball_speed_hi が hard_ball_plateau_episodes の間まったく動かない (頭打ち)
+    #   3. 総エピソード数が hard_ball_force_episodes を超えた (保険。1・2 が成立しない
+    #      まま学習が終わるのを防ぐ = 「静かにスキップされる」ことが無いようにする)
+    hard_ball_plateau_episodes: int = 50000
+    hard_ball_force_episodes: int = 400000
     #   0 にしないのは、到達 0.4s 級だと知覚 (遅延 116ms + 更新 40ms) が間に合わず
     #   学習信号がゼロのノイズになるため。
 

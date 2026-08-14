@@ -47,6 +47,14 @@ parser.add_argument(
 )
 parser.add_argument("--low_level_obs_group", type=str, default="low_level")
 parser.add_argument("--low_level_cmd_term_name", type=str, default="velocity_commands")
+parser.add_argument(
+    "--high_action_deadband", type=float, default=0.0,
+    help="Norm-based deadband on the high-level command. MUST match training (recorded in the run's"
+    " params/goalkeeper_meta.txt). This script times 'reach AND stop', and the stop half depends"
+    " directly on the deadband: without it the policy keeps emitting sub-threshold commands, the"
+    " frozen policy never enters its standing mode, and the measured reach times come out longer"
+    " than the real ones. 0 keeps the legacy behaviour for policies trained without a deadband.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -101,6 +109,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         low_level_cmd_term_name=args_cli.low_level_cmd_term_name,
         action_clip=args_cli.high_action_clip,
         high_action_dim=3,
+        action_deadband=args_cli.high_action_deadband,
     )
 
     print(f"[INFO] Loading high-level checkpoint: {resume_path}")

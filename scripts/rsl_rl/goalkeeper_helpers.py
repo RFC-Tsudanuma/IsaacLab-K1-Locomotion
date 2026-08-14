@@ -60,6 +60,9 @@ class HierarchicalVecEnvWrapper:
         low_level_cmd_term_name: str = "velocity_commands",
         action_clip=(1.0, 1.0, 1.0),
         high_action_dim: int = 3,
+        action_deadband: float = 0.0,
+        cmd_scale_range=None,
+        cmd_delay_range=None,
     ):
         self.env = inner_env
         self.low_level_policy = low_level_policy
@@ -96,6 +99,76 @@ class HierarchicalVecEnvWrapper:
             self.num_envs, self.num_actions, device=self.device
         )
 
+        # -- 指令デッドバンド (norm 基準) --
+        # ガウス方策は厳密な 0 を出せないので、放置すると上位が常に微小な指令を出し続け、
+        # 下位の「指令ノルム < cmd_threshold なら位相ゼロ = 停止」規約に一生入れず、
+        # キーパーがその場足踏みし続ける。3 軸のノルムがこの値未満なら全成分を 0 に落とす。
+        #
+        # ★ 軸別のデッドバンドにしてはいけない。07-28 の下位には横移動中に
+        #   「yaw ≈ 10°/s のドリフト」と「後退 ≈ 0.10 m/s のドリフト」があり、上位は
+        #   それを打ち消す小さな定常オフセット (wz ≈ -0.175, vx ≈ +0.10) を出し続ける
+        #   必要がある。軸別に閾値を掛けるとこの補正が潰れる。
+        #   下位自身の停止判定も norm 基準 (rough_env_cfg の _COMMAND_THRESHOLD) なので
+        #   規約としてもこちらが整合する。
+        self.action_deadband = float(action_deadband)
+
+        # -- 下位エンベロープの DR (per-episode 固定) --
+        # 上位は「sim の下位」の上でタイミング (何秒前に動き出せば間に合うか) を学ぶので、
+        # 実機の下位が sim より遅い/遅延が大きいとその前提ごと崩れる。指令にスケールと
+        # 遅延を掛けて「少し鈍い下位」も学習分布に入れておく。
+        #   cmd_scale_range: (lo, hi) 指令に掛かる倍率。1.3 × U(0.8,1.0) = 実効 1.04〜1.30 m/s。
+        #   cmd_delay_range: (lo, hi) 指令が下位に届くまでの遅延 [tick] (整数、両端含む)。
+        # どちらも None なら無効 (既存タスクの挙動は変わらない)。
+        self._cmd_scale_range = tuple(float(v) for v in cmd_scale_range) if cmd_scale_range else None
+        self._cmd_delay_range = tuple(int(v) for v in cmd_delay_range) if cmd_delay_range else None
+        self._has_cmd_dr = (self._cmd_scale_range is not None) or (self._cmd_delay_range is not None)
+
+        self._cmd_scale = torch.ones(self.num_envs, 1, device=self.device)
+        if self._cmd_delay_range is not None:
+            lo, hi = self._cmd_delay_range
+            if lo < 0 or hi < lo:
+                raise ValueError(f"cmd_delay_range must satisfy 0 <= lo <= hi, got {self._cmd_delay_range}")
+            self._max_delay = hi
+            # 遅延用リングバッファ: (max_delay + 1, num_envs, action_dim)。
+            # 添字 0 が最新、k が k tick 前。
+            self._cmd_hist = torch.zeros(
+                self._max_delay + 1, self.num_envs, self.num_actions, device=self.device
+            )
+            self._cmd_delay = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        else:
+            self._max_delay = 0
+            self._cmd_hist = None
+            self._cmd_delay = None
+        # 起動時に全 env ぶんサンプルしておく (最初のエピソードから DR が効くように)
+        self._resample_cmd_dr(torch.arange(self.num_envs, device=self.device))
+
+    # -- 下位エンベロープ DR --
+    def _resample_cmd_dr(self, env_ids: torch.Tensor) -> None:
+        """``env_ids`` のエピソード固定 DR パラメータを引き直し、遅延履歴を消す。"""
+        if env_ids.numel() == 0:
+            return
+        if self._cmd_scale_range is not None:
+            lo, hi = self._cmd_scale_range
+            self._cmd_scale[env_ids, 0] = torch.rand(env_ids.numel(), device=self.device) * (hi - lo) + lo
+        if self._cmd_delay_range is not None:
+            lo, hi = self._cmd_delay_range
+            self._cmd_delay[env_ids] = torch.randint(
+                lo, hi + 1, (env_ids.numel(),), device=self.device, dtype=torch.long
+            )
+            # 前のエピソードの指令が遅延バッファ経由で漏れないよう 0 で埋める
+            self._cmd_hist[:, env_ids, :] = 0.0
+
+    def _apply_cmd_delay(self, cmd: torch.Tensor) -> torch.Tensor:
+        """指令をリングバッファに積み、env ごとの遅延ぶん過去の指令を返す。"""
+        if self._cmd_hist is None:
+            return cmd
+        # 1 tick ずらして最新を先頭に入れる (max_delay は高々数 tick なので roll で十分)
+        self._cmd_hist = torch.roll(self._cmd_hist, shifts=1, dims=0)
+        self._cmd_hist[0] = cmd
+        # gather: env ごとに異なる遅延 tick の行を引く
+        idx = self._cmd_delay.view(1, -1, 1).expand(1, self.num_envs, self.num_actions)
+        return self._cmd_hist.gather(0, idx).squeeze(0)
+
     # -- pass-through properties expected by rsl_rl / IsaacLab utilities --
     @property
     def cfg(self):
@@ -127,6 +200,7 @@ class HierarchicalVecEnvWrapper:
 
     # -- VecEnv API --
     def reset(self):
+        self._resample_cmd_dr(torch.arange(self.num_envs, device=self.device))
         return self.env.reset()
 
     def get_observations(self):
@@ -134,7 +208,22 @@ class HierarchicalVecEnvWrapper:
 
     def step(self, action: torch.Tensor):
         # Per-axis clip: self.action_clip is (num_actions,); broadcast over batch.
-        cmd = torch.clamp(action.to(self.device), -self.action_clip, self.action_clip)
+        cmd = torch.clamp(action.to(self.device), -self.action_clip, self.action_clip).detach()
+
+        # デッドバンド (norm 基準) → 遅延 → スケール の順で適用する。
+        # デッドバンドは「上位側の出力整形」なので実機の推論ループにも同じものを実装する
+        # 前提で先に掛ける。遅延とスケールは「下位/伝送側の性質」なので後段。
+        if self.action_deadband > 0.0:
+            below = torch.norm(cmd, dim=1, keepdim=True) < self.action_deadband
+            cmd = torch.where(below, torch.zeros_like(cmd), cmd)
+        cmd = self._apply_cmd_delay(cmd)
+        # ★ _prev_high_action にはスケール前の値を書く。スケールは「下位が指令ほど
+        #   動けない」という plant 側の性質であって上位の出力ではないので、これを
+        #   観測に混ぜると実機に無い情報 (自分の指令が何倍で効いているか) を
+        #   ポリシーが直接読めてしまう。ポリシーは自分の動きの結果から推定するべき。
+        #   なお gait_phase もこのバッファから作られるが、位相の停止判定は norm と
+        #   閾値の比較だけなので 0.8〜1.0 のスケール差で判定は変わらない。
+        delivered = cmd * self._cmd_scale
 
         # Frozen policy is fixed: never need autograd for it. Wrap the whole
         # low-level inference in inference_mode so that we don't build a
@@ -144,9 +233,7 @@ class HierarchicalVecEnvWrapper:
 
             low_group_tensor = env_obs[self.low_level_obs_group].clone()
             s, e = self._cmd_slot
-            # cmd may carry grad info from the high-level sampler; detach defensively
-            # before stuffing into the frozen policy's input slot.
-            low_group_tensor[:, s:e] = cmd.detach()
+            low_group_tensor[:, s:e] = delivered
             low_obs = {k: env_obs[k] for k in env_obs.keys()}
             low_obs[self.low_level_obs_group] = low_group_tensor
 
@@ -155,9 +242,17 @@ class HierarchicalVecEnvWrapper:
         # Stash *before* env.step so that the post-step obs (incl. any auto-reset
         # branches) observes the correct prev high action. For envs that get
         # auto-reset inside env.step, the reset event clears this slot.
-        self.env.unwrapped._prev_high_action.copy_(cmd.detach())
+        self.env.unwrapped._prev_high_action.copy_(cmd)
 
-        return self.env.step(joint_action)
+        obs, rew, dones, extras = self.env.step(joint_action)
+
+        # env.step 内で auto-reset された env は次のエピソードなので DR を引き直す。
+        # DR を使わない (既存の) タスクでは毎ステップの nonzero() が無駄なので丸ごと飛ばす。
+        if self._has_cmd_dr and dones is not None:
+            done_ids = dones.to(device=self.device).flatten().nonzero(as_tuple=False).flatten()
+            self._resample_cmd_dr(done_ids)
+
+        return obs, rew, dones, extras
 
     def close(self):
         return self.env.close()

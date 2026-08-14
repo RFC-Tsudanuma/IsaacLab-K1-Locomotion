@@ -255,3 +255,87 @@ def adaptive_difficulty(
         env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
 
     return _log()
+
+
+def adaptive_hard_ball(
+    env: "ManagerBasedRLEnv",
+    env_ids,
+) -> dict:
+    """難易度カリキュラムが上限/頭打ちに達したら「到達不能球」を自動で混ぜ始める。
+
+    **必ず :func:`adaptive_difficulty` より後に登録すること。** 本関数は成功率 EMA を
+    更新せず、``adaptive_difficulty`` が書いた ``_gk_speed_hi`` / ``_gk_episode_count``
+    を読むだけなので、先に走らせないと 1 ステップ古い状態を見ることになる
+    (CurriculumManager は cfg の定義順に実行する)。
+
+    なぜ自動化するか:
+        到達不能球の初速は ``ball_speed_cap`` ではなく **その時点の初速上限 hi の
+        ``hard_ball_speed_mult`` 倍** から引かれる。学習初期 (hi=1.0) に有効化しても
+        1.0〜1.6 m/s にしかならず「不能」にならないので、有効化はカリキュラムが
+        伸び切ってからでなければならない。しかしそれを手動運用にすると、忘れたときに
+        **取れない球を一度も経験していないポリシーがそのまま実機へ行く**。実測では
+        そのポリシーに到達不能球を与えると転倒が 1 回 → 56 回に増える。リセット条件が
+        転倒である以上、これは最悪の失敗モードなので構造的に防ぐ。
+
+    有効化のトリガ (いずれか):
+        1. ``ball_speed_hi >= ball_speed_cap`` — これ以上難しくならない
+        2. ``ball_speed_hi`` が ``hard_ball_plateau_episodes`` の間まったく動かない
+        3. 総エピソード数が ``hard_ball_force_episodes`` を超えた (保険)
+
+    有効化後は ``hard_ball_ramp_episodes`` ごとに ``hard_ball_step`` ずつ増やし、
+    ``hard_ball_prob_max`` で頭打ちにする。一度上げた混入率は下げない
+    (カリキュラムが再び動き出しても、取れない球の経験は保持したいため)。
+
+    ``hard_ball_prob`` は ``GoalkeeperParamsCfg`` の値を直接書き換える。
+    :func:`~.events.reset_ball_shot` は毎回 cfg から読み直すのでそのまま反映される。
+
+    Returns:
+        ログ用 dict (Curriculum/<term名>/<key> として TensorBoard に出る)。
+    """
+    p = _gk_params(env)
+
+    if getattr(env, "_gk_hard_state", None) is None:
+        # last_hi: 直近に観測した初速上限 / since: それが変わってからのエピソード数の基点
+        env._gk_hard_state = {"last_hi": None, "since": 0, "started": False, "next_step_at": 0}
+
+    st = env._gk_hard_state
+    hi_buf = getattr(env, "_gk_speed_hi", None)
+    episodes = int(getattr(env, "_gk_episode_count", 0))
+
+    def _log() -> dict:
+        return {
+            "hard_ball_prob": float(p.hard_ball_prob),
+            "started": float(st["started"]),
+            "plateau_episodes": float(episodes - st["since"]),
+        }
+
+    # 自動化が無効、または難易度カリキュラムがまだ初期化されていない
+    if not bool(getattr(p, "hard_ball_auto", False)) or hi_buf is None:
+        return _log()
+
+    hi = float(hi_buf.item())
+    if st["last_hi"] is None or abs(hi - st["last_hi"]) > 1e-6:
+        # 初速上限が動いた → 頭打ち判定の基点をリセット
+        st["last_hi"] = hi
+        st["since"] = episodes
+
+    if not st["started"]:
+        at_cap = hi >= float(p.ball_speed_cap) - 1e-6
+        plateaued = (episodes - st["since"]) >= int(p.hard_ball_plateau_episodes)
+        forced = episodes >= int(p.hard_ball_force_episodes)
+        if at_cap or plateaued or forced:
+            st["started"] = True
+            st["next_step_at"] = episodes
+            reason = "cap" if at_cap else ("plateau" if plateaued else "force")
+            print(
+                f"[goalkeeper] 到達不能球の混入を開始します (trigger={reason},"
+                f" hi={hi:.2f}, episodes={episodes})"
+            )
+
+    if st["started"] and episodes >= st["next_step_at"]:
+        target = float(p.hard_ball_prob_max)
+        if float(p.hard_ball_prob) < target - 1e-9:
+            p.hard_ball_prob = min(target, float(p.hard_ball_prob) + float(p.hard_ball_step))
+        st["next_step_at"] = episodes + int(p.hard_ball_ramp_episodes)
+
+    return _log()

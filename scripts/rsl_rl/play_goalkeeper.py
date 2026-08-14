@@ -73,6 +73,31 @@ parser.add_argument(
     default="velocity_commands",
     help="Observation term whose slice gets overwritten by the high-level action.",
 )
+parser.add_argument(
+    "--high_action_deadband",
+    type=float,
+    default=0.0,
+    help="Norm-based deadband on the high-level command. MUST match the value used at training time"
+    " (see params/goalkeeper_meta.txt of the run): a policy trained with a deadband has never been"
+    " evaluated inside that band, so replaying without it runs the policy in an undefined region.",
+)
+parser.add_argument(
+    "--cmd_scale_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="Per-episode randomisation of the low-level's effective gain. Left off by default in play so what you"
+    " see is the nominal behaviour; pass the training values to inspect worst-case robustness.",
+)
+parser.add_argument(
+    "--cmd_delay_range",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="Per-episode randomisation of the command transport delay [ticks]. Off by default in play.",
+)
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -182,6 +207,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         low_level_cmd_term_name=args_cli.low_level_cmd_term_name,
         action_clip=args_cli.high_action_clip,
         high_action_dim=3,
+        action_deadband=args_cli.high_action_deadband,
+        cmd_scale_range=args_cli.cmd_scale_range,
+        cmd_delay_range=args_cli.cmd_delay_range,
     )
 
     # High-level (goalkeeper) policy runner — load from --checkpoint.

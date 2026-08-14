@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 
     from isaaclab.envs import ManagerBasedRLEnv
 
-__all__ = ["compute_symmetric_states"]
+__all__ = ["compute_symmetric_states", "compute_symmetric_states_high_level"]
 
 # 観測レイアウト (goalkeeper_direct_env_cfg.py の K1GKDirectStage1PolicyCfg と一致させること)
 #   [0:49]  歩行 K1PolicyCfg と同一 (locomotion の _mirror_policy_obs が担当)
@@ -206,6 +206,79 @@ def compute_symmetric_states(
         )
         actions_aug[:batch_size] = actions[:]
         actions_aug[batch_size:] = _mirror_joints(actions)
+    else:
+        actions_aug = None
+
+    return obs_aug, actions_aug
+
+
+# ---------------------------------------------------------------------------
+# 階層版 (goalkeeper_hier_env_cfg.py) 用
+# ---------------------------------------------------------------------------
+
+# 上位 action = 歩行コマンド (vx, vy, wz)。矢状面の鏡像では横速度と旋回だけ符号反転。
+_HIGH_ACTION_DIM = 3
+_HIGH_ACTION_MIRROR_SIGN = [1.0, -1.0, -1.0]
+
+
+def _high_action_sign(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    key = ("high_action", device, dtype)
+    sign = _CONST_CACHE.get(key)
+    if sign is None:
+        sign = torch.tensor(_HIGH_ACTION_MIRROR_SIGN, device=device, dtype=dtype)
+        _CONST_CACHE[key] = sign
+    return sign
+
+
+@torch.no_grad()
+def compute_symmetric_states_high_level(
+    env: "ManagerBasedRLEnv",
+    obs: "TensorDict | None" = None,
+    actions: torch.Tensor | None = None,
+):
+    """階層版ゴールキーパーの上位ポリシー用の左右対称変換 (rsl-rl 用)。
+
+    観測のレイアウトは直接制御版と**完全に同一** (policy 59 / critic 64) なので反転規則も
+    そのまま使える。差し替わっているのは中身だけで、対称性の観点では等価:
+
+        * ``velocity_commands`` スロット: 直接版は ``task_drive_vector`` (dx, dy, dyaw)、
+          階層版は前回の上位 action (vx, vy, wz)。どちらも (前後, 左右, 旋回) の 3 成分で
+          反転符号は (+, -, -) で同じ。critic 側の ``_CRITIC_HEAD_SIGN`` もこの並び。
+        * ``gait_phase``: どちらも (sinL, cosL, sinR, cosR) で左右入れ替え。
+
+    違うのは**行動だけ**で、12 関節ではなく 3 次元の歩行コマンドになる。
+
+    上位にも mirror loss を掛ける理由: 下位 (07-28) は data augmentation 無し・
+    mirror_loss_coeff=0.5 の世代で学習されており、横移動時に約 10°/s の系統的な yaw
+    ドリフト (= 左右非対称歩容の典型症状) が残っている。上位までそれに引きずられて
+    左右で別の戦略に収束すると、片側のセーブだけ弱いキーパーになる。
+    """
+    # -- 観測 (直接制御版と同一レイアウトなので既存の反転をそのまま使う)
+    if obs is not None:
+        batch_size = obs.batch_size[0]
+        obs_aug = obs.repeat(2)
+        obs_aug["policy"][:batch_size] = obs["policy"][:]
+        obs_aug["policy"][batch_size:] = _mirror_gk_policy_obs(obs["policy"])
+        if "critic" in obs_aug.keys():
+            obs_aug["critic"][:batch_size] = obs["critic"][:]
+            obs_aug["critic"][batch_size:] = _mirror_gk_critic_obs(obs["critic"])
+    else:
+        obs_aug = None
+
+    # -- 行動 (歩行コマンド 3 次元。vy と wz の符号を反転)
+    if actions is not None:
+        if actions.shape[-1] != _HIGH_ACTION_DIM:
+            raise ValueError(
+                f"symmetry: 上位 action の次元が想定 ({_HIGH_ACTION_DIM}) と異なります:"
+                f" {actions.shape[-1]}。高レベル action を (vx, vy, wz) 以外にしたなら"
+                " _HIGH_ACTION_MIRROR_SIGN を更新してください。"
+            )
+        batch_size = actions.shape[0]
+        actions_aug = torch.zeros(
+            batch_size * 2, actions.shape[1], device=actions.device, dtype=actions.dtype
+        )
+        actions_aug[:batch_size] = actions[:]
+        actions_aug[batch_size:] = actions * _high_action_sign(actions.device, actions.dtype)
     else:
         actions_aug = None
 

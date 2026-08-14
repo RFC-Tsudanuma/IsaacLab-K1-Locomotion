@@ -125,3 +125,51 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKDirectStage2PPORunnerCfg",
     },
 )
+
+##
+# 階層版 v2 (goalkeeper_hier_env_cfg.py)
+#   凍結下位 = k1_gk_direct_stage1/2026-07-28 (速度コマンド追従、横 1.28 m/s、実機実績あり)。
+#   上位が歩行コマンド (vx, vy, wz) を学習する。直接制御版 Stage2 が手書き P 制御
+#   (task_drive_vector) で埋めていたスロットを、学習したポリシーで置き換えるのが主眼。
+#   学習・再生は階層エンジン (train_goalkeeper.py / play_goalkeeper.py) を使う。
+##
+
+gym.register(
+    id="Isaac-GoalkeeperHier-Stage1-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_hier_env_cfg:K1GKHierStage1EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKHierStage1PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperHier-Stage1-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_hier_env_cfg:K1GKHierStage1EnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKHierStage1PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperHier-Stage2-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_hier_env_cfg:K1GKHierStage2EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKHierStage2PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperHier-Stage2-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_hier_env_cfg:K1GKHierStage2EnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKHierStage2PPORunnerCfg",
+    },
+)

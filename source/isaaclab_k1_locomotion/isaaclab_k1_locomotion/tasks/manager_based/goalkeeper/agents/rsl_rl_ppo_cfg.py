@@ -12,7 +12,7 @@ from isaaclab_rl.rsl_rl import (
     RslRlSymmetryCfg,
 )
 
-from ..mdp.symmetry import compute_symmetric_states
+from ..mdp.symmetry import compute_symmetric_states, compute_symmetric_states_high_level
 
 
 @configclass
@@ -158,3 +158,108 @@ class K1GKDirectStage2PPORunnerCfg(K1GKDirectPPORunnerCfg):
 
     max_iterations = 20000
     experiment_name = "k1_gk_direct_stage2"
+
+
+# ---------------------------------------------------------------------------
+# 階層版 v2 (goalkeeper_hier_env_cfg.py)
+#   凍結下位 = k1_gk_direct_stage1/2026-07-28 (実機デプロイ実績あり、横 1.28 m/s)
+#   上位 action = 歩行コマンド (vx, vy, wz) の 3 次元
+# ---------------------------------------------------------------------------
+
+@configclass
+class K1GKHierPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """階層版ゴールキーパーの上位ポリシー PPO 設定。
+
+    Stage1 → Stage2 で同じネットワーク形状を使う (``--resume`` で ckpt を渡すため
+    途中で変更しないこと)。experiment_name はステージ別サブクラスで分ける。
+    """
+
+    num_steps_per_env = 24
+    save_interval = 100
+    max_iterations = 10000
+    experiment_name = "k1_gk_hier_stage2"
+
+    # 上位 (ゴールキーパー戦術) 方策のネットワーク構造。
+    policy = RslRlPpoActorCriticCfg(
+        init_noise_std=0.7,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256, 256, 128],
+        critic_hidden_dims=[256, 256, 128],
+        activation="elu",
+    )
+    # 凍結する下位 (07-28) のネットワーク構造。
+    # ★ 実際には exported/policy.pt (TorchScript) を渡すのでこの設定は使われない
+    #   (TorchScript は正規化器ごと焼き込まれている)。生の model_*.pt を渡す運用に
+    #   切り替えるときのために、07-28 の学習時設定と一致させてある。
+    #   その場合 actor_obs_normalization=True が必須: 07-28 は観測正規化ありで
+    #   学習されており、ここが False だと _build_frozen_policy が
+    #   actor_obs_normalizer.* を strict=False で黙って捨て、正規化なしで走る。
+    low_level_policy = RslRlPpoActorCriticCfg(
+        init_noise_std=0.8,
+        actor_obs_normalization=True,
+        critic_obs_normalization=True,
+        actor_hidden_dims=[256, 128, 128],
+        critic_hidden_dims=[256, 128, 128],
+        activation="elu",
+    )
+    algorithm = RslRlPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        # ★ 2026-08-13: 0.004 → 0.008。1 回目の Stage1 学習で mean_noise_std が
+        #   初期 0.7 から 0.045 まで潰れ、iter 1000 以降は方策がほぼ決定論的になって
+        #   同じ状態しか訪れなくなっていた (全指標が横ばい)。物理 DR を reset に
+        #   変えて状態分布を広げる以上、探索も残っていないと活かせない。
+        entropy_coef=0.008,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+    def __post_init__(self):
+        if hasattr(super(), "__post_init__"):
+            super().__post_init__()
+
+        # 上位にも左右対称性を掛ける。観測レイアウトは直接制御版と同一で、行動だけが
+        # 12 関節 → 歩行コマンド 3 次元に変わるので専用の変換関数を使う。
+        # 凍結下位 (07-28) は data augmentation 無し・係数 0.5 の世代で、横移動時に
+        # 約 10°/s の yaw ドリフト (左右非対称歩容の典型症状) が残っている。上位まで
+        # 左右で別戦略に収束すると片側のセーブだけ弱いキーパーになるので入れておく。
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=True,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_symmetric_states_high_level,
+            mirror_loss_coeff=2.0,
+        )
+
+
+@configclass
+class K1GKHierStage1PPORunnerCfg(K1GKHierPPORunnerCfg):
+    """Stage 1: ボールなし。ランダム目標 y への到達・停止と、姿勢/前後位置の維持。
+
+    上位が学ぶのは実質「3 つの数字の出し方」だけなので、報酬の最適化自体は
+    1000 iter 程度で頭打ちになる (1 回目の学習で確認済み)。
+
+    ★ 2026-08-13: 3000 → 5000。ただし「報酬をさらに伸ばす」ためではなく、
+      **物理 DR を reset モードに変えた分の経験を稼ぐため**。startup のままでは
+      物理パラメータが 4096 通りで固定なので反復を増やしても何も広がらなかったが、
+      reset にした今は 1 iter ごとに新しい物理条件のエピソードが積み上がる。
+      実機転移を見据えて分布を広く踏ませる、という目的の反復。
+    """
+
+    max_iterations = 5000
+    experiment_name = "k1_gk_hier_stage1"
+
+
+@configclass
+class K1GKHierStage2PPORunnerCfg(K1GKHierPPORunnerCfg):
+    """Stage 2: ゴール + ボール + 適応カリキュラム。Stage1 ckpt から --resume。"""
+
+    max_iterations = 20000
+    experiment_name = "k1_gk_hier_stage2"

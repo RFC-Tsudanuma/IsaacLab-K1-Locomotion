@@ -99,6 +99,37 @@ parser.add_argument(
     help="Name of the observation term within --low_level_obs_group whose slice gets overwritten by the high-level"
     " action before being passed to the frozen policy.",
 )
+parser.add_argument(
+    "--high_action_deadband",
+    type=float,
+    default=0.0,
+    help="Norm-based deadband on the high-level command: if ||(vx, vy, wz)|| is below this, all three components are"
+    " zeroed before being handed to the frozen policy. A Gaussian policy never outputs an exact zero, so without"
+    " this the robot never satisfies the low-level's stop rule (||cmd|| < 0.05 -> zero gait phase) and marches in"
+    " place forever. MUST be norm-based, not per-axis: the high-level has to keep emitting small standing offsets"
+    " (wz ~ -0.175, vx ~ +0.10) to cancel the frozen policy's yaw/backward drift, and a per-axis deadband would"
+    " kill them. Implement the same rule in the deploy inference loop. 0 disables it (legacy behaviour).",
+)
+parser.add_argument(
+    "--cmd_scale_range",
+    type=float,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="Per-episode domain randomisation of the low-level's effective gain: the command handed to the frozen"
+    " policy is multiplied by U(LO, HI). The high-level otherwise learns timings (how early to start moving) that"
+    " are tuned to the *sim* low-level; this keeps it working when the real one is slower. Not applied to the"
+    " observed action, so the policy has to infer the gain from its own motion (as on hardware).",
+)
+parser.add_argument(
+    "--cmd_delay_range",
+    type=int,
+    nargs=2,
+    default=None,
+    metavar=("LO", "HI"),
+    help="Per-episode domain randomisation of the command transport delay [control ticks, inclusive]. Same purpose"
+    " as --cmd_scale_range but for latency between the high-level and the frozen low-level.",
+)
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -261,6 +292,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         low_level_cmd_term_name=args_cli.low_level_cmd_term_name,
         action_clip=args_cli.high_action_clip,
         high_action_dim=3,
+        action_deadband=args_cli.high_action_deadband,
+        cmd_scale_range=args_cli.cmd_scale_range,
+        cmd_delay_range=args_cli.cmd_delay_range,
     )
 
     # High-level runner.
@@ -279,6 +313,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         f.write(f"high_action_clip (vx, vy, wz): {tuple(args_cli.high_action_clip)}\n")
         f.write(f"low_level_obs_group: {args_cli.low_level_obs_group}\n")
         f.write(f"low_level_cmd_term_name: {args_cli.low_level_cmd_term_name}\n")
+        # ★ 下の 3 つは play / eval / 実機デプロイでも同じ値にすること。
+        #   特に deadband は「学習中に一度も評価されていない指令域」を作るので、
+        #   再生側で外すとポリシーが未学習の領域で走ることになる。
+        f.write(f"high_action_deadband: {args_cli.high_action_deadband}\n")
+        f.write(f"cmd_scale_range: {args_cli.cmd_scale_range}\n")
+        f.write(f"cmd_delay_range: {args_cli.cmd_delay_range}\n")
 
     # 学習時の frozen checkpoint をログに保存。後で play / 再学習する際に「どの歩行ポリシーで
     # 学習したか」を取り違えないようにするための保険。

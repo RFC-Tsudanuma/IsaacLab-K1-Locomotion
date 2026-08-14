@@ -336,8 +336,13 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         self.scene.terrain.terrain_type = "plane"
         self.scene.terrain.terrain_generator = None
 
-        # --- 初期配置: 守備面 (ゴールラインの guard_x=0.4m 前) 付近 ---
-        self.events.reset_base.params["pose_range"]["x"] = (0.3, 0.5)
+        # --- 初期配置: 守備面 (ゴールラインの guard_x [m] 前) 付近 ---
+        # ★ 2026-08-12: guard_x を JSON で変えても初期配置が追従するよう、直値
+        #   (0.3, 0.5) をやめて guard_x ± 0.1 から導出する。追従しないと、守備面を
+        #   前に出したのに初期位置だけ後ろに残り、エピソード開始直後に必ず前進指令
+        #   (dx = (guard_x - x) / 1.0) が出る状態になる。
+        _gx = float(self.goalkeeper.guard_x)
+        self.events.reset_base.params["pose_range"]["x"] = (_gx - 0.1, _gx + 0.1)
         self.events.reset_base.params["pose_range"]["y"] = (-0.5, 0.5)
         self.events.reset_base.params["pose_range"]["yaw"] = (-0.3, 0.3)
         self.events.reset_base.params["velocity_range"] = {
