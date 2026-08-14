@@ -99,6 +99,12 @@ class KickDirectionCommand(UniformVelocityCommand):
         # 蹴った瞬間の軸足の配置 (キック方向フレーム、ボール中心基準) [m]。
         self.metrics["plant_lon"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["plant_lat"] = torch.zeros(self.num_envs, device=self.device)
+        # 低指令域 (v_target < low_speed_threshold) だけを切り出した内訳。
+        # 全 env 平均の kick_rate / kick_vel_ratio では「弱い指令だけ蹴れていない/
+        # 飛びすぎている」が高指令域の成績に埋もれて見えないため (walk_weak_kick 用)。
+        self.metrics["kick_low_frac"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_rate_low"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_vel_ratio_low"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -129,6 +135,15 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["sole_height_at_kick"] = state["sole_height_at_kick"] * kick_done
         self.metrics["plant_lon"] = state["plant_lon_frozen"] * kick_done
         self.metrics["plant_lat"] = state["plant_lat_frozen"] * kick_done
+
+        # 低指令域の内訳。読み方:
+        #   低指令域のキック成功率 = kick_rate_low / kick_low_frac
+        #   低指令域の追従率       = kick_vel_ratio_low / kick_rate_low
+        # (どちらも分母を別メトリクスとして出すので、割り戻して読むこと)
+        is_low = (v_target < self.cfg.low_speed_threshold).float()
+        self.metrics["kick_low_frac"] = is_low
+        self.metrics["kick_rate_low"] = kick_done * is_low
+        self.metrics["kick_vel_ratio_low"] = ratio * kick_done * is_low
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
@@ -190,6 +205,14 @@ class KickDirectionCommandCfg(UniformVelocityCommandCfg):
     target_speed_range: tuple[float, float] = (1.0, 4.0)
     """目標ボール速度 [m/s] のサンプリング範囲。command[:, 2] に格納される。"""
 
+    low_speed_threshold: float = 0.8
+    """``kick_*_low`` メトリクスで「低指令域」とみなす v_target の上限 [m/s]。
+
+    既定 0.8 は kick_state の既定 v_thresh と同じ。**この値未満の指令は、既定の
+    latch 閾値のままだと「指令どおり蹴っても latch が発火しない」領域**なので、
+    そこだけを切り出して見られるようにしてある (メトリクスのみ。挙動には影響しない)。
+    """
+
 
 class BallFollowVelocityCommand(DiscreteVelocityCommand):
     """目標終端 G へ向かう速度コマンド。walk phase では通常の歩行コマンドに切り替わる。
@@ -235,6 +258,8 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             v_thresh=self.cfg.v_thresh,
             command_name=self.cfg.kick_direction_command_name or "kick_direction",
             track_ball=self.cfg.track_ball,
+            v_thresh_target_frac=self.cfg.v_thresh_target_frac,
+            v_thresh_floor=self.cfg.v_thresh_floor,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -302,4 +327,14 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
     :func:`..kick_state.kick_state` の同名引数を参照。``terminations.kick_finished`` の
     params にも **同じ値** を渡すこと (先に呼ばれた方でその step の状態が確定するため)。
     """
+
+    v_thresh_target_frac: float = 0.0
+    """>0 で latch 閾値を指令速度に追従させる。0.0 (既定) はスカラー v_thresh のまま。
+
+    :func:`..kick_state.kick_state` の同名引数を参照。``track_ball`` と同じく
+    ``terminations.kick_finished`` にも **同じ値** を渡すこと。
+    """
+
+    v_thresh_floor: float = 0.0
+    """指令追従の閾値の切片 = 下限 [m/s]。``v_thresh_target_frac`` とセットで使う。"""
 

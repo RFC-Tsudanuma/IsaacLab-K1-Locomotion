@@ -130,6 +130,54 @@ def kick_velocity_strong(
     return r_dir * state["v_ball_frozen"]
 
 
+def kick_velocity_overshoot(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    margin: float = 0.2,
+    overshoot_sat: float = 1.0,
+) -> torch.Tensor:
+    """項10. Kick Velocity Overshoot = clamp(v_ball − (v_target + margin), 0, sat)。
+
+    負の重みで使う。shape: (N,)
+
+    **非対称**であることが肝。``kick_velocity_scaled`` の Gaussian は速すぎも遅すぎも
+    同じだけ減点するが、減点は「報酬が減る」だけなので、``kick_velocity_strong``
+    (生の球速に比例・上限なし) が同時に居ると **蹴りすぎの方が黒字**になる。実際
+    walk_kick_360 の重み配分では、指令 0.5 に対して:
+
+    * 正しく蹴る (v=0.5):  scaled 1.2×1.00 + strong 0.9×0.5 ≈ 1.65
+    * 蹴りすぎ  (v=1.5):  scaled 1.2×e^-1 + strong 0.9×1.5 ≈ 1.79   ← こちらが得
+
+    この項は超過分**だけ**を直接罰するので、上の不等号を反転させられる。
+
+    Args:
+        margin: この量までの超過は無罰 [m/s]。latch の量子化 (閾値をまたいだ瞬間の値を
+            採る) と接触モデルのばらつきぶんの遊び。
+        overshoot_sat: 超過量の飽和値 [m/s]。**青天井にしないこと**。
+
+            NOTE: この項は他の項1-3 と同じく post-latch に dense で払われるので、
+                  猶予窓 (2.0 秒 = 100 step) ぶん累積する。RewardManager は
+                  value * weight * dt を毎 step 払うので、1 エピソードの総額は
+                  ``超過量 × weight × 2.0`` になる。負の dense 払いなので、
+                  ``_r_direction`` の NOTE と同じ「外したら早く転んで損切り」の
+                  抜け道が理屈上ありうる (転倒罰は -100 × dt = -2.0 の一度きり)。
+                  飽和させて総額を転倒罰より小さく保つことでこれを塞ぐ:
+                  weight = -2.0 × _KICK_W_SCALE = -0.6, sat = 1.0 なら最大 -1.2 で、
+                  転んで止めるより払い切った方が得な範囲に収まる。
+                  weight や窓を変えるときはこの不等式を必ず引き直すこと。
+
+    NOTE: 凍結値 (``v_ball_frozen``) を使う。飛翔中の減速後の値ではなく、
+          **latch した瞬間の射出速度**が指令と比べる対象。
+    """
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+
+    excess = state["v_ball_frozen"] - (state["v_target"] + margin)
+    excess = torch.clamp(excess, min=0.0, max=overshoot_sat)
+    return excess * state["kick_done"].float()
+
+
 def kick_elevation(
     env: ManagerBasedRLEnv,
     r_stance: float,

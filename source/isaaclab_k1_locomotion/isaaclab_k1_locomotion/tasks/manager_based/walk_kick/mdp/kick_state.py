@@ -84,10 +84,46 @@ def kick_state(
     command_name: str = "kick_direction",
     ball_name: str = "soccer_ball",
     track_ball: bool = False,
+    v_thresh_target_frac: float = 0.0,
+    v_thresh_floor: float = 0.0,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
     Args:
+        v_thresh_target_frac: >0 にすると値 latch のトリガー速度を **指令速度 v_target に
+            比例させ、env ごとに下げる**::
+
+                v_thresh_eff = clamp(frac * v_target, min=v_thresh_floor, max=v_thresh)
+
+            0.0 (既定) ではスカラーの ``v_thresh`` をそのまま使う = 従来挙動。
+
+            **なぜ必要か**: 既定の閾値 0.8 m/s に対し walk_kick 系の指令帯は (0.25, 2.0)
+            なので、**指令の下半分は「指令どおり正しく蹴ると latch が発火しない」**。
+            latch しなければキック報酬は 1 つも払われず (項1-3 は kick_done ゲート)、
+            kick_finished も発火しないので、弱いキックは学習上まったく報われない。
+            結果として「指令を無視して強く蹴る」が構造的な最適解になる。閾値を指令に
+            追従させると、弱い指令のときだけ低い閾値で latch できるようになる。
+
+            **必ず比例にすること (切片つきの一次式にしないこと)**。``scale*v + offset``
+            の形にすると帯の下端で閾値が指令を追い越す (0.5×0.25+0.2 = 0.325 > 0.25) ため、
+            いちばん救いたい最弱の指令だけが救われないという逆転が起きる。比例なら
+            frac < 1 である限り閾値は必ず指令より下に来る。
+
+            frac の値は「指令の何割出れば蹴ったと認めるか」。0.6 は
+            ``kick_direction`` の片側速度ゲート (``v_gate_frac``) の既定と同じ考え方で、
+            指令の 6 割に届かないへなちょこ接触を latch させないための足切りになる。
+
+        v_thresh_floor: 実効閾値の下限 [m/s]。歩行中に足がボールをかすっただけで
+            誤 latch するのを防ぐ床。
+
+            NOTE: 接触カウント (:data:`_TOUCH_DV_THRESH` = 0.15 m/s) より **上**に取ること。
+                  0.2 なら「触ったが latch はしない」領域が残り、``ball_touch_count`` と
+                  ``kick_rate`` の差として観測できる。0.15 以下にすると両者が区別できない。
+            NOTE: 帯の下端の指令より **下**であることを必ず確認すること。床が指令を
+                  上回ると、その指令では正しく蹴っても latch しない (上の逆転が復活する)。
+                  指令帯 (0.25, 2.0) に対して床 0.2 は 0.05 m/s の余裕しかないので、
+                  帯の下端を下げるときは床も一緒に下げること。
+
         track_ball: True にすると、値 latch 前は **P_kick を毎ステップ現在のボール位置から
             引き直す**。既定 (False) はエピソード開始時のボール位置に固定する従来挙動。
 
@@ -103,6 +139,12 @@ def kick_state(
                   配る必要はない。毎ステップ最初に走ることが保証されている
                   :func:`..terminations.kick_finished` (と、同じ値を持つ
                   :class:`..commands.BallFollowVelocityCommandCfg`) にだけ渡せばよい。
+
+    NOTE: ``v_thresh_target_frac`` / ``v_thresh_floor`` も ``track_ball`` と
+          まったく同じ扱い。トリガー判定を行うのは kick_state 自身だけで、報酬項は
+          結果 (``kick_done`` と凍結値) を読むだけなので、報酬項の signature を
+          増やす必要はない。``kick_finished`` と ``base_velocity`` の 2 か所に
+          **同じ値**を配ること。
     """
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
@@ -315,7 +357,22 @@ def kick_state(
     )
     state["prev_v_ball"] = v_ball
 
-    trigger = (v_ball > v_thresh) & (~state["kick_done"])
+    # ------------------------------------------------------------------ #
+    # トリガー閾値。既定はスカラー (従来挙動) だが、v_thresh_target_frac > 0 なら
+    # 指令速度に比例する **per-env テンソル** になる。
+    #   v_thresh_eff = clamp(frac * v_target, min=v_thresh_floor, max=v_thresh)
+    # v_target は既にこの関数内で読んである (cmd[:, 2]) ので追加コストはほぼ無い。
+    # 比較 (v_ball > v_thr) はスカラー・テンソルどちらでもそのまま通る。
+    # ------------------------------------------------------------------ #
+    if v_thresh_target_frac > 0.0:
+        v_thr = torch.clamp(
+            v_thresh_target_frac * v_target, min=v_thresh_floor, max=v_thresh
+        )
+    else:
+        v_thr = v_thresh
+    state["v_thresh_eff"] = v_thr if torch.is_tensor(v_thr) else torch.full_like(v_ball, v_thr)
+
+    trigger = (v_ball > v_thr) & (~state["kick_done"])
 
     if trigger.any():
         # τ_direction: ボールの飛翔方向と蹴り方向の角度誤差 [rad]

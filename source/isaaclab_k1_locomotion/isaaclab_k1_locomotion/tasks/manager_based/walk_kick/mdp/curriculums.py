@@ -97,6 +97,100 @@ def linear_reward_weight(
         term.weight = new_weight
 
 
+def piecewise_reward_weight(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    term_name: str,
+    knots: list[tuple[float, float]],
+    steps_per_iteration: int = 0,
+) -> dict[str, float]:
+    """折れ線で報酬重みを動かすカリキュラム。``linear_reward_weight`` の多段版。
+
+    ``knots`` は ``[(step, weight), ...]`` を step の昇順で与える。区間内は線形補間、
+    最初の knot より前は最初の weight、最後の knot より後は最後の weight で固定する。
+    ``steps_per_iteration > 0`` なら step を iteration 単位として解釈するのは
+    :func:`linear_reward_weight` と同じ。
+
+    **なぜ 1 本の線形ランプでは足りないか** (walk_weak_kick の ``kick_velocity_strong``):
+    この項は「立ち上げてから落とす」必要がある。0 から学習し直すタスクでは、まず
+    ``kick_velocity_strong`` を効かせて **「ボールを強く蹴る」という行動そのものを
+    獲得させ** (これが無いとキックが発見されない)、獲得できてから 0 へ落として
+    「指令どおりの強さで蹴る」へ移す。上げっぱなしだと常に全力キックが最適のままで、
+    下げっぱなしだとそもそもキックを発見できない。
+
+    NOTE: 返り値の dict は ``Curriculum/<term_name>/weight`` として TensorBoard に出る。
+          いま折れ線のどこにいるかを kick_rate と並べて読むこと。
+    """
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
+
+    if step <= knots[0][0]:
+        new_weight = knots[0][1]
+    elif step >= knots[-1][0]:
+        new_weight = knots[-1][1]
+    else:
+        new_weight = knots[-1][1]
+        for (s0, w0), (s1, w1) in zip(knots[:-1], knots[1:]):
+            if s0 <= step <= s1:
+                alpha = 0.0 if s1 == s0 else (step - s0) / (s1 - s0)
+                new_weight = w0 + (w1 - w0) * alpha
+                break
+
+    term = env.reward_manager.get_term_cfg(term_name)
+    if abs(term.weight - new_weight) > 1e-8:
+        term.weight = new_weight
+
+    return {"weight": new_weight}
+
+
+def linear_reward_param(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    term_name: str,
+    param_name: str,
+    start_value: float,
+    end_value: float,
+    start_step: int,
+    end_step: int,
+    steps_per_iteration: int = 0,
+) -> dict[str, float]:
+    """報酬項の **params の 1 つ** を線形にアニールするカリキュラム。
+
+    :func:`linear_reward_weight` が weight を動かすのに対し、こちらはシェイピング係数
+    (``sigma_velocity`` など) を動かす。weight と違って「効かせる強さ」ではなく
+    「採点の厳しさ」を変えたいときに使う。
+
+    **なぜ必要か** (walk_weak_kick の ``sigma_velocity``): 指令帯 (0.25, 2.0) の幅 1.75 に
+    対して既定の σ=1.0 は太すぎ、指令 0.5 に対して v=1.5 を出しても
+    exp(−((1.5−0.5)/1.0)²) = 0.37 とそこそこの点が付く。σ を絞れば指令間の差が付くが、
+    最初から絞ると学習初期の下手なキックが軒並み 0 点になって勾配が死ぬ。
+    そこで太い σ で始めて徐々に絞る。
+
+    NOTE: ``RewardManager.get_term_cfg`` が返す cfg の ``params`` を書き換える。報酬関数は
+          毎ステップ params を読み直すので次のステップから反映される。
+    NOTE: 返り値は ``Curriculum/<term_name>/<param_name>`` として TensorBoard に出る。
+    """
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
+
+    if step <= start_step:
+        new_value = start_value
+    elif step >= end_step:
+        new_value = end_value
+    else:
+        alpha = (step - start_step) / (end_step - start_step)
+        new_value = start_value + (end_value - start_value) * alpha
+
+    term = env.reward_manager.get_term_cfg(term_name)
+    term.params[param_name] = new_value
+
+    return {param_name: new_value}
+
+
 def linear_command_speed_range(
     env: ManagerBasedRLEnv,
     _env_ids: torch.Tensor,
