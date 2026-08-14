@@ -149,7 +149,14 @@ def _update_success_ema(env: "ManagerBasedRLEnv", env_ids, p) -> int:
         #   success_ema が恒常的に下がり、適応カリキュラムが「難しすぎる」と誤判定して
         #   難易度を下げ続けてしまう (混入率 15% なら成功率が 15pt 目減りする)。
         #   除外すれば、到達不能球はカリキュラムに対して中立になる。
-        hard_lost = conceded[env_ids] & bufs["hard_ball"][env_ids]
+        # ★ 2026-08-14: 幾何判定で「そのキーパー位置から物理的に取れない」と分かった球
+        #   での失点も除外する (:func:`~.events._mark_unreachable`)。
+        #   ユーザー指示: 昇格閾値 (0.85) を下げるのではなく分母から外す。キーパーは
+        #   可能な限り全部止めるべきなので基準は下げず、「右端にいるときに左端へ速い球」
+        #   のような物理的に不可能な球でカリキュラムが止まるのだけを防ぐ。
+        #   失点ペナルティ (-500) は除外しないので、ポリシーは諦めずに向かう。
+        skip = bufs["hard_ball"][env_ids] | bufs["unreachable"][env_ids]
+        hard_lost = conceded[env_ids] & skip
         valid = (faced > 0) & (~hard_lost)
         n = int(valid.sum().item())
         if n == 0:
@@ -244,15 +251,30 @@ def adaptive_difficulty(
         env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
     elif ema < float(p.adaptive_fail_threshold):
         # 難 → 易: 直近に上げた軸 (初速) から戻す
+        #
+        # ★ 2026-08-14: **実際に難易度を下げられたときだけ** EMA のリセットと
+        #   クールダウンを行うよう修正した。以前は最易段 (aim_stage=0 かつ
+        #   hi=ball_speed_max) で下げる余地が無くても、EMA を neutral (=0.70) に
+        #   戻して 3000 エピソードの判定停止を張っていた。難易度は 1 ミリも動いて
+        #   いないのに実績を捨てるので、
+        #     * EMA が実態 (実測 0.6) より高い 0.70 に繰り返し引き戻される
+        #     * その間の判定が止まる
+        #   となり、最易段で詰まったときに「詰まっている」という事実がログ上でも
+        #   薄まっていた (実際に 12500 iter 停滞したランで cooldown_left が
+        #   常時非ゼロだった)。下げられないなら何もせず、EMA を素直に育てる。
+        lowered = False
         if env._gk_speed_hi.item() > float(p.ball_speed_max) + 1e-6:
             env._gk_speed_hi = (env._gk_speed_hi - float(p.adaptive_speed_delta)).clamp(
                 min=float(p.ball_speed_max)
             )
+            lowered = True
         elif env._gk_aim_stage > 0:
             env._gk_aim_stage -= 1
             env._gk_aim_y.fill_(stages[env._gk_aim_stage])
-        env._gk_success_ema.fill_(neutral)
-        env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
+            lowered = True
+        if lowered:
+            env._gk_success_ema.fill_(neutral)
+            env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
 
     return _log()
 
@@ -320,8 +342,22 @@ def adaptive_hard_ball(
         st["since"] = episodes
 
     if not st["started"]:
-        at_cap = hi >= float(p.ball_speed_cap) - 1e-6
-        plateaued = (episodes - st["since"]) >= int(p.hard_ball_plateau_episodes)
+        # ★ 2026-08-14: 「難易度が十分上がっていること」を前提条件に追加した。
+        #   以前は「ball_speed_hi が動かない」だけを頭打ち判定にしていたが、これは
+        #   **「上限で頭打ち」と「一度も上がっていない」を区別できない**。実際、
+        #   最易段 (aim_stage=0 / hi=1.0) から一度も動かないランで判定が成立し、
+        #   到達不能球が最易段で有効化された。到達不能球の初速は cap ではなく
+        #   **その時点の hi の hard_ball_speed_mult 倍** なので、hi=1.0 では
+        #   1.0〜1.6 m/s にしかならず「不能」にならない = 立ち上がりを遅くするだけ。
+        #   狙い先が最終段まで広がっていることを必須条件にする。
+        top_stage = len(p.aim_y_stages) - 1
+        advanced = int(getattr(env, "_gk_aim_stage", 0)) >= top_stage
+        at_cap = advanced and hi >= float(p.ball_speed_cap) - 1e-6
+        plateaued = advanced and (episodes - st["since"]) >= int(p.hard_ball_plateau_episodes)
+        # 保険だけは難易度に関係なく発火させる (学習が終わるまでに一度も経験しない
+        # 事態を防ぐのが目的なので)。ただし閾値は実測ペースに合わせること:
+        # 4096 env / 25s エピソードで **1 iter あたり約 63 エピソード** 進む
+        # (実測: 12500 iter で 786,000 エピソード)。
         forced = episodes >= int(p.hard_ball_force_episodes)
         if at_cap or plateaued or forced:
             st["started"] = True

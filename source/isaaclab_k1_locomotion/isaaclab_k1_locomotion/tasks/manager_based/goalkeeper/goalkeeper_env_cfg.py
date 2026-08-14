@@ -147,7 +147,45 @@ class GoalkeeperParamsCfg:
     stage1_far_zone: tuple = (0.95, 1.3)  # ポスト際ゾーンの |y| 範囲 [m]。ポスト間 2.6m の往復を練習させる
 
     # ステージ2/3: ボールのスポーンと初速
-    spawn_dist_range: tuple = (1.5, 5.0)
+    #
+    # ★ 2026-08-14: サンプリング順を「距離 → 速度クランプ」から
+    #   **「速度 → 距離」** に反転した (reset_ball_shot 参照)。距離は
+    #       d ∈ [ v × spawn_time_near ,  max(spawn_dist_floor, v × spawn_time_far) ]
+    #   から引かれる。spawn_dist_range と min_time_to_line は**もう使われない**
+    #   (旧ラン/直接制御版との互換のためフィールドだけ残してある)。
+    #
+    #   旧方式の問題:
+    #     * 「近い = 必ず遅い」を強制するので、速い球が近距離から来ない (実機では起きる)
+    #     * 遅い球が最遠から来る。位置ノイズ σ(d)=0.124d+0.149 は 6.5m で 0.96m
+    #       (ゴール幅の 3/4) に達し、到達点予測が無意味になる。知覚クリーン実験で
+    #       これが学習速度を約 10 倍遅くしていることを確認した。
+    spawn_dist_range: tuple = (1.5, 5.0)   # ← 未使用 (互換のため残置)
+    # 距離の上限を決める時間 [s]。d_max = v × これ。v=3 → 4.2m / v=6 → 8.4m。
+    spawn_time_far: float = 1.4
+    # 距離の下限を決める時間 [s]。「反応が成立する最短距離」。v=6 → 3.3m で、
+    # 守備面まで 0.40s・知覚レイテンシ 0.156s を引いて反応 0.24s、その場から 6cm 移動 +
+    # タッチ判定 0.5m = 0.56m 幅をカバーできる。0.4 まで詰めると反応時間がほぼ消え、
+    # 立っていた場所に偶然来たときだけ止まる運任せの球になり学習信号がノイズ化する。
+    spawn_time_near: float = 0.55
+    # 遅い球が至近距離に湧くのを防ぐ距離の下限 [m] (v=1 だと上限 1.4m で近すぎるため)。
+    spawn_dist_floor: float = 2.0
+    # スポーン距離そのものの床 [m]。v × spawn_time_near だけだと 0.5 m/s の球が 0.28m =
+    # ロボットの足元に湧く。後段に「0.6m 未満なら押し出す」補正はあるが、あれは狙い方向を
+    # 変えてしまうので最初から湧かせない。
+    spawn_dist_near_floor: float = 1.0
+    # スポーン点を守備面のどれだけ前に出すかの最小値 [m]。距離だけで下限を決めると
+    # 広角の球が **キーパーの背後** に湧く (ang=±1.1rad では sx = 0.45d なので、
+    # d=1.5m でも sx=0.68m < guard_x)。実測: この制約が無いと最易段でも 40% が
+    # 到達不能判定になり、入れると 10.4% に落ちる。
+    spawn_ahead_min: float = 0.7
+
+    # --- 到達可能性の判定に使う下位ポリシーのエンベロープ (_mark_unreachable) ---
+    # ★ 下位を差し替えたら実測して更新すること。現在の値は 07-28
+    #   (k1_gk_direct_stage1/2026-07-28_17-13-15) を eval_gk_direct_lateral.py で
+    #   計測した結果。
+    reach_v_max: float = 1.278     # 定常横速度 [m/s] (指令 1.3 に対する実測)
+    reach_t_acc: float = 0.6       # 静止 → 定常の立ち上がり [s]
+    reach_latency_s: float = 0.156  # 知覚レイテンシ 116ms + 更新間隔 40ms
     spawn_half_angle: float = 1.1          # スポーン方位 ±[rad] (+x 正面基準, ≈63°)
     aim_y_range: float = 1.1               # 狙い先 y ∈ ±この値 [m] (ポスト内側)
     # 適応カリキュラム (mdp.adaptive_difficulty) が段階的に広げる狙い先 y の範囲 [m]。
@@ -168,7 +206,12 @@ class GoalkeeperParamsCfg:
     #   既定 0.0 なので、override JSON で有効化しない限り従来の挙動は変わらない。
     hard_ball_prob: float = 0.0        # 到達不能球にする確率
     hard_ball_speed_mult: float = 1.6  # 初速を上限 hi の何倍まで出すか
-    hard_ball_min_time: float = 0.5    # 到達不能球に適用する緩和クランプ [s]。
+    # ★ 2026-08-14: 距離サンプリング反転に伴い、到達不能球は「距離の下限をさらに詰める」
+    #   ことで作る。v=6 なら 6×0.35 = 2.1m から飛んでくる (守備面まで 0.2s、知覚を引くと
+    #   反応時間ほぼゼロ = 届かない)。0 にしないのは、届かないことを認識する余地は
+    #   残すため (知覚が何も届かないと学習信号がただのノイズになる)。
+    hard_ball_time_near: float = 0.35
+    hard_ball_min_time: float = 0.5    # ← 未使用 (互換のため残置)
 
     # --- 到達不能球の自動有効化 (mdp.adaptive_hard_ball、2026-08-13 追加) ---
     # ★ 到達不能球は「初速上限 hi が十分上がってから」でないと意味がない。hard ball の
@@ -187,8 +230,12 @@ class GoalkeeperParamsCfg:
     #   2. ball_speed_hi が hard_ball_plateau_episodes の間まったく動かない (頭打ち)
     #   3. 総エピソード数が hard_ball_force_episodes を超えた (保険。1・2 が成立しない
     #      まま学習が終わるのを防ぐ = 「静かにスキップされる」ことが無いようにする)
-    hard_ball_plateau_episodes: int = 50000
-    hard_ball_force_episodes: int = 400000
+    # ★ 2026-08-14: 実測ペースに合わせて桁を修正。4096 env / 25s エピソードでは
+    #   **1 iter あたり約 63 エピソード**進む (12500 iter で 786,000 エピソード)。
+    #   旧値 50000 / 400000 は iter 800 / iter 6000 相当で、早すぎた。
+    #   新値は iter 換算でおよそ 4800 / 24000 iter 相当。
+    hard_ball_plateau_episodes: int = 300000
+    hard_ball_force_episodes: int = 1500000
     #   0 にしないのは、到達 0.4s 級だと知覚 (遅延 116ms + 更新 40ms) が間に合わず
     #   学習信号がゼロのノイズになるため。
 
@@ -242,6 +289,24 @@ class GoalkeeperParamsCfg:
     loc_recover_tau_s: float = 5.0
     loc_max_err_m: float = 0.6         # 累積誤差の上限 [±m] (跳びの直後だけ触れる保険)
     loc_max_err_rad: float = 0.3       # 累積誤差の上限 [±rad]
+
+    # --- 自己位置の跳び → ボール速度への漏れ込み (2026-08-14 追加) ---
+    # 実機のボール速度は観測値ではなく、フィールド座標系のボール位置
+    # (= 自己位置 + 相対位置) を CVKF で微分した推定値。自己位置が跳ぶとボールが
+    # 動いたのと区別が付かず、偽の速度になる。CVKF に自機移動の補償項は無い。
+    #
+    # 下の 3 つは vision_filter の CVKF の**確定パラメータから数値的に導出**した値で、
+    # 実測値ではない (measurement_noise_std=0.25m / process_acceleration_std=0.8m/s^2 /
+    # NIS 閾値 9.21 から定常カルマンゲインを解いた結果)。したがって実機を計測しなくても
+    # この形は再現できる。未知なのは「跳びの頻度と大きさ」の方で、そちらは
+    # loc_jump_hz_range / loc_jump_m で DR 済み。
+    #
+    # ★ インパルスではなく時定数 0.79s の「山」であることが本質。1 フレームのスパイクを
+    #   入れると「1 フレームだけ無視する」という実機に転移しない対処を学習してしまう。
+    #   2 秒続く偽の「接近中」信号は、キーパーをポストまで走らせるのに十分な長さ。
+    loc_vel_leak_coef: float = 0.82        # ピーク偽速度 [m/s] = coef × 跳び幅 [m]
+    loc_vel_leak_tau_s: float = 0.79       # 山の減衰時定数 [s] (約 2 秒で収まる)
+    loc_vel_leak_nis_gate_m: float = 0.80  # これを超える跳びは NIS ゲートで棄却され漏れない
 
     # 知覚DR (VirtualPerception + 速度バイアス) を全部切ってクリーン観測にするフラグ。
     perception_clean: bool = False

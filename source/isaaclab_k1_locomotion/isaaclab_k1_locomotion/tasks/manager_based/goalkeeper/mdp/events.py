@@ -189,8 +189,74 @@ def reset_ball_shot(
     n = len(env_ids)
     r = float(p.ball_radius)
 
-    dist = torch.empty(n, device=env.device).uniform_(*[float(v) for v in p.spawn_dist_range])
+    # --- 初速を先に引き、距離をその初速から決める (2026-08-14 に順序を反転) ---
+    #
+    # 旧方式は「距離を一様サンプル → 初速を min_time_to_line でクランプ」だった。
+    # これは「近い = 必ず遅い」を強制するため、
+    #   * 速い球が近距離から来ることが原理的に無い (実機では普通に起きる)
+    #   * 逆に遅い球が最遠 (6.5m) から来る。ボール位置ノイズは σ(d)=0.124d+0.149 で
+    #     6.5m では 0.96m = ゴール幅の 3/4 に達し、到達点予測が無意味になる。
+    #     知覚クリーン実験で、この遠距離ノイズが学習速度を約 10 倍遅くしていることを確認
+    #     (199 iter 時点でセーブ率 55.2% → クリーン 70.9%)。
+    # の 2 つの問題があった。
+    #
+    # 新方式は「初速 v を引き、距離を [v·t_near, max(d_floor, v·t_far)] から引く」:
+    #   * t_far  (spawn_time_far)  = 距離の上限。v=3 → 4.2m (ユーザー指定)、v=6 → 8.4m
+    #   * t_near (spawn_time_near) = 距離の下限 = 「反応が成立する最短距離」。
+    #     v=6 なら 3.3m で、守備面まで 0.40s・知覚レイテンシを引いて反応 0.24s。
+    #     その場から 6cm 移動 + タッチ判定 0.5m = 0.56m 幅をカバーできる水準。
+    #     これ以上詰める (t_near=0.4) と反応時間がほぼゼロになり、立っていた場所に
+    #     偶然来たときだけ止まる運任せの球になって学習信号がノイズ化する。
+    #   * d_floor は遅い球が至近距離に湧くのを防ぐ下限 (v=1 で 1.4m は近すぎるため)。
+    # 「それより厳しい球」は従来どおり hard_ball 側で少量だけ混ぜる (5.3 の二層構造)。
+    hi_buf = getattr(env, "_gk_speed_hi", None)
+    hi = float(hi_buf.item()) if hi_buf is not None else float(p.ball_speed_max)
+    speed = torch.empty(n, device=env.device).uniform_(float(p.ball_speed_min), hi)
+
+    hard_prob = float(getattr(p, "hard_ball_prob", 0.0))
+    hard = torch.rand(n, device=env.device) < hard_prob
+    if hard_prob > 0.0:
+        mult = float(getattr(p, "hard_ball_speed_mult", 1.6))
+        hard_speed = torch.empty(n, device=env.device).uniform_(hi, max(hi * mult, hi + 1e-3))
+        speed = torch.where(hard, hard_speed, speed)
+
+    t_near = float(getattr(p, "spawn_time_near", 0.55))
+    t_far = float(getattr(p, "spawn_time_far", 1.4))
+    d_floor = float(getattr(p, "spawn_dist_floor", 2.0))
+    # 到達不能球は下限をさらに詰める (= 反応が間に合わない距離から撃つ)
+    if hard_prob > 0.0:
+        t_near_hard = float(getattr(p, "hard_ball_time_near", 0.35))
+        t_near_t = torch.where(
+            hard,
+            torch.full((n,), t_near_hard, device=env.device),
+            torch.full((n,), t_near, device=env.device),
+        )
+    else:
+        t_near_t = torch.full((n,), t_near, device=env.device)
+
+    # ★ 下限にも床を入れる。v×t_near だけだと遅い球 (0.5 m/s) が 0.28m = ロボットの
+    #   足元に湧く。reset_ball_shot は後段で「ロボットから 0.6m 未満なら radial に
+    #   押し出す」補正をするが、その補正はボールの狙い方向を変えてしまうので、
+    #   最初から湧かせない方がよい。
     ang = torch.empty(n, device=env.device).uniform_(-float(p.spawn_half_angle), float(p.spawn_half_angle))
+
+    d_near_floor = float(getattr(p, "spawn_dist_near_floor", 1.0))
+    d_lo = torch.clamp(speed * t_near_t, min=d_near_floor)
+
+    # ★ スポーン点が守備面より前になることを保証する (2026-08-14)。
+    #   距離だけで下限を決めると、広角の球が **キーパーの背後** に湧く。
+    #   sx = d·cos(ang) なので、ang=±1.1rad(63°) では sx = 0.45d。d=1.5m でも
+    #   sx = 0.68m となり guard_x=0.8 より内側で、猶予ゼロの球になる。
+    #   実測: この制約が無いと最易段でも 40% が到達不能判定、入れると 10.4% に落ちる。
+    #   spawn_ahead_min は「守備面のどれだけ前に湧かせるか」の最小値 [m]。
+    ahead = float(getattr(p, "spawn_ahead_min", 0.7))
+    guard_x = float(p.guard_x)
+    d_geom = (guard_x + ahead) / torch.cos(ang).clamp(min=0.1)
+    d_lo = torch.maximum(d_lo, d_geom)
+
+    d_hi = torch.clamp(speed * t_far, min=d_floor)
+    d_hi = torch.maximum(d_hi, d_lo + 1e-3)          # 下限が上限を超える組み合わせの保険
+    dist = d_lo + torch.rand(n, device=env.device) * (d_hi - d_lo)
     spawn_x = dist * torch.cos(ang)
     spawn_y = dist * torch.sin(ang)
 
@@ -209,36 +275,31 @@ def reset_ball_shot(
     aim_range = float(aim_buf.item()) if aim_buf is not None else float(p.aim_y_range)
     aim_y = torch.empty(n, device=env.device).uniform_(-aim_range, aim_range)
 
-    hi_buf = getattr(env, "_gk_speed_hi", None)
-    hi = float(hi_buf.item()) if hi_buf is not None else float(p.ball_speed_max)
-    speed = torch.empty(n, device=env.device).uniform_(float(p.ball_speed_min), hi)
-
-    # ★ 2026-08-11: 確率 hard_ball_prob で「到達不能球」にする。実現可能性クランプを
-    #   緩め (hard_ball_min_time)、初速も上限の hard_ball_speed_mult 倍まで出す。
-    #   狙いは「届かない球で自壊しない」を学ばせること (GoalkeeperParamsCfg 参照)。
-    hard_prob = float(getattr(p, "hard_ball_prob", 0.0))
-    hard = torch.rand(n, device=env.device) < hard_prob
-    if hard_prob > 0.0:
-        mult = float(getattr(p, "hard_ball_speed_mult", 1.6))
-        hard_speed = torch.empty(n, device=env.device).uniform_(hi, max(hi * mult, hi + 1e-3))
-        speed = torch.where(hard, hard_speed, speed)
-
     # スポーン点 → 狙い先 (x=0, y=aim_y) の方向単位ベクトル
     dir_x = -spawn_x
     dir_y = aim_y - spawn_y
     norm = torch.sqrt(dir_x**2 + dir_y**2).clamp(min=1e-6)
-    # 実現可能性クランプ: 到達時間 = 距離/速度 ≥ min_time_to_line
-    # (到達不能球だけ hard_ball_min_time まで緩める)
-    min_t = torch.full((n,), float(p.min_time_to_line), device=env.device)
-    if hard_prob > 0.0:
-        min_t = torch.where(
-            hard, torch.full_like(min_t, float(getattr(p, "hard_ball_min_time", 0.5))), min_t
-        )
-    v_feasible = norm / min_t.clamp(min=1e-3)
-    speed = torch.minimum(speed, v_feasible)
+    # ★ 速度クランプ (旧 min_time_to_line) は廃止。距離を速度から決めるようになったので
+    #   「近い×高速」は距離サンプリングの下限 (spawn_time_near) で直接制御している。
+    #   ここで再度クランプすると、狙い先が横に振れて norm が伸びた分だけ二重に効く。
     bufs["hard_ball"][env_ids] = hard
     vx = speed * dir_x / norm
     vy = speed * dir_y / norm
+
+    # --- 「この球はこのキーパー位置から物理的に取れるか」を発射時に判定する ---
+    #
+    # ★ 2026-08-14 (ユーザー指示): 取れない球を成功率の集計から外すため。
+    #   閾値 (adaptive_success_threshold=0.85) を下げるのではなく **分母から外す**。
+    #   「キーパーは可能な限り全部止めるべき」という要求を保ったまま、物理的に不可能な
+    #   球でカリキュラムが止まるのを防ぐ。失点ペナルティ (-500) は除外しないので、
+    #   ポリシーは取れない球でも諦めずに向かう (集計だけの話)。
+    #
+    #   これにより「右端にいるときに左端へ速い球」は自動的に除外され、
+    #   「右端にいるときに左端へ**遅い**球」は除外されない (時間があるので取れるべき)。
+    #   難易度ではなく物理で線を引くので恣意性が無い。
+    #
+    #   判定は真値で行う (観測ではなく集計用のブックキーピングなので)。
+    _mark_unreachable(env, env_ids, spawn_x, spawn_y, vx, vy, speed)
 
     pose = torch.zeros(n, 7, device=env.device)
     pose[:, 0] = env.scene.env_origins[env_ids, 0] + spawn_x
@@ -256,6 +317,62 @@ def reset_ball_shot(
     ball.write_root_velocity_to_sim(vel, env_ids=env_ids)
 
     bufs["ball_active"][env_ids] = True
+
+
+def _mark_unreachable(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor,
+    spawn_x: torch.Tensor,
+    spawn_y: torch.Tensor,
+    vx: torch.Tensor,
+    vy: torch.Tensor,
+    speed: torch.Tensor,
+) -> None:
+    """発射した球が「そのキーパー位置から物理的に取れるか」を判定して記録する。
+
+    :func:`~.curriculums._update_success_ema` が、ここで True になった球での失点を
+    成功率の集計から除外する (失点ペナルティは除外しない = ポリシーは諦めない)。
+
+    判定 (すべて真値。集計用のブックキーピングなので観測は使わない):
+
+        守備面 x = guard_x を通過する y   … 等速直線で外挿し ±goal_half_width にクランプ
+        猶予時間 t_avail                  … そこまでの飛行時間 − 知覚レイテンシ
+        必要移動 Δy                       … |通過 y − キーパーの現在 y| − タッチ判定半径
+        必要時間 t_need                   … 下位の実測エンベロープ (定常速度と立ち上がり)
+                                            による加速込みの横移動時間
+
+    ``t_need > t_avail`` なら到達不能。パラメータはすべて GoalkeeperParamsCfg にあり、
+    下位ポリシーを差し替えたら ``reach_v_max`` / ``reach_t_acc`` を実測値に更新すること。
+    """
+    p = _gk_params(env)
+    dev = env.device
+
+    v_max = float(getattr(p, "reach_v_max", 1.278))     # 下位の定常横速度 [m/s]
+    t_acc = float(getattr(p, "reach_t_acc", 0.6))       # 静止→定常の立ち上がり [s]
+    lat = float(getattr(p, "reach_latency_s", 0.156))   # 知覚レイテンシ + 更新間隔 [s]
+    touch = float(getattr(p, "touch_proximity", 0.5))
+    guard_x = float(p.guard_x)
+    max_y = float(p.goal_half_width)
+    d_acc = 0.5 * v_max * t_acc                          # 加速中に進む距離 [m]
+
+    # 守備面 x=guard_x を通過するまでの時間と、その時点の y
+    vx_in = (-vx).clamp(min=1e-3)                        # ゴール方向 (=-x) の速度成分
+    t_guard = ((spawn_x - guard_x) / vx_in).clamp(min=0.0)
+    y_guard = (spawn_y + vy * t_guard).clamp(-max_y, max_y)
+    t_avail = t_guard - lat
+
+    ky = robot_pos_goal(env)[env_ids, 1]
+    dy = (y_guard - ky).abs() - touch                    # タッチ判定ぶんは動かなくてよい
+    dy = dy.clamp(min=0.0)
+
+    # 加速込みの横移動時間: 短距離は等加速、長距離は加速 + 定常
+    t_short = torch.sqrt((2.0 * dy * t_acc / v_max).clamp(min=0.0))
+    t_long = t_acc + (dy - d_acc) / v_max
+    t_need = torch.where(dy <= d_acc, t_short, t_long)
+
+    unreachable = t_need > t_avail
+    bufs = gk_buffers(env)
+    bufs["unreachable"][env_ids] = unreachable
 
 
 def reset_ball_perception(
@@ -296,6 +413,9 @@ def reset_ball_perception(
     # 自己位置推定の誤差: エピソード固定バイアス + ドリフト速度 + 跳びの頻度。
     _gk_loc_buffers(env)
     env._gk_loc_err[env_ids] = 0.0
+    # 跳び由来のボール速度の漏れも持ち越さない (前エピソードの山が残ると開始直後に
+    # 存在しない「接近中」信号が出る)。
+    env._gk_loc_vel_leak[env_ids] = 0.0
     if bool(getattr(p, "perception_clean", False)):
         env._gk_loc_bias[env_ids] = 0.0
         env._gk_loc_drift[env_ids] = 0.0

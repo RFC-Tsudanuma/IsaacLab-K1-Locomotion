@@ -380,6 +380,17 @@ class K1GKHierStage1EnvCfg(K1GKHierEnvCfg):
         self.goalkeeper.stage1_target_range = STAGE1_TARGET_HALF_WIDTH
         self.goalkeeper.stage1_far_zone = STAGE1_FAR_ZONE
 
+        # ★ 2026-08-14: パーク位置を知覚の検出範囲 (max_detection_range = 7.0m) の外へ。
+        #   既定の (5.0, 0) はロボット (guard_x=0.9) から 4.1m で **視界内** に入る。
+        #   直接版 Stage1 は zeros_obs でスロットをゼロにしていたが、階層版は Stage2 の
+        #   観測クラスを継承しているため、パーク中の静止ボールが実値として観測に
+        #   入っていた (= ボール観測を「固定ランドマーク」として自己位置の補助に使う
+        #   余地があり、Stage2 でボールが動き出すとその前提が崩れる)。9m なら範囲外で
+        #   mask=0 → 観測は自然にゼロになり、直接版のダミー 0 と同じ意味になる。
+        #   ※ 2026-08-14_02-38-00 以前の Stage1 ckpt は旧配置で学習済み (影響は限定的
+        #     と評価したので作り直しはしない)。次に Stage1 を回すときから効く。
+        self.goalkeeper.park_pos = (9.0, 0.0)
+
         # ボールは発射せず遠方にパーク + ランダム目標を採番する。
         # ★ reset_gk_buffers より後に登録すること (目標を上書きするため)。親の
         #   __post_init__ で reset_gk_buffers → reset_ball の順に登録済みなので、
@@ -433,6 +444,10 @@ class K1GKHierStage2EnvCfg(K1GKHierEnvCfg):
         #   リセットせず止めた地点から次の球に備えるため、2 球目以降の開始位置は
         #   前の球をどこで止めたかで自然にばらける。実戦の「キックオフから始まって
         #   連続でシュートを受ける」流れとも一致する。
+        # --- 守備面: ゴールラインから 0.8m 前 (ユーザー指示 2026-08-14、0.9 → 0.8) ---
+        # ★ guard_x より先に設定すること。下の初期配置がこの値から導出される。
+        self.goalkeeper.guard_x = 0.8
+
         _gx = float(self.goalkeeper.guard_x)
         self.events.reset_base.params["pose_range"]["x"] = (_gx, _gx)
         self.events.reset_base.params["pose_range"]["y"] = (0.0, 0.0)
@@ -445,23 +460,19 @@ class K1GKHierStage2EnvCfg(K1GKHierEnvCfg):
             "roll": (-0.1, 0.1), "pitch": (-0.1, 0.1), "yaw": (-0.1, 0.1),
         }
 
-        # --- ボール初速の上限 5.0 m/s (ユーザー指示 2026-08-13) ---
-        # ★ cap を上げるだけでは 5 m/s は実現しない。reset_ball_shot には実現可能性
-        #   クランプ speed <= (スポーン点→狙い先の距離) / min_time_to_line があり、
-        #   spawn_dist_range 上限 5.0m・min_time_to_line 1.2s では
-        #       v_feasible <= 5.2 / 1.2 ≈ 4.3 m/s
-        #   で頭打ちになり、cap 5.0 は一度も届かない。
+        # --- ボール初速の上限 6.0 m/s (ユーザー指示 2026-08-14) ---
+        # 距離は reset_ball_shot が **初速から** 決める (spawn_time_near/far)。
+        # 既定値のままで要求どおりの分布になる:
+        #     v=1 → 0.55〜2.0m / v=3 → 1.65〜4.2m / v=6 → 3.30〜8.4m
+        # 「3 m/s までは 4.2m まで」「それ以上は遠くてもよい」「速い球も近距離から来る」
+        # の 3 つを同時に満たす。spawn_dist_range / min_time_to_line はもう使われない。
         #
-        #   そこで **スポーン距離の上限を広げる** ことで 5 m/s を可能にする:
-        #       6.0m / 1.2s = 5.0 m/s  → 6.0m 以遠のスポーンで cap に到達できる
-        #   上限を 6.5m にして、5 m/s が出る球がそれなりの割合で混ざるようにした。
-        #
-        #   min_time_to_line を下げる (1.2 → 1.0) という手もあるが、そちらは
-        #   **近距離の球も含めて全部の反応時間を削る**ので難易度の上がり方が乱暴になる。
-        #   「速い球は遠くから来る」という物理的に自然な相関を保つ本案を採る。
-        #   知覚側も max_detection_range=7.0m なので 6.5m は視野内に収まる。
-        self.goalkeeper.ball_speed_cap = 5.0
-        self.goalkeeper.spawn_dist_range = (1.5, 6.5)
+        # ★ 知覚の max_detection_range は 7.0m。v=6 の上限 8.4m はそれを超えるが、
+        #   その場合は「最初の数フレームはボールが見えず、7m を切ってから見え始める」
+        #   という実機どおりの挙動になるだけで破綻はしない (VirtualPerception が
+        #   range 外を mask=0 で返す)。むしろ遠距離の高速球で「見えてから反応する」
+        #   状況を経験させられる。
+        self.goalkeeper.ball_speed_cap = 6.0
 
 
 # ---------------------------------------------------------------------------

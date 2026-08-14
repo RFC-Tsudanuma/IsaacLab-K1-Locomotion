@@ -62,6 +62,10 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         # 今飛んでいる球が「到達不能球」(hard_ball_prob で混ぜたもの) か。
         # 適応カリキュラムはこの球での失点を成功率の集計から除外する。
         env._gk_hard_ball = torch.zeros(n, dtype=torch.bool, device=env.device)
+        # 今飛んでいる球が「そのキーパー位置から物理的に取れない」か
+        # (:func:`~.events._mark_unreachable` が発射時に幾何から判定する)。
+        # hard_ball が確率で決め打ちするのに対し、こちらは実際の位置関係で決まる。
+        env._gk_unreachable = torch.zeros(n, dtype=torch.bool, device=env.device)
     return {
         "target_y": env._gk_target_y,
         "ball_active": env._gk_ball_active,
@@ -72,6 +76,7 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "respawn_cd": env._gk_respawn_cd,
         "save_count": env._gk_save_count,
         "save_quality": env._gk_save_quality,
+        "unreachable": env._gk_unreachable,
         "hard_ball": env._gk_hard_ball,
     }
 
@@ -111,6 +116,8 @@ def _gk_loc_buffers(env: "ManagerBasedRLEnv") -> None:
         env._gk_loc_drift = torch.zeros(n, 3, device=env.device)   # ドリフト速度 [m/s, rad/s]
         env._gk_loc_jump_p = torch.zeros(n, device=env.device)     # 跳びの毎ステップ確率
         env._gk_loc_step = -1
+        # 跳びがボール速度推定に漏れ込む分 (ゴール座標系 [m/s])。:func:`_gk_loc_tick` 参照。
+        env._gk_loc_vel_leak = torch.zeros(n, 2, device=env.device)
 
 
 def _gk_loc_tick(env: "ManagerBasedRLEnv") -> None:
@@ -126,6 +133,12 @@ def _gk_loc_tick(env: "ManagerBasedRLEnv") -> None:
     err = env._gk_loc_err
     err += env._gk_loc_drift * dt
 
+    # ★ 跳びがボール速度に漏れ込む分を減衰させる (発火より先に進めること。発火した
+    #   ステップの寄与がその場で 1 ステップ分減衰しないようにするため)。
+    tau_v = float(getattr(p, "loc_vel_leak_tau_s", 0.79))
+    if tau_v > 0.0:
+        env._gk_loc_vel_leak *= math.exp(-dt / tau_v)
+
     jump = torch.rand(env.num_envs, device=env.device) < env._gk_loc_jump_p
     if bool(jump.any()):
         jmag = float(getattr(p, "loc_jump_m", 0.5))
@@ -134,6 +147,35 @@ def _gk_loc_tick(env: "ManagerBasedRLEnv") -> None:
         delta[:, :2] *= jmag
         delta[:, 2] *= jyaw
         err = torch.where(jump.unsqueeze(-1), err + delta, err)
+
+        # ★ 2026-08-14: 自己位置の跳びを **ボール速度推定の過渡** に伝える。
+        #   実機のボール速度は観測値ではなく、フィールド座標系のボール位置 (= 自己位置 +
+        #   相対位置) を CVKF で微分した推定値なので、自己位置が跳ぶとボールが動いたのと
+        #   区別が付かない。CVKF に自機移動の補償項は無く、原理的に分離できない。
+        #
+        #   応答の形は CVKF の確定パラメータ (measurement_noise_std=0.25m,
+        #   process_acceleration_std=0.8m/s^2, NIS 閾値 9.21) から数値的に導出済み:
+        #     * 位置カルマンゲイン 0.096 = 実効10フレーム平均の重い平滑化器
+        #     * 0.5m のステップ入力 → ピーク 0.408 m/s、時定数 0.79s、約2秒の「山」
+        #     * 係数 = 0.408 / 0.5 = 0.82 (25Hz/30Hz でほぼ不変)
+        #     * 1.0m 超の跳びは NIS ゲート (実効 0.80m) で棄却されるので漏れない
+        #
+        #   ★ インパルスではなく「山」にすることが重要。1 フレームのスパイクを入れると
+        #     「1 フレームだけ無視する」という実機に転移しない対処を学習してしまう。
+        #     2 秒続く偽の「接近中」信号は、キーパーをポストまで走らせるのに十分な長さ。
+        #
+        #   なおドリフト由来の 1:1 漏れは実装しない。現行の loc_drift_xy_mps=0.03 では
+        #   漏れも 0.03 m/s にしかならず、既存のエピソード固定バイアス
+        #   (perc_vel_bias_range 0.5〜1.0 m/s) に埋もれる。「持続的に速度がずれている」
+        #   という形は既にそちらでモデル化済み。
+        gate = float(getattr(p, "loc_vel_leak_nis_gate_m", 0.80))
+        coef = float(getattr(p, "loc_vel_leak_coef", 0.82))
+        jump_xy = delta[:, :2]
+        # NIS ゲートを通る跳びだけが速度に化ける (大きすぎる跳びは外れ値として棄却される)
+        passed = jump & (torch.norm(jump_xy, dim=1) <= gate)
+        env._gk_loc_vel_leak += torch.where(
+            passed.unsqueeze(-1), coef * jump_xy, torch.zeros_like(jump_xy)
+        )
 
     # ★ 再収束。MCL はランドマークが視野に入った時点で誤差が**戻る**。これが無いと
     #   ドリフトと跳びで誤差が上限に張り付いたままになり、ロボットが「自分は 0.8m
@@ -378,10 +420,25 @@ def _gk_perception_tick(env: "ManagerBasedRLEnv") -> None:
     ball: RigidObject = env.scene["soccer_ball"]
     vp.update(env.scene["robot"], ball.data.root_pos_w[:, :3])
 
-    # 速度: 真値 (base yaw frame) + エピソード固定バイアス。見えていない (mask=0) 間は 0。
+    # 速度: 真値 (base yaw frame) + エピソード固定バイアス + 自己位置の跳び由来の過渡。
+    # 見えていない (mask=0) 間は 0。
     _, vel_b = _gk_true_rel_state(env)
     mask = vp.ball_mask.unsqueeze(1)
-    env._gkp_out_vel = (vel_b + env._gkp_vel_bias) * mask
+
+    # ★ 2026-08-14: 自己位置の跳びがボール速度推定に化ける分を加える。
+    #   実機のボール速度はフィールド座標系で推定されるので、漏れもフィールド座標系で
+    #   発生する (:func:`_gk_loc_tick`)。観測は base yaw frame なので、実機が
+    #   local_velocity = R(-theta) * global_velocity で回し戻すのと同じ変換をする。
+    #   使う角度は **推定 heading** (実機のポリシーが使えるのはそれだけ)。
+    _gk_loc_tick(env)
+    leak_g = env._gk_loc_vel_leak
+    _, heading_est = robot_pose_est(env)
+    c, s = torch.cos(heading_est), torch.sin(heading_est)
+    leak_b = torch.stack(
+        [c * leak_g[:, 0] + s * leak_g[:, 1], -s * leak_g[:, 0] + c * leak_g[:, 1]], dim=1
+    )
+
+    env._gkp_out_vel = (vel_b + env._gkp_vel_bias + leak_b) * mask
 
 
 def _gk_perceived_goal_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor]:

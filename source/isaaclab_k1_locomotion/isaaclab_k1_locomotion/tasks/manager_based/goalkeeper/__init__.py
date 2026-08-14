@@ -173,3 +173,11 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKHierStage2PPORunnerCfg",
     },
 )
+
+##
+# デュアルヒストリー版 (dualhist/。arXiv:2401.16889 の dual I/O history の試験実装)
+#   階層版 v2 の上位ポリシーの観測に短期 (0.1s) / 長期 (1.0s、1D CNN 圧縮) の履歴を足した版。
+#   タスク登録以外は dualhist/ 配下で完結しており、既存タスクには影響しない。
+##
+
+from . import dualhist  # noqa: E402, F401

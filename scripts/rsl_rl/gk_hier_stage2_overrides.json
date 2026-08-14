@@ -1,0 +1,8 @@
+{
+  "_comment": "階層版ゴールキーパー Stage 2 の設定上書き (train_gk_hier_stage2.sh が既定で読む)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。",
+  "_comment_perc_vel_bias": "★ 2026-08-14: これを入れ忘れたまま Stage2 を 12500 iter 回し、カリキュラムが最初の段 (aim_y 0.4 / 初速 1.0) から一度も進まなかった (success_ema 0.59 で不感帯に停滞、セーブ率 6 割)。原因は cfg 既定の perc_vel_bias_range 0.5〜1.0 で、これは 2026-07-31 に直接制御版で既に『信号より大きいノイズ』と実測されている値: ボール横速度の中央値 0.41 m/s に対し 1.8 倍、速度の符号が 43% で反転し、到達点予測が逆側のポストへ飛ぶ。指令の 38% が逆方向を向いていた。0.05〜0.15 にすると予測誤差 1.04m→0.39m、接近判定の失敗 33%→0%。直接制御版の成功したランは全てこの値を使っている (goalkeeper_stage3_overrides.json)。実機のビジョン精度を実測したらその値に置き換えること。",
+  "_comment_scope": "ball_speed_cap / spawn_dist_range / hard_ball_auto などは goalkeeper_hier_env_cfg.py 側で設定済みなので、ここでは重複させない (二重管理を避ける)。",
+  "env": {
+    "goalkeeper.perc_vel_bias_range": [0.05, 0.15]
+  }
+}

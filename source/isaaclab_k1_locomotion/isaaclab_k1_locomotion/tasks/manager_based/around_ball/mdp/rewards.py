@@ -28,6 +28,59 @@ if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
 
+# ============================================================================
+# ハンドオフ (突進→通常歩行の引き渡し) 中の報酬ゲーティング
+#
+# ``HierarchicalVecEnvWrapper`` (scripts/rsl_rl/dribble_helpers.py) が
+# ``env._handoff_active`` を立てている間、上位ポリシーの action は捨てられ、
+# 代わりに通常歩行コマンドが frozen に流れている。つまりその区間の挙動は
+# **上位ポリシーの制御下にない** ので、上位 action に紐づく報酬・ペナルティを
+# 課金してはいけない (ポリシーが起こしていない事象で加点/減点されてしまう)。
+#
+# 一方で ``termination_penalty`` は **残す**。ハンドオフ後に転倒したら -500 が
+# エピソードに乗り、GAE で遡って「どんな速度・姿勢で接触したか」に信用割当される。
+# これが「ハンドオフを生き延びられる状態で突っ込む」を学習させる本体。
+# ``ball_moved_along_kick`` も残す (蹴りの成果は評価したいので)。
+# ============================================================================
+
+
+def handoff_mask(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """ハンドオフ中は 0、それ以外は 1 の per-env マスク (N,)。
+
+    状態機が無効 (handoff なしの学習・他タスク) なら ``_handoff_active`` が存在せず
+    常に 1 を返すので、ゲート版の報酬をそのまま使っても従来と同じ挙動になる。
+    """
+    flag = getattr(env, "_handoff_active", None)
+    if flag is None:
+        return torch.ones(env.num_envs, device=env.device)
+    return (~flag).float()
+
+
+def gated_high_action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """:func:`locomotion.mdp.rewards.high_action_rate_l2` のハンドオフゲート版。"""
+    from ...locomotion.mdp.rewards import high_action_rate_l2
+
+    return high_action_rate_l2(env) * handoff_mask(env)
+
+
+def gated_high_action_smoothness_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """:func:`locomotion.mdp.rewards.high_action_smoothness_l2` のハンドオフゲート版。"""
+    from ...locomotion.mdp.rewards import high_action_smoothness_l2
+
+    return high_action_smoothness_l2(env) * handoff_mask(env)
+
+
+def gated_high_action_xy_coactivation(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """:func:`locomotion.mdp.rewards.high_action_xy_coactivation` のハンドオフゲート版。
+
+    ``normal_cmd`` はランダム化されていて vx・vy が同時に立つことがあるが、それは
+    上位ポリシーの出力ではないので罰さない。
+    """
+    from ...locomotion.mdp.rewards import high_action_xy_coactivation
+
+    return high_action_xy_coactivation(env) * handoff_mask(env)
+
+
 def _kick_geometry(
     env: ManagerBasedRLEnv,
     command_name: str,
@@ -191,7 +244,14 @@ def charge_to_ball_when_aligned(
     reward = gate * torch.clamp(v_along / max_speed, 0.0, 1.0)
 
     # min_distance > 0 のときのみ、その距離より近くで報酬を切る (既定 0 = 切らない)。
-    return torch.where(dist < min_distance, torch.zeros_like(reward), reward)
+    reward = torch.where(dist < min_distance, torch.zeros_like(reward), reward)
+
+    # ★ハンドオフ後は 0。これが無いと「蹴った後もボールを追い続ける」ことに
+    # 満額 (weight 18.0 × gate 1.0 × v_along 1.0) が払われ続ける。蹴った後は
+    # ボールが正面に飛ぶので gate≈1 のまま、全速で追えば v_along≈1 になり、
+    # 転倒 (-500) を差し引いても黒字になってしまう (実測された転倒の主因)。
+    # ハンドオフ後は上位 action が捨てられているので、そもそもポリシーの手柄でもない。
+    return reward * handoff_mask(env)
 
 
 def ball_disturbance_when_misaligned(
