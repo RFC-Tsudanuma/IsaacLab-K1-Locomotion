@@ -8,11 +8,16 @@
 #   ./scripts/fetch_ckpt.sh --full k1_walk_kick     # run ディレクトリ丸ごと
 #   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (policy*.onnx) も取ってくる
 #   ./scripts/fetch_ckpt.sh --video k1_walk_kick    # videos/ も取ってくる
+#   ./scripts/fetch_ckpt.sh --tfevents k1_walk_kick # TensorBoard のログも取ってくる
 #
 # --onnx / --video を付けたときは、**ssh 越しにリモートで生成してから回収する**
 # (既定)。リモートに古い成果物が残っていても必ず作り直す。生成には Isaac Sim の
 # 起動を伴うので数分かかる。
 #   --no-remote-exec        生成せず、無ければ従来どおり WARN だけ出す
+#
+# --tfevents は既に学習が書き出したものを回収するだけなので、リモートでの生成は
+# 伴わない (Isaac Sim も起動しない)。--full なら run ディレクトリ丸ごとなので不要。
+#
 #   --gym-task <ID>         gym タスク ID の自動解決を上書きする
 #   --video-length <N>      録画するステップ数 (既定 200)
 #   VAST_PYTHON=...         リモートの IsaacLab python を明示する
@@ -30,6 +35,7 @@ FULL=0
 LIST=0
 ONNX=0
 VIDEO=0
+TFEVENTS=0
 REMOTE_EXEC=1
 GYM_TASK=""
 VIDEO_LENGTH=200
@@ -44,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --list|-l) LIST=1; shift ;;
     --onnx)    ONNX=1; shift ;;
     --video)   VIDEO=1; shift ;;
+    --tfevents) TFEVENTS=1; shift ;;
     --no-remote-exec) REMOTE_EXEC=0; shift ;;
     --gym-task) GYM_TASK="$2"; shift 2 ;;
     --video-length) VIDEO_LENGTH="$2"; shift 2 ;;
@@ -318,6 +325,14 @@ if [[ "$VIDEO" -eq 1 && "$FULL" -eq 0 ]]; then
   # --video 付き学習の録画、または play.py --video の出力 (videos/)
   "${SCP[@]}" -r "$SSH_TARGET:$REMOTE_RUN_DIR/videos" "$LOCAL_RUN_DIR/" \
     || echo "WARN: リモートに videos/ がありません (録画に失敗した?)" >&2
+fi
+
+if [[ "$TFEVENTS" -eq 1 && "$FULL" -eq 0 ]]; then
+  # rsl_rl の SummaryWriter は run ディレクトリ直下に events.out.tfevents.* を書く。
+  # glob はリモートのシェルが展開するのでクォートしない。学習が途中でも
+  # 追記中のファイルをそのままコピーできる (TensorBoard は末尾が欠けても読める)。
+  "${SCP[@]}" "$SSH_TARGET:$REMOTE_RUN_DIR/events.out.tfevents.*" "$LOCAL_RUN_DIR/" \
+    || echo "WARN: リモートに events.out.tfevents.* がありません" >&2
 fi
 
 echo
