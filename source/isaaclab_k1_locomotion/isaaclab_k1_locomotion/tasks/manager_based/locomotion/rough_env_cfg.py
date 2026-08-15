@@ -72,7 +72,7 @@ def _apply_play_viewer(cfg) -> None:
     cfg.viewer.origin_type = "asset_root"
     cfg.viewer.asset_name = "robot"
     cfg.viewer.env_index = 0
-    cfg.viewer.eye = (2.5, 2.5, 1.5)   # 追尾対象からの相対位置 [m]
+    cfg.viewer.eye = (6.0, 6.0, 3.5)   # 追尾対象からの相対位置 [m]
     cfg.viewer.lookat = (0.0, 0.0, 0.5)  # 足元ではなく胴体あたりを見る
 
 _LEG_NET_PATH = os.path.join(
