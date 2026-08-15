@@ -23,6 +23,11 @@ def kick_finished(
     track_ball: bool = False,
     v_thresh_target_frac: float = 0.0,
     v_thresh_floor: float = 0.0,
+    physical_kick_detection: bool = False,
+    kick_detection_foot_distance_threshold: float = 0.23,
+    kick_detection_min_foot_speed_towards_ball: float = 0.2,
+    kick_detection_velocity_change_threshold: float = 0.5,
+    kick_detection_warmup_steps: int = 5,
 ) -> torch.Tensor:
     """キック成立 (kick_done) から delay_steps 後にエピソードを終了する。shape: (N,) bool
 
@@ -34,10 +39,9 @@ def kick_finished(
           カリキュラムで 0 から立ち上げる報酬項に状態更新を任せることはできない。
           TerminationManager は RewardManager より先に走るので、報酬項が読む時点で最新になる。
 
-    ``track_ball`` (転がるボール用に P_kick を latch まで追従させる) と
-    ``v_thresh_target_*`` (latch 閾値を指令速度に追従させる) は :func:`kick_state` に
-    そのまま渡す。**この項が毎ステップ最初に kick_state を呼ぶ**ので、ここに渡せば
-    その step の状態全体に効く。
+    ``track_ball``、``v_thresh_target_*``、``physical_kick_detection`` とその閾値群は
+    :func:`kick_state` にそのまま渡す。**この項が毎ステップ最初に kick_state を呼ぶ**
+    ので、ここに渡せばその step の状態全体に効く。
     """
     state = kick_state(
         env,
@@ -47,6 +51,11 @@ def kick_finished(
         track_ball=track_ball,
         v_thresh_target_frac=v_thresh_target_frac,
         v_thresh_floor=v_thresh_floor,
+        physical_kick_detection=physical_kick_detection,
+        kick_detection_foot_distance_threshold=kick_detection_foot_distance_threshold,
+        kick_detection_min_foot_speed_towards_ball=kick_detection_min_foot_speed_towards_ball,
+        kick_detection_velocity_change_threshold=kick_detection_velocity_change_threshold,
+        kick_detection_warmup_steps=kick_detection_warmup_steps,
     )
 
     if not hasattr(env, "_kick_done_counter"):

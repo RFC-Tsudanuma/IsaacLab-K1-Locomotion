@@ -237,6 +237,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+    elif agent_cfg.class_name in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}:
+        from isaaclab_k1_locomotion.tasks.manager_based.walk_kick_likelihood.agents.runner import (
+            DirectKickingOnPolicyRunner,
+        )
+
+        runner = DirectKickingOnPolicyRunner(
+            env,
+            agent_cfg.to_dict(),
+            log_dir=log_dir,
+            device=agent_cfg.device,
+        )
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
     # write git state to logs
@@ -257,7 +268,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Force-load workaround: runner.load() can silently no-op for some checkpoints
         # (see PLAY_LOAD_ISSUE.md). Detect and force-load if needed.
         ckpt = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
-        ckpt_msd = ckpt["model_state_dict"]
+        if "model_state_dict" in ckpt:
+            ckpt_msd = ckpt["model_state_dict"]
+        elif agent_cfg.class_name in {
+            "DirectKickingOnPolicyRunner",
+            "WalkKickLikelihoodOnPolicyRunner",
+        } and "model" in ckpt:
+            expected_metadata = policy.checkpoint_metadata()
+            actual_metadata = ckpt.get("model_metadata")
+            if actual_metadata != expected_metadata:
+                raise ValueError(
+                    "DirectKicking checkpoint model_metadata does not match the configured policy. "
+                    f"Expected {expected_metadata}, got {actual_metadata}"
+                )
+            ckpt_msd = ckpt["model"]
+        else:
+            raise KeyError("Checkpoint does not contain model_state_dict")
         live_msd = policy.state_dict()
         mismatched = [
             k for k in ckpt_msd if k in live_msd and not torch.equal(live_msd[k].cpu(), ckpt_msd[k].cpu())
@@ -299,9 +325,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         pretrained_path = os.path.abspath(args_cli.load_pretrained)
         print(f"[INFO]: Loading pretrained weights (strict=False) from: {pretrained_path}")
         loaded = torch.load(pretrained_path, map_location=agent_cfg.device)
-        state_dict = loaded.get("model_state_dict", loaded)
 
         policy = getattr(runner.alg, 'actor_critic', None) or getattr(runner.alg, 'policy', None)
+        if (
+            agent_cfg.class_name
+            in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}
+            and isinstance(loaded, dict)
+            and "model" in loaded
+        ):
+            expected_metadata = policy.checkpoint_metadata()
+            actual_metadata = loaded.get("model_metadata")
+            if actual_metadata != expected_metadata:
+                raise ValueError(
+                    "DirectKicking checkpoint model_metadata does not match the configured policy. "
+                    f"Expected {expected_metadata}, got {actual_metadata}"
+                )
+            state_dict = loaded["model"]
+        else:
+            state_dict = loaded.get("model_state_dict", loaded)
 
         # 形の合うテンソルだけをロードする。
         # obs次元が違う転移では入力層 (actor.0.weight) と normalizer の形が合わないので

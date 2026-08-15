@@ -260,6 +260,11 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             track_ball=self.cfg.track_ball,
             v_thresh_target_frac=self.cfg.v_thresh_target_frac,
             v_thresh_floor=self.cfg.v_thresh_floor,
+            physical_kick_detection=self.cfg.physical_kick_detection,
+            kick_detection_foot_distance_threshold=self.cfg.kick_detection_foot_distance_threshold,
+            kick_detection_min_foot_speed_towards_ball=self.cfg.kick_detection_min_foot_speed_towards_ball,
+            kick_detection_velocity_change_threshold=self.cfg.kick_detection_velocity_change_threshold,
+            kick_detection_warmup_steps=self.cfg.kick_detection_warmup_steps,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -338,3 +343,21 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
     v_thresh_floor: float = 0.0
     """指令追従の閾値の切片 = 下限 [m/s]。``v_thresh_target_frac`` とセットで使う。"""
 
+    physical_kick_detection: bool = False
+    """True で足接近とボール速度変化による moving-ball 用 latch 判定を使う。
+
+    False (既定) は従来の絶対ボール速度 latch。``terminations.kick_finished`` の params にも
+    同じ値と以下の全閾値を渡すこと。
+    """
+
+    kick_detection_foot_distance_threshold: float = 0.23
+    """現在/前ステップの足―ボール 3D 距離の上限 [m]。"""
+
+    kick_detection_min_foot_speed_towards_ball: float = 0.2
+    """前ステップのボール方向へ進む足速度の下限 [m/s]。"""
+
+    kick_detection_velocity_change_threshold: float = 0.5
+    """ボール XY 速度ベクトルのステップ間変化量の下限 [m/s]。"""
+
+    kick_detection_warmup_steps: int = 5
+    """エピソード開始後に物理判定を遮断するステップ数。標準 50 Hz では 0.1 秒。"""

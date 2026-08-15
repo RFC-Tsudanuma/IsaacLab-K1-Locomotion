@@ -78,6 +78,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import copy
 import math
 import os
 import time
@@ -463,14 +464,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    elif agent_cfg.class_name in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}:
+        from isaaclab_k1_locomotion.tasks.manager_based.walk_kick_likelihood.agents.runner import (
+            DirectKickingOnPolicyRunner,
+        )
+
+        runner = DirectKickingOnPolicyRunner(
+            env,
+            agent_cfg.to_dict(),
+            log_dir=None,
+            device=agent_cfg.device,
+        )
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    if agent_cfg.class_name in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}:
+        # Inference never needs optimizer state; source checkpoints use a
+        # different optimizer/training loop even though model tensors match.
+        runner.load(resume_path, load_optimizer=False)
+    else:
+        runner.load(resume_path)
 
     # `runner.load` can silently no-op for some checkpoints, leaving the live policy at
     # initialization values. Re-load the state_dict directly into the policy as a safeguard.
     raw_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
-    ckpt_msd = raw_ckpt.get("model_state_dict", raw_ckpt) if isinstance(raw_ckpt, dict) else None
+    if isinstance(raw_ckpt, dict) and "model_state_dict" in raw_ckpt:
+        ckpt_msd = raw_ckpt["model_state_dict"]
+    elif (
+        agent_cfg.class_name
+        in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}
+        and isinstance(raw_ckpt, dict)
+        and "model" in raw_ckpt
+    ):
+        ckpt_msd = raw_ckpt["model"]
+    else:
+        ckpt_msd = raw_ckpt if isinstance(raw_ckpt, dict) else None
     if isinstance(ckpt_msd, dict):
         policy_to_load = runner.alg.policy if hasattr(runner.alg, "policy") else runner.alg.actor_critic
         target_device = next(policy_to_load.parameters()).device
@@ -502,8 +529,27 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     run_dir = os.path.dirname(resume_path)
     export_model_dir = os.path.join(run_dir, "exported")
     onnx_filename = f"{agent_cfg.experiment_name}_{os.path.basename(run_dir)}.onnx"
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
+    if agent_cfg.class_name in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}:
+        # Isaac Lab's generic ONNX helper assumes actor[0] is a Linear layer.
+        # Here the actor begins with a horizon-LSTM encoder, so export that
+        # self-contained actor with its actual 132D input contract.
+        os.makedirs(export_model_dir, exist_ok=True)
+        actor = copy.deepcopy(policy_nn.actor).cpu().eval()
+        torch.jit.script(actor).save(os.path.join(export_model_dir, "policy.pt"))
+        dummy_observation = torch.zeros(1, policy_nn.num_observations)
+        torch.onnx.export(
+            actor,
+            dummy_observation,
+            os.path.join(export_model_dir, onnx_filename),
+            export_params=True,
+            opset_version=18,
+            input_names=["obs"],
+            output_names=["actions"],
+            dynamic_axes={},
+        )
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
     print(f"[INFO]: Exported policy to: {os.path.join(export_model_dir, onnx_filename)}")
 
     dt = env.unwrapped.step_dt

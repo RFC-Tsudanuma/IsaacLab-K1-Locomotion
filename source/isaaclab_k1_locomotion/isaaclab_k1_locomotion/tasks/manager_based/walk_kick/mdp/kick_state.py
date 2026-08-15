@@ -7,8 +7,9 @@
 
 値 latch (凍結) と状態 latch (フラグ) を厳密に分けて保持する。
 
-* 値 latch: トリガー L (``v_ball > v_thresh``) の発火時に τ_direction / v_ball / v_ball_3d /
-  φ (仰角) / p_style を **同時に**スナップショットして固定する。以降はその凍結値で dense に払う。
+* 値 latch: トリガー L (既定は ``v_ball > v_thresh``、opt-in では足とボールの物理的な
+  速度変化) の発火時に τ_direction / v_ball / v_ball_3d / φ (仰角) / p_style を
+  **同時に**スナップショットして固定する。以降はその凍結値で dense に払う。
 * 状態 latch: ``kick_done`` (L 発火) と ``overshoot_fired`` (後方レイ R の左右跨ぎ)。
   いずれもエピソード内で一度立ったら解除しない。
 
@@ -86,6 +87,11 @@ def kick_state(
     track_ball: bool = False,
     v_thresh_target_frac: float = 0.0,
     v_thresh_floor: float = 0.0,
+    physical_kick_detection: bool = False,
+    kick_detection_foot_distance_threshold: float = 0.23,
+    kick_detection_min_foot_speed_towards_ball: float = 0.2,
+    kick_detection_velocity_change_threshold: float = 0.5,
+    kick_detection_warmup_steps: int = 5,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
@@ -140,11 +146,27 @@ def kick_state(
                   :func:`..terminations.kick_finished` (と、同じ値を持つ
                   :class:`..commands.BallFollowVelocityCommandCfg`) にだけ渡せばよい。
 
-    NOTE: ``v_thresh_target_frac`` / ``v_thresh_floor`` も ``track_ball`` と
-          まったく同じ扱い。トリガー判定を行うのは kick_state 自身だけで、報酬項は
-          結果 (``kick_done`` と凍結値) を読むだけなので、報酬項の signature を
-          増やす必要はない。``kick_finished`` と ``base_velocity`` の 2 か所に
-          **同じ値**を配ること。
+        physical_kick_detection: True のとき、絶対ボール速度ではなく、足がボールへ向かう
+            接触候補とボール XY 速度ベクトルのステップ間変化の両方で latch する。
+            初速を持つボールが触れていないのに latch するのを防ぐ moving-ball 用 opt-in。
+            False (既定) は従来の ``v_ball > v_thresh`` を一切変更しない。
+
+        kick_detection_foot_distance_threshold: 現在または前ステップの足―ボール 3D 距離の
+            小さい方に対する接触候補の上限 [m]。
+
+        kick_detection_min_foot_speed_towards_ball: 前ステップの足からボールへの方向へ進む
+            足速度の下限 [m/s]。
+
+        kick_detection_velocity_change_threshold: ボール XY 速度ベクトルのステップ間変化量の
+            下限 [m/s]。
+
+        kick_detection_warmup_steps: エピソード開始後に物理判定を遮断するステップ数。
+            既定 5 は標準の 50 Hz 制御で 0.1 秒。
+
+    NOTE: すべてのトリガー設定は ``track_ball`` とまったく同じ扱い。トリガー判定を
+          行うのは kick_state 自身だけで、報酬項は結果 (``kick_done`` と凍結値) を
+          読むだけなので、報酬項の signature を増やす必要はない。``kick_finished`` と
+          ``base_velocity`` の 2 か所に **同じ値**を配ること。
     """
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
@@ -155,7 +177,8 @@ def kick_state(
     ball = env.scene[ball_name]
     device = env.device
 
-    ball_pos = ball.data.root_pos_w[:, :2]
+    ball_pos_3d = ball.data.root_pos_w[:, :3]
+    ball_pos = ball_pos_3d[:, :2]
     ball_vel = ball.data.root_lin_vel_w[:, :2]
     ball_vel_z = ball.data.root_lin_vel_w[:, 2]
     ball_z = ball.data.root_pos_w[:, 2]
@@ -196,6 +219,9 @@ def kick_state(
             "p_style_frozen": torch.zeros(env.num_envs, device=device),
             "apex_height": torch.zeros(env.num_envs, device=device),
             "prev_v_ball": torch.zeros(env.num_envs, device=device),
+            "prev_ball_pos_w": torch.zeros(env.num_envs, 3, device=device),
+            "prev_ball_vel_xy": torch.zeros(env.num_envs, 2, device=device),
+            "prev_foot_pos_w": torch.zeros(env.num_envs, 2, 3, device=device),
             "touch_count": torch.zeros(env.num_envs, device=device),
             "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
@@ -303,11 +329,45 @@ def kick_state(
     # 静止配置のタスクでも保険として効く)。
     # ------------------------------------------------------------------ #
     dv = v_ball - state["prev_v_ball"]
-    touched = (dv > _TOUCH_DV_THRESH) & (state["touch_refractory"] == 0) & (~just_reset)
+    speed_touch_candidate = (
+        (dv > _TOUCH_DV_THRESH) & (state["touch_refractory"] == 0) & (~just_reset)
+    )
 
     # 足リンクの位置。d_sole_to_ball と接触時足高さの両方で使う。
     foot_ids = _foot_body_ids(env, robot)
     foot_pos = robot.data.body_pos_w[:, foot_ids, :]  # (N, 2, 3)
+
+    # reset 行はその時点の状態を履歴の基準にする。全 env を一括初期化せず、
+    # episode_length_buf == 1 の行だけを更新するので partial reset と干渉しない。
+    if just_reset.any():
+        state["prev_ball_pos_w"][just_reset] = ball_pos_3d[just_reset]
+        state["prev_ball_vel_xy"][just_reset] = ball_vel[just_reset]
+        state["prev_foot_pos_w"][just_reset] = foot_pos[just_reset]
+
+    if physical_kick_detection:
+        per_foot_candidate = _physical_kick_candidates(
+            foot_pos,
+            state["prev_foot_pos_w"],
+            ball_pos_3d,
+            state["prev_ball_pos_w"],
+            float(env.step_dt),
+            kick_detection_foot_distance_threshold,
+            kick_detection_min_foot_speed_towards_ball,
+        )
+        ball_velocity_change = (ball_vel - state["prev_ball_vel_xy"]).norm(dim=-1)
+        warmup_finished = env.episode_length_buf >= kick_detection_warmup_steps
+        physical_trigger = (
+            per_foot_candidate.any(dim=-1)
+            & (ball_velocity_change >= kick_detection_velocity_change_threshold)
+            & warmup_finished
+            & (~just_reset)
+            & (~state["kick_done"])
+        )
+        touched = speed_touch_candidate | physical_trigger
+    else:
+        per_foot_candidate = None
+        physical_trigger = None
+        touched = speed_touch_candidate
 
     # ------------------------------------------------------------------ #
     # 接触瞬間の足裏高さ [m]。射出仰角を決めている唯一の量なので、真値で記録する。
@@ -320,8 +380,20 @@ def kick_state(
     #       キック本体の足高さを測れない (φ=27° なのに 7.4cm という矛盾した値になった)。
     #       latch を起こした接触 = キック本体なので、そのときの値を採る。
     # ------------------------------------------------------------------ #
-    d_foot_to_ball = (foot_pos - ball.data.root_pos_w[:, :3].unsqueeze(1)).norm(dim=-1)  # (N, 2)
+    d_foot_to_ball = (foot_pos - ball_pos_3d.unsqueeze(1)).norm(dim=-1)  # (N, 2)
     kicking_foot = d_foot_to_ball.argmin(dim=1)  # (N,)
+    if per_foot_candidate is not None:
+        previous_distance = (
+            state["prev_foot_pos_w"] - state["prev_ball_pos_w"].unsqueeze(1)
+        ).norm(dim=-1)
+        candidate_distance = torch.minimum(d_foot_to_ball, previous_distance)
+        masked_distance = torch.where(
+            per_foot_candidate,
+            candidate_distance,
+            torch.full_like(candidate_distance, torch.inf),
+        )
+        candidate_foot = masked_distance.argmin(dim=1)
+        kicking_foot = torch.where(per_foot_candidate.any(dim=-1), candidate_foot, kicking_foot)
     sole_z = foot_pos[torch.arange(env.num_envs, device=device), kicking_foot, 2] - _SOLE_OFFSET
 
     state["sole_height_last_touch"] = torch.where(
@@ -372,7 +444,11 @@ def kick_state(
         v_thr = v_thresh
     state["v_thresh_eff"] = v_thr if torch.is_tensor(v_thr) else torch.full_like(v_ball, v_thr)
 
-    trigger = (v_ball > v_thr) & (~state["kick_done"])
+    if physical_kick_detection:
+        trigger = physical_trigger
+    else:
+        # 既定/static 経路は従来の式をそのまま維持する。
+        trigger = (v_ball > v_thr) & (~state["kick_done"])
 
     if trigger.any():
         # τ_direction: ボールの飛翔方向と蹴り方向の角度誤差 [rad]
@@ -460,7 +536,42 @@ def kick_state(
     state["p_style"] = p_style
     state["d_to_P_kick"] = (robot_pos - state["P_kick"]).norm(dim=-1)
 
+    # 次ステップの物理判定用履歴。reset 行を含め、現在値で環境ごとに更新する。
+    state["prev_ball_pos_w"].copy_(ball_pos_3d)
+    state["prev_ball_vel_xy"].copy_(ball_vel)
+    state["prev_foot_pos_w"].copy_(foot_pos)
+
     return state
+
+
+def _physical_kick_candidates(
+    current_feet_pos: torch.Tensor,
+    previous_feet_pos: torch.Tensor,
+    current_ball_pos: torch.Tensor,
+    previous_ball_pos: torch.Tensor,
+    dt: float,
+    max_foot_ball_distance: float,
+    min_foot_speed_towards_ball: float,
+) -> torch.Tensor:
+    """足ごとの接触候補を source 3af2acc と同じテンソル式で返す。"""
+
+    current_ball_pos = current_ball_pos.unsqueeze(1)
+    previous_ball_pos = previous_ball_pos.unsqueeze(1)
+
+    current_distance = (current_feet_pos - current_ball_pos).norm(dim=-1)
+    previous_distance = (previous_feet_pos - previous_ball_pos).norm(dim=-1)
+    foot_ball_distance = torch.minimum(current_distance, previous_distance)
+
+    previous_foot_to_ball = previous_ball_pos - previous_feet_pos
+    previous_foot_to_ball_direction = previous_foot_to_ball / (
+        previous_foot_to_ball.norm(dim=-1, keepdim=True) + 1.0e-6
+    )
+    foot_velocity = (current_feet_pos - previous_feet_pos) / dt
+    foot_speed_towards_ball = (foot_velocity * previous_foot_to_ball_direction).sum(dim=-1)
+
+    return (foot_ball_distance <= max_foot_ball_distance) & (
+        foot_speed_towards_ball >= min_foot_speed_towards_ball
+    )
 
 
 _FOOT_IDS_ATTR = "_kick_foot_body_ids"
