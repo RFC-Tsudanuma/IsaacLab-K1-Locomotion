@@ -46,6 +46,18 @@ parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
 parser.add_argument(
+    "--cmd",
+    type=float,
+    nargs=3,
+    default=None,
+    metavar=("VX", "VY", "WZ"),
+    help=(
+        "Fix the base_velocity command to (vx, vy, wz) every step instead of letting it resample "
+        "randomly. Use this to inspect one motion in isolation, e.g. '--cmd 0 1.5 0' for pure "
+        "lateral. Ignored when --viser is set (the GUI sliders take over)."
+    ),
+)
+parser.add_argument(
     "--override_json",
     type=str,
     default=None,
@@ -156,7 +168,8 @@ def setup_viser(env, urdf_path: str, port: int):
     # GUI for velocity command override
     with server.gui.add_folder("Velocity Command"):
         gui_vx = server.gui.add_slider("lin_vel_x [m/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
-        gui_vy = server.gui.add_slider("lin_vel_y [m/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
+        # gk_direct (横移動特化) は vy ±1.5 まで学習しているので、そこまで振れるようにする。
+        gui_vy = server.gui.add_slider("lin_vel_y [m/s]", min=-1.5, max=1.5, step=0.05, initial_value=0.0)
         gui_wz = server.gui.add_slider("ang_vel_z [rad/s]", min=-1.0, max=1.0, step=0.05, initial_value=0.0)
         gui_reset = server.gui.add_button("Reset to 0")
 
@@ -172,11 +185,11 @@ def setup_viser(env, urdf_path: str, port: int):
     return server, base_frame, viser_urdf, joint_indices, gui
 
 
-def override_command_from_viser(env, gui):
-    """Overwrite the ``base_velocity`` command tensor with viser GUI values.
+def set_fixed_command(env, vx: float, vy: float, wz: float):
+    """Overwrite the ``base_velocity`` command tensor with a fixed (vx, vy, wz).
 
     Also disables the heading-based ang_vel_z recomputation and the standing-env
-    zeroing so the GUI values survive the next ``_update_command`` call.
+    zeroing so the value survives the next ``_update_command`` call.
     """
     cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
     ref = getattr(cmd_term, "vel_command_b", None)
@@ -186,10 +199,7 @@ def override_command_from_viser(env, gui):
         return
     device = ref.device
     num_envs = ref.shape[0]
-    fixed = torch.tensor(
-        [[float(gui["vx"].value), float(gui["vy"].value), float(gui["wz"].value)]],
-        device=device,
-    ).repeat(num_envs, 1)
+    fixed = torch.tensor([[float(vx), float(vy), float(wz)]], device=device).repeat(num_envs, 1)
 
     if hasattr(cmd_term, "vel_command_b"):
         cmd_term.vel_command_b[:] = fixed
@@ -199,6 +209,11 @@ def override_command_from_viser(env, gui):
     # Disable standing-env zeroing of the whole command vector.
     if hasattr(cmd_term, "is_standing_env"):
         cmd_term.is_standing_env[:] = False
+
+
+def override_command_from_viser(env, gui):
+    """Overwrite the ``base_velocity`` command tensor with viser GUI values."""
+    set_fixed_command(env, gui["vx"].value, gui["vy"].value, gui["wz"].value)
 
 
 def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
@@ -261,6 +276,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
+
+    # --cmd で速度指令を固定するときは、コマンド項の再サンプル・停止 env・heading 制御を
+    # **環境生成前に**止めておく。tensor を上書きするだけでは resampling_time_range ごとに
+    # ランダムな指令へ戻されてしまう。
+    # ★ さらに再サンプルは「停止 env の抽選」もやり直すので、rel_standing_envs > 0 の
+    #   タスク (例: Isaac-GKLateral-K1-v0 は 0.15) では num_envs=1 でもその確率で
+    #   勝手に止まる。固定指令の観察にはどちらも邪魔なので両方切る。
+    if args_cli.cmd is not None and hasattr(env_cfg, "commands"):
+        _vc = getattr(env_cfg.commands, "base_velocity", None)
+        if _vc is not None:
+            _vc.heading_command = False
+            _vc.rel_standing_envs = 0.0
+            _vc.resampling_time_range = (1.0e9, 1.0e9)
+            print(f"[INFO] --cmd {tuple(args_cli.cmd)}: 再サンプル/停止env/heading制御を無効化しました。")
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -348,6 +377,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # reset environment
     obs = env.get_observations()
+    # --cmd の固定値を最初の推論より前に流し込む (リセット時の再サンプル分を上書きする)。
+    if args_cli.cmd is not None:
+        with torch.inference_mode():
+            set_fixed_command(env, *args_cli.cmd)
+        obs = env.get_observations()
     timestep = 0
     # manual frame buffer for robust video recording
     _manual_frames = [] if args_cli.video else None
@@ -362,6 +396,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     override_command_from_viser(env, viser_state[4])
                 except Exception as e:
                     print(f"[WARNING] Viser command override failed: {e}")
+            elif args_cli.cmd is not None:
+                # エピソードのリセット時にはコマンドが再サンプルされるので毎ステップ入れ直す。
+                set_fixed_command(env, *args_cli.cmd)
             # agent stepping
             actions = policy(obs)
             # env stepping

@@ -48,7 +48,13 @@ def modify_push_robot(
     イベント関数に渡されるので、こちらも cfg.params を上書きすれば次回呼び出しで反映される。
     """
     if env.common_step_counter > num_steps:
-        term_cfg = env.event_manager.get_term_cfg(term_name)
+        # PLAY / eval 用の cfg は push_robot を無効化 (None) しているので term が存在しない。
+        # 学習では必ず存在するので、ここで no-op にしても学習側の挙動は変わらない。
+        # (無効化しないと eval が 6000 ステップ地点で ValueError で落ちる。)
+        try:
+            term_cfg = env.event_manager.get_term_cfg(term_name)
+        except ValueError:
+            return
         if interval_range_s is not None:
             term_cfg.interval_range_s = interval_range_s
         if velocity_range is not None:

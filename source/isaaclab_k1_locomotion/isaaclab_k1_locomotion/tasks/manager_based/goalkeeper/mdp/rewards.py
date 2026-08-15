@@ -637,3 +637,60 @@ def foot_clearance_relative(
     swing_left = (~stance_left).float()
     swing_right = (~stance_right).float()
     return rew_left * swing_left + rew_right * swing_right
+
+
+def onset_reach_bonus(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    reach_frac: float = 0.9,
+    min_cmd: float = 0.6,
+    onset_s: float = 0.8,
+    change_tol: float = 0.4,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """指令速度の ``reach_frac`` 倍に**初めて到達した瞬間**、早いほど大きい一回限りの報酬。
+
+    なぜ線形の :func:`onset_speed_bonus` では足りなかったか (2026-08-15 の実測):
+        1 本目 (11200 iter) の t90 は指令 1.3 で 0.719s と、07-28 の 0.565s より遅かった。
+        立ち上がりの内訳を見ると t50 = 0.28s (ほぼ 1 歩) は速く、**残り 40% に丸 1 歩ぶん
+        余計にかかる**。線形報酬は「速度が上がるほど得」なので序盤 (誤差が大きい領域) に
+        勾配が集中し、定常の 90% 付近では傾きがほぼ無い。つまり **一番遅い「最後の詰め」に
+        圧がかかっていなかった**。
+
+    本項は t90 そのものを目的関数にする:
+        到達時刻 t で ``1 - t / onset_s`` を一回だけ払う (早いほど大)。窓を過ぎたら 0。
+        1 コマンドにつき 1 回だけなので「到達後に速度を維持する」動機は既存の追従報酬に任せ、
+        こちらは純粋に **到達までの時間** だけを最適化する。
+
+    ★ 歩行位相は 1.6Hz 固定 (ユーザー指定の制約) なので、1 歩 = 0.31s の量子化から逃げられない。
+      本項で縮められるのは「1 歩あたりの押しの強さ」であって歩数そのものではない。
+      0.4s 台に届かない場合、残る手は位相周波数を上げることだけになる。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    from .events import update_lateral_buffers
+
+    bufs = update_lateral_buffers(env, command_name=command_name, change_tol=change_tol)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+
+    cmd_xy = cmd[:, :2]
+    cmd_norm = torch.norm(cmd_xy, dim=1)
+    direction = cmd_xy / cmd_norm.clamp(min=1e-6).unsqueeze(1)
+    toward = (vel_b[:, :2] * direction).sum(dim=1)
+
+    onset_steps = max(1, int(onset_s / env.step_dt))
+    elapsed = bufs["since_change"]
+    in_window = (elapsed >= 0) & (elapsed < onset_steps)
+    newly = (
+        in_window
+        & (~bufs["reach_paid"])
+        & (cmd_norm > min_cmd)
+        & (toward >= reach_frac * cmd_norm)
+    )
+    bufs["reach_paid"] |= newly
+
+    speed_ratio = 1.0 - elapsed.float() / float(onset_steps)
+    return newly.float() * speed_ratio.clamp(min=0.0)

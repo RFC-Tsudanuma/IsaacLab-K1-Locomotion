@@ -52,9 +52,11 @@ from ..locomotion.rough_env_cfg import (
 from .goalkeeper_direct_env_cfg import LATERAL_TARGET_SPEED, K1GKDirectStage1EnvCfg
 from .mdp.events import reset_lateral_buffers
 from .mdp.rewards import (
+    flight_phase,
     foot_clearance_relative,
     heading_hold,
     onset_action_rate_l2,
+    onset_reach_bonus,
     onset_speed_bonus,
     track_lin_vel_x_exp,
 )
@@ -65,10 +67,13 @@ ONSET_WINDOW_S: float = 0.8
 # 「コマンドが変わった」とみなす線速度指令の変化量 [m/s]。
 ONSET_CHANGE_TOL: float = 0.4
 # 遊脚の目標持ち上げ量 [m] (**絶対高さではない**)。接地時の足リンク原点は地面から
-# 0.035m なので、絶対高さ表記なら 0.105m。07-28 は絶対 0.095 (= 持ち上げ 6cm) で
-# 実測 4cm 台だった。σ=0.03 のガウスは誤差 2.1cm 付近で勾配が最大になるので、
-# 現在地 4cm からの引き上げ圧が最も強くなる位置に置いている。
-TARGET_FOOT_LIFT: float = 0.07
+# 0.035m なので、絶対高さ表記なら 0.095m。
+# ★ 2026-08-15: 0.07 → 0.06 に引き下げ。1 本目 (11200 iter) は実測 7.6cm と要件 5cm を
+#   大きく超えた一方、**その要求が歩容を跳躍に変え、立ち上がり (0.565→0.719s) と
+#   横速度 (1.278→1.151) を同時に壊した**。足上げは優先度 3 位なので、1 位の立ち上がりと
+#   「速度を落とさない」制約を優先して要求を下げる。07-28 と同じ 6cm 相当だが、
+#   測り方 (支持脚基準) と位相 (get_phase_freq 追従) を直してあるぶん実測値は上に出るはず。
+TARGET_FOOT_LIFT: float = 0.06
 
 
 @configclass
@@ -119,6 +124,21 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
                 "change_tol": ONSET_CHANGE_TOL,
             },
         )
+        # ★ 2026-08-15 追加。上の線形報酬だけでは **立ち上がりが 07-28 より遅くなった**
+        #   (t90 @cmd1.3 = 0.565s → 0.719s)。線形は序盤に勾配が集中し、定常の 90% 付近
+        #   (= 一番時間を食っている「最後の詰め」) にほとんど圧がかからないため。
+        #   本項は到達時刻そのものを目的関数にする (早く届くほど大きい一回限りの報酬)。
+        self.rewards.onset_reach = RewTerm(
+            func=onset_reach_bonus,
+            weight=8.0,
+            params={
+                "command_name": "base_velocity",
+                "reach_frac": 0.9,
+                "min_cmd": 0.6,
+                "onset_s": ONSET_WINDOW_S,
+                "change_tol": ONSET_CHANGE_TOL,
+            },
+        )
         # 過渡だけ平滑ペナルティを緩める。定常区間の倍率は 07-28 と同一。
         # ★ 実機で動きがガタついたら最初にここを onset_scale=1.0 に戻す。
         self.rewards.action_rate_l2 = RewTerm(
@@ -146,11 +166,12 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
                 "change_tol": ONSET_CHANGE_TOL,
             },
         )
-        # 角速度追従の重みは 07-28 の 5.0 から戻す。5.0 はドリフト対策で上げた値だが、
-        # ドリフトは heading_hold が直接見るのでここまで要らない。2026-07-29 に 7.0 を
-        # 試して横速度が 1.182 → 0.628 に落ちた実績があり、この項は上げすぎると
-        # 横移動を殺す。★ 逆に wz の追従が悪化したらここを 5.0 に戻す。
-        self.rewards.track_ang_vel_z_exp.weight = 3.5
+        # ★ 2026-08-15: 3.5 に下げたのは失敗。heading_hold が肩代わりする想定だったが、
+        #   1 本目の実測で yaw ドリフトは平均 13.3 → 17.1°/s と **悪化**した。
+        #   07-28 と同じ 5.0 に戻し、heading_hold と併用する
+        #   (角速度追従 = 指令への即応、heading_hold = 溜まったズレ、で役割が違う)。
+        #   ※ 7.0 まで上げるのは 2026-07-29 に失敗済み (横速度 1.182 → 0.628)。
+        self.rewards.track_ang_vel_z_exp.weight = 5.0
 
         # ------------------------------------------------------------------
         # 4. 足上げ
@@ -167,11 +188,23 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
                 "cmd_threshold": _COMMAND_THRESHOLD,
             },
         )
-        # 跳躍の抜け道が測り方で塞がったので、上下動ペナルティを緩める。
-        # 07-28 の -2.5 は「絶対高さ報酬を跳躍で稼ぐ」のを間接的に潰すための値で、
-        # 副作用として着地の衝撃吸収と加速時の重心の上下動まで削っていた。
-        # ★ 目視で跳ぶようなら -2.5 に戻す (Episode_Reward/lin_vel_z_l2 を監視)。
-        self.rewards.lin_vel_z_l2.weight = -1.5
+        # ★ 2026-08-15 (1 本目の実測で修正): -1.5 に緩めたが **跳躍が出た** ので
+        #   07-28 と同じ -2.5 に戻す。
+        #   緩めた根拠は「支持脚基準にしたので跳んでも値が増えない」だったが、これは誤り。
+        #   塞げるのは「両足が同じだけ上がる (体ごと持ち上げ)」だけで、**空中で片脚を畳んで
+        #   もう片脚を垂らせば相対高さは稼げる**。接地の拘束が無いぶん空中の方が楽なので、
+        #   抜け道は狭まっただけで塞がっていなかった。
+        self.rewards.lin_vel_z_l2.weight = -2.5
+        # 両足同時浮き = 跳躍そのものを直接罰する。lin_vel_z_l2 は上下動全般を罰するので
+        # 強めると歩行に必要な重心の上下動や着地の衝撃吸収まで巻き添えにするが、本項は
+        # 「両足浮き」だけを見るので **片脚を高く上げること自体は無罰**。
+        # ★ 2026-07-29 に絶対高さ版 + 位相ズレ状態で -2.0 を試したときは、跳躍は完全に
+        #   止まった代わりに足上げが 2.6〜3.3cm まで落ちた。今回は測り方 (支持脚基準) と
+        #   位相 (get_phase_freq 追従) を直してあるので同じ結果になるとは限らないが、
+        #   **足上げが 07-28 の 4cm 台を割ったら真っ先にここを疑うこと**。
+        #   その場合の次の一手は本項を下げるのではなく、足上げを縛っている
+        #   ankle_deviation / joint_deviation_hip を緩める方向。
+        self.rewards.flight_phase = RewTerm(func=flight_phase, weight=-2.0)
 
         # ------------------------------------------------------------------
         # 5. 後退ドリフト (優先度低)

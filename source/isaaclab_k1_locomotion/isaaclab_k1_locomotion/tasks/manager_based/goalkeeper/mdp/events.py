@@ -598,6 +598,9 @@ def lateral_buffers(env: "ManagerBasedEnv") -> dict:
             "cmd_prev": torch.zeros(n, 3, device=dev),
             "since_change": torch.full((n,), -1, dtype=torch.long, device=dev),
             "ref_yaw": torch.zeros(n, device=dev),
+            # 今のコマンドで「指令速度の所定割合に到達した」ボーナスを払い済みか
+            # (:func:`~.rewards.onset_reach_bonus` が 1 コマンドにつき 1 回だけ払うため)
+            "reach_paid": torch.zeros(n, dtype=torch.bool, device=dev),
             "last_step": -1,
         }
         setattr(env, _LATERAL_ATTR, bufs)
@@ -638,6 +641,7 @@ def update_lateral_buffers(
 
     bufs["since_change"] += 1
     bufs["since_change"][resync] = 0
+    bufs["reach_paid"][resync] = False
 
     # 基準ヘディングは指令角速度を積分する (wz=0 なら「向きを保て」と同義)。
     bufs["ref_yaw"] = wrap_to_pi(bufs["ref_yaw"] + cmd[:, 2] * dt)
@@ -658,3 +662,4 @@ def reset_lateral_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["since_change"][env_ids] = -1
     bufs["ref_yaw"][env_ids] = 0.0
     bufs["cmd_prev"][env_ids] = 0.0
+    bufs["reach_paid"][env_ids] = False

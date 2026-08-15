@@ -66,6 +66,16 @@ parser.add_argument(
     help="Gait frequency [Hz] used to window the foot-height measurement.",
 )
 parser.add_argument(
+    "--onset_reps", type=int, default=3,
+    help="Number of stand-still -> full-command step responses per command (0 disables).",
+)
+parser.add_argument("--onset_pre_s", type=float, default=0.6, help="Stand-still duration before the step [s].")
+parser.add_argument("--onset_max_s", type=float, default=2.0, help="Trace length after the step [s].")
+parser.add_argument(
+    "--onset_frac", type=float, default=0.9,
+    help="Fraction of the steady speed used as the rise-time threshold (0.9 = t90).",
+)
+parser.add_argument(
     "--cmd_clip", type=float, nargs=2, default=[1.0, 1.5], metavar=("VX", "VY"),
     help="Per-axis command clip (gk_direct Stage1 range: vx +/-1.0, vy +/-1.5). Must be >= cmd_list values.",
 )
@@ -180,6 +190,44 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             continue
         axis_x, axis_y = eff_vx / norm, eff_vy / norm  # yaw=0 前提の進行方向 (world)
 
+        # --- 立ち上がり (加速) の計測 ---
+        # 静止 → 指令全開のステップ応答を撮り、定常速度の onset_frac (既定 90%) に
+        # 達するまでの時間を測る。セーブに必要な横移動 0.3〜0.8m はまるごと加速区間に
+        # 入るので、**定常速度より立ち上がりの方がセーブ率に効く**。
+        # 定常速度はこの後の往復計測で求めるので、ここでは軌跡だけ貯めておく。
+        onset_traces = []
+        if args_cli.onset_reps > 0:
+            pre_steps = max(1, int(args_cli.onset_pre_s / dt))
+            trace_steps = max(1, int(args_cli.onset_max_s / dt))
+            ones = torch.ones(n, device=device)
+            for _rep in range(int(args_cli.onset_reps)):
+                teleport_to_start()
+                # 静止させる (コマンド 0)。歩容も stop 判定に入って足踏みが止まる。
+                for _ in range(pre_steps):
+                    with torch.inference_mode():
+                        set_command(0.0, 0.0, ones)
+                        action = policy(obs)
+                        obs, _, _, _ = inner_env.step(action)
+                        set_command(0.0, 0.0, ones)
+                # ここでコマンドを全開に立ち上げる
+                trace = torch.zeros(trace_steps, n, device=device)
+                bad = torch.zeros(n, dtype=torch.bool, device=device)
+                for k in range(trace_steps):
+                    with torch.inference_mode():
+                        set_command(eff_vx, eff_vy, ones)
+                        action = policy(obs)
+                        obs, _, dones, _ = inner_env.step(action)
+                        set_command(eff_vx, eff_vy, ones)
+                    # コマンドと同じ意味論 (base の yaw frame) で速度を測り、指令方向へ射影する
+                    v_w = robot.data.root_lin_vel_w[:, :2]
+                    h = robot.data.heading_w
+                    v_fwd = v_w[:, 0] * torch.cos(h) + v_w[:, 1] * torch.sin(h)
+                    v_lat = -v_w[:, 0] * torch.sin(h) + v_w[:, 1] * torch.cos(h)
+                    trace[k] = v_fwd * axis_x + v_lat * axis_y
+                    if dones is not None:
+                        bad |= dones.to(device=device, dtype=torch.bool).flatten()
+                onset_traces.append((trace.cpu(), (~bad).cpu()))
+
         teleport_to_start()
         anchor = (robot.data.root_pos_w[:, :2] - raw_env.scene.env_origins[:, :2]).clone()
         direction = torch.ones(n, device=device)
@@ -275,6 +323,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         results.append({
             "cmd": (vx_cmd, vy_cmd),
             "sent": (eff_vx, eff_vy),
+            "axis": (axis_x, axis_y),
+            "onset": onset_traces,
             "fwd": float((fwd_sum / denom).item()),
             "lat": float((lat_sum / denom).item()),
             "head_drift": float((head_drift_sum / denom).item()) * 180.0 / math.pi,
@@ -306,6 +356,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             f"{r['cmd'][0]:6.2f},{r['cmd'][1]:5.2f} {r['fwd']:7.3f} {r['lat']:7.3f} {speed:7.3f} "
             f"{r['head_drift']:9.1f}° {r['n']:5d} {r['resets']:6d}"
         )
+
+    if any(r["onset"] for r in results):
+        frac = float(args_cli.onset_frac)
+
+        def _rise_time(res: dict, level: float) -> tuple[float, float]:
+            """定常速度の ``level`` 倍に達するまでの平均時間 [s] と到達率を返す。"""
+            steady = res["fwd"] * res["axis"][0] + res["lat"] * res["axis"][1]
+            if steady <= 1e-6:
+                return float("nan"), 0.0
+            hits, total, times = 0, 0, 0.0
+            for trace, valid in res["onset"]:
+                reached = trace >= level * steady          # (steps, env)
+                ok = reached.any(dim=0) & valid
+                idx = reached.float().argmax(dim=0)        # 最初に超えたステップ
+                total += int(valid.sum().item())
+                hits += int(ok.sum().item())
+                if bool(ok.any()):
+                    times += float(((idx[ok] + 1).float() * dt).sum().item())
+            if hits == 0:
+                return float("nan"), 0.0
+            return times / hits, hits / max(total, 1)
+
+        print("\n--- 立ち上がり (静止 → 指令全開のステップ応答) ---")
+        print(f"{'cmd(vx,vy)':>13} {'定常':>8} {'t50':>8} {f't{int(frac*100)}':>8} {'到達率':>8}")
+        for r in results:
+            if not r["onset"]:
+                continue
+            steady = r["fwd"] * r["axis"][0] + r["lat"] * r["axis"][1]
+            t50, _ = _rise_time(r, 0.5)
+            t_hi, rate = _rise_time(r, frac)
+            print(f"{r['cmd'][0]:6.2f},{r['cmd'][1]:5.2f} {steady:7.3f}m/s {t50:7.3f}s {t_hi:7.3f}s "
+                  f"{rate * 100:7.1f}%")
+        print(f"  定常 = 往復計測で得た速度を指令方向へ射影した値。t50/t{int(frac * 100)} は"
+              f"その {50}% / {int(frac * 100)}% に達するまでの時間。")
+        print(f"  試行数 = 指令あたり {args_cli.onset_reps} 回 × {args_cli.num_envs} env。"
+              "到達率は転倒した env を除いた到達割合 (低いと計測窓 --onset_max_s が短い)。")
+        print("  ★ 最重要指標。07-28 は約 0.6s。目標は 0.4s 台。")
 
     print("\n--- 足の持ち上げ高さ (1 歩ごとのピーク) ---")
     print(f"{'cmd(vx,vy)':>13} {'左平均':>9} {'右平均':>9}")
