@@ -694,3 +694,114 @@ def onset_reach_bonus(
 
     speed_ratio = 1.0 - elapsed.float() / float(onset_steps)
     return newly.float() * speed_ratio.clamp(min=0.0)
+
+
+def _sole_min_z(asset: Articulation, body_idx: int, corners: torch.Tensor) -> torch.Tensor:
+    """足裏 4 隅のうち **最も低い点** のワールド z を返す (N,)。"""
+    from isaaclab.utils.math import quat_apply
+
+    n = asset.data.body_pos_w.shape[0]
+    pos = asset.data.body_pos_w[:, body_idx, :]           # (N, 3)
+    quat = asset.data.body_quat_w[:, body_idx, :]         # (N, 4) wxyz
+    q = quat.unsqueeze(1).expand(n, 4, 4).reshape(-1, 4)
+    c = corners.unsqueeze(0).expand(n, 4, 3).reshape(-1, 3)
+    world_z = (quat_apply(q, c).reshape(n, 4, 3) + pos.unsqueeze(1))[:, :, 2]
+    return world_z.min(dim=1).values
+
+
+def foot_clearance_sole(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    target_clearance: float = 0.03,
+    phase_freq: float = 1.6,
+    stance_ratio: float = 0.5,
+    cmd_threshold: float = 0.05,
+    sigma: float = 0.02,
+    foot_box: tuple[float, float, float, float] = (0.1195, -0.0659, 0.040, -0.0382),
+    speed_gate_frac: float = 0.9,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遊脚の **足裏最下点** のクリアランスを目標に追従させる報酬 [0, 1]。
+
+    :func:`foot_clearance_relative` (足リンク原点で測る版) の後継。2026-08-15 の実測で、
+    **上げた高さの 40〜70% が足の傾きで失われている** ことが分かったのが理由:
+
+        | | 原点 lift | 足裏最下点 p50 | p05 |
+        |---|---|---|---|
+        | 07-28 @cmd1.3 | 3.2〜3.9cm | 1.9〜2.3cm | **0.7cm** |
+        | 2 本目 @cmd1.3 | 6.6〜7.3cm | 3.4〜4.7cm | 1.6〜2.2cm |
+
+    足長は 0.185m あるので、遊脚が 12° 底屈しているだけでつま先は 2.5cm 下がる。
+    つまずくのはつま先なので、**原点の高さを目標にするのは指標として間違っていた**。
+
+    測定点を足裏にすると、ポリシーは同じ報酬を 2 通りの手段で達成できる:
+
+        1. 脚を高く上げる … 長く浮く必要があり、刻めなくなって横速度が落ちる (高コスト)
+        2. 遊脚の足首を水平に保つ … 空中の足首は地面反力に関与しないので速度に無影響 (低コスト)
+
+    最適化は安い方を選ぶので、**「控えめな足上げ + 水平な足」** に収束することを狙う。
+    2 本目は原点基準 6.6〜7.3cm を要求した結果、横速度が 1.278 → 0.710 m/s と半減した。
+    本項の目標 3cm は 07-28 の脚上げ量 (3.2〜3.9cm) より低いので、速度を削る圧にならない。
+
+    跳躍の抜け道は :func:`foot_clearance_relative` と同じく **支持脚基準** (遊脚の足裏 −
+    支持脚の足裏) で塞ぐ。位相も同じく ``get_phase_freq`` 経由で DR に追従する。
+
+    Args:
+        target_clearance: 足裏最下点の目標クリアランス [m]。人工芝のパイル 20〜30mm を
+            上回る 0.03 を既定にしている。
+        speed_gate_frac: 指令速度のこの割合に達していれば満額。**「遅く歩いて足を上げる」
+            解を報酬上ありえなくするためのゲート**で、追従率に比例して報酬を減らす。
+            2 本目はこのゲートが無く、速度を半分捨てて足上げ報酬を取り切っていた。
+        foot_box: 足裏 4 隅のオフセット (toe_x, heel_x, half_y, sole_z) [m]。
+            既定値は K1_locomotion.urdf の Left_Foot.STL バウンディングボックス実測。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    from ...locomotion.mdp.events import get_phase_freq
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    left_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_idx = asset.find_bodies("right_foot_link")[0][0]
+
+    toe_x, heel_x, half_y, sole_z = [float(v) for v in foot_box]
+    corners = torch.tensor(
+        [[toe_x, half_y, sole_z], [toe_x, -half_y, sole_z],
+         [heel_x, half_y, sole_z], [heel_x, -half_y, sole_z]],
+        device=env.device,
+    )
+    z_left = _sole_min_z(asset, left_idx, corners)
+    z_right = _sole_min_z(asset, right_idx, corners)
+
+    # feet_phase と同一の desired-stance 判定 (位相周波数も同じソースから取る)
+    t = env.episode_length_buf * env.step_dt
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)
+    phase_right = (phase_left + math.pi) % (2.0 * math.pi)
+    stance_threshold = 2.0 * math.pi * stance_ratio
+    stance_left = phase_left < stance_threshold
+    stance_right = phase_right < stance_threshold
+
+    cmd = env.command_manager.get_command(command_name)
+    cmd_speed = torch.norm(cmd[:, :3], dim=1)
+    is_stopped = cmd_speed < cmd_threshold
+    stance_left = stance_left | is_stopped
+    stance_right = stance_right | is_stopped
+
+    # 支持脚の足裏を基準にした相対クリアランス (跳躍で稼げない)
+    clr_left = z_left - z_right
+    clr_right = z_right - z_left
+    rew_left = torch.exp(-torch.square(target_clearance - clr_left) / sigma**2)
+    rew_right = torch.exp(-torch.square(target_clearance - clr_right) / sigma**2)
+
+    # --- 速度ゲート: 指令に追従できている割合だけ支払う ---
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    cmd_xy = cmd[:, :2]
+    cmd_norm = torch.norm(cmd_xy, dim=1)
+    direction = cmd_xy / cmd_norm.clamp(min=1e-6).unsqueeze(1)
+    toward = (vel_b[:, :2] * direction).sum(dim=1)
+    gate = (toward / (speed_gate_frac * cmd_norm).clamp(min=1e-3)).clamp(0.0, 1.0)
+    gate = torch.where(cmd_norm < cmd_threshold, torch.ones_like(gate), gate)
+
+    swing_left = (~stance_left).float()
+    swing_right = (~stance_right).float()
+    return (rew_left * swing_left + rew_right * swing_right) * gate

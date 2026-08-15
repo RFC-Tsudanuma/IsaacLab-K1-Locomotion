@@ -44,6 +44,19 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["save_count"][env_ids] = 0
     bufs["save_quality"][env_ids] = 0.0
     bufs["hard_ball"][env_ids] = False
+    bufs["unreachable"][env_ids] = False
+
+    # ★ 2026-08-15: 歩行位相のアキュムレータと指令ローパスの状態をクリアする。
+    #   どちらも前エピソードの値を持ち越すと、開始直後に「途中の位相」や
+    #   「前の球への指令」が出てしまう。
+    from .observations import _DRIVE_FILT_ATTR, _TASK_PHASE_ATTR
+
+    phase = getattr(env, _TASK_PHASE_ATTR, None)
+    if phase is not None:
+        phase[env_ids] = 0.0
+    filt = getattr(env, _DRIVE_FILT_ATTR, None)
+    if filt is not None:
+        filt[env_ids] = 0.0
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:

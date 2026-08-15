@@ -27,7 +27,7 @@
    heading を保持する項が無いこと。→ 対称性は現行設定 (aug 有効 / 係数 2.0) を継承し、
    :func:`~.mdp.rewards.heading_hold` で積分 yaw 誤差を直接罰する。
 3. **足上げ**: 速度域で 4cm 台。人工芝のパイル (20〜30mm) を考えると薄い。
-   → :func:`~.mdp.rewards.foot_clearance_relative` (支持脚基準 + 位相整合) で
+   → :func:`~.mdp.rewards.foot_clearance_sole` (足裏最下点 + 支持脚基準 + 位相整合) で
      跳躍の抜け道を塞いだうえで目標を 7cm へ。
 4. **後退ドリフト**: -0.10 m/s。→ :func:`~.mdp.rewards.track_lin_vel_x_exp` を薄く追加。
 
@@ -53,7 +53,7 @@ from .goalkeeper_direct_env_cfg import LATERAL_TARGET_SPEED, K1GKDirectStage1Env
 from .mdp.events import reset_lateral_buffers
 from .mdp.rewards import (
     flight_phase,
-    foot_clearance_relative,
+    foot_clearance_sole,
     heading_hold,
     onset_action_rate_l2,
     onset_reach_bonus,
@@ -66,14 +66,13 @@ from .mdp.rewards import (
 ONSET_WINDOW_S: float = 0.8
 # 「コマンドが変わった」とみなす線速度指令の変化量 [m/s]。
 ONSET_CHANGE_TOL: float = 0.4
-# 遊脚の目標持ち上げ量 [m] (**絶対高さではない**)。接地時の足リンク原点は地面から
-# 0.035m なので、絶対高さ表記なら 0.095m。
-# ★ 2026-08-15: 0.07 → 0.06 に引き下げ。1 本目 (11200 iter) は実測 7.6cm と要件 5cm を
-#   大きく超えた一方、**その要求が歩容を跳躍に変え、立ち上がり (0.565→0.719s) と
-#   横速度 (1.278→1.151) を同時に壊した**。足上げは優先度 3 位なので、1 位の立ち上がりと
-#   「速度を落とさない」制約を優先して要求を下げる。07-28 と同じ 6cm 相当だが、
-#   測り方 (支持脚基準) と位相 (get_phase_freq 追従) を直してあるぶん実測値は上に出るはず。
-TARGET_FOOT_LIFT: float = 0.06
+# 遊脚の **足裏最下点** の目標クリアランス [m] (足リンク原点の高さではない)。
+# ★ 2026-08-15 (3 本目): 測定点を足リンク原点から足裏に変更した。実測で
+#   「上げた高さの 40〜70% が足の傾きで失われている」ことが分かったため
+#   (07-28: 原点 3.2〜3.9cm に対しつま先は 0.7cm)。詳細は foot_clearance_sole の docstring。
+#   0.03 は人工芝のパイル 20〜30mm を上回る値で、かつ 07-28 の脚上げ量 (3.2〜3.9cm) より
+#   低い。**脚を高く上げなくても足首を水平にすれば届く**ので、速度を削る圧にならない。
+TARGET_SOLE_CLEARANCE: float = 0.03
 
 
 @configclass
@@ -133,7 +132,10 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
             weight=8.0,
             params={
                 "command_name": "base_velocity",
-                "reach_frac": 0.9,
+                # ★ 2026-08-15: 0.9 → 0.75。指令 1.3 に対する実速度は 1.15 前後 (88%) なので
+                #   「指令の 90%」は高速域では原理的に到達不可能で、2 本目は本項がほぼ一度も
+                #   発火していなかった (raw 0.0007 = 期待値の 1/200)。
+                "reach_frac": 0.75,
                 "min_cmd": 0.6,
                 "onset_s": ONSET_WINDOW_S,
                 "change_tol": ONSET_CHANGE_TOL,
@@ -176,16 +178,23 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         # ------------------------------------------------------------------
         # 4. 足上げ
         # ------------------------------------------------------------------
-        # 支持脚基準 + 位相整合の版に差し替える (絶対高さ版は跳躍で達成できてしまう)。
+        # ★ 2026-08-15 (3 本目): 測定点を **足裏最下点** に変更 + **速度ゲート**を追加。
+        #   2 本目は原点基準で 6.6〜7.3cm を達成したが、横速度が 1.278 → 0.710 m/s と半減した。
+        #   原因は「足を高く上げる = 長く浮く = 刻めない」で、07-28 の実スイング時間
+        #   0.13〜0.14s (名目 0.31s の半分以下の高デューティ歩容) が壊れたこと。
+        #   足裏で測れば「足首を水平に保つ」という **速度に無影響な手段** でも達成できるので、
+        #   最適化がそちらへ逃げることを期待する。速度ゲートは「遅く歩いて足を上げる」解を
+        #   報酬上ありえなくする保険 (2 本目はこれが無く、速度を半分捨てて満額取っていた)。
         self.rewards.foot_clearance = RewTerm(
-            func=foot_clearance_relative,
+            func=foot_clearance_sole,
             weight=2.5,
             params={
                 "command_name": "base_velocity",
-                "target_lift": TARGET_FOOT_LIFT,
+                "target_clearance": TARGET_SOLE_CLEARANCE,
                 "phase_freq": _PHASE_FREQ,
                 "stance_ratio": _STANCE_RATIO,
                 "cmd_threshold": _COMMAND_THRESHOLD,
+                "speed_gate_frac": 0.9,
             },
         )
         # ★ 2026-08-15 (1 本目の実測で修正): -1.5 に緩めたが **跳躍が出た** ので
