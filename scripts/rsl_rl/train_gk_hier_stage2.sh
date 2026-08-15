@@ -8,8 +8,12 @@
 #   STAGE1_CKPT=logs/rsl_rl/k1_gk_hier_stage1/<run>/model_XXXX.pt \
 #       ./scripts/rsl_rl/train_gk_hier_stage2.sh
 #
-# 初速レンジ等を変えたいときは --override_json '{"env": {"goalkeeper.ball_speed_max": 0.8}}'
-# の形で渡す (GoalkeeperParamsCfg のフィールドはすべて JSON から上書きできる)。
+# ★ --override_json は **JSON 文字列ではなくファイルパス** を取る。既定で
+#   gk_hier_stage2_overrides.json を読む (OVERRIDE_JSON で差し替え可)。
+#   このファイルには perc_vel_bias_range 0.05〜0.15 が入っており、**外すと学習が進まない**。
+#   cfg 既定の 0.5〜1.0 はボール横速度より大きいノイズで、到達点予測が 43% の確率で
+#   逆側のポストへ飛ぶ (詳細は JSON 内のコメント)。実際にこれを入れ忘れて 12500 iter
+#   回し、カリキュラムが最初の段から一度も動かなかった。
 #
 # 比較対象 (直接制御版のベースライン、k1_gk_direct_stage2/2026-08-12_12-06-02 @ 76k iter):
 #   success_ema 0.796 / ball_speed_hi 3.10 m/s / goal_conceded 0.451
@@ -23,6 +27,7 @@ cd "${REPO_ROOT}"
 # 凍結する下位ポリシー。**Stage 1 と必ず同じものを使うこと** (下位が変わると上位が
 # 学んだタイミングの前提が丸ごと崩れる)。TorchScript を使う理由は stage1 の sh を参照。
 FROZEN_CKPT=${FROZEN_CKPT:-logs/rsl_rl/k1_gk_direct_stage1/2026-07-28_17-13-15/exported/policy.pt}
+OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/gk_hier_stage2_overrides.json}
 
 if [[ -z "${STAGE1_CKPT}" ]]; then
     echo "STAGE1_CKPT に Stage 1 のチェックポイントを指定してください。" >&2
@@ -41,5 +46,6 @@ fi
     --high_action_deadband 0.1 \
     --cmd_scale_range 0.8 1.0 \
     --cmd_delay_range 1 3 \
+    --override_json "${OVERRIDE_JSON}" \
     --resume --checkpoint "${STAGE1_CKPT}" \
     --headless --num_envs 4096 "$@"

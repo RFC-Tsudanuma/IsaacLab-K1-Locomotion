@@ -319,7 +319,14 @@ class GoalkeeperParamsCfg:
     # ステージ3: 適応カリキュラム (セーブ成功率 EMA → 初速上限)
     adaptive_success_threshold: float = 0.85
     adaptive_fail_threshold: float = 0.55
-    adaptive_speed_delta: float = 0.05      # 1 回の調整量 [m/s]
+    adaptive_speed_delta: float = 0.05      # 1 回の調整量 [m/s] (加算方式のとき)
+    # ★ 2026-08-15: 初速の刻みを **乗算** にする倍率。1.0 以下なら従来の加算方式。
+    #   加算 0.05 は上限が 3.0 だった頃の設定で、cap 6.0 では 1.0 → 6.0 に 100 回の
+    #   昇格が必要になる。実測 1 昇格 ≈ 3400 iter なので 340,000 iter (約 8 日) かかり
+    #   実用にならない。×1.2 なら 10 回で到達する。
+    #   速い球ほど 0.05 m/s の差は相対的に小さいので、比率で刻む方が難易度として素直。
+    #   昇格直後の落ち込みが大きすぎるようなら 1.15 (13 回) に下げる。
+    adaptive_speed_ratio: float = 1.2
     adaptive_ema_alpha: float = 0.01        # エピソード 1 件あたりの EMA 更新率
     adaptive_warmup_episodes: int = 2000    # 調整開始までのウォームアップ件数
     # 難易度を 1 段動かした後、次の判定を再開するまでに必要なエピソード件数。

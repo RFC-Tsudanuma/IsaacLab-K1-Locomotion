@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import json
+import os
 import torch
 from typing import TYPE_CHECKING
 
@@ -23,6 +25,66 @@ from .events import _gk_params
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
+
+
+# ---------------------------------------------------------------------------
+# カリキュラム進捗の永続化
+#
+# ★ 2026-08-15 追加。rsl_rl の save() が保存するのはモデル・オプティマイザ・iter だけで、
+#   カリキュラムの到達点 (_gk_speed_hi / _gk_aim_stage) は **resume のたびに初期値へ
+#   巻き戻る**。直接制御版のログを調べたところ、12 本のランすべてが speed 1.00 から
+#   始まっており、20000 iter かけて 2.3〜4.1 まで上げては次のランで捨てる、を
+#   繰り返していた。これを止めるために自前で永続化する。
+#
+#   ckpt 本体に入れず別ファイルにしてあるのは、rsl_rl に手を入れずに済ませるため。
+#   保存先は「学習ログのランディレクトリ」で、--resume 時は渡された ckpt のあるラン
+#   ディレクトリから読む (train_goalkeeper.py が env に _gk_curriculum_paths を設定)。
+# ---------------------------------------------------------------------------
+
+_STATE_FILENAME = "curriculum_state.json"
+
+
+def _curriculum_state_path(env: "ManagerBasedRLEnv", key: str) -> str | None:
+    """保存/読み込み先のパスを返す。未設定なら None (永続化を行わない)。"""
+    paths = getattr(env, "_gk_curriculum_paths", None)
+    if not paths:
+        return None
+    d = paths.get(key)
+    return os.path.join(d, _STATE_FILENAME) if d else None
+
+
+def _load_curriculum_state(env: "ManagerBasedRLEnv") -> dict:
+    """resume 元のランディレクトリから進捗を読む。無ければ空 dict。"""
+    path = _curriculum_state_path(env, "load")
+    if not path or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception as e:  # 壊れていても学習は続ける (最易段から始まるだけ)
+        print(f"[goalkeeper] カリキュラム進捗の読み込みに失敗しました ({e})。最易段から開始します。")
+        return {}
+
+
+def save_curriculum_state(env: "ManagerBasedRLEnv") -> None:
+    """現在の進捗を保存する。``adaptive_difficulty`` が難易度を変えるたびに呼ぶ。"""
+    path = _curriculum_state_path(env, "save")
+    if not path:
+        return
+    state = {
+        "aim_stage": int(getattr(env, "_gk_aim_stage", 0)),
+        "ball_speed_hi": float(getattr(env, "_gk_speed_hi", torch.tensor(0.0)).item()),
+        "success_ema": float(getattr(env, "_gk_success_ema", torch.tensor(0.5)).item()),
+        "episode_count": int(getattr(env, "_gk_episode_count", 0)),
+    }
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, path)          # 書き込み中の中断で壊れないよう原子的に置換
+    except Exception as e:
+        print(f"[goalkeeper] カリキュラム進捗の保存に失敗しました ({e})。学習は続行します。")
 
 
 def adaptive_ball_speed(
@@ -207,12 +269,28 @@ def adaptive_difficulty(
     stages = [float(s) for s in p.aim_y_stages]
 
     if getattr(env, "_gk_speed_hi", None) is None:
-        env._gk_speed_hi = torch.tensor(float(p.ball_speed_max), device=env.device)
-        env._gk_success_ema = torch.tensor(0.5, device=env.device)
-        env._gk_episode_count = 0
-        env._gk_aim_stage = 0
-        env._gk_aim_y = torch.tensor(stages[0], device=env.device)
+        # ★ 2026-08-15: 保存済みの進捗があれば復元する。無ければ最易段から。
+        #   rsl_rl の save() はモデル・オプティマイザ・iter しか保存しないので、
+        #   カリキュラムの到達点は自前で永続化しないと **resume のたびに 1.0 / 0.4 へ
+        #   巻き戻る**。直接制御版が 12 本のランを回して毎回 speed 1.00 から
+        #   やり直していたのはこれが原因 (ログで確認済み)。
+        st = _load_curriculum_state(env)
+        env._gk_speed_hi = torch.tensor(
+            st.get("ball_speed_hi", float(p.ball_speed_max)), device=env.device
+        )
+        env._gk_success_ema = torch.tensor(st.get("success_ema", 0.5), device=env.device)
+        env._gk_episode_count = int(st.get("episode_count", 0))
+        env._gk_aim_stage = int(st.get("aim_stage", 0))
+        env._gk_aim_y = torch.tensor(
+            stages[min(env._gk_aim_stage, len(stages) - 1)], device=env.device
+        )
         env._gk_cooldown = 0
+        if st:
+            print(
+                f"[goalkeeper] カリキュラム進捗を復元: aim_stage={env._gk_aim_stage}"
+                f" / ball_speed_hi={env._gk_speed_hi.item():.2f}"
+                f" / episodes={env._gk_episode_count}"
+            )
 
     def _log() -> dict:
         return {
@@ -244,11 +322,23 @@ def adaptive_difficulty(
             env._gk_aim_stage += 1
             env._gk_aim_y.fill_(stages[env._gk_aim_stage])
         else:
-            env._gk_speed_hi = (env._gk_speed_hi + float(p.adaptive_speed_delta)).clamp(
-                max=float(p.ball_speed_cap)
-            )
+            # ★ 2026-08-15: 加算から **乗算** に変更。
+            #   加算 0.05 は上限が 3.0 だった頃の設定で、cap 6.0 だと 1.0 → 6.0 に
+            #   100 回の昇格が必要になる。実測 1 昇格 ≈ 3400 iter なので 340,000 iter
+            #   (約 8 日) かかる計算で、実用にならなかった。
+            #   乗算 ×1.2 なら 10 回で到達する。速い球ほど 0.05 m/s の差は相対的に
+            #   小さいので、比率で上げる方が難易度の刻みとしても素直。
+            #   ratio <= 1.0 を指定した場合は従来どおり adaptive_speed_delta の加算。
+            ratio = float(getattr(p, "adaptive_speed_ratio", 1.0))
+            if ratio > 1.0:
+                env._gk_speed_hi = (env._gk_speed_hi * ratio).clamp(max=float(p.ball_speed_cap))
+            else:
+                env._gk_speed_hi = (env._gk_speed_hi + float(p.adaptive_speed_delta)).clamp(
+                    max=float(p.ball_speed_cap)
+                )
         env._gk_success_ema.fill_(neutral)
         env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
+        save_curriculum_state(env)
     elif ema < float(p.adaptive_fail_threshold):
         # 難 → 易: 直近に上げた軸 (初速) から戻す
         #
@@ -264,9 +354,13 @@ def adaptive_difficulty(
         #   常時非ゼロだった)。下げられないなら何もせず、EMA を素直に育てる。
         lowered = False
         if env._gk_speed_hi.item() > float(p.ball_speed_max) + 1e-6:
-            env._gk_speed_hi = (env._gk_speed_hi - float(p.adaptive_speed_delta)).clamp(
-                min=float(p.ball_speed_max)
-            )
+            ratio = float(getattr(p, "adaptive_speed_ratio", 1.0))
+            if ratio > 1.0:
+                env._gk_speed_hi = (env._gk_speed_hi / ratio).clamp(min=float(p.ball_speed_max))
+            else:
+                env._gk_speed_hi = (env._gk_speed_hi - float(p.adaptive_speed_delta)).clamp(
+                    min=float(p.ball_speed_max)
+                )
             lowered = True
         elif env._gk_aim_stage > 0:
             env._gk_aim_stage -= 1
@@ -275,6 +369,7 @@ def adaptive_difficulty(
         if lowered:
             env._gk_success_ema.fill_(neutral)
             env._gk_cooldown = env._gk_episode_count + int(p.adaptive_cooldown_episodes)
+            save_curriculum_state(env)
 
     return _log()
 

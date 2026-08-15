@@ -271,6 +271,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     start_time = time.time()
 
+    # --- カリキュラム進捗の永続化パスを env に渡す (2026-08-15) ---
+    # ★ RslRlVecEnvWrapper より **前** に設定すること。wrapper の __init__ が env.reset()
+    #   を呼び、そこで CurriculumManager が走って adaptive_difficulty が初期化される。
+    #   その時点でパスが無いと、保存済みの進捗を読めず最易段から始まってしまう。
+    #
+    # rsl_rl の save() はモデル・オプティマイザ・iter しか保存しないため、ゴールキーパーの
+    # カリキュラム到達点 (ball_speed_hi / aim_stage) は mdp/curriculums.py 側が
+    # curriculum_state.json として自前で永続化する。これが無いと --resume のたびに
+    # 最易段 (初速 1.0 / 狙い先 ±0.4) へ巻き戻る。
+    # (直接制御版のログでは 12 本のランすべてが speed 1.00 から始まっていた)
+    _curr_load_dir = None
+    if agent_cfg.resume:
+        _ckpt = agent_cfg.load_checkpoint
+        if _ckpt and os.path.isfile(_ckpt):
+            _curr_load_dir = os.path.dirname(os.path.abspath(_ckpt))
+        else:
+            _root = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
+            try:
+                _curr_load_dir = os.path.dirname(
+                    get_checkpoint_path(_root, agent_cfg.load_run, agent_cfg.load_checkpoint)
+                )
+            except Exception:
+                _curr_load_dir = None
+    env.unwrapped._gk_curriculum_paths = {"load": _curr_load_dir, "save": log_dir}
+
     # Inner env: consumes joint-target actions output by the frozen policy.
     inner_env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
