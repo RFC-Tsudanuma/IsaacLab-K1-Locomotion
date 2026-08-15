@@ -47,6 +47,34 @@ _K1_URDF_PATH = os.path.join(
     "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf",
 )
 
+
+def _apply_play_viewer(cfg) -> None:
+    """PLAY 用にカメラを 0 番のロボット追尾へ切り替える。
+
+    IsaacLab の ``ViewerCfg`` の既定は ``origin_type="world"`` / ``eye=(7.5, 7.5, 7.5)``
+    / ``lookat=(0, 0, 0)``、つまり **ワールド原点を見つめたまま動かないカメラ**。
+    terrain generator を使う環境ではこれが問題になる。generator は env origin を
+    サブ地形のグリッドに割り当てるので、ワールド原点は「どの env でもない地形の
+    真ん中」でしかなく、ロボットは原点から遠く離れた位置に散らばる。結果、
+    ``play.py --video`` で録れる動画に**地形しか映らない**。
+
+    ``origin_type="asset_root"`` にすると ``eye`` / ``lookat`` の意味が
+    「ワールド座標」から「追尾対象からの相対オフセット」に変わり、カメラは
+    post-update イベントで毎フレーム追従する。``world`` のままオフセットだけ
+    縮めても直らないのはこのため。
+
+    ``asset_name`` は ``origin_type`` が asset 系のとき必須で、未設定だと
+    ``ViewportCameraController`` が ``ValueError`` を投げる。
+
+    学習時 (``--headless`` で ``--video`` なし) はそもそも
+    ``ViewportCameraController`` が生成されないので、この設定は無視される。
+    """
+    cfg.viewer.origin_type = "asset_root"
+    cfg.viewer.asset_name = "robot"
+    cfg.viewer.env_index = 0
+    cfg.viewer.eye = (2.5, 2.5, 1.5)   # 追尾対象からの相対位置 [m]
+    cfg.viewer.lookat = (0.0, 0.0, 0.5)  # 足元ではなく胴体あたりを見る
+
 _LEG_NET_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "../../../../../../actuator_net_leg.pt",
@@ -458,5 +486,7 @@ class K1RoughEnvCfg_PLAY(K1RoughEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        _apply_play_viewer(self)
 
         

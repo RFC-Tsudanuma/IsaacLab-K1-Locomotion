@@ -42,7 +42,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..locomotion.flat_env_cfg import K1FlatEnvCfg
-from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD, _PHASE_FREQ
+from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD, _PHASE_FREQ, _apply_play_viewer
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1, ObservationsCfg
 from . import mdp
 
@@ -743,6 +743,8 @@ class K1WalkKickWalkPhaseRoughEnvCfg_PLAY(K1WalkKickWalkPhaseRoughEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
+        _apply_play_viewer(self)
+
 
 @configclass
 class K1WalkKickRoughEnvCfg(K1WalkKickEnvCfg):
@@ -779,6 +781,8 @@ class K1WalkKickRoughEnvCfg_PLAY(K1WalkKickRoughEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        _apply_play_viewer(self)
 
 
 @configclass
@@ -824,6 +828,8 @@ class K1WalkKick360RoughEnvCfg_PLAY(K1WalkKick360RoughEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        _apply_play_viewer(self)
 
 
 # --------------------------------------------------------------------------- #
