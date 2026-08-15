@@ -9,8 +9,9 @@
 #   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (policy*.onnx) も取ってくる
 #   ./scripts/fetch_ckpt.sh --video k1_walk_kick    # videos/ も取ってくる
 #
-# --onnx / --video を付けたときリモートに成果物が無ければ、**ssh 越しにリモートで
-# 生成してから回収する** (既定)。生成には Isaac Sim の起動を伴うので数分かかる。
+# --onnx / --video を付けたときは、**ssh 越しにリモートで生成してから回収する**
+# (既定)。リモートに古い成果物が残っていても必ず作り直す。生成には Isaac Sim の
+# 起動を伴うので数分かかる。
 #   --no-remote-exec        生成せず、無ければ従来どおり WARN だけ出す
 #   --gym-task <ID>         gym タスク ID の自動解決を上書きする
 #   --video-length <N>      録画するステップ数 (既定 200)
@@ -255,25 +256,17 @@ EOF
 }
 
 # --------------------------------------------------------------------------- #
-# 成果物がリモートに無ければ生成する
+# 成果物をリモートで生成する (--onnx / --video 指定時)
 # --------------------------------------------------------------------------- #
 NEED_ONNX=0
 NEED_VIDEO=0
 
 if [[ "$REMOTE_EXEC" -eq 1 && -n "$GYM_BASE" ]] && [[ "$ONNX" -eq 1 || "$VIDEO" -eq 1 ]]; then
-  # 問い合わせに失敗したら「無い」とみなして生成を試みる (set -e で落とさない)
-  HAS_ONNX=0
-  HAS_VIDEO=0
-  read -r HAS_ONNX HAS_VIDEO < <("${SSH[@]}" bash -s <<EOF
-d='$REMOTE_RUN_DIR'
-o=0; v=0
-ls "\$d"/exported/*.onnx >/dev/null 2>&1 && o=1
-ls "\$d"/videos/*/*.mp4  >/dev/null 2>&1 && v=1
-echo "\$o \$v"
-EOF
-  ) || true
-  [[ "$ONNX" -eq 1 && "$HAS_ONNX" -eq 0 ]] && NEED_ONNX=1
-  [[ "$VIDEO" -eq 1 && "$HAS_VIDEO" -eq 0 ]] && NEED_VIDEO=1
+  # リモートに既に exported/ や videos/ があっても**必ず作り直す**。
+  # cfg (カメラ・報酬など) をいじった直後に、古い成果物がそのまま回収されて
+  # 「変更が効いていない」ように見えるのを防ぐ。
+  NEED_ONNX="$ONNX"
+  NEED_VIDEO="$VIDEO"
 
   # play.py は再生のついでに exported/ も書き出すので、動画を撮るなら
   # そちらで onnx もまとめて片付く (Isaac Sim の起動を 1 回減らせる)。
