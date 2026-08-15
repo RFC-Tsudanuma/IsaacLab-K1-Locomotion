@@ -57,6 +57,6 @@ gym.register(
     },
 )
 
-# NOTE: 通し実行は scripts/rsl_rl/train_walk_middle_kick.sh (stage 1 は同梱 checkpoint を再利用)。
+# NOTE: 通し実行は scripts/rsl_rl/train_walk_kick_middle.sh (stage 1 は同梱 checkpoint を再利用)。
 #       --reset_noise_std は **使わないこと** (理由は env cfg の docstring 参照)。
 # NOTE: カリキュラムが 3000 iteration で終点に着くので、--max_iterations は 3000 以上。

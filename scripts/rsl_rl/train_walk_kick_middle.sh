@@ -19,12 +19,12 @@
 # python の解決・STAGE・ITER・NUM_ENVS・追加引数の扱いは全て同じ。
 #
 # 使い方:
-#   ./scripts/rsl_rl/train_walk_middle_kick.sh                  # stage 2,3 を通しで実行
-#   ITER=5000 ./scripts/rsl_rl/train_walk_middle_kick.sh        # 各段の iteration を指定
-#   STAGE=2 ./scripts/rsl_rl/train_walk_middle_kick.sh          # stage 2 だけ
+#   ./scripts/rsl_rl/train_walk_kick_middle.sh                  # stage 2,3 を通しで実行
+#   ITER=5000 ./scripts/rsl_rl/train_walk_kick_middle.sh        # 各段の iteration を指定
+#   STAGE=2 ./scripts/rsl_rl/train_walk_kick_middle.sh          # stage 2 だけ
 #   STAGE=3 KICK_CKPT=logs/rsl_rl/k1_walk_middle_kick/<run>/model_<N>.pt \
-#       ./scripts/rsl_rl/train_walk_middle_kick.sh              # 既存の middle から 360 だけ
-#   WALK_CKPT=logs/.../model_4999.pt ./scripts/rsl_rl/train_walk_middle_kick.sh
+#       ./scripts/rsl_rl/train_walk_kick_middle.sh              # 既存の middle から 360 だけ
+#   WALK_CKPT=logs/.../model_4999.pt ./scripts/rsl_rl/train_walk_kick_middle.sh
 #                                                               # 別の walk phase から
 #
 # NOTE: ITER は **3000 以上**にすること。キック報酬のカリキュラム

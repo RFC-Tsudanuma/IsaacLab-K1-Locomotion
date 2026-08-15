@@ -82,7 +82,7 @@ strong の折れ線、σ アニールの窓、ボール物性 DR) は weak と�
 
 学習手順 (3 段。stage 1 はリポジトリ同梱の checkpoint を再利用)::
 
-    ./scripts/rsl_rl/train_walk_middle_kick.sh
+    ./scripts/rsl_rl/train_walk_kick_middle.sh
 
 段ごとに手で回す場合は :class:`K1WalkMiddleKickEnvCfg` の docstring を参照。
 ``--reset_noise_std`` は **使わないこと** (理由は walk_weak_kick の docstring と同じ)。
