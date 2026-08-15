@@ -226,8 +226,22 @@ def post_save_hold(env: "ManagerBasedRLEnv") -> torch.Tensor:
     合計 約3.0秒。``touched`` は :func:`~.events.relaunch_ball_after_save` が
     次の球の発射時に False へ戻すので、この 1 つのフラグで区間全体を覆える
     (``ball_active`` はセーブ確定時に False になってしまうので区間の途中で切れる)。
+
+    ★ 2026-08-15: ``GoalkeeperParamsCfg.post_save_hold_until_relaunch = False`` にすると
+      **セーブ確定までで保持を終える** (``save_cd >= 0`` の区間だけ True)。残りの
+      respawn 待ち時間は保持が解けるので、``compute_target_y`` が目標 0 (中央) を返し、
+      次の球に備えて中央へ復帰する動きが出る。継続モードでは 2 球目以降が必ず「前の球を
+      止めた場所」から始まり、中央から 0.6m ずれるだけで到達不能球が 33% → 42% に増える
+      ため、復帰の有無はセーブ率に大きく効く (cfg 側のコメント参照)。
+      既定は True = 従来どおり。
     """
-    return gk_buffers(env)["touched"]
+    bufs = gk_buffers(env)
+    touched = bufs["touched"]
+    if bool(getattr(env.cfg.goalkeeper, "post_save_hold_until_relaunch", True)):
+        return touched
+    # セーブ確定までのカウントダウン中だけ保持する。確定後 (save_cd < 0) は解放され、
+    # 次の球までの待ち時間が中央への復帰に使える。
+    return touched & (bufs["save_cd"] >= 0)
 
 
 def compute_target_y(
@@ -629,7 +643,94 @@ def task_drive_vector(
     #   (正面へ向き直す) が残ると「止めた地点で立つ」にならないので3成分とも落とす。
     #   ノルム 0 < cmd_threshold なので task_drive_phase_obs も位相をゼロ埋めし、
     #   ステージ1 で学習済みの「停止」挙動がそのまま出る。
-    return torch.where(post_save_hold(env).unsqueeze(1), torch.zeros_like(drive), drive)
+    drive = torch.where(post_save_hold(env).unsqueeze(1), torch.zeros_like(drive), drive)
+
+    # ★ 2026-08-15: 1 次ローパスで平滑化する。
+    #
+    #   この指令は自己位置 (MCL) から作られるので、MCL が跳ぶと不連続に飛ぶ。
+    #   しかも dy = ずれ / 0.15s なので **0.195m 以上のずれで常に全力**になる設定で、
+    #   MCL の跳び (±0.5m) は必ず「全力で横へ動け」に化ける。歩行中にこれが入ると
+    #   急激な方向転換になり、位相を安定させても崩れる余地が残る。
+    #   MuJoCo でランドマーク認識がカクついたときにロボットが揺れる件の、
+    #   task_drive_phase_obs 側の修正では塞ぎきれない残りの経路。
+    #
+    #   本物のボールの動きは連続なのでローパスをほぼ素通りするが、MCL の跳びは
+    #   1 フレームの不連続なので大きく減衰する。実機の vision_filter が CVKF で
+    #   位置を平滑化しているのと同じ考え方で、むしろ実機の挙動に近づく。
+    #
+    #   ★ 実機の C++ 側にも同じフィルタを同じ時定数で実装すること。入れないと
+    #     sim で学習した前提と挙動が変わる。
+    #   ★ 状態を持つので reset_gk_buffers でクリアすること (前エピソードの指令が
+    #     残ると開始直後に存在しない指令が出る)。
+    tau = float(getattr(_gk_params_local(env), "drive_filter_tau_s", 0.12))
+    if tau > 0.0:
+        prev = getattr(env, _DRIVE_FILT_ATTR, None)
+        if prev is None or prev.shape != drive.shape:
+            prev = drive.clone()
+            setattr(env, _DRIVE_FILT_ATTR, prev)
+        # 同一ステップ内の複数回呼び出し (policy/critic/phase) では 1 回だけ更新する
+        if getattr(env, _DRIVE_FILT_STEP_ATTR, -1) != int(env.common_step_counter):
+            alpha = min(1.0, float(env.step_dt) / tau)
+            prev = prev + alpha * (drive - prev)
+            setattr(env, _DRIVE_FILT_ATTR, prev)
+            setattr(env, _DRIVE_FILT_STEP_ATTR, int(env.common_step_counter))
+        drive = getattr(env, _DRIVE_FILT_ATTR)
+
+    return drive
+
+
+_TASK_PHASE_ATTR = "_gk_task_gait_phase"
+_TASK_PHASE_STEP_ATTR = "_gk_task_gait_phase_step"
+
+# task_drive_vector の 1 次ローパス用の状態 (MCL の跳びが指令に化けるのを抑える)
+_DRIVE_FILT_ATTR = "_gk_drive_filtered"
+_DRIVE_FILT_STEP_ATTR = "_gk_drive_filtered_step"
+
+
+def _gk_params_local(env: "ManagerBasedRLEnv"):
+    """env cfg の GoalkeeperParamsCfg を返す (events からの import 循環を避けるため再定義)。"""
+    return env.cfg.goalkeeper
+
+
+def _task_gait_phase_accum(env: "ManagerBasedRLEnv", phase_freq: float, walking: torch.Tensor) -> torch.Tensor:
+    """歩行位相を **積算** して返す φ∈[0,2π) (per-env)。
+
+    ★ 2026-08-15 追加。旧実装は φ = 2π·f·t (エピソード開始からの絶対時間) で毎回
+      計算し直していた。停止中もこの t は進み続けるので、ゼロ埋めから復帰したとき
+      **位相が飛んだ位置から再開する**。1.6Hz なら 0.3 秒止まっただけで 0.48 周期
+      ≒ 170° 飛ぶ。片足が空中にある最中にこれが起きると支持脚の切り替えが噛み合わず
+      崩れる。MuJoCo でランドマーク認識がカクついたとき、ボールが静止していても
+      ロボットが揺れて転倒したのはこれが原因。
+
+      本関数は「歩いている間だけ位相を進める」ので、停止 → 再開が連続する。
+      around_ball の :func:`~...around_ball.mdp.observations._high_action_gait_phase`
+      と同じ方式 (あちらは速度依存周波数、こちらは固定 1.6Hz)。
+
+    Args:
+        walking: 歩行中フラグ (N,)。False の env は位相を進めない。
+    """
+    from ...locomotion.mdp.events import get_phase_freq
+
+    phase = getattr(env, _TASK_PHASE_ATTR, None)
+    if phase is None or phase.shape != (env.num_envs,):
+        phase = torch.zeros(env.num_envs, device=env.device)
+        setattr(env, _TASK_PHASE_ATTR, phase)
+        setattr(env, _TASK_PHASE_STEP_ATTR, -1)
+
+    # 同一ステップ内の複数回呼び出し (policy/critic) では 1 回だけ積算する
+    if getattr(env, _TASK_PHASE_STEP_ATTR, -1) != int(env.common_step_counter):
+        # get_phase_freq は per-env テンソルを返すが、randomize_phase_freq イベントが
+        # 未登録だと float を返すので、どちらでも動くようテンソル化する。
+        pf = get_phase_freq(env, phase_freq)
+        step = 2.0 * math.pi * float(env.step_dt) * (
+            pf if torch.is_tensor(pf) else torch.full_like(phase, float(pf))
+        )
+        phase = (phase + torch.where(walking, step, torch.zeros_like(step))) % (2.0 * math.pi)
+        # リセット直後の env は位相 0 から (locomotion と同じ規約)
+        phase = torch.where(env.episode_length_buf <= 1, torch.zeros_like(phase), phase)
+        setattr(env, _TASK_PHASE_ATTR, phase)
+        setattr(env, _TASK_PHASE_STEP_ATTR, int(env.common_step_counter))
+    return getattr(env, _TASK_PHASE_ATTR)
 
 
 def task_drive_phase_obs(
@@ -640,6 +741,8 @@ def task_drive_phase_obs(
     vx_scale: float = 1.0,
     vy_scale: float = 1.3,
     use_perceived: bool = True,
+    use_measured_speed: bool = True,
+    speed_threshold: float = 0.15,
 ) -> torch.Tensor:
     """ステージ2/3 の ``gait_phase`` スロット (4 次元)。タスク駆動の歩行位相。
 
@@ -650,12 +753,43 @@ def task_drive_phase_obs(
     ★ 向き成分 (dyaw) は判定に含めない。足踏みでは向きは直らない (その場旋回が要る) のに、
       yaw drift は実測で恒常的に 7〜12° あり、それだけでしきい値を超えて
       「定位置にいるのに歩き続ける」状態になっていたため。
-    """
-    from ...locomotion.mdp.events import get_phase_freq
 
-    t = env.episode_length_buf * env.step_dt
-    pf = get_phase_freq(env, phase_freq)
-    phase_left = 2.0 * math.pi * pf * t
+    ★ 2026-08-15: **歩行を自己位置推定から切り離した**。修正は 2 点:
+
+      (a) 停止判定を実測ベース速度にする (``use_measured_speed``)
+          旧実装は task_drive_vector の並進成分で判定していたが、あれは自己位置
+          (MCL) から計算される量なので、**歩行リズムが自己位置に直結していた**。
+              dy = (target_y - pos_y) / 0.15   ← MCL が揺れると dy が跳ねる
+          MuJoCo でランドマーク認識がカクつくと MCL 推定が細かく跳び、しきい値
+          0.12 を高頻度でまたいで「歩行 ⇔ 停止」がトグルする。**ボールが静止して
+          いてもロボットが揺れて転倒する**のはこれが原因。実測速度なら MCL が
+          どう揺れても跳ねない (実機でも IMU + 脚オドメトリから取れる量)。
+
+      (b) 位相を積算にする (:func:`_task_gait_phase_accum`)
+          旧実装は φ = 2π·f·t の絶対時間ベースで、停止中も t が進むため復帰時に
+          位相が飛ぶ (1.6Hz なら 0.3 秒の停止で約 170°)。片足が空中のときにこれが
+          起きると支持脚の切り替えが噛み合わず崩れる。積算なら停止→再開が連続する。
+
+      (a) がトグルを止め、(b) がトグル時の飛びを消す。両方で歩容の破綻を防ぐ。
+      ``use_measured_speed=False`` で旧挙動 (既存 ckpt の再生・比較用)。
+
+    Args:
+        use_measured_speed: True で実測ベース速度、False で旧来の task_drive_vector 判定。
+        speed_threshold: 実測速度がこれ未満なら停止とみなす [m/s]。
+            旧 cmd_threshold (0.12) は「位置ずれ [m] を 0.15s で割った速度」に対する
+            閾値で単位の意味が違うため、stage1_speed_tol (0.15) と揃えてある。
+    """
+    if use_measured_speed:
+        robot: Articulation = env.scene["robot"]
+        speed = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+        walking = speed >= speed_threshold
+    else:
+        drive = task_drive_vector(
+            env, max_y=max_y, vx_scale=vx_scale, vy_scale=vy_scale, use_perceived=use_perceived
+        )
+        walking = torch.norm(drive[:, :2], dim=1) >= cmd_threshold
+
+    phase_left = _task_gait_phase_accum(env, phase_freq, walking)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([
@@ -663,11 +797,7 @@ def task_drive_phase_obs(
         torch.sin(phase_right), torch.cos(phase_right),
     ], dim=1)
 
-    drive = task_drive_vector(
-        env, max_y=max_y, vx_scale=vx_scale, vy_scale=vy_scale, use_perceived=use_perceived
-    )
-    drive_norm = torch.norm(drive[:, :2], dim=1, keepdim=True)
-    return torch.where(drive_norm < cmd_threshold, torch.zeros_like(phase), phase)
+    return torch.where(walking.unsqueeze(1), phase, torch.zeros_like(phase))
 
 
 def gk_self_state(

@@ -105,6 +105,23 @@ class K1GKHierDHStage2EnvCfg(K1GKHierStage2EnvCfg):
         super().__post_init__()
         _add_history_reset(self)
 
+        # --- セーブ後に中央へ戻す (2026-08-15) ---
+        # 継続モードでは 2 球目以降が必ず「前の球を止めた場所」から始まる。到達可能性
+        # モデルで測ると、球が来た瞬間のキーパー y と「物理的に取れない球」の割合は
+        #     y=0.0 → 33.0% / y=0.4 → 37.3% / y=0.6 → 42.1% / y=0.8 → 47.9%
+        # で、中央から 0.6m ずれるだけで +9pt。下位を横 2.0 m/s に作り直しても -2.8pt
+        # しか改善しない (猶予時間に対して立ち上がり 0.6s + 遅延 0.156s が支配的で、
+        # 定常速度に乗る前に決着がつくため) ので、**立ち位置の方が桁で効く**。
+        #
+        # 従来はセーブ後 3.0s のあいだ指令が全成分ゼロで、復帰時間が構造的にゼロだった。
+        # 保持をセーブ確定 (2.0s) までに縮め、respawn 待ちを 1.0s → 2.0s に伸ばして
+        # 復帰に充てる。2.0s あれば横 1.278 m/s・立ち上がり 0.6s でも約 1.3m 戻れるので、
+        # 0.8m のずれは解消できる。目標 0 (中央) は compute_target_y が自動で返すため
+        # 報酬の変更は不要。
+        self.goalkeeper.post_save_hold_until_relaunch = False
+        if getattr(self.events, "relaunch_ball", None) is not None:
+            self.events.relaunch_ball.params["respawn_delay_steps"] = 100
+
 
 @configclass
 class K1GKHierDHStage1EnvCfg_PLAY(K1GKHierDHStage1EnvCfg):

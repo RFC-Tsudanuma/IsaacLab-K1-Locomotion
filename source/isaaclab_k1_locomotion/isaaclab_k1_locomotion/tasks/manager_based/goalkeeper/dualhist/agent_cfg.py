@@ -69,6 +69,23 @@ class K1GKHierDHPPORunnerCfg(K1GKHierPPORunnerCfg):
 
     def __post_init__(self):
         super().__post_init__()
+
+        # ★ 2026-08-15: entropy_coef 0.008 → 0.02。
+        #   Stage2 の実測で mean_noise_std が初期 0.7 から **0.053** まで潰れ、3500 iter
+        #   のあいだ一度も回復しなかった (0.0534 → 0.0528)。方策がほぼ決定論的で、
+        #   PPO が新しい挙動を試せない状態。
+        #
+        #   これが停滞の主因と見ている根拠: 同時点で success_ema は 0.648 で頭打ちだが、
+        #   「物理的に取れない球」は発射時に判定されて **成功率の集計から除外済み**
+        #   (events._mark_unreachable + curriculums._update_success_ema)。つまり 0.648 は
+        #   *取れるはずの球* に対する成功率で、届く球の 35% を落としている = 伸びしろは
+        #   まだある。下位の速度が天井なら EMA はもっと高い値で張り付くはずで、
+        #   実際そうなっていない。
+        #
+        #   既存階層版も同じ症状で 0.004 → 0.008 に上げた経緯があるが、それでも足りて
+        #   いなかった。DH は観測が 444 次元と広く、探索が潰れると届かない領域が増える。
+        self.algorithm.entropy_coef = 0.02
+
         # 親は 59 次元固定の反転関数を入れるので、履歴ブロック対応版へ差し替える。
         self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
             use_data_augmentation=True,

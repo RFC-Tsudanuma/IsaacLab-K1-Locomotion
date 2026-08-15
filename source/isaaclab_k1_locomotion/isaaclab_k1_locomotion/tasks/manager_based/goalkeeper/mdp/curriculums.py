@@ -87,6 +87,22 @@ def save_curriculum_state(env: "ManagerBasedRLEnv") -> None:
         print(f"[goalkeeper] カリキュラム進捗の保存に失敗しました ({e})。学習は続行します。")
 
 
+def _neutral_ema(p) -> float:
+    """難易度を変えた直後に EMA を戻す中立値。
+
+    既定 (``adaptive_neutral_ema = None``) は success と fail の中点で、これは従来の
+    挙動そのもの。明示すると 2 つの閾値から独立に決められる。
+
+    分離が要る理由: 降格を減らそうと ``adaptive_fail_threshold`` を下げると、中点も
+    一緒に下がって「中立値 → success_threshold」の距離が伸び、**昇格が遅くなる**。
+    往復を止めることと昇格を速く保つことが両立できなくなる。
+    """
+    v = getattr(p, "adaptive_neutral_ema", None)
+    if v is not None:
+        return float(v)
+    return 0.5 * (float(p.adaptive_success_threshold) + float(p.adaptive_fail_threshold))
+
+
 def adaptive_ball_speed(
     env: "ManagerBasedRLEnv",
     env_ids,
@@ -161,7 +177,7 @@ def adaptive_ball_speed(
 
     # ウォームアップ中は調整しない (EMA が立ち上がるまで待つ)
     if env._gk_episode_count >= int(p.adaptive_warmup_episodes):
-        neutral = 0.5 * (float(p.adaptive_success_threshold) + float(p.adaptive_fail_threshold))
+        neutral = _neutral_ema(p)
         if env._gk_success_ema.item() > float(p.adaptive_success_threshold):
             env._gk_speed_hi = (env._gk_speed_hi + float(p.adaptive_speed_delta)).clamp(
                 max=float(p.ball_speed_cap)
@@ -313,7 +329,7 @@ def adaptive_difficulty(
         return _log()
 
     ema = env._gk_success_ema.item()
-    neutral = 0.5 * (float(p.adaptive_success_threshold) + float(p.adaptive_fail_threshold))
+    neutral = _neutral_ema(p)
     top_stage = len(stages) - 1
 
     if ema > float(p.adaptive_success_threshold):

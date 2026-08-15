@@ -17,13 +17,23 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Isaac Lab の起動スクリプト。貸し GPU (vast.ai 等) でパスが違う場合は
+# ISAACLAB_SH=/path/to/isaaclab.sh を指定する。
+ISAACLAB_SH=${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}
+if [[ ! -x "${ISAACLAB_SH}" ]]; then
+    echo "[ERROR] Isaac Lab の起動スクリプトが見つかりません: ${ISAACLAB_SH}" >&2
+    echo "        ISAACLAB_SH=/path/to/isaaclab.sh を指定してください。" >&2
+    exit 1
+fi
+
+
 # 凍結する下位ポリシー。既存階層版と同じ 07-28 (実機デプロイ実績あり、横 1.28 m/s)。
 # TorchScript を使う理由は train_gk_hier_stage1.sh のコメント参照。
 FROZEN_CKPT=${FROZEN_CKPT:-logs/rsl_rl/k1_gk_direct_stage1/2026-07-28_17-13-15/exported/policy.pt}
 
 # --high_action_clip / --high_action_deadband / --cmd_scale_range / --cmd_delay_range は
 # 既存階層版とまったく同じ値にしてある。比較対象と条件を揃えるため変えないこと。
-/workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train_goalkeeper.py \
+"${ISAACLAB_SH}" -p scripts/rsl_rl/train_goalkeeper.py \
     --task Isaac-GoalkeeperHierDH-Stage1-K1-v0 \
     --frozen_checkpoint "${FROZEN_CKPT}" \
     --low_level_obs_group low_level \

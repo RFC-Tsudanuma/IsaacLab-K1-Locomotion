@@ -21,8 +21,18 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Isaac Lab の起動スクリプト。貸し GPU (vast.ai 等) でパスが違う場合は
+# ISAACLAB_SH=/path/to/isaaclab.sh を指定する。
+ISAACLAB_SH=${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}
+if [[ ! -x "${ISAACLAB_SH}" ]]; then
+    echo "[ERROR] Isaac Lab の起動スクリプトが見つかりません: ${ISAACLAB_SH}" >&2
+    echo "        ISAACLAB_SH=/path/to/isaaclab.sh を指定してください。" >&2
+    exit 1
+fi
+
+
 FROZEN_CKPT=${FROZEN_CKPT:-logs/rsl_rl/k1_gk_direct_stage1/2026-07-28_17-13-15/exported/policy.pt}
-OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/gk_hier_stage2_overrides.json}
+OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/gk_hier_dh_stage2_overrides.json}
 
 if [[ -z "${STAGE1_CKPT}" ]]; then
     echo "STAGE1_CKPT にデュアルヒストリー版 Stage 1 のチェックポイントを指定してください。" >&2
@@ -30,7 +40,7 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
     exit 1
 fi
 
-/workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train_goalkeeper.py \
+"${ISAACLAB_SH}" -p scripts/rsl_rl/train_goalkeeper.py \
     --task Isaac-GoalkeeperHierDH-Stage2-K1-v0 \
     --frozen_checkpoint "${FROZEN_CKPT}" \
     --low_level_obs_group low_level \

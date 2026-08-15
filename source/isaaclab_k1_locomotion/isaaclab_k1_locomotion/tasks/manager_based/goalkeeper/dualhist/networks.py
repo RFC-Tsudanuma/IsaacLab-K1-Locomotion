@@ -36,8 +36,12 @@ import torch.nn as nn
 from types import SimpleNamespace
 
 from rsl_rl.modules import ActorCritic
-from rsl_rl.networks import MLP
+from rsl_rl.networks import MLP, EmpiricalNormalization
 from rsl_rl.utils import resolve_nn_activation
+
+# 観測正規化の std がこれ未満の次元は「そのステージで一度も動かなかった列」とみなす。
+# :meth:`ActorCriticDualHistory._sanitize_obs_normalizer` 参照。
+_DEGENERATE_STD = 1e-3
 
 
 def _conv_out_len(length: int, kernels, strides) -> int:
@@ -180,6 +184,66 @@ class ActorCriticDualHistory(ActorCritic):
             f"Actor (dual history): base {num_base} + short {int(hist_short_frames)}x{int(hist_frame_dim)}"
             f" = {num_direct} direct, long {int(hist_long_frames)}x{int(hist_frame_dim)}"
             f" -> latent {self.actor.latent_dim}\n{self.actor}"
+        )
+
+    # -- 観測正規化の縮退対策 ------------------------------------------------
+
+    def load_state_dict(self, state_dict: dict, strict: bool = True) -> bool:
+        """重みを読み込み、続けて観測正規化の縮退列を無害化する。
+
+        ``OnPolicyRunner.load`` (= ``--resume``) から呼ばれる。Stage 1 → Stage 2 の
+        受け渡しでここが効く。
+        """
+        resumed = super().load_state_dict(state_dict, strict=strict)
+        self._sanitize_obs_normalizer("actor", self.actor_obs_normalizer)
+        self._sanitize_obs_normalizer("critic", self.critic_obs_normalizer)
+        return resumed
+
+    @staticmethod
+    def _sanitize_obs_normalizer(tag: str, norm) -> None:
+        """Stage 1 で一度も動かなかった観測列の正規化統計をリセットする。
+
+        ★ これが無いと Stage 2 が壊れる (2026-08-15 に実際に起きた)。仕組み:
+
+        Stage 1 はボールを検出範囲外 (park_pos = 9m) に置くので、ボール由来の観測列は
+        **全ステップ厳密に 0**。:class:`~rsl_rl.networks.EmpiricalNormalization` は
+        そこから ``std = 0`` を学習する。正規化は::
+
+            (x - mean) / (std + eps)      # eps = 1e-2
+
+        なので、Stage 2 でボールが見え始めた瞬間、その列は **最大 100 倍** に増幅されて
+        ネットワークへ入る (フィールド座標のボール x は最大 9m → 900)。
+
+        しかも自力では戻らない。EmpiricalNormalization の更新率は
+        ``rate = batch / 累積count`` で、Stage 1 を 5000 iter 回した時点で
+        count ≈ 10 億、rate ≈ 1e-4。分散が実値に追いつくまで **1 万 iter 級**かかる。
+        その間ずっと入力スケールが 2 桁ずれたままなので、方策は壊れ、PPO の適応学習率は
+        KL を抑えようと潰れ、セーブ成功率が上がらず**適応カリキュラムが 1 段も進まない**。
+
+        直接制御版・既存階層版でこれが表面化しなかったのは、park_pos が 5m だった頃の
+        Stage 1 ckpt を使っていて、ボール列に実分散が入っていたため
+        (``goalkeeper_hier_env_cfg.py`` の park_pos 変更は 2026-08-14、DH 版の Stage 1 が
+        その後に回した最初の学習だった)。デュアルヒストリー版は履歴のボール 3ch × 55 frame
+        = 165 列がまとめて縮退するので、同じ地雷を桁違いに強く踏む。
+
+        対処: **縮退した列だけ** mean=0 / var=1 / std=1 に戻す。健全な列 (歩行 49 次元など)
+        の学習済み統計はそのまま残すこと。全体をリセットすると、joint_pos のように
+        std=0.03 で 33 倍に増幅されて学習された列のスケールまで変わり、同じ理由で壊れる。
+        """
+        if not isinstance(norm, EmpiricalNormalization):
+            return
+        bad = (norm._std.squeeze(0) < _DEGENERATE_STD)
+        n_bad = int(bad.sum().item())
+        if n_bad == 0:
+            return
+        idx = torch.nonzero(bad).flatten().tolist()
+        norm._mean[0, bad] = 0.0
+        norm._var[0, bad] = 1.0
+        norm._std[0, bad] = 1.0
+        preview = idx[:12] + (["..."] if len(idx) > 12 else [])
+        print(
+            f"[dualhist] {tag} 観測正規化: 縮退した {n_bad} 列を mean=0/var=1 にリセットしました"
+            f" (Stage 1 で一度も動かなかった列)。列番号: {preview}"
         )
 
 

@@ -23,13 +23,23 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Isaac Lab の起動スクリプト。貸し GPU (vast.ai 等) でパスが違う場合は
+# ISAACLAB_SH=/path/to/isaaclab.sh を指定する。
+ISAACLAB_SH=${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}
+if [[ ! -x "${ISAACLAB_SH}" ]]; then
+    echo "[ERROR] Isaac Lab の起動スクリプトが見つかりません: ${ISAACLAB_SH}" >&2
+    echo "        ISAACLAB_SH=/path/to/isaaclab.sh を指定してください。" >&2
+    exit 1
+fi
+
+
 NUM_ENVS=${NUM_ENVS:-4096}
 STAGE1_ITERS=${STAGE1_ITERS:-5000}    # k1_gk_hier_dh_stage1 の既定と同じ
 STAGE2_ITERS=${STAGE2_ITERS:-60000}   # k1_gk_hier_dh_stage2 の既定と同じ
 STAGE1_TAG=${STAGE1_TAG:-dhfull}
 
 FROZEN_CKPT=${FROZEN_CKPT:-logs/rsl_rl/k1_gk_direct_stage1/2026-07-28_17-13-15/exported/policy.pt}
-OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/gk_hier_stage2_overrides.json}
+OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/gk_hier_dh_stage2_overrides.json}
 
 # --- 前提ファイルの確認 (Stage 1 を数時間回してから Stage 2 で落ちるのを防ぐ) ---
 for f in "${FROZEN_CKPT}" "${OVERRIDE_JSON}"; do
@@ -57,7 +67,7 @@ COMMON_ARGS=(
 echo "=============================================================="
 echo "[Stage 1/2] ボールなし。ランダム目標 y への到達と停止 (${STAGE1_ITERS} iter, ${NUM_ENVS} envs)"
 echo "=============================================================="
-/workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train_goalkeeper.py \
+"${ISAACLAB_SH}" -p scripts/rsl_rl/train_goalkeeper.py \
     --task Isaac-GoalkeeperHierDH-Stage1-K1-v0 \
     --run_name "${STAGE1_TAG}" \
     --max_iterations "${STAGE1_ITERS}" \
@@ -81,7 +91,7 @@ echo "[Stage 2/2] ゴール + ボール + 適応カリキュラム (追加 ${STA
 echo "            resume: ${STAGE1_CKPT}"
 echo "=============================================================="
 # ★ --max_iterations は --resume 時「追加分」であって総数ではない (train_goalkeeper.py 参照)。
-/workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train_goalkeeper.py \
+"${ISAACLAB_SH}" -p scripts/rsl_rl/train_goalkeeper.py \
     --task Isaac-GoalkeeperHierDH-Stage2-K1-v0 \
     --override_json "${OVERRIDE_JSON}" \
     --resume --checkpoint "${STAGE1_CKPT}" \
