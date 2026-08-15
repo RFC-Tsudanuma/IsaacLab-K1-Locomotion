@@ -173,3 +173,30 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360MovingBallPPORunnerCfg",
     },
 )
+
+# --------------------------------------------------------------------------- #
+# Ablation 3: 知覚ノイズ (perception noise ablation)
+#
+# 実機の認識パイプライン (30Hz vision + 遅延 + ジッタ) をボール位置観測に模した版。
+# walk_kick_360 の checkpoint から --load_pretrained で fine-tune する前提。
+# 観測 55 次元・並びは同一 (prev_ball_pos スロットの中身だけが変わる)。
+# --------------------------------------------------------------------------- #
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-360-Noisy-Ball-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKick360NoisyBallEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360NoisyBallPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-360-Noisy-Ball-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKick360NoisyBallEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360NoisyBallPPORunnerCfg",
+    },
+)

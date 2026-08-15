@@ -93,3 +93,13 @@ class K1WalkKick360MovingBallPPORunnerCfg(K1WalkKick360PPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick_360_moving_ball"
+
+
+@configclass
+class K1WalkKick360NoisyBallPPORunnerCfg(K1WalkKick360PPORunnerCfg):
+    """Perception noise ablation。walk_kick_360 の checkpoint から --load_pretrained で始める前提。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_360_noisy_ball"

@@ -903,3 +903,78 @@ class K1WalkKick360MovingBallEnvCfg_PLAY(K1WalkKick360MovingBallEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+# --------------------------------------------------------------------------- #
+# Ablation 3: 知覚ノイズ (perception noise ablation)
+#
+# 実機で walk_kick_360 の方策を回すと、蹴り損ねがそこそこの確率で起きる。原因は
+# ボール認識の誤差 (計測済み: 約 3cm、prev_ball_pos の Unoise ±2cm より広い) と
+# 認識遅延 (制御 50Hz に対し vision 30Hz + 未計測の処理・通信遅延)。
+# シム側のボール位置観測を実機の認識パイプライン寄りにして fine-tune する。
+#
+# * _BALL_OBS_DELAY_STEP_RANGE: エピソードごとに一様サンプルする遅延 [制御ステップ]。
+#   (2, 6) = 40-120ms @50Hz。実機の遅延計測ができたら「計測値 + マージン」に絞ること。
+# * _BALL_OBS_CAMERA_HZ: 実機の vision レート。ホールドのぶん実効遅延はさらに
+#   0〜1 フレーム (0-33ms) 伸びる。
+# * _BALL_OBS_JITTER: フレーム更新時に引き直す一様ノイズ [m]。ホールド中は同じ実現値が
+#   保持されるので、毎ステップ独立な Unoise より濾しにくい (実機の誤差系列に近い)。
+# --------------------------------------------------------------------------- #
+_BALL_OBS_DELAY_STEP_RANGE = (2, 6)
+_BALL_OBS_CAMERA_HZ = 30.0
+_BALL_OBS_JITTER = 0.05
+
+
+@configclass
+class K1WalkKick360NoisyBallEnvCfg(K1WalkKick360EnvCfg):
+    """知覚ノイズ+遅延つき全方位版。ボール位置観測だけを実機の認識パイプライン寄りにする。
+
+    :class:`K1WalkKick360EnvCfg` との差は policy の ``prev_ball_pos`` 項だけ:
+    固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) を、
+    :func:`.mdp.observations.noisy_ball_pos_b` (エピソードごとランダム遅延 2-6 ステップ +
+    30Hz サンプル&ホールド + フレーム同期ジッタ ±5cm) に差し替える。
+    walk_kick_360 の checkpoint からの fine-tune 前提::
+
+        _labpython2 scripts/rsl_rl/train.py \\
+            --task Isaac-Velocity-Flat-K1-Walk-Kick-360-Noisy-Ball-v0 \\
+            --headless --num_envs 4096 \\
+            --load_pretrained logs/rsl_rl/k1_walk_kick_360/<run>/model_<N>.pt
+
+    観測は 55 次元・並びとも同一なので checkpoint はそのまま載る。触らないもの:
+
+    * **critic の ``prev_ball_pos``**: 従来どおり :func:`.mdp.prev_ball_pos_b`
+      (ノイズ無し 1 ステップ遅延)。critic は特権情報 (``ball_pos_rel``) も持つ
+      asymmetric 構成なので、ここを汚す理由がない。
+    * **``ball_vel``**: 静止ボールではほぼ 0 で、遅延・ホールドを掛けても実質変わらない。
+      転がるボール (moving_ball ablation) と組むときは同じパイプラインを通すこと。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        term = self.observations.policy.prev_ball_pos
+        term.func = mdp.noisy_ball_pos_b
+        term.params = {
+            "delay_step_range": _BALL_OBS_DELAY_STEP_RANGE,
+            "camera_hz": _BALL_OBS_CAMERA_HZ,
+            "jitter": _BALL_OBS_JITTER,
+        }
+        # ジッタは関数内でフレーム同期に付与する (ホールド中は同じ実現値を保持する) ので、
+        # 毎ステップ独立の Unoise は外す。残すと二重にノイズが乗る。
+        term.noise = None
+
+
+@configclass
+class K1WalkKick360NoisyBallEnvCfg_PLAY(K1WalkKick360NoisyBallEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        # enable_corruption=False は ObsTerm の noise しか切らない。関数内ジッタも
+        # それに合わせて切る。遅延 + サンプル&ホールドは観測パイプラインの構造なので残す。
+        self.observations.policy.prev_ball_pos.params["jitter"] = 0.0
