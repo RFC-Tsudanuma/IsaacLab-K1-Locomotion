@@ -263,3 +263,18 @@ class K1GKHierStage2PPORunnerCfg(K1GKHierPPORunnerCfg):
 
     max_iterations = 20000
     experiment_name = "k1_gk_hier_stage2"
+
+
+@configclass
+class K1GKLateralPPORunnerCfg(K1GKDirectPPORunnerCfg):
+    """横移動特化の下位ポリシー (``goalkeeper_lateral_env_cfg.py``)。
+
+    ネットワーク形状・PPO ハイパーパラメータは Stage1 と完全に同一
+    (07-28 の ckpt から ``--resume`` して重みを引き継ぐため、変えてはいけない)。
+    対称性設定も継承する = **data augmentation 有効 / mirror 係数 2.0**。
+    07-28 は aug 無効 / 係数 0.5 の世代で、左右非対称な歩容が残っており、
+    横移動時の系統的な yaw ドリフト (約 10°/s) の要因の一つと見ている。
+    """
+
+    max_iterations = 15000
+    experiment_name = "k1_gk_lateral"

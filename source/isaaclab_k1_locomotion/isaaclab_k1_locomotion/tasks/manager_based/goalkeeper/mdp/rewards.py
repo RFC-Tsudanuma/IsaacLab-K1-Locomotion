@@ -417,3 +417,223 @@ def face_field(
     robot = env.scene[asset_cfg.name]
     heading = robot.data.heading_w  # env はワールド軸に沿って配置されるので yaw=0 が +x
     return torch.exp(-torch.square(heading) / std**2)
+
+
+# ---------------------------------------------------------------------------
+# 横移動特化タスク (goalkeeper_lateral_env_cfg.py) 用の報酬
+#
+# 07-28 (k1_gk_direct_stage1/2026-07-28_17-13-15) の実測を出発点にしている:
+#   横追従は誤差 2% で極めて良好 / 立ち上がり 0.6s / yaw ドリフト 10°/s /
+#   足上げ 4cm 台 / 後退ドリフト -0.10 m/s。
+# 定常速度はもう伸ばす余地がないので、**過渡 (立ち上がり) と姿勢** を直接評価する。
+# ---------------------------------------------------------------------------
+
+
+def onset_speed_bonus(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    v_ref: float = 1.3,
+    min_cmd: float = 0.6,
+    onset_s: float = 0.8,
+    change_tol: float = 0.4,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """**速度コマンドが変わった直後 ``onset_s`` 秒だけ** 効く、実速度の線形報酬 [0, 1]。
+
+    なぜ要るか:
+        セーブに必要な横移動は 0.3〜0.8m が中心で、その帯域はまるごと加速区間に入る。
+        2.6m 横断は 1.278 m/s で 2.35s、1.6 m/s に上げても 1.99s しか縮まらない
+        (定常 25% 増で 15% 短縮) 一方、立ち上がり 0.6s → 0.4s は全域に効く。
+        既存の :func:`lateral_speed_bonus` は定常速度しか見ておらず、
+        「ゆっくり立ち上がってから定常で稼ぐ」解と「即座に立ち上がる」解を区別できない。
+
+    設計:
+        * **線形** (ガウスではない)。過渡の序盤は誤差が必ず大きく、exp 型だと
+          そこで勾配が消えて「諦め」に落ちる (exp 報酬の諦め問題)。
+        * 指令方向への射影速度なので、逆方向に飛び出すと 0 になる。
+        * コマンドが大きく変わった (``change_tol``) 直後だけ有効。定常区間で
+          二重取りさせない。窓の長さ ``onset_s`` は目標立ち上がり時間より少し長く取る。
+
+    Returns:
+        [0, 1] の報酬。窓の外・低速コマンドでは 0。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    from .events import update_lateral_buffers
+
+    bufs = update_lateral_buffers(env, command_name=command_name, change_tol=change_tol)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+
+    cmd_xy = cmd[:, :2]
+    cmd_norm = torch.norm(cmd_xy, dim=1)
+    direction = cmd_xy / cmd_norm.clamp(min=1e-6).unsqueeze(1)
+    toward = (vel_b[:, :2] * direction).sum(dim=1)
+
+    onset_steps = max(1, int(onset_s / env.step_dt))
+    in_window = bufs["since_change"] < onset_steps
+    gate = (cmd_norm > min_cmd) & in_window & (bufs["since_change"] >= 0)
+    return (toward / v_ref).clamp(0.0, 1.0) * gate.float()
+
+
+def onset_action_rate_l2(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    stand_still_scale: float = 3.0,
+    onset_s: float = 0.8,
+    onset_scale: float = 0.4,
+    change_tol: float = 0.4,
+) -> torch.Tensor:
+    """``action_rate_l2`` の、**立ち上がり区間だけ倍率を下げる**版 (weight < 0 で使う)。
+
+    加速は本質的に「アクションを速く動かすこと」なので、平滑性ペナルティと正面衝突する。
+    07-28 は ``action_rate_l2 = -0.4`` / ``action_smoothness_l2 = -0.12`` で、定常歩容には
+    適切だが立ち上がりを鈍らせる。過渡の ``onset_s`` 秒だけ ``onset_scale`` 倍に緩める。
+
+    ★ 実機で動きがガタつくようなら **最初にここを 1.0 (= 緩和なし) に戻す**こと。
+      定常区間の倍率は 07-28 と同一なので、緩和は過渡にしか効かない。
+    """
+    from ...locomotion.mdp.rewards import _stand_still_boost
+    from .events import update_lateral_buffers
+
+    bufs = update_lateral_buffers(env, command_name=command_name, change_tol=change_tol)
+
+    a = env.action_manager.action
+    a_prev = env.action_manager.prev_action
+    penalty = torch.sum(torch.square(a - a_prev), dim=1)
+    if stand_still_scale != 1.0:
+        penalty = penalty * _stand_still_boost(
+            env, command_name, cmd_threshold, 0.2, 0.2, stand_still_scale
+        )
+
+    onset_steps = max(1, int(onset_s / env.step_dt))
+    in_window = (bufs["since_change"] >= 0) & (bufs["since_change"] < onset_steps)
+    scale = torch.where(in_window, torch.full_like(penalty, onset_scale), torch.ones_like(penalty))
+    return penalty * scale
+
+
+def heading_hold(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    max_err: float = 0.6,
+    change_tol: float = 0.4,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """指令角速度を積分した **基準ヘディングからのズレ** のペナルティ (weight < 0 で使う)。
+
+    なぜ要るか:
+        ``track_ang_vel_z_exp`` が見ているのは **角速度** であって向きそのものではない。
+        わずかな定常角速度誤差は積分されて向きのドリフトになり、角速度追従の報酬では
+        原理的に止められない (07-28 実測: 横移動中に約 10°/s、円を描く)。
+        重みを上げる対処は 2026-07-29 に試して失敗している
+        (7.0 で yaw は改善したが横速度 1.182 → 0.628、外股 3 倍)。
+        本項は「溜まったズレ」だけを罰するので、旋回性能そのものは削らない。
+
+    基準ヘディングは :func:`~.events.update_lateral_buffers` が
+    ``ref_yaw += wz_cmd * dt`` で積分し、線速度コマンドの変化時とリセット時に
+    実ヨーへ取り直す。したがって wz=0 の指令では「向きを保て」、wz≠0 の指令では
+    「指令レートで回れ (溜め込むな)」を同時に意味する。
+
+    Returns:
+        ``|wrap(yaw - ref_yaw)|`` を ``max_err`` [rad] 付近で飽和させた値 [0, max_err)。
+
+        飽和に ``clamp`` ではなく ``tanh`` を使うのは、**飽和域で勾配を残すため**。
+        10°/s のドリフトは再サンプル周期 (最大 4s) で 0.7rad に達し、上限 0.6 を
+        普通に超える。clamp だと一番直したい領域で勾配がゼロになる。
+    """
+    from .events import update_lateral_buffers
+
+    bufs = update_lateral_buffers(env, command_name=command_name, change_tol=change_tol)
+    asset: Articulation = env.scene[asset_cfg.name]
+    err = wrap_to_pi(asset.data.heading_w - bufs["ref_yaw"]).abs()
+    return max_err * torch.tanh(err / max_err)
+
+
+def track_lin_vel_x_exp(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    std: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """前後方向 (base yaw frame の x) の速度コマンド追従だけを見るガウス報酬 [0, 1]。
+
+    :func:`track_lin_vel_y_exp` の前後版。07-28 は横移動中に約 -0.10 m/s の後退
+    ドリフトが出る。合算型の ``track_lin_vel_xy_exp`` では、横で稼げていると
+    前後の小さなバイアスに勾配がほとんど残らないため、専用項で圧をかける。
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    vel_b = quat_apply_inverse(yaw_quat(asset.data.root_quat_w), asset.data.root_lin_vel_w[:, :3])
+    err = torch.square(cmd[:, 0] - vel_b[:, 0])
+    return torch.exp(-err / std**2)
+
+
+def foot_clearance_relative(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    target_lift: float = 0.07,
+    phase_freq: float = 1.6,
+    stance_ratio: float = 0.5,
+    cmd_threshold: float = 0.05,
+    sigma: float = 0.03,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遊脚の **支持脚に対する相対高さ** を目標値に追従させる報酬 [0, 1]。
+
+    locomotion の :func:`~...locomotion.mdp.rewards.foot_clearance_ji` を 2 点直した版。
+
+    1. **測り方**: あちらは足リンクの *ワールド z (絶対高さ)* を見るため、
+       「遊脚を股関節・膝で上げる」以外に「体ごと持ち上げる (跳ぶ)」でも達成できる。
+       実際 2026-07-27〜29 に目標を 6cm→7cm に上げた実験では跳躍に退行し、
+       跳躍を封じると足上げが 2.6〜3.3cm まで落ちた。
+       本項は ``遊脚 z − 支持脚 z`` を見るので、両足が同時に上がる跳躍では値が増えず、
+       **抜け道が原理的に塞がる**。支持脚の足リンクは接地しているので、実質
+       「地面からの高さ」を測っているのと同じ (地形は平面固定)。
+       跳躍を間接的に抑えるための ``lin_vel_z_l2`` の強い重み (-2.5) を緩められる
+       ぶん、重心の上下動が要る加速にも効く。
+
+    2. **位相**: あちらは ``phase_freq`` を固定値で使うが、``feet_phase`` /
+       ``phase_obs`` は ``get_phase_freq`` 経由で ``randomize_phase_freq``
+       (±0.05Hz, env ごと固定) に追従する。エピソード 20s では δ=0.05 の個体が
+       t=10s で **逆位相** になり、報酬が接地脚の高さを要求する時間帯が生まれる
+       (そしてそれを満たす唯一の手段が跳躍)。本項は他の位相項と同じ周波数を使う。
+
+    ``target_lift`` は **持ち上げ量** [m] (絶対高さではない)。接地時の足リンク原点は
+    地面から 0.035m にあるので、絶対高さ表記に直すと ``0.035 + target_lift``。
+    """
+    from ...locomotion.mdp.events import get_phase_freq
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    left_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_idx = asset.find_bodies("right_foot_link")[0][0]
+    z_left = asset.data.body_pos_w[:, left_idx, 2]
+    z_right = asset.data.body_pos_w[:, right_idx, 2]
+
+    # feet_phase と同一の desired-stance 判定 (位相周波数も同じソースから取る)
+    t = env.episode_length_buf * env.step_dt
+    pf = get_phase_freq(env, phase_freq)
+    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)
+    phase_right = (phase_left + math.pi) % (2.0 * math.pi)
+    stance_threshold = 2.0 * math.pi * stance_ratio
+    stance_left = phase_left < stance_threshold
+    stance_right = phase_right < stance_threshold
+
+    cmd_speed = torch.norm(env.command_manager.get_command(command_name)[:, :3], dim=1)
+    is_stopped = cmd_speed < cmd_threshold
+    stance_left = stance_left | is_stopped
+    stance_right = stance_right | is_stopped
+
+    # 支持脚基準の持ち上げ量 (負にもなりうる)
+    lift_left = z_left - z_right
+    lift_right = z_right - z_left
+    rew_left = torch.exp(-torch.square(target_lift - lift_left) / sigma**2)
+    rew_right = torch.exp(-torch.square(target_lift - lift_right) / sigma**2)
+
+    swing_left = (~stance_left).float()
+    swing_right = (~stance_right).float()
+    return rew_left * swing_left + rew_right * swing_right

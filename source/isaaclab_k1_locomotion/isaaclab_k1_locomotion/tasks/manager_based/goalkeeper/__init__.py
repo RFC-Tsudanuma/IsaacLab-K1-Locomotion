@@ -175,6 +175,33 @@ gym.register(
 )
 
 ##
+# 横移動特化の下位ポリシー (goalkeeper_lateral_env_cfg.py)
+#   現行の下位 = k1_gk_direct_stage1/2026-07-28_17-13-15 (実機デプロイ済み) の後継候補。
+#   観測 59 次元・アクション・速度指令レンジは Stage1 と同一で、報酬だけ差し替えてある
+#   (立ち上がり / heading 保持 / 支持脚基準の足上げ / 後退ドリフト)。
+##
+
+gym.register(
+    id="Isaac-GKLateral-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_lateral_env_cfg:K1GKLateralEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKLateralPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GKLateral-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.goalkeeper_lateral_env_cfg:K1GKLateralEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1GKLateralPPORunnerCfg",
+    },
+)
+
+##
 # デュアルヒストリー版 (dualhist/。arXiv:2401.16889 の dual I/O history の試験実装)
 #   階層版 v2 の上位ポリシーの観測に短期 (0.1s) / 長期 (1.0s、1D CNN 圧縮) の履歴を足した版。
 #   タスク登録以外は dualhist/ 配下で完結しており、既存タスクには影響しない。

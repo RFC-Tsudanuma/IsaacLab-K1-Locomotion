@@ -17,6 +17,7 @@ import torch
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import wrap_to_pi
 
 from ...around_ball.mdp.observations import _high_action_cmd
 from .observations import ball_pos_goal, gk_buffers, robot_pos_goal
@@ -571,3 +572,89 @@ def relaunch_ball_after_save(
 
     reset_ball_shot(env, fire_ids, ball_cfg=ball_cfg)
     reset_ball_perception(env, fire_ids)
+
+
+# ---------------------------------------------------------------------------
+# 横移動特化タスク (goalkeeper_lateral_env_cfg.py) 用の状態バッファ
+# ---------------------------------------------------------------------------
+
+_LATERAL_ATTR = "_gk_lateral_buffers"
+
+
+def lateral_buffers(env: "ManagerBasedEnv") -> dict:
+    """横移動特化タスクの状態バッファ (遅延生成)。
+
+    * ``cmd_prev``     : 前ステップの速度コマンド。変化検出に使う。
+    * ``since_change`` : 速度コマンドが「大きく変わって」からの経過ステップ数。
+                         立ち上がり (加速) 報酬のゲートに使う。負値は「次回の更新で
+                         基準を取り直す」ためのセンチネル (リセット直後)。
+    * ``ref_yaw``      : 指令角速度 wz を積分した **基準ヘディング**。
+                         実ヨーとのズレが「積分 yaw 誤差」= ドリフトそのもの。
+    """
+    bufs = getattr(env, _LATERAL_ATTR, None)
+    if bufs is None:
+        n, dev = env.num_envs, env.device
+        bufs = {
+            "cmd_prev": torch.zeros(n, 3, device=dev),
+            "since_change": torch.full((n,), -1, dtype=torch.long, device=dev),
+            "ref_yaw": torch.zeros(n, device=dev),
+            "last_step": -1,
+        }
+        setattr(env, _LATERAL_ATTR, bufs)
+    return bufs
+
+
+def update_lateral_buffers(
+    env: "ManagerBasedEnv",
+    command_name: str = "base_velocity",
+    change_tol: float = 0.4,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> dict:
+    """1 ステップにつき 1 回だけバッファを更新する (何度呼んでも安全)。
+
+    報酬関数の先頭から呼ぶ想定。``common_step_counter`` でガードしてあるので、
+    EventTerm として登録しなくても、複数の報酬から呼んでも二重更新しない。
+    EventTerm の実行順に依存しないぶん、こちらの方が壊れにくい。
+
+    基準ヘディングの取り直し (resync) は **線速度コマンドが大きく変わったとき**と
+    **リセット直後**に行う。取り直さないと誤差が上限まで飽和して勾配が消え、
+    取り直しすぎると積分ドリフトを検出できない。コマンド再サンプル周期
+    (1.5〜4.0s) がそのまま「ドリフトを溜めて測る窓」になる。
+    """
+    bufs = lateral_buffers(env)
+    step = int(env.common_step_counter)
+    if bufs["last_step"] == step:
+        return bufs
+    bufs["last_step"] = step
+
+    asset = env.scene[asset_cfg.name]
+    cmd = env.command_manager.get_command(command_name)
+    dt = env.step_dt
+
+    # 線速度指令の変化だけを見る。wz は heading 制御を使うと毎ステップ動くので、
+    # 変化検出に混ぜると常時 onset 扱いになってしまう。
+    changed = torch.norm(cmd[:, :2] - bufs["cmd_prev"][:, :2], dim=1) > change_tol
+    resync = changed | (bufs["since_change"] < 0)
+
+    bufs["since_change"] += 1
+    bufs["since_change"][resync] = 0
+
+    # 基準ヘディングは指令角速度を積分する (wz=0 なら「向きを保て」と同義)。
+    bufs["ref_yaw"] = wrap_to_pi(bufs["ref_yaw"] + cmd[:, 2] * dt)
+    bufs["ref_yaw"][resync] = asset.data.heading_w[resync]
+
+    bufs["cmd_prev"] = cmd.clone()
+    return bufs
+
+
+def reset_lateral_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
+    """リセットされた env の横移動バッファを無効化する (次の更新で取り直す)。
+
+    ここでヨーを読まないのは、EventTerm の実行順 (reset_base より前か後か) に
+    依存しないようにするため。センチネル -1 を入れておけば、次のステップで
+    :func:`update_lateral_buffers` が新しい姿勢を基準に取り直す。
+    """
+    bufs = lateral_buffers(env)
+    bufs["since_change"][env_ids] = -1
+    bufs["ref_yaw"][env_ids] = 0.0
+    bufs["cmd_prev"][env_ids] = 0.0
