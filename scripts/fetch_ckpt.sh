@@ -243,6 +243,9 @@ remote_run_py() {
 
   "${SSH[@]}" bash -s <<EOF
 set -euo pipefail
+# DISPLAY が残っていると Kit が --headless でも XOpenDisplay を呼んで segfault する
+# (vast.ai コンテナで実測。対話シェルからの学習は通るのに ssh 経由だけ落ちる原因)。
+unset DISPLAY XAUTHORITY
 VAST_PYTHON_REMOTE='${VAST_PYTHON:-}'
 cd '$REMOTE_ROOT'
 $REMOTE_PY_RESOLVER
