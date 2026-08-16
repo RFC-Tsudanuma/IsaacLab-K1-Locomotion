@@ -832,10 +832,40 @@ _DRIVE_FILT_STEP_ATTR = "_gk_drive_filtered_step"
 #   (= 脚が出かけては止まる = 振動)。真値で学習していると、この状況を一度も経験しない。
 #
 #   ここでは (a) 相関ノイズを載せて実機相当の入力にし、(b) ヒステリシスを入れて
-#   トグル自体を起きにくくする。★ (b) は実機の C++ 側にも同じ値で実装すること。
+#   トグル自体を起きにくくし、(c) **遅延**を入れる。
+#   ★ (b) は実機の C++ 側にも同じ値で実装すること。
+#
+# ★ (c) の遅延がなぜ要るか (2026-08-16 追加。ノイズだけ入れたのは片手落ちだった)
+#
+#   このゲートは **閉ループの中**にある:
+#       ゲート → gait_phase → 方策 → 関節 → ロボットの速度 → ゲート
+#   出力が方策を動かし、方策がロボットを動かし、その速度がゲートに戻る。
+#   しかも判定はハードしきい値 (0/1) なので、跨いだ瞬間に入力が飛ぶ。
+#   **閉ループ + ハードしきい値 + 遅延 = 自励振動の典型条件**で、ノイズがゼロでも
+#   振動する (歩き始めと止まり際は真値でも必ずしきい値を跨ぐため)。
+#
+#   シムで振動しないのは ``root_lin_vel_b`` が真値かつ **遅延ゼロ**だから。跨いだ
+#   瞬間に方策が反応するので往復しない。実機のゲート入力は
+#       InEKF 200Hz (5ms) + 差分の半サンプル (2.5ms) + LPF 5Hz の群遅延 (31.8ms)
+#       + executor の遅延 = 40〜60ms = 制御 2〜3 tick
+#   遅れている。遅延ゼロで学習した方策は「今の状態を見て今すぐ強く直す」制御則を
+#   獲得するので、そこに遅延を入れると必ず行き過ぎて振動する (シャワーの温度調節と同じ)。
+#
+#   ★ 既存の DelayedPDActuatorCfg(min_delay=2, max_delay=7) とは **別の経路**。
+#     あちらは「方策の出力 → 関節トルク」= ループの出力側。ここは
+#     「ロボットの速度 → 歩行判定」= ループの入力側。片側だけ模擬しても
+#     ループ全体の位相遅れが実機より小さいままで、sim では安定・実機では振動になる。
+#
+#   ★ DR は遅延を **消さない**。「遅れた情報しか来ない世界で安定する制御則」を
+#     学ばせるためのもの。遅延の除去は推論側の仕事
+#     (/k1_inekf/velocity → /k1_inekf/planar_odom の twist に替えて LPF の 31.8ms を省く)。
 _BASE_VEL_NOISE_ATTR = "_gk_base_vel_noise"        # 相関ノイズの状態 (N, 2)
 _BASE_VEL_NOISE_STEP_ATTR = "_gk_base_vel_noise_step"
 _BASE_VEL_NOISE_SCALE_ATTR = "_gk_base_vel_noise_scale"  # env ごとの倍率 (N,)
+_BASE_VEL_HIST_ATTR = "_gk_base_vel_hist"          # 遅延用リングバッファ (D, N, 2)
+_BASE_VEL_HIST_POS_ATTR = "_gk_base_vel_hist_pos"  # リングバッファの書き込み位置 (int)
+_BASE_VEL_HIST_STEP_ATTR = "_gk_base_vel_hist_step"
+_BASE_VEL_DELAY_ATTR = "_gk_base_vel_delay"        # env ごとの遅延段数 (N,) long
 _WALK_GATE_ATTR = "_gk_walk_gate"                  # ヒステリシスの保持状態 (N,) bool
 
 
@@ -844,11 +874,55 @@ def _gk_params_local(env: "ManagerBasedRLEnv"):
     return env.cfg.goalkeeper
 
 
+def _delayed_base_vel(env: "ManagerBasedRLEnv", vel_b: torch.Tensor, delay_range: tuple) -> torch.Tensor:
+    """ベース速度を env ごとの段数だけ遅らせて返す (N, 2)。
+
+    実機のゲート入力は 40〜60ms (制御 2〜3 tick) 遅れている。シムは遅延ゼロなので、
+    しきい値を跨いだ瞬間に方策が反応でき、閉ループが往復しない。この差を埋めないと
+    「遅れた情報で判断する」状況を学習中に一度も経験しないまま実機に出ることになる。
+    詳細は _BASE_VEL_* 定数群のコメント参照。
+
+    リングバッファ長は max(delay_range)+1。段数は env ごとに固定 (個体差として扱い、
+    エピソードリセットでは変えない)。0 段を含めると「遅延なし」の env も混ざるので、
+    既定は 1〜3 段 = 20〜60ms にしてある。
+    """
+    lo, hi = int(delay_range[0]), int(delay_range[1])
+    if hi <= 0:
+        return vel_b
+    depth = hi + 1
+
+    hist = getattr(env, _BASE_VEL_HIST_ATTR, None)
+    if hist is None or hist.shape != (depth, *vel_b.shape):
+        # 立ち上がりは現在値で埋める (ゼロ埋めだと開始直後だけ「静止していた」ことになる)
+        hist = vel_b.unsqueeze(0).repeat(depth, 1, 1).clone()
+        setattr(env, _BASE_VEL_HIST_ATTR, hist)
+        setattr(env, _BASE_VEL_HIST_POS_ATTR, 0)
+        setattr(env, _BASE_VEL_HIST_STEP_ATTR, -1)
+
+    delay = getattr(env, _BASE_VEL_DELAY_ATTR, None)
+    if delay is None or delay.shape != (env.num_envs,):
+        delay = torch.randint(lo, hi + 1, (env.num_envs,), device=env.device)
+        setattr(env, _BASE_VEL_DELAY_ATTR, delay)
+
+    pos = int(getattr(env, _BASE_VEL_HIST_POS_ATTR, 0))
+    # 同一ステップ内の複数回呼び出し (policy/critic) では 1 回だけ書き込む
+    if getattr(env, _BASE_VEL_HIST_STEP_ATTR, -1) != int(env.common_step_counter):
+        pos = (pos + 1) % depth
+        hist[pos] = vel_b
+        setattr(env, _BASE_VEL_HIST_POS_ATTR, pos)
+        setattr(env, _BASE_VEL_HIST_STEP_ATTR, int(env.common_step_counter))
+
+    # env ごとに (pos - delay) の行を引く
+    idx = (pos - delay) % depth                      # (N,)
+    return hist[idx, torch.arange(env.num_envs, device=env.device)]
+
+
 def _measured_base_speed(
     env: "ManagerBasedRLEnv",
     noise_amp: float,
     noise_tau_s: float,
     noise_scale_range: tuple[float, float],
+    delay_range: tuple = (1, 3),
 ) -> torch.Tensor:
     """歩行ゲートの入力にする「実機相当のベース速度推定値」(N,)。
 
@@ -866,13 +940,19 @@ def _measured_base_speed(
       静止させて /k1_inekf/velocity を記録したら、その実測に置き換えること。
       env ごとに 0.5〜1.5 倍して振ってあるのは、実測が無いぶん幅を持たせるため。
 
+    ★ 遅延 (``delay_range``) はノイズとは別の効き方をする。ノイズは「しきい値を
+      跨ぎやすくする」だけだが、遅延は「跨いだ後の判断を狂わせる」ので、閉ループの
+      振動に直結する。ノイズだけ入れても遅延起因の振動には耐性が付かない。
+
     Args:
         noise_amp: ノイズの振幅 [m/s]。0 で無効 (真値をそのまま返す)。
         noise_tau_s: 相関の時定数 [s]。
         noise_scale_range: env ごとの倍率の範囲。
+        delay_range: ゲート入力の遅延段数の範囲 [制御 step]。実機実測 40〜60ms に
+            対して 1〜3 step (20〜60ms)。(0, 0) で無効。
     """
     robot: Articulation = env.scene["robot"]
-    vel_b = robot.data.root_lin_vel_b[:, :2]
+    vel_b = _delayed_base_vel(env, robot.data.root_lin_vel_b[:, :2], delay_range)
     if noise_amp <= 0.0:
         return torch.norm(vel_b, dim=1)
 
@@ -993,6 +1073,7 @@ def task_drive_phase_obs(
     speed_noise: float = 0.1,
     speed_noise_tau_s: float = 0.08,
     speed_noise_scale_range: tuple = (0.5, 1.5),
+    speed_delay_range: tuple = (1, 3),
     phase_step_jitter: float = 0.1,
 ) -> torch.Tensor:
     """ステージ2/3 の ``gait_phase`` スロット (4 次元)。タスク駆動の歩行位相。
@@ -1032,10 +1113,14 @@ def task_drive_phase_obs(
       ノイズの周期でトグルし、位相のゼロ埋めと再開が繰り返されて振動になる。
       **MCL 起因のトグルを潰したら、速度推定起因の同じトグルが別口から復活した**形。
 
-      対策は 2 つ:
+      対策は 3 つ:
         * ``speed_noise``: ゲートの入力に相関ノイズを載せて実機相当にする
+        * ``speed_delay_range``: ゲートの入力を 1〜3 step 遅らせる (実機 40〜60ms 相当)
         * ``speed_gate_lo`` / ``speed_gate_hi``: ヒステリシスでトグル自体を起きにくくする
       ★ ヒステリシスは実機の C++ 側にも同じ値で実装すること。片側だけでは意味がない。
+      ★ このゲートは閉ループ (ゲート → 位相 → 方策 → 関節 → 速度 → ゲート) の中にあり、
+        判定がハードしきい値なので、**遅延だけでも自励振動する**。ノイズより遅延の方が
+        機構的に直結している (_BASE_VEL_* 定数群のコメント参照)。
 
     Args:
         use_measured_speed: True で実測ベース速度、False で旧来の task_drive_vector 判定。
@@ -1046,10 +1131,13 @@ def task_drive_phase_obs(
             どちらかが None なら ``speed_threshold`` の単一しきい値に戻る。
         speed_noise: ゲート入力に載せるノイズの振幅 [m/s]。0 で無効。**実測ではない**
             (:func:`_measured_base_speed` の注記参照)。
+        speed_delay_range: ゲート入力の遅延段数 [制御 step]。(0, 0) で無効。
         phase_step_jitter: 位相増分の揺らぎ幅 (:func:`_task_gait_phase_accum` 参照)。
     """
     if use_measured_speed:
-        speed = _measured_base_speed(env, speed_noise, speed_noise_tau_s, speed_noise_scale_range)
+        speed = _measured_base_speed(
+            env, speed_noise, speed_noise_tau_s, speed_noise_scale_range, speed_delay_range
+        )
         if speed_gate_lo is None or speed_gate_hi is None:
             walking = speed >= speed_threshold
         else:

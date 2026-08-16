@@ -50,10 +50,12 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     #   どちらも前エピソードの値を持ち越すと、開始直後に「途中の位相」や
     #   「前の球への指令」が出てしまう。
     # ★ 2026-08-16: 歩行ゲートの sim2real 用の状態も同様にクリアする。
-    #   ノイズは前エピソードの相関を持ち越さないよう 0 から、ゲートは停止状態から
-    #   始める (位相が 0 から始まる規約に合わせる)。倍率 (_BASE_VEL_NOISE_SCALE_ATTR)
-    #   だけは env ごとの個体差なので **リセットしない** (startup DR と同じ扱い)。
+    #   ノイズは前エピソードの相関を持ち越さないよう 0 から、ゲートは停止状態から、
+    #   遅延バッファは 0 から始める (位相が 0 から始まる規約に合わせる)。
+    #   env ごとの個体差 (_BASE_VEL_NOISE_SCALE_ATTR = ノイズ倍率、
+    #   _BASE_VEL_DELAY_ATTR = 遅延段数) だけは **リセットしない** (startup DR と同じ扱い)。
     from .observations import (
+        _BASE_VEL_HIST_ATTR,
         _BASE_VEL_NOISE_ATTR,
         _DRIVE_FILT_ATTR,
         _TASK_PHASE_ATTR,
@@ -69,6 +71,9 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     vnoise = getattr(env, _BASE_VEL_NOISE_ATTR, None)
     if vnoise is not None:
         vnoise[env_ids] = 0.0
+    vhist = getattr(env, _BASE_VEL_HIST_ATTR, None)
+    if vhist is not None:
+        vhist[:, env_ids] = 0.0   # (depth, N, 2) なので env 軸は 1 番目
     gate = getattr(env, _WALK_GATE_ATTR, None)
     if gate is not None:
         gate[env_ids] = False
