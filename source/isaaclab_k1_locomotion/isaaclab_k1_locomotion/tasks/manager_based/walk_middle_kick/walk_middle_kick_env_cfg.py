@@ -261,7 +261,7 @@ class K1WalkMiddleKick360NoisyBallEnvCfg(K1WalkMiddleKick360EnvCfg):
     :class:`K1WalkMiddleKick360EnvCfg` との差は policy のボール位置観測だけで、
     :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` が
     「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
-    フレーム同期ジッタ ±5cm」に差し替える (詳細はあちらの docstring)。
+    フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm」に差し替える (詳細はあちらの docstring)。
 
     middle のレシピ (weak の 3 点セット + 帯 (3.2, 4.5) + σ 終点 0.5 + ボール物性 DR) は
     基底の ``__post_init__`` で全て済んでおり、観測差し替えは報酬にもコマンド帯にも

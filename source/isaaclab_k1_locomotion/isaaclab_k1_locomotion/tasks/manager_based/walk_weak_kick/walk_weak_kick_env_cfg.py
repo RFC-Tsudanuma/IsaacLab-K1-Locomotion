@@ -346,7 +346,7 @@ class K1WalkKick360WeakNoisyBallEnvCfg(K1WalkKick360WeakEnvCfg):
     :class:`K1WalkKick360WeakEnvCfg` との差は policy のボール位置観測だけで、
     :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` が
     「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
-    フレーム同期ジッタ ±5cm」に差し替える (詳細はあちらの docstring)。
+    フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm」に差し替える (詳細はあちらの docstring)。
 
     weak のレシピ (latch 閾値の指令追従・strong の折れ線・σ アニール・overshoot 罰・
     ボール物性 DR) は基底の ``__post_init__`` で全て済んでおり、観測差し替えは

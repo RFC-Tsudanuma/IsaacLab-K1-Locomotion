@@ -193,7 +193,8 @@ def noisy_ball_pos_b(
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     delay_step_range: tuple[int, int] = (2, 6),
     camera_hz: float = 30.0,
-    jitter: float = 0.05,
+    jitter_std: float = 0.067,
+    jitter_clip: float = 0.2,
 ) -> torch.Tensor:
     """実機の認識パイプラインを模したボール水平位置（ベース相対）。shape: (N, 2)
 
@@ -211,9 +212,17 @@ def noisy_ball_pos_b(
        50Hz 制御 × 30Hz カメラなら 2,2,1 ステップ間隔の繰り返しで更新され、間は前の値を
        保持する。フレーム位相はエピソードごとにランダム。ホールドのぶん実効遅延は
        ``delay`` に加えて 0〜1 フレーム分 (30Hz なら 0-33ms) 伸びる。
-    3. **ジッタ**: フレーム更新時に一様乱数 ±``jitter`` [m] を引き直して載せる。
-       ホールド中は同じノイズ実現値が保持される (毎ステップ独立な Unoise とはここが違う。
-       cfg 側でこの項の Unoise は外すこと)。
+    3. **ジッタ**: フレーム更新時に軸ごと独立なガウス乱数 N(0, ``jitter_std``²) [m] を
+       引き直して載せ、±``jitter_clip`` でクリップする。ホールド中は同じノイズ実現値が
+       保持される (毎ステップ独立な Unoise とはここが違う。cfg 側でこの項の Unoise は
+       外すこと)。
+       一様分布ではなくガウスにするのは、実機の認識誤差が「ほとんどの時刻は小さく、
+       たまに大きく外す」分布だから。一様 ±20cm は「常時 20cm 級に外れている」ことに
+       なり、ボール半径 0.11m を超える誤差が定常化して位置信号そのものが壊れる。
+       既定の std 0.067 は ``jitter_clip`` (0.2) の 1/3 で、3σ = クリップ点。
+       サンプルの 99.7% がクリップされずに通り、クリップは分布の裾を切るだけになる
+       (std をこれより大きく取るとクリップ点に確率質量が溜まり、実質「±clip の
+       二値ノイズ」に近づいてしまう)。
 
     遅延はベース相対位置に対して掛ける。実機はオドメトリアンカーで自己移動分を補償して
     いるので、これは実機より保守的 (アンカーの不完全さ・オドメトリドリフトも被覆する) な
@@ -242,6 +251,10 @@ def noisy_ball_pos_b(
             int(delay_step_range[0]), int(delay_step_range[1]) + 1, (n,), device=device
         )
 
+    def _jitter(n: int) -> torch.Tensor:
+        """クリップ済みガウスジッタ。shape: (n, 2)"""
+        return (torch.randn(n, 2, device=device) * jitter_std).clamp_(-jitter_clip, jitter_clip)
+
     step = int(env.common_step_counter)
     state = getattr(env, "_noisy_ball_pos_state", None)
     if state is None:
@@ -252,7 +265,7 @@ def noisy_ball_pos_b(
             "delay": _sample_delay(env.num_envs),
             # カメラフレーム位相 [s]。frame_dt を超えたらフレーム到来。
             "acc": torch.rand(env.num_envs, device=device) * frame_dt,
-            "held": cur + (torch.rand_like(cur) * 2.0 - 1.0) * jitter,
+            "held": cur + _jitter(env.num_envs),
             "env_ids": torch.arange(env.num_envs, device=device),
             "step": step,
         }
@@ -274,7 +287,7 @@ def noisy_ball_pos_b(
         if new_frame.any():
             idx = (head - state["delay"]) % buf_len
             meas = state["buf"][state["env_ids"], idx]
-            meas = meas + (torch.rand_like(meas) * 2.0 - 1.0) * jitter
+            meas = meas + _jitter(env.num_envs)
             state["held"] = torch.where(new_frame.unsqueeze(-1), meas, state["held"])
 
         # 4. リセット直後の env は履歴を現在位置で埋め直し、delay とフレーム位相を再サンプル。
@@ -286,9 +299,7 @@ def noisy_ball_pos_b(
             state["buf"][just_reset] = cur[just_reset].unsqueeze(1)
             state["delay"][just_reset] = _sample_delay(n)
             state["acc"][just_reset] = torch.rand(n, device=device) * frame_dt
-            state["held"][just_reset] = (
-                cur[just_reset] + (torch.rand(n, 2, device=device) * 2.0 - 1.0) * jitter
-            )
+            state["held"][just_reset] = cur[just_reset] + _jitter(n)
 
     return state["held"]
 

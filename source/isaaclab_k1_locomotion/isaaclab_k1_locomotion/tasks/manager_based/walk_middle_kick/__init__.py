@@ -59,7 +59,7 @@ gym.register(
 
 # Stage 4 (middle): 知覚ノイズ+遅延つき。k1_walk_middle_kick_360 の checkpoint から続ける。
 # stage 3 との差は policy のボール位置観測だけ (エピソードごとランダム遅延 + 30Hz
-# サンプル&ホールド + ジッタ ±5cm)。観測 55 次元・並びは同一なので checkpoint はそのまま載る。
+# サンプル&ホールド + ガウスジッタ σ=6.7cm・クリップ ±20cm)。観測 55 次元・並びは同一なので checkpoint はそのまま載る。
 gym.register(
     id="Isaac-Velocity-Flat-K1-Walk-Middle-Kick-360-Noisy-Ball-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

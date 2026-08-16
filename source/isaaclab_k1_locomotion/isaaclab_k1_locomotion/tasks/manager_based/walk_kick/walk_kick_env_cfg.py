@@ -923,12 +923,24 @@ class K1WalkKick360MovingBallEnvCfg_PLAY(K1WalkKick360MovingBallEnvCfg):
 #   (2, 6) = 40-120ms @50Hz。実機の遅延計測ができたら「計測値 + マージン」に絞ること。
 # * _BALL_OBS_CAMERA_HZ: 実機の vision レート。ホールドのぶん実効遅延はさらに
 #   0〜1 フレーム (0-33ms) 伸びる。
-# * _BALL_OBS_JITTER: フレーム更新時に引き直す一様ノイズ [m]。ホールド中は同じ実現値が
-#   保持されるので、毎ステップ独立な Unoise より濾しにくい (実機の誤差系列に近い)。
+# * _BALL_OBS_JITTER_STD / _CLIP: フレーム更新時に引き直すガウスノイズ [m] とその
+#   クリップ点。ホールド中は同じ実現値が保持されるので、毎ステップ独立な Unoise より
+#   濾しにくい (実機の誤差系列に近い)。
+#
+#   実機の計測値は約 3cm だが、std はその倍以上の 0.067 を取る。実機の誤差は「たまに
+#   大きく外す」裾を持ち、蹴り損ねを起こしているのはその裾の側だと考えられるため、
+#   ±20cm 級の外れも学習中に見せておく。3σ = 0.2 = クリップ点なので、
+#   99.7% のサンプルはクリップされずに通る (= 実質的な最大が ±20cm)。
+#
+#   一様分布にしないこと。一様 ±20cm は「常時 20cm 級に外れている」ことになり、
+#   ボール半径 0.11m を超える誤差が定常化して位置信号そのものが壊れる (方策が
+#   ボール観測を信用しなくなる)。ガウスなら質量が 0 付近に集まり、
+#   「普段は正確・たまに大外し」という実機の分布形に近くなる。
 # --------------------------------------------------------------------------- #
 _BALL_OBS_DELAY_STEP_RANGE = (2, 6)
 _BALL_OBS_CAMERA_HZ = 30.0
-_BALL_OBS_JITTER = 0.05
+_BALL_OBS_JITTER_STD = 0.067
+_BALL_OBS_JITTER_CLIP = 0.2
 
 
 def _apply_noisy_ball_obs(cfg: "K1WalkKickEnvCfg") -> None:
@@ -956,7 +968,8 @@ def _apply_noisy_ball_obs(cfg: "K1WalkKickEnvCfg") -> None:
     term.params = {
         "delay_step_range": _BALL_OBS_DELAY_STEP_RANGE,
         "camera_hz": _BALL_OBS_CAMERA_HZ,
-        "jitter": _BALL_OBS_JITTER,
+        "jitter_std": _BALL_OBS_JITTER_STD,
+        "jitter_clip": _BALL_OBS_JITTER_CLIP,
     }
     # ジッタは関数内でフレーム同期に付与する (ホールド中は同じ実現値を保持する) ので、
     # 毎ステップ独立の Unoise は外す。残すと二重にノイズが乗る。
@@ -970,7 +983,7 @@ def _disable_ball_obs_jitter(cfg: "K1WalkKickEnvCfg") -> None:
     :func:`_apply_noisy_ball_obs` が関数側に移したジッタはそれに合わせて別途切る。
     遅延とサンプル&ホールドは観測パイプラインの構造 (= PLAY で見たいもの) なので残す。
     """
-    cfg.observations.policy.prev_ball_pos.params["jitter"] = 0.0
+    cfg.observations.policy.prev_ball_pos.params["jitter_std"] = 0.0
 
 
 @configclass
@@ -980,7 +993,7 @@ class K1WalkKick360NoisyBallEnvCfg(K1WalkKick360EnvCfg):
     :class:`K1WalkKick360EnvCfg` との差は policy の ``prev_ball_pos`` 項だけ:
     固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) を、
     :func:`.mdp.observations.noisy_ball_pos_b` (エピソードごとランダム遅延 2-6 ステップ +
-    30Hz サンプル&ホールド + フレーム同期ジッタ ±5cm) に差し替える。
+    30Hz サンプル&ホールド + フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm) に差し替える。
     walk_kick_360 の checkpoint からの fine-tune 前提::
 
         _labpython2 scripts/rsl_rl/train.py \\
