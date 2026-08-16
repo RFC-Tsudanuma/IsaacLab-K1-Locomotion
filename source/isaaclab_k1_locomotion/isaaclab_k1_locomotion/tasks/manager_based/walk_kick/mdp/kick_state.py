@@ -205,6 +205,8 @@ def kick_state(
             # plant_lon: キック方向成分 (+ = ボールより前)。plant_lat: 横方向の **絶対値**。
             "plant_lon_frozen": torch.zeros(env.num_envs, device=device),
             "plant_lat_frozen": torch.zeros(env.num_envs, device=device),
+            # 蹴り足のワールド鉛直速度 [m/s]。値 latch で凍結する。+ = すくい上げ。
+            "foot_vz_frozen": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
@@ -252,6 +254,7 @@ def kick_state(
         state["sole_height_at_kick"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
+        state["foot_vz_frozen"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # 転がるボール用: latch 前は P_kick を現在のボール位置から毎ステップ引き直す。
@@ -346,6 +349,22 @@ def kick_state(
     plant_lon = (d_sup * kick_dir).sum(dim=-1)
     plant_lat = torch.abs((d_sup * right_vec).sum(dim=-1))
 
+    # ------------------------------------------------------------------ #
+    # 蹴り足のワールド鉛直速度 v_z [m/s]。値 latch で凍結する (foot_vz_frozen)。
+    #
+    # + = 接触の瞬間に足が上へ動いている = 「すくい上げ」。ボールを浮かせる運動量が
+    # 反発 (ボールの restitution) ではなく **足の運動** から来ていることの直接の指標。
+    # Isaac (e≈0.6) と MuJoCo/実機 (e≈0) で挙動が割れるのは、反発に頼った解が
+    # 反発係数の消える環境で浮かなくなるため。この量を報酬に使うことで、浮かせる
+    # メカニズムを反発非依存 (運動学依存) の側へ寄せる (:func:`..rewards.kick_foot_lift`)。
+    #
+    # NOTE: 足リンク原点の速度をそのまま採る。足裏中心は原点から z = −_SOLE_OFFSET に
+    #       あるので厳密には足の角速度ぶん (ω × r) だけずれるが、sole_z (足裏高さ) を
+    #       「リンク原点 − _SOLE_OFFSET」で近似しているのと同じ扱いに揃えてある。
+    # ------------------------------------------------------------------ #
+    foot_vel = robot.data.body_lin_vel_w[:, foot_ids, :]  # (N, 2, 3)
+    foot_vz = foot_vel[torch.arange(env.num_envs, device=device), kicking_foot, 2]
+
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
     state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
@@ -413,6 +432,10 @@ def kick_state(
         # 瞬間に接地しているので、キック本体のステップの値がそのまま構えを表す。
         state["plant_lon_frozen"] = torch.where(trigger, plant_lon, state["plant_lon_frozen"])
         state["plant_lat_frozen"] = torch.where(trigger, plant_lat, state["plant_lat_frozen"])
+        # 蹴り足の鉛直速度も plant_* と同じく **latch したステップの現在値** を採る。
+        # latch = ボールが動き出した瞬間なので、そのステップの足速度がすくい上げの
+        # 有無をそのまま表す。
+        state["foot_vz_frozen"] = torch.where(trigger, foot_vz, state["foot_vz_frozen"])
         state["kick_done"] = state["kick_done"] | trigger
 
     kick_done = state["kick_done"]

@@ -62,6 +62,13 @@ class KickDirectionCommand(UniformVelocityCommand):
       軸足がボール後方に残っていると蹴り足が高い位置に当たるので、
       ``sole_height_at_kick`` が下がらない原因の切り分けに使う。
       これも「キックが成立した env」だけで平均している。
+    * ``foot_vz``: 蹴った瞬間の **蹴り足** のワールド鉛直速度 [m/s]。**正 = すくい上げ**。
+      ボールが浮いた原因が足の上向き運動 (反発係数に依存しない) なのか、地面との反発
+      (Isaac では e≈0.6 だが MuJoCo・実機では ≈0) なのかを切り分ける指標。
+      ``kick_apex_height`` が出ているのにここが 0 付近なら、その解は反発に依存しており
+      実機へ転移しない。:func:`~.rewards.kick_foot_lift` の ``vz_foot_sat`` は
+      この実測値を見て決める (飽和しきっているなら上げる)。
+      これも「キックが成立した env」だけで平均している。
 
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
@@ -99,6 +106,8 @@ class KickDirectionCommand(UniformVelocityCommand):
         # 蹴った瞬間の軸足の配置 (キック方向フレーム、ボール中心基準) [m]。
         self.metrics["plant_lon"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["plant_lat"] = torch.zeros(self.num_envs, device=self.device)
+        # 蹴った瞬間の蹴り足の鉛直速度 [m/s]。+ = すくい上げ。vz_foot_sat のチューニング用。
+        self.metrics["foot_vz"] = torch.zeros(self.num_envs, device=self.device)
         # 低指令域 (v_target < low_speed_threshold) だけを切り出した内訳。
         # 全 env 平均の kick_rate / kick_vel_ratio では「弱い指令だけ蹴れていない/
         # 飛びすぎている」が高指令域の成績に埋もれて見えないため (walk_weak_kick 用)。
@@ -135,6 +144,7 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["sole_height_at_kick"] = state["sole_height_at_kick"] * kick_done
         self.metrics["plant_lon"] = state["plant_lon_frozen"] * kick_done
         self.metrics["plant_lat"] = state["plant_lat_frozen"] * kick_done
+        self.metrics["foot_vz"] = state["foot_vz_frozen"] * kick_done
 
         # 低指令域の内訳。読み方:
         #   低指令域のキック成功率 = kick_rate_low / kick_low_frac

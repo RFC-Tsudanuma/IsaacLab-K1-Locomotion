@@ -79,6 +79,61 @@ Walk-Loop-Shoot からの変更点
    ので、原理上は ``k1_walk_kick_walk_phase`` の checkpoint をそのまま
    ``--load_pretrained`` に使い回せる (walk_lob 専用の walk phase を別に回す必要はない)。
 
+7. **すくい上げの報酬 (kick_foot_lift) を追加する。**
+   「蹴る瞬間に蹴り足が上向きに動いている」ことを狙う項。Isaac Sim では浮くのに
+   MuJoCo・実機では浮かない、という転移失敗への対策。
+
+   原因はボールの反発係数で、Isaac の既定 (e≈0.6) では **足を水平に突っ込んで地面との
+   間でボールを弾ませる** だけで vz が出るのに対し、MuJoCo・実機 (e≈0) ではその成分が
+   丸ごと消える。``kick_loft`` / ``kick_elevation`` は結果 (ボールの vz・仰角) しか
+   見ないのでこの機構の違いを区別できず、シミュレータ固有の解でも満点が出てしまう。
+   この項は **原因側** (接触の瞬間の足の鉛直速度) を直接報酬にして、浮かせる
+   メカニズムを反発非依存 = 運動学依存の側へ寄せる。
+
+   既存項とは **加算** で並べる (``kick_loft`` に掛けない)。項の内部は他と同じく
+   ``r_direction`` への乗算で、非負・飽和型 (青天井にしない)。kick_plant_foot と
+   まったく同じ契約。導出は :func:`~..walk_kick.mdp.rewards.kick_foot_lift` の
+   docstring と _FOOT_LIFT_VZ_SAT のコメントを参照。
+
+   効いているかは ``Metrics/kick_direction/foot_vz`` (→ 正へ立ち上がるか) と
+   ``kick_apex_height`` の 2 つで見る。apex は出ているのに foot_vz が 0 付近のままなら、
+   その解はまだ反発に依存しており実機へ転移しない。
+
+   NOTE: DR の反発範囲 (0.0-0.7) は既に e=0 を含んでいるが、それでも Isaac 固有の解が
+         残るのは、DR が「たまたま e が低い env でも動く解」を要求するだけで
+         「どの機構で浮かせるか」を指定しないため。この項はそこを直接指定する。
+
+8. **ボール位置観測に知覚ノイズ+遅延を入れる (stage 2 から)。**
+   :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` を
+   ``__post_init__`` の最後で呼び、policy の ``prev_ball_pos`` を
+   「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
+   フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm」に差し替える。
+   項7 と同じ **実機・MuJoCo でロブが失敗する** 問題への対策だが、そちらが「浮かせる
+   機構」= 物理側の転移だったのに対し、こちらは「ボールがどこにあると思っているか」
+   = 観測側の転移を潰す。実機の認識は遅れるうえ、たまに大きく外す裾を持つので、
+   固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) の既定では見えない誤差形になる。
+
+   **weak / middle との違い**: あちらは 360 (stage 3) の後に stage 4 として
+   :class:`~..walk_weak_kick.walk_weak_kick_env_cfg.K1WalkKick360WeakNoisyBallEnvCfg` /
+   :class:`~..walk_middle_kick.walk_middle_kick_env_cfg.K1WalkMiddleKick360NoisyBallEnvCfg`
+   を別クラス・別タスクとして積む。walk_lob には 360 ステージが無く 2 段構成なので、
+   段を足さずに **stage 2 本体へ直接** 適用する。したがって walk_lob には
+   「ノイズ無し版の stage 2」は存在しない (ノイズ有りが既定)。
+
+   観測は 55 次元・並びとも変わらない (差し替えるのは ``prev_ball_pos`` の
+   func/params/noise だけ) ので、walk phase や loop_shoot / loop_pass の checkpoint は
+   これまでどおり ``--load_pretrained`` でそのまま載る。critic の ``prev_ball_pos``
+   (ノイズ無し) と ``ball_vel`` には触らない。詳細と「触らないもの」は
+   :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` の docstring 参照。
+
+   PLAY では :func:`~..walk_kick.walk_kick_env_cfg._disable_ball_obs_jitter` で
+   **ジッタだけ** 0 にする。遅延とサンプル&ホールドは観測パイプラインの構造そのもの
+   (= PLAY で見たいもの) なので残す。``enable_corruption = False`` は ObsTerm の
+   ``noise`` しか切らず、関数側へ移したジッタには効かないのでこの呼び出しが必須。
+
+   NOTE: ``--reset_noise_std`` は使わないこと (weak / middle と同じ)。ノイズ耐性の
+         獲得が目的で、獲得済みの蹴り方を壊す理由がない。
+
 継承したまま変えないもの
 ------------------------
 * ボール物性の DR (摩擦 0.3-1.0 / 0.2-0.8、反発 0.0-0.7、質量スケール 0.9-1.15)。
@@ -102,6 +157,8 @@ from isaaclab.utils import configclass
 
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
+    _apply_noisy_ball_obs,
+    _disable_ball_obs_jitter,
     _KICK_STATE_PARAMS,
     _KICK_W_SCALE,
     K1WalkKickWalkPhaseEnvCfg,
@@ -195,6 +252,33 @@ _PLANT_SIGMA_LAT = 0.06
 # --------------------------------------------------------------------------- #
 _PLANT_FOOT_WEIGHT = 2.0
 
+# --------------------------------------------------------------------------- #
+# すくい上げ報酬 (kick_foot_lift) の飽和足速度 vz_foot_sat [m/s] と最終重み
+#
+# kick_foot_lift = r_dir * clamp(foot_vz / vz_foot_sat, 0, 1)。foot_vz は latch 時に
+# 凍結した蹴り足のワールド鉛直速度 (+ = 上向き)。
+#
+# なぜ要るか: walk_lob は Isaac Sim では浮くのに MuJoCo・実機では浮かない。ボールの
+# 反発係数が Isaac では e≈0.6、MuJoCo・実機では ≈0 で、**足を水平に突っ込んで地面との
+# 間でボールを弾ませる** 型の解は e が消えると丸ごと機能しなくなる。kick_loft /
+# kick_elevation は結果 (ボールの vz・仰角) しか見ないのでこの機構の違いを区別できず、
+# シミュレータ固有の解でも満点が出てしまう。この項は原因側 (接触の瞬間に足自身が上へ
+# 動いているか) を直接報酬にして、浮かせるメカニズムを反発非依存の側へ寄せる。
+#
+#   _FOOT_LIFT_VZ_SAT = 2.0 : ボール vz 目標 (_LOB_VZ_SAT = 5.0) に対して運動学的に
+#       必要な足速度の目安。剛体衝突なので 1:1 では移らないが、飽和型 (線形ランプ) は
+#       届かない値を置いても勾配が死なないので厳密である必要はない。実測は
+#       Metrics/kick_direction/foot_vz で見て、飽和しきっていたら上げること。
+#   _FOOT_LIFT_WEIGHT = 2.0 : kick_plant_foot と同じ。direction (6.0) / loft (5.0) /
+#       elevation (5.0) より明確に下。これも目的そのものではなく **「蹴り方」の指定**
+#       なので、大きくすると高さより蹴り方の最適化に学習が引っ張られる。
+#
+# NOTE: 既存項とは **加算** で並べる (kick_loft に掛けない)。学習初期はすくい上げが
+#       まず出ないので、掛けると loft の勾配がゼロ付近で死ぬ。kick_plant_foot と同じ契約。
+# --------------------------------------------------------------------------- #
+_FOOT_LIFT_VZ_SAT = 2.0
+_FOOT_LIFT_WEIGHT = 2.0
+
 
 @configclass
 class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
@@ -273,6 +357,62 @@ class K1WalkLobEnvCfg(K1WalkLoopShootEnvCfg):
             },
         )
 
+        # -- 6. すくい上げ (kick_foot_lift) を追加
+        #
+        # 「蹴る瞬間に蹴り足が上へ動いている」ことを狙う項。walk_lob が Isaac Sim では
+        # 浮くのに MuJoCo・実機では浮かない問題への対策で、浮かせるメカニズムを
+        # ボールの反発係数依存 (Isaac e≈0.6 / MuJoCo・実機 e≈0) から運動学依存へ移す。
+        # 詳しい理屈は _FOOT_LIFT_VZ_SAT のコメントと
+        # :func:`~..walk_kick.mdp.rewards.kick_foot_lift` の docstring を参照。
+        #
+        # kick_plant_foot とまったく同じ契約で置く: 既存項とは **加算** で並べ
+        # (kick_loft に掛けない)、項の内部は r_direction への乗算、非負 (すくい上げの
+        # ない蹴りは罰さず「報われない」だけ)、飽和で青天井にしない。
+        #
+        # sigma_direction は他のキック報酬と必ず揃えること (_LOB_SIGMA_DIRECTION)。
+        #
+        # 効いているかは ``Metrics/kick_direction/foot_vz`` (→ 正へ立ち上がるか) と
+        # ``kick_apex_height`` の 2 つで見る。apex は出ているのに foot_vz が 0 付近の
+        # ままなら、その解はまだ反発に依存しており実機へ転移しない。
+        self.rewards.kick_foot_lift = RewTerm(
+            func=mdp.kick_foot_lift,
+            weight=0.0,
+            params={
+                **_KICK_STATE_PARAMS,
+                "sigma_direction": _LOB_SIGMA_DIRECTION,
+                "vz_foot_sat": _FOOT_LIFT_VZ_SAT,
+            },
+        )
+        self.curriculum.kick_foot_lift_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                "term_name": "kick_foot_lift",
+                "start_weight": 0.0,
+                "end_weight": _FOOT_LIFT_WEIGHT * _KICK_W_SCALE,
+                "start_step": 0,
+                "end_step": 500,
+                "steps_per_iteration": 24,
+            },
+        )
+
+        # -- 7. ボール位置観測を実機の認識パイプライン寄りにする
+        #
+        # 項6 (kick_foot_lift) と同じ「実機・MuJoCo でロブが失敗する」問題への対策の、
+        # 観測側。
+        # 固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) を、エピソードごとランダム
+        # 遅延 2-6 ステップ + 30Hz サンプル&ホールド + フレーム同期ガウスジッタ
+        # (σ=6.7cm・クリップ ±20cm) に差し替える。
+        #
+        # weak / middle は 360 (stage 3) の後に stage 4 の別クラスとして積んでいるが、
+        # walk_lob には 360 ステージが無い 2 段構成なので、段を足さずに stage 2 本体へ
+        # 直接入れる (= walk_lob にノイズ無しの stage 2 は無い)。
+        #
+        # **必ず全ての報酬・カリキュラム登録が済んだ後 (= __post_init__ の最後) に呼ぶこと。**
+        # 差し替えるのは policy の prev_ball_pos の func/params/noise だけで、観測の
+        # 次元・並び (55 次元) は変わらないので checkpoint はそのまま載る。
+        # critic 側の prev_ball_pos と ball_vel には触らない (あちらの docstring 参照)。
+        _apply_noisy_ball_obs(self)
+
 
 @configclass
 class K1WalkLobEnvCfg_PLAY(K1WalkLobEnvCfg):
@@ -284,6 +424,11 @@ class K1WalkLobEnvCfg_PLAY(K1WalkLobEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+        # enable_corruption = False は ObsTerm の noise しか切らないので、関数側へ移した
+        # ジッタは別途 0 にする。遅延とサンプル&ホールドは観測パイプラインの構造
+        # (= PLAY で見たいもの) なので残す。weak / middle の PLAY と同じ扱い。
+        _disable_ball_obs_jitter(self)
 
 
 @configclass

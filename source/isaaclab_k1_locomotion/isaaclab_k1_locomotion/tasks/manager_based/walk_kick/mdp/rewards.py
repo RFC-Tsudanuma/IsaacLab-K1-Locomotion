@@ -310,6 +310,59 @@ def kick_plant_foot(
     return r_dir * f_lon * f_lat
 
 
+def kick_foot_lift(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    vz_foot_sat: float = 2.0,
+) -> torch.Tensor:
+    """項11. Foot Lift (すくい上げ) = r_direction * clamp(foot_vz / vz_foot_sat, 0, 1)。shape: (N,)
+
+    latch 時に凍結した **蹴り足の鉛直速度** (``foot_vz_frozen``、+ = 上向き) を評価する。
+    狙いは **「ボールが浮くメカニズムを反発係数依存から運動学依存へ移す」** こと。
+
+    walk_lob は Isaac Sim では浮くのに MuJoCo・実機では浮かない。原因はボールの反発係数で、
+    Isaac の既定 (e≈0.6) では「足を水平に突っ込んでボールを地面との間で弾ませる」だけで
+    vz が出てしまうのに対し、MuJoCo・実機 (e≈0) ではその成分が丸ごと消える。
+    ``kick_loft`` / ``kick_elevation`` は **結果** (ボールの vz・仰角) だけを見るので、
+    どちらの機構で浮いたかを区別できず、シミュレータ固有の解を選んでも満点が出る。
+
+    この項は **原因側** (接触の瞬間に足自身が上へ動いているか) を直接報酬にする。
+    足の上向き運動量から移る vz は反発係数に依存しないので、この項で誘導した解は
+    e が消える環境でもそのまま残る。``kick_loft`` (結果) と並べて置くことで、
+    「上げろ」と「すくい上げで上げろ」を同時に要求する形になる。
+
+    * f_lift = clamp(foot_vz / vz_foot_sat, 0, 1)。**打ち下ろし (foot_vz < 0) は 0**。
+      踏みつけ型の解にはこの項から一切払われない。
+    * ``vz_foot_sat = 2.0`` [m/s] はボール vz 目標 (walk_lob の ``vz_sat`` = 5.0) に対して
+      運動学的に必要な足速度の目安。剛体衝突では質量比と接触法線で伝達率が決まるので
+      1:1 では移らないが、飽和型 (線形ランプ) なので厳密な値である必要はない。届かない
+      値を置いても勾配は死なず、逆に飽和させると圧力が消える (``kick_loft`` と同じ)。
+      実測は ``Metrics/kick_direction/foot_vz`` で見て、飽和しているようなら上げること。
+
+    設計上の約束 (kick_loft / kick_plant_foot と同じ):
+
+    * **r_direction への乗算**であること。加算にすると「方向を無視して足を上に振る」だけで
+      報酬が取れてしまう。乗算なら kick_done ゲート・方向精度 (τ_direction)・胴体の正対
+      (p_style) を全て通過した蹴りにしか払われない。``sigma_direction`` は同じタスクの
+      他のキック報酬と **必ず同じ値** にすること (項ごとに違うと方位を外したときの損得が
+      食い違って何を最適化しているのか読めなくなる)。
+    * **他のキック報酬とは加算で並べる**。``kick_loft`` に掛けてはいけない。学習初期は
+      すくい上げがまず出ないので、掛けると loft の勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。すくい上げのない蹴りは「罰される」のではなく「報われない」に
+      留める。負の dense 払いにすると、_r_direction の NOTE と同じ「外したら早く転んで
+      損切り」の抜け道が復活する。
+    * **青天井にしないこと**。飽和 (vz_foot_sat で頭打ち) が「足を全力で上へ振り抜く」
+      だけの解を防いでいる (kick_elevation の NOTE と同じ原則)。
+    """
+    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+
+    f_lift = torch.clamp(state["foot_vz_frozen"] / vz_foot_sat, min=0.0, max=1.0)
+    return r_dir * f_lift
+
+
 def walk_speed(
     env: ManagerBasedRLEnv,
     r_stance: float,
