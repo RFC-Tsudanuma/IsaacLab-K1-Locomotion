@@ -38,6 +38,17 @@ parser.add_argument(
     help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint (resume only).",
 )
 parser.add_argument(
+    "--reset_obs_normalizer",
+    action="store_true",
+    default=False,
+    help=(
+        "Reset the observation-normalizer running statistics (mean/var/count) to their initial "
+        "state after loading a checkpoint. Use when resuming across a stage boundary that changes "
+        "what the observation slots mean (e.g. gk Stage1 -> Stage2, where the task slots go from "
+        "zeros_obs dummies to real values). See the block at the load site for why."
+    ),
+)
+parser.add_argument(
     "--warmstart_actor",
     type=str,
     default=None,
@@ -243,6 +254,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     start_time = time.time()
 
+    # --- ゴールキーパーのカリキュラム進捗の永続化パスを env に渡す (2026-08-16) ---
+    # ★ RslRlVecEnvWrapper より **前** に設定すること。wrapper の __init__ が env.reset()
+    #   を呼び、そこで CurriculumManager が走って adaptive_difficulty が初期化される。
+    #   その時点でパスが無いと保存済みの進捗を読めず、最易段から始まってしまう。
+    #
+    # rsl_rl の save() はモデル・オプティマイザ・iter しか保存しないため、ゴールキーパーの
+    # カリキュラム到達点 (ball_speed_hi / aim_stage) は goalkeeper/mdp/curriculums.py が
+    # curriculum_state.json として自前で永続化する。これが無いと --resume のたびに
+    # 最易段 (初速 1.0 / 狙い先 ±0.4) へ巻き戻る。
+    #   load: resume 元のランディレクトリ / save: 今回のランディレクトリ
+    # goalkeeper 以外のタスクでは curriculums.py 側が参照しないので無害。
+    if hasattr(env.unwrapped.cfg, "goalkeeper"):
+        _curr_load_dir = os.path.dirname(resume_path) if (
+            agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation"
+        ) else None
+        env.unwrapped._gk_curriculum_paths = {"load": _curr_load_dir, "save": log_dir}
+
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
@@ -279,6 +307,49 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if mismatched:
             print(f"[WARN]: runner.load no-op detected; force-loading {len(mismatched)} mismatched keys.")
             policy.load_state_dict(ckpt_msd, strict=False)
+
+        # --- 観測正規化の統計をリセットする (ステージ境界をまたぐ resume 用) ---
+        #
+        # ★ 2026-08-16: ゴールキーパー Stage1 -> Stage2 の resume で実害を確認した。
+        #
+        #   rsl_rl の EmpiricalNormalization は ckpt の model_state_dict に mean/var/count を
+        #   含むので、--resume すると **前ステージの統計をそのまま引き継ぐ**。しかも
+        #   ``until`` は既定 None で、学習の最後まで更新し続ける (更新率 rate = 今回の
+        #   サンプル数 / 累積 count なので、累積が大きいほど新しいデータが効かなくなる)。
+        #
+        #   ゴールキーパー Stage1 はボール系スロット (ball_pos_rel / ball_vel / ball_active /
+        #   target_y / self_state = obs[49:59]) が全て zeros_obs のダミーで、Stage2 で初めて
+        #   実値が入る。したがって Stage2 の統計は「ゼロが大量に入ったあとに実値が乗る」
+        #   二峰分布の平均になり、実値が不当に縮む。
+        #
+        #   実測 (k1_gk_direct_stage2/2026-08-15_11-31-55, model_48200):
+        #     Stage1 count 5,406,720,000 -> Stage2 count 8,670,609,408
+        #     Stage2 の寄与率 = 3,263,889,408 / 8,670,609,408 = 0.376
+        #     cos(yaw) は常に ~1.0 のはずが mean = 0.3736  (予測 1.0 * 0.376 = 0.3764)
+        #     self_x は guard_x=0.9 付近のはずが mean = 0.2994
+        #   → タスク観測 8 スロットが一律 **約 0.38 倍に潰されて** 方策に入っていた。
+        #
+        #   重みの引き継ぎ (warmstart の目的) にダミーゼロの統計まで要らないので、
+        #   ステージ境界では統計だけ捨てる。count=0 に戻せば Stage2 の実データで
+        #   最初から推定し直す。
+        #
+        # ★ 重みは触らない。統計 (mean/var/std/count) だけをリセットする。
+        # ★ opt-in。通常の「同一ステージの続きから」では **使わないこと** (せっかく貯めた
+        #   統計を捨てて、序盤の観測スケールが暴れる)。
+        if args_cli.reset_obs_normalizer:
+            _n_reset = 0
+            for _name, _mod in policy.named_modules():
+                if not (hasattr(_mod, "_mean") and hasattr(_mod, "count")):
+                    continue
+                with torch.no_grad():
+                    _mod._mean.zero_()
+                    _mod._var.fill_(1.0)
+                    _mod._std.fill_(1.0)
+                    _mod.count.zero_()
+                _n_reset += 1
+                print(f"[INFO]: Reset obs-normalizer statistics: {_name}")
+            if _n_reset == 0:
+                print("[WARN]: --reset_obs_normalizer set but no normalizer module was found.")
 
         # re-inject action noise std if requested (recover from collapsed std after long training)
         if args_cli.reset_noise_std is not None:

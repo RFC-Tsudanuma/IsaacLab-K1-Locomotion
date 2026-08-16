@@ -92,6 +92,8 @@ from .mdp.observations import (
 )
 from .mdp.rewards import (
     face_field,
+    # ★ 足裏基準の足上げ報酬 (Stage2 で foot_clearance_ji を差し替える。理由は使用箇所を参照)
+    foot_clearance_sole,
     hold_default_pose_after_save,
     lateral_speed_bonus,
     save_clearance_bonus,
@@ -390,7 +392,38 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
 
         # 停止判定のしきい値を 3 箇所で揃える。
         _STOP_TOL = 0.12
-        self.rewards.foot_clearance.params["cmd_threshold"] = _STOP_TOL
+
+        # --- 足上げ報酬を **足裏基準** に差し替える (2026-08-16) ---
+        #
+        # 継承元 (K1GKDirectEnvCfg) は foot_clearance_ji で、測っているのは
+        # **足リンク原点** の高さ。ところが原点は足裏から 3.82cm 上にあり、足首が
+        # 底屈しているとつま先はほとんど上がらない。07-28 の実測で
+        # **原点 3.2〜3.9cm に対しつま先 0.7cm** = 上げた高さの 4〜7 割が足の傾きで
+        # 失われていた。実際につまずくのはつま先なので、この測り方では
+        # 「上げているつもりで擦っている」解に満額を払ってしまう。
+        #
+        # foot_clearance_sole は足裏 4 隅の最小高さを支持脚基準で測り、位相と整合を
+        # 取る (詳細は同関数の docstring と goalkeeper_lateral_env_cfg.py の
+        # TARGET_SOLE_CLEARANCE の解説)。横移動特化タスクで先に導入した実装をそのまま使う。
+        #
+        # 目標 0.03m は人工芝のパイル (20〜30mm) を上回り、かつ 07-28 の脚上げ量
+        # (3.2〜3.9cm) より低い。**脚を高く上げなくても足首を水平にすれば届く**ので、
+        # 速度を削る方向の圧にならない。weight/target を上げる軸は探索済みで、
+        # 上げると跳躍に退行することが分かっている (だから測り方を変える)。
+        #
+        # speed_gate_frac=0.9 は「遅く歩いて足だけ上げる」解を報酬上ありえなくする保険。
+        self.rewards.foot_clearance = RewTerm(
+            func=foot_clearance_sole,
+            weight=2.5,
+            params={
+                "command_name": "base_velocity",
+                "target_clearance": 0.03,
+                "phase_freq": _PHASE_FREQ,
+                "stance_ratio": _STANCE_RATIO,
+                "cmd_threshold": _STOP_TOL,
+                "speed_gate_frac": 0.9,
+            },
+        )
         if self.rewards.feet_phase is not None:
             self.rewards.feet_phase.params["cmd_threshold"] = _STOP_TOL
 
