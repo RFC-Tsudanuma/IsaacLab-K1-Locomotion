@@ -84,6 +84,18 @@ logs/rsl_rl/k1_walk_middle_kick_360/*
 logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/*
 !logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/model_4999.pt
 
+# walk_kick_360_weak の checkpoint (stage 3, weak)。カリキュラム (0/500/1500/3000) は
+# 走り切った後の状態 (strong=0 / σ=0.35 / overshoot 満額)。
+# sim 実測 (iter 3000): kick_rate 0.973 / kick_vel_ratio 1.098 / kick_dir_error 6.6°、
+# 低指令域は成功率 0.96 / 追従率 1.40 (まだ蹴りすぎ)。
+# 5000 まで延長する --resume 元、および知覚ノイズ版
+# (Walk-Kick-360-Weak-Noisy-Ball, stage 4) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_kick_360_weak/
+logs/rsl_rl/k1_walk_kick_360_weak/*
+!logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/
+logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/*
+!logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/model_3000.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
