@@ -91,6 +91,8 @@ strong の折れ線、σ アニールの窓、ボール物性 DR) は weak と�
 from isaaclab.utils import configclass
 
 from ..walk_kick.walk_kick_env_cfg import (
+    _apply_noisy_ball_obs,
+    _disable_ball_obs_jitter,
     K1WalkKick360EnvCfg,
     K1WalkKickEnvCfg,
 )
@@ -249,3 +251,54 @@ class K1WalkMiddleKick360EnvCfg_PLAY(K1WalkMiddleKick360EnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class K1WalkMiddleKick360NoisyBallEnvCfg(K1WalkMiddleKick360EnvCfg):
+    """Stage 4 (middle): 知覚ノイズ+遅延つき。stage 3 (middle, 360) の checkpoint から続ける。
+
+    実機で蹴り損ねが出る原因のうち、報酬構造ではなく **観測の質** の側を潰す段。
+    :class:`K1WalkMiddleKick360EnvCfg` との差は policy のボール位置観測だけで、
+    :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` が
+    「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
+    フレーム同期ジッタ ±5cm」に差し替える (詳細はあちらの docstring)。
+
+    middle のレシピ (weak の 3 点セット + 帯 (3.2, 4.5) + σ 終点 0.5 + ボール物性 DR) は
+    基底の ``__post_init__`` で全て済んでおり、観測差し替えは報酬にもコマンド帯にも
+    触れないのでそのまま残る::
+
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Flat-K1-Walk-Middle-Kick-360-Noisy-Ball-v0 \
+            --headless --num_envs 4096 --max_iterations 3000 \
+            --load_pretrained logs/rsl_rl/k1_walk_middle_kick_360/<run>/model_<N>.pt
+
+    NOTE: この帯では観測ノイズの影響が weak より大きく出る可能性がある。狙う飛距離が
+          5-10 m と長いぶん、同じ蹴り角の誤差でも着弾のずれが比例して広がるため。
+          weak 版と揃えた ±5cm / 2-6 ステップから始めて、実機の遅延を計測できたら
+          :data:`~..walk_kick.walk_kick_env_cfg._BALL_OBS_DELAY_STEP_RANGE` を
+          「計測値 + マージン」に絞ること (両系統で共有している定数なので、
+          帯ごとに変えたくなったらここで params を上書きする)。
+
+    NOTE: 基底のカリキュラム (0/500/1500/3000 iteration) の扱いは weak 版と同じ
+          (:class:`~..walk_weak_kick.walk_weak_kick_env_cfg.K1WalkKick360WeakNoisyBallEnvCfg`
+          の NOTE 参照)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_noisy_ball_obs(self)
+
+
+@configclass
+class K1WalkMiddleKick360NoisyBallEnvCfg_PLAY(K1WalkMiddleKick360NoisyBallEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        _disable_ball_obs_jitter(self)

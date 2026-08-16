@@ -57,6 +57,29 @@ gym.register(
     },
 )
 
+# Stage 4 (middle): 知覚ノイズ+遅延つき。k1_walk_middle_kick_360 の checkpoint から続ける。
+# stage 3 との差は policy のボール位置観測だけ (エピソードごとランダム遅延 + 30Hz
+# サンプル&ホールド + ジッタ ±5cm)。観測 55 次元・並びは同一なので checkpoint はそのまま載る。
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Middle-Kick-360-Noisy-Ball-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_middle_kick_env_cfg:K1WalkMiddleKick360NoisyBallEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkMiddleKick360NoisyBallPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Middle-Kick-360-Noisy-Ball-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_middle_kick_env_cfg:K1WalkMiddleKick360NoisyBallEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkMiddleKick360NoisyBallPPORunnerCfg",
+    },
+)
+
 # NOTE: 通し実行は scripts/rsl_rl/train_walk_kick_middle.sh (stage 1 は同梱 checkpoint を再利用)。
 #       --reset_noise_std は **使わないこと** (理由は env cfg の docstring 参照)。
 # NOTE: カリキュラムが 3000 iteration で終点に着くので、--max_iterations は 3000 以上。
