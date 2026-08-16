@@ -76,6 +76,14 @@ logs/rsl_rl/k1_walk_long_pass/*
 logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/*
 !logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/model_4000.pt
 
+# middle_kick_360 の checkpoint (stage 3, middle)。帯 (3.2, 4.5) m/s = 実機 5-10 m 相当。
+# 知覚ノイズ版 (Walk-Middle-Kick-360-Noisy-Ball, stage 4) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_middle_kick_360/
+logs/rsl_rl/k1_walk_middle_kick_360/*
+!logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/
+logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/*
+!logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/model_4999.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
