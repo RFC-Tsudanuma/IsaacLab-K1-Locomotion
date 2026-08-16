@@ -153,6 +153,7 @@ docstring 参照）。
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
 from ..walk_kick import mdp
@@ -321,7 +322,7 @@ _OBS_HISTORY_LENGTH = 100
 
 
 def enable_obs_history(cfg) -> None:
-    """policy 観測グループを 50 フレームの履歴にする。
+    """policy 観測グループを :data:`_OBS_HISTORY_LENGTH` フレームの履歴にする。
 
     Stage 1-3 の履歴入力版 (:mod:`.walk_long_pass_stages_env_cfg`) からも呼ぶので、
     設定は必ずここに 1 箇所にまとめる。片方だけ履歴長を変えると stage 間で
@@ -330,6 +331,77 @@ def enable_obs_history(cfg) -> None:
     """
     cfg.observations.policy.history_length = _OBS_HISTORY_LENGTH
     cfg.observations.policy.flatten_history_dim = False
+
+
+# 着地の作り込み系の shaping 項。long_pass 系列 (Stage 1-4) では全段で無効化する。
+#
+#   feet_landing_impact : 接地瞬間の接地力ノルムを罰する  (weight -0.5e-2)
+#   feet_landing_vel    : 接地瞬間の足速度を罰する        (weight -1.5)
+#   feet_heel_strike    : 接地瞬間のかかと下がり姿勢を賞する (weight +5.0)
+#
+# いずれも「接地イベントの瞬間」にだけ効くスパースな項で、蹴りとは相性が悪い。
+# 蹴り足のスイングは接地を強く速くする方向にしか作れないので、蹴るほど
+# feet_landing_impact / feet_landing_vel の罰が増える。feet_heel_strike も
+# 蹴り足の踏み込みがかかと下がりになりにくいぶん、蹴ると取り逃す報酬になる。
+# 結果として「蹴らずに丁寧に歩く」方が得になる圧が常時かかる。
+#
+# NOTE: 消すのは long_pass 系列だけ。これらは共用の K1FlatEnvCfg で定義されており、
+#       元を消すと walk_kick / walk_pass / walk_lob / walk_mid_kick / loop_shoot と
+#       コミット済みの基準 checkpoint まで道連れになる。
+_LANDING_SHAPING_TERMS = (
+    "feet_landing_impact",
+    "feet_landing_vel",
+    "feet_heel_strike",
+)
+
+
+# 蹴りのある段 (Stage 2-4) での feet_phase の weight。継承元は 2.0。
+#
+# 経緯 (実測):
+#   着地 shaping 3 項を消したことで Stage 1 の歩容が大きく良くなり、位相追従が
+#   ほぼ満点に張り付くようになった。その結果 Stage 2 に入った時点で
+#   Episode_Reward/feet_phase が 0.62 (旧) → 1.71 (新) と 2.7 倍になり、
+#   キックが払うコスト (kick_finished で latch の 2 秒後にエピソードが終わるので、
+#   キックは常に「残りの歩行報酬を捨てる」コストを払う。冒頭の「帯は一段で
+#   上げてはいけない」節と同じ機序) がそのぶん膨らんだ。
+#
+#   実測: Stage 2 を 4000 iteration 回して kick_rate は 0.19-0.28 で完全に停滞し、
+#   kick_elevation_deg は 0.97° (旧 run は同 iteration で kick_rate 0.99 /
+#   elevation 15.6°)。それでいて mean_reward は 12.5 対 7.7 で新 run の方が高い。
+#   つまり「蹴らずに歩く」が正しく最適解になっていた。
+#
+#   歩行報酬の総量を、実際に蹴りを獲得できていた頃の水準に戻す。
+#   2.0 * (0.62 / 1.71) ≒ 0.73 なので 0.8 を採る。
+#
+# NOTE: Stage 1 (歩行のみ) では下げない。歩容そのものはこの項で作っており、
+#       Stage 1 で下げると土台が崩れる。下げるのは蹴りと綱引きになる段だけ。
+_KICK_STAGE_FEET_PHASE_WEIGHT = 0.8
+
+
+def rebalance_gait_vs_kick(cfg) -> None:
+    """蹴りのある段で feet_phase の weight を下げる (:data:`_KICK_STAGE_FEET_PHASE_WEIGHT`)。
+
+    Stage 2-4 から呼ぶ。Stage 1 からは呼ばない。
+    """
+    term = getattr(cfg.rewards, "feet_phase", None)
+    if term is not None:
+        term.weight = _KICK_STAGE_FEET_PHASE_WEIGHT
+
+
+def disable_landing_shaping(cfg) -> None:
+    """着地 shaping 3 項 (:data:`_LANDING_SHAPING_TERMS`) を無効化する。
+
+    Stage 1-4 の全段から呼ぶ。段によって有無が変わると、前段が獲得した歩容が
+    次の段で罰せられる (あるいはその逆) ことになるので、必ず全段で揃えること。
+
+    報酬項の増減は観測にも行動にも影響しないので、checkpoint の引き継ぎには
+    影響しない (actor / critic の形は変わらない)。
+    """
+    for name in _LANDING_SHAPING_TERMS:
+        # 親の構成が変わって項が無くなっていても落ちないように getattr でガードする
+        # (kick 系の項を None にしている他 cfg と同じ扱い)。
+        if getattr(cfg.rewards, name, None) is not None:
+            setattr(cfg.rewards, name, None)
 
 
 # kick_state を参照する報酬項（v_thresh を配る対象）。
@@ -361,20 +433,70 @@ _KICK_STATE_REWARD_TERMS = (
 # --------------------------------------------------------------------------- #
 _OBS_DELAY_MAX_S = 0.02
 
+# --------------------------------------------------------------------------- #
+# ボール観測 (視覚由来) の遅延上限 [s]
+#
+# 本体センサ (IMU / エンコーダ) と分けてあるのは、実機での出所が違うため。
+# ボールはカメラ → 検出 → 座標変換のパイプラインを通るので、実機のレイテンシは
+# 内界センサより **明確に大きい** (一般的なヒューマノイドで 30-60 ms = 1.5-3 ステップ)。
+#
+# 実効遅延は **2 項とも 0.02-0.08 s** になるよう組んである:
+#
+#   prev_ball_pos : 0.02 (prev_ball_pos_b の固定 1 ステップ) + [0, 0.06] = 0.02-0.08
+#   ball_vel      : 0.02 (_BALL_OBS_BASE_DELAY_S)            + [0, 0.06] = 0.02-0.08
+#
+# ball_vel 側に固定ぶんを足しているのは、prev_ball_pos が設計上すでに 1 ステップ
+# 遅れているため。同じカメラフレームから出る 2 つの量のレイテンシが 1 ステップ
+# ずれているのは実機ではあり得ないので揃える。vision group で乱数を共有するので、
+# ランダム成分も 2 項で同じ値になる。
+#
+# 0.08 s = 4 ステップ。実機のカメラ遅延を測った結果で調整すること。
+# ball_vel だけ従来どおり [0, 0.06] に戻したいなら _BALL_OBS_BASE_DELAY_S = 0.0。
+# --------------------------------------------------------------------------- #
+_BALL_OBS_DELAY_MAX_S = 0.06
+_BALL_OBS_BASE_DELAY_S = 0.02
+
+# --------------------------------------------------------------------------- #
+# ボール観測のノイズ (一様、±この値)
+#
+# 継承値は位置 ±0.02 m / 速度 ±0.1 m/s。実機のカメラ由来の量としては楽観的すぎる
+# (とくに速度はフレーム間差分から求めるので、位置ノイズを dt = 0.02 s で微分した
+#  ぶんのばらつきが原理的に乗る)。
+#
+# 位置 ±0.07 m はボール半径 (0.11 m) の 6 割ほど。±0.1 m (半径とほぼ同じ) で回した
+# run では帯が 5.0 に乗った直後 (iteration 3000 付近) が性能のピークで、その後は
+# critic の value loss が繰り返し発散して崩壊と自己回復を繰り返した。位置ノイズを
+# 少し緩めて、その不安定さがボール位置の観測ノイズ由来かどうかを見る。
+#
+# 速度 ±0.5 m/s は指令帯 (3.2-5.0) の 10-15%。ボール速度観測に頼った蹴り分けは
+# ほぼできなくなるが、そもそも実機で信用できない量なので頼らせない方が正しい。
+# --------------------------------------------------------------------------- #
+_BALL_POS_NOISE = 0.07
+_BALL_VEL_NOISE = 0.5
+
 # 遅延を掛ける policy 観測項と、遅延量を共有するセンサ (group)。
 #
 # group が同じ項は同じ遅延量を引く。projected_gravity と base_ang_vel は同じ IMU、
 # joint_pos と joint_vel は同じエンコーダ読み出しから来るので、独立に遅れることは
 # 物理的にあり得ない (重力は最新なのに角速度だけ 1 ステップ古い、など)。
+# ボール 2 項も同じカメラフレームから出るので "vision" で共有する。
+#
+# 4 要素目は max_delay_s を引く元の定数名 ("body" = 内界センサ, "ball" = 視覚)。
 _DELAYED_OBS_TERMS = (
-    ("projected_gravity", "imu", "delayed_projected_gravity"),
-    ("base_ang_vel", "imu", "delayed_base_ang_vel"),
-    ("joint_pos", "encoder", "delayed_joint_pos_rel"),
-    ("joint_vel", "encoder", "delayed_joint_vel_rel"),
+    ("projected_gravity", "imu", "delayed_projected_gravity", "body"),
+    ("base_ang_vel", "imu", "delayed_base_ang_vel", "body"),
+    ("joint_pos", "encoder", "delayed_joint_pos_rel", "body"),
+    ("joint_vel", "encoder", "delayed_joint_vel_rel", "body"),
+    ("ball_vel", "vision", "delayed_ball_vel_b", "ball"),
+    ("prev_ball_pos", "vision", "delayed_prev_ball_pos_b", "ball"),
 )
 
 
-def enable_obs_delay(cfg, max_delay_s: float = _OBS_DELAY_MAX_S) -> list[str]:
+def enable_obs_delay(
+    cfg,
+    max_delay_s: float = _OBS_DELAY_MAX_S,
+    ball_max_delay_s: float | None = None,
+) -> list[str]:
     """policy 観測の IMU / エンコーダ由来の項にセンサ遅延 DR を掛ける。
 
     既存の ObsTerm の ``func`` と ``params`` だけを差し替える。項を作り直さないのは
@@ -393,20 +515,39 @@ def enable_obs_delay(cfg, max_delay_s: float = _OBS_DELAY_MAX_S) -> list[str]:
     その場合は全 stage で同じ ``max_delay_s`` にすること (遅延の有無で歩き方が
     変わるので、段の間で条件が変わると引き継ぎの意味が薄れる)。
 
+    Args:
+        max_delay_s: 内界センサ (IMU / エンコーダ) の遅延上限 [s]。
+        ball_max_delay_s: ボール観測 (視覚) の遅延上限 [s]。None なら
+            :data:`_BALL_OBS_DELAY_MAX_S`。実機のカメラ遅延は内界センサより
+            大きいので別パラメータにしてある。
+
     Returns:
         遅延を掛けた観測項の名前。
     """
+    if ball_max_delay_s is None:
+        ball_max_delay_s = _BALL_OBS_DELAY_MAX_S
+
     applied: list[str] = []
-    for term_name, group, func_name in _DELAYED_OBS_TERMS:
+    for term_name, group, func_name, source in _DELAYED_OBS_TERMS:
         term = getattr(cfg.observations.policy, term_name, None)
         if term is None:
             raise AttributeError(
                 f"policy 観測に '{term_name}' がありません。遅延 DR の対象項名が"
                 " 継承元の観測構成と食い違っています。"
             )
+        delay = ball_max_delay_s if source == "ball" else max_delay_s
         term.func = getattr(mdp, func_name)
-        term.params = {**term.params, "max_delay_s": max_delay_s, "group": group}
+        term.params = {**term.params, "max_delay_s": delay, "group": group}
+        # prev_ball_pos は固定 1 ステップを元から持っているので base は足さない。
+        # ball_vel だけ同じぶんを足して、同じカメラ由来の 2 項の実効遅延を揃える。
+        if term_name == "ball_vel":
+            term.params["base_delay_s"] = _BALL_OBS_BASE_DELAY_S
         applied.append(term_name)
+
+    # ボール観測のノイズを実機のカメラ由来の量に合わせて広げる
+    # (_BALL_POS_NOISE / _BALL_VEL_NOISE のコメント参照)。
+    cfg.observations.policy.ball_vel.noise = Unoise(n_min=-_BALL_VEL_NOISE, n_max=_BALL_VEL_NOISE)
+    cfg.observations.policy.prev_ball_pos.noise = Unoise(n_min=-_BALL_POS_NOISE, n_max=_BALL_POS_NOISE)
     return applied
 
 
@@ -485,12 +626,24 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 0. Actor の観測を 50 フレームの履歴にする
+        # -- 0. Actor の観測を _OBS_HISTORY_LENGTH フレームの履歴にする
         #
         # 項の中身・順序・ノイズは継承元のまま。1 フレーム 55 次元が
-        # (num_envs, 50, 55) になるだけで、切り出し方 (直近 5 + CNN 潜在) は
+        # (num_envs, H, 55) になるだけで、切り出し方 (直近 5 + CNN 潜在) は
         # ネットワーク側の仕事。定数の意図は _OBS_HISTORY_LENGTH のコメント参照。
         enable_obs_history(self)
+
+        # -- 0a. 着地 shaping 3 項を無効化する
+        #
+        # Stage 1-3 でも同じヘルパを呼んでいる。理由は disable_landing_shaping の
+        # コメント参照 (蹴るほど損をする圧がかかるため)。
+        disable_landing_shaping(self)
+
+        # -- 0a'. 歩行報酬 (feet_phase) を蹴りと釣り合う量まで下げる
+        #
+        # Stage 2/3 (walk_long_pass_stages_env_cfg) でも同じヘルパを呼ぶ。
+        # 理由は _KICK_STAGE_FEET_PHASE_WEIGHT のコメント参照。
+        rebalance_gait_vs_kick(self)
 
         # -- 0b. IMU / エンコーダ由来の観測にセンサ遅延 DR を掛ける
         #

@@ -10,7 +10,8 @@
     Stage 1 walk phase → Stage 2 loop_pass → Stage 3 loop_pass_360 → Stage 4 long_pass
 
 Stage 4 (:class:`~.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg`) の actor は
-50 フレームの観測履歴を見るので、**前段も同じ観測形でないと checkpoint が繋がらない**
+:data:`~.walk_long_pass_env_cfg._OBS_HISTORY_LENGTH` フレームの観測履歴を見るので、
+**前段も同じ観測形でないと checkpoint が繋がらない**
 (actor の入力次元と重みの名前が変わり、train.py が黙って捨てる)。
 
 一方で Stage 1-3 の元タスク
@@ -24,9 +25,11 @@ Stage 4 (:class:`~.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg`) の actor は
 基準 checkpoint も actor が使えなくなる。そこで long_pass 系列専用のタスクを別 ID で
 登録し、共用タスクは 1 フレーム観測のまま残す。
 
-中身の差分は :func:`~.walk_long_pass_env_cfg.enable_obs_history` の 1 行だけ。
-報酬・コマンド・シーン・カリキュラムは元タスクと完全に同一なので、挙動の違いは
-観測の見え方だけに閉じている。experiment_name (= logs の出力先) は
+中身の差分は :func:`~.walk_long_pass_env_cfg.enable_obs_history` (観測を履歴にする) と
+:func:`~.walk_long_pass_env_cfg.disable_landing_shaping` (着地 shaping 3 項を消す) の
+2 箇所だけ。コマンド・シーン・カリキュラムは元タスクと完全に同一。
+着地 shaping を消すのは Stage 4 と揃えるため — 段によって有無が変わると、前段が
+獲得した歩容が次の段で罰せられることになる。experiment_name (= logs の出力先) は
 ``k1_walk_long_pass_*`` で分けてあり、既存の run と混ざらない。
 """
 
@@ -39,7 +42,7 @@ from ..walk_loop_pass.walk_loop_pass_env_cfg import (
     K1WalkLoopPassEnvCfg,
     K1WalkLoopPassEnvCfg_PLAY,
 )
-from .walk_long_pass_env_cfg import enable_obs_history
+from .walk_long_pass_env_cfg import disable_landing_shaping, enable_obs_history, rebalance_gait_vs_kick
 
 
 @configclass
@@ -49,6 +52,7 @@ class K1WalkLongPassWalkPhaseEnvCfg(K1WalkKickWalkPhaseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
 
 
 @configclass
@@ -56,6 +60,7 @@ class K1WalkLongPassWalkPhaseEnvCfg_PLAY(K1WalkKickWalkPhaseEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
 
 
 @configclass
@@ -65,6 +70,8 @@ class K1WalkLongPassLoopPassEnvCfg(K1WalkLoopPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
+        rebalance_gait_vs_kick(self)
 
 
 @configclass
@@ -72,6 +79,8 @@ class K1WalkLongPassLoopPassEnvCfg_PLAY(K1WalkLoopPassEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
+        rebalance_gait_vs_kick(self)
 
 
 @configclass
@@ -81,6 +90,8 @@ class K1WalkLongPassLoop360EnvCfg(K1WalkLoopPass360EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
+        rebalance_gait_vs_kick(self)
 
 
 @configclass
@@ -88,3 +99,5 @@ class K1WalkLongPassLoop360EnvCfg_PLAY(K1WalkLoopPass360EnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
         enable_obs_history(self)
+        disable_landing_shaping(self)
+        rebalance_gait_vs_kick(self)

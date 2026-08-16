@@ -266,22 +266,28 @@ def _delayed_signal(
     group: str,
     value: torch.Tensor,
     max_delay_s: float,
+    base_delay_s: float = 0.0,
 ) -> torch.Tensor:
-    """``value`` を [0, max_delay_s] の範囲でランダムに遅延させて返す。
+    """``value`` を ``base_delay_s + [0, max_delay_s]`` だけ遅延させて返す。
 
     Args:
         key: 項ごとの履歴バッファを引くキー (項ごとに一意にすること)。
-        group: 遅延量を共有するセンサ名 ("imu" / "encoder" など)。
+        group: 遅延量を共有するセンサ名 ("imu" / "encoder" / "vision" など)。
+            同じ group の項は同じ乱数を引く。
         value: 今ステップの生の観測 (num_envs, dim)。
-        max_delay_s: 遅延の上限 [s]。0 以下なら素通し。
+        max_delay_s: ランダム成分の上限 [s]。
+        base_delay_s: 全 env 共通の固定遅延 [s]。同じセンサから来るのに片方の項だけ
+            設計上すでに遅れている場合 (:func:`prev_ball_pos_b` の 1 ステップ)、
+            遅れていない方にこれを与えて実効遅延を揃える。
     """
-    if max_delay_s <= 0.0:
+    if max_delay_s <= 0.0 and base_delay_s <= 0.0:
         return value
 
     dt = env.step_dt
     max_lag = max_delay_s / dt
+    base_lag = base_delay_s / dt
     # 補間には hist[i0] と hist[i0+1] が要るので、最大遅延ぶん + 1 フレーム持つ。
-    n_frames = int(math.ceil(max_lag)) + 1
+    n_frames = int(math.ceil(base_lag + max_lag)) + 1
     step = int(env.common_step_counter)
     num_envs = value.shape[0]
 
@@ -325,9 +331,10 @@ def _delayed_signal(
     if bool(just_reset.any()):
         hist[:, just_reset] = value[just_reset].unsqueeze(0)
 
-    # -- 3. 線形補間
-    i0 = torch.floor(lag).long().clamp_(min=0, max=n_frames - 2)
-    weight = (lag - i0.to(lag.dtype)).unsqueeze(-1)
+    # -- 3. 線形補間 (固定遅延ぶんを足してから)
+    total_lag = lag + base_lag
+    i0 = torch.floor(total_lag).long().clamp_(min=0, max=n_frames - 2)
+    weight = (total_lag - i0.to(total_lag.dtype)).unsqueeze(-1)
     env_idx = torch.arange(num_envs, device=value.device)
     return (1.0 - weight) * hist[i0, env_idx] + weight * hist[i0 + 1, env_idx]
 
@@ -374,3 +381,38 @@ def delayed_joint_vel_rel(
     """エンコーダ由来の関節速度 (デフォルトからの相対) を遅延させたもの。"""
     value = base_mdp.joint_vel_rel(env, asset_cfg=asset_cfg)
     return _delayed_signal(env, "joint_vel_rel", group, value, max_delay_s)
+
+
+def delayed_ball_vel_b(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "vision",
+    base_delay_s: float = 0.0,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """視覚由来のボール速度を遅延させたもの。
+
+    ``base_delay_s`` は :func:`prev_ball_pos_b` が設計上持っている固定 1 ステップと
+    実効遅延を揃えるためのもの。同じカメラフレームから出る 2 つの量なので、
+    レイテンシが 1 ステップずれているのは実機ではあり得ない。
+    """
+    value = ball_vel_b(env, ball_cfg=ball_cfg)
+    return _delayed_signal(env, "ball_vel_b", group, value, max_delay_s, base_delay_s)
+
+
+def delayed_prev_ball_pos_b(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "vision",
+    base_delay_s: float = 0.0,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """視覚由来のボール位置を遅延させたもの。
+
+    NOTE: :func:`prev_ball_pos_b` は **元から 1 ステップ (0.02 s) 遅らせた値** を返す
+          (知覚遅延を模す設計。関数名の "prev" がそれ)。ここでの遅延はその上に載るので、
+          この項の実効遅延は ``0.02 + [0, max_delay_s]`` 秒。``base_delay_s`` は
+          ここでは 0 のまま使うこと (二重に足すことになる)。
+    """
+    value = prev_ball_pos_b(env, ball_cfg=ball_cfg)
+    return _delayed_signal(env, "prev_ball_pos_b", group, value, max_delay_s, base_delay_s)
