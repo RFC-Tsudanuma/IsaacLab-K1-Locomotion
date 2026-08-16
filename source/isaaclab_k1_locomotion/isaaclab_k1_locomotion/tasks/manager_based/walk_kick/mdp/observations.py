@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
-from ...locomotion.mdp.events import get_phase_freq
+from ...locomotion.mdp.events import get_phase_freq, get_phase_offset
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -82,10 +82,14 @@ def gait_phase_sincos(
     右脚位相は左脚位相 + π で一意に決まるため、ここでは左脚位相のみを渡す。
     コマンド速度が ``cmd_threshold`` 未満のときは ``phase_obs`` と同様にゼロで
     埋め、停止すべき状況であることを明示する (feet_phase 報酬のゲートと揃える)。
+
+    ``randomize_phase_offset`` イベントが登録されている環境 (両足キック系タスク) では
+    env ごとの初期オフセットが乗る。方策はこの sin/cos から現在位相を直接読めるので、
+    オフセット自体を別スロットで開示する必要はない。
     """
     t = env.episode_length_buf * env.step_dt
     pf = get_phase_freq(env, phase_freq)
-    phase = 2.0 * math.pi * pf * t
+    phase = 2.0 * math.pi * pf * t + get_phase_offset(env)
 
     phase_sincos = torch.stack([torch.sin(phase), torch.cos(phase)], dim=1)
 
@@ -168,6 +172,22 @@ def walk_command_xy(
 ) -> torch.Tensor:
     """walk phase: 速度コマンドの (vx, vy) を prev_ball_pos スロットに載せる。shape: (N, 2)"""
     return env.command_manager.get_command(command_name)[:, :2]
+
+
+def walk_command_xyz(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """walk phase: 速度コマンド (vx, vy, 0) を 3 次元のボール位置スロットに載せる。shape: (N, 3)
+
+    :func:`walk_command_xy` の 3 次元版。両足キック系タスクはスロット 3 が
+    「ボール 3D 位置」なので、walk phase でもここに仮想的な目標点を載せて
+    「スロットが指す方へ歩く」という入力→挙動の対応を kick phase と共通にする。
+    z は歩行中は意味を持たないので 0 (kick phase でも蹴るまでは ≈ ボール半径で
+    ほぼ一定なので、この差はフェードイン期間で吸収される)。
+    """
+    cmd = env.command_manager.get_command(command_name)[:, :2]
+    return torch.cat([cmd, torch.zeros_like(cmd[:, :1])], dim=-1)
 
 
 def walk_command_yaw_dir(
@@ -342,3 +362,72 @@ def prev_ball_pos_b(
     state["cur"][just_reset] = cur[just_reset]
 
     return state["prev"]
+
+
+# --------------------------------------------------------------------------- #
+# 遅延つきボール位置 (履歴バッファ版)
+#
+# :func:`prev_ball_pos_b` は「1 ステップ前の 2D 位置」1 種類しか出せない。論文の観測は
+# **Current Ball 3D Position (3) と Previous Ball 2D Position (2) の 2 スロット**を持つ
+# ので、遅延の違う 2 つの標本を同じ履歴から取り出せるようにしたのがこの関数。
+#
+# 遅延を残す理由は :func:`ball_pos_rel` の NOTE と同じ (実機の vision は制御より遅い)。
+# 論文どおり「遅延ゼロの現在位置」を渡すと critic の特権情報と区別が付かなくなるので、
+# **現在位置スロットも 1 ステップ遅延**とし、previous スロットをその 1 つ前にする。
+#
+# 履歴は「そのステップの base yaw フレームで測った相対位置」をそのまま積む
+# (:func:`prev_ball_pos_b` と同じ規約)。過去の計測を過去のロボット姿勢で表した値になり、
+# 実機の vision 出力の扱いと一致する。
+# --------------------------------------------------------------------------- #
+_BALL_HIST_ATTR = "_ball_pos_hist_state"
+_BALL_HIST_LEN = 3  # 現在 (delay 0) + 過去 2 ステップぶん
+
+
+def delayed_ball_pos_b(
+    env: ManagerBasedRLEnv,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    delay_steps: int = 1,
+    dim: int = 3,
+) -> torch.Tensor:
+    """``delay_steps`` ステップ前のボール位置（ベース相対）。shape: (N, ``dim``)
+
+    Args:
+        delay_steps: 何ステップ前の値を返すか。0 = 遅延なし。``_BALL_HIST_LEN`` 未満。
+        dim: 3 なら (x, y, z)、2 なら水平成分のみ。
+
+    同一ステップ内で policy / critic の両グループ・複数スロットから呼ばれても履歴が
+    二重に進まないよう、``common_step_counter`` でステップ境界を検出する
+    (:func:`prev_ball_pos_b` と同じ)。エピソード開始直後は履歴が無いので現在位置で
+    全段を埋める (ゼロ埋めするとボールがベース原点にあるという誤った観測になる)。
+    """
+    if not 0 <= delay_steps < _BALL_HIST_LEN:
+        raise ValueError(
+            f"delayed_ball_pos_b: delay_steps は 0-{_BALL_HIST_LEN - 1} の範囲 (指定: {delay_steps})。"
+            " これより長い遅延が要るなら _BALL_HIST_LEN を増やすこと。"
+        )
+
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene["robot"]
+
+    rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
+    cur = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)  # (N, 3)
+
+    step = int(env.common_step_counter)
+    state = getattr(env, _BALL_HIST_ATTR, None)
+    if state is None:
+        # (N, _BALL_HIST_LEN, 3)。index 0 が最新 (delay 0)。
+        hist = cur.unsqueeze(1).repeat(1, _BALL_HIST_LEN, 1).clone()
+        state = {"hist": hist, "step": step}
+        setattr(env, _BALL_HIST_ATTR, state)
+    elif state["step"] != step:
+        # ステップが進んだ: 全段を 1 つ古い側へずらして、先頭に今の値を入れる
+        state["hist"] = torch.roll(state["hist"], shifts=1, dims=1)
+        state["hist"][:, 0] = cur
+        state["step"] = step
+
+    # リセット直後の env は前エピソードの履歴を引き継がせない
+    just_reset = env.episode_length_buf == 0
+    if just_reset.any():
+        state["hist"][just_reset] = cur[just_reset].unsqueeze(1)
+
+    return state["hist"][:, delay_steps, :dim]

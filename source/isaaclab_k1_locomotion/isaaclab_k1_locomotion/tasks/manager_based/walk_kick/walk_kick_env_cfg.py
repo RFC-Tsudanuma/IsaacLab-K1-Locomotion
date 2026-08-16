@@ -546,9 +546,14 @@ class K1WalkKickWalkPhaseEnvCfg(K1WalkKickEnvCfg):
             _group.ball_vel.params = {"dim": 2}
             _group.target_kick_velocity.func = mdp.zero_obs
             _group.target_kick_velocity.params = {"dim": 1}
-        # critic の特権情報のボール位置もゼロ埋め (次元は 3 のまま)
-        self.observations.critic.ball_pos_rel.func = mdp.zero_obs
-        self.observations.critic.ball_pos_rel.params = {"dim": 3}
+        # critic の特権情報のボール位置もゼロ埋め (次元は 3 のまま)。
+        # NOTE: 派生タスクによっては critic がこのスロットを持たない。両足キック版
+        #       (walk_kick_both_feet) は観測スロット 3 自体がボール位置なので、critic は
+        #       そこを delay_steps=0 の真値にして特権スロットを畳んでいる。
+        #       スロット構成に依存しないよう、有無を見てから触る。
+        if getattr(self.observations.critic, "ball_pos_rel", None) is not None:
+            self.observations.critic.ball_pos_rel.func = mdp.zero_obs
+            self.observations.critic.ball_pos_rel.params = {"dim": 3}
 
         # -- ボールをシーンから取り除く（観測にも報酬にも現れないため）
         self.scene.soccer_ball = None
