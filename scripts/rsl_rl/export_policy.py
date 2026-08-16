@@ -70,6 +70,11 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
+from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
+    ActorCriticHistoryCNN,
+    export_history_policy_as_jit,
+    export_history_policy_as_onnx,
+)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -130,8 +135,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         normalizer = None
 
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    if isinstance(policy_nn, ActorCriticHistoryCNN):
+        # 観測履歴を見る actor は nn.Sequential ではないので標準 exporter が使えない
+        # (actor[0].in_features を見に行く)。入力は (1, history_length, obs_dim) で、
+        # 正規化器は exporter の中に焼き込まれる (play.py と同じ分岐)。
+        export_history_policy_as_jit(policy_nn, path=export_model_dir, filename="policy.pt")
+        export_history_policy_as_onnx(policy_nn, path=export_model_dir, filename="policy.onnx")
+        print(
+            f"[INFO] Exported history-input policy (obs shape = (1, {policy_nn.history_length},"
+            f" {policy_nn.obs_dim}))"
+        )
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
     print(f"[INFO] Exported policy.pt and policy.onnx to: {export_model_dir}")
 
     env.close()

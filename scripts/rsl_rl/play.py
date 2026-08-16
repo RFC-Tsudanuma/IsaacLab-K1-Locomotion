@@ -106,6 +106,11 @@ from isaaclab_tasks.utils import get_checkpoint_path
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401
+from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
+    ActorCriticHistoryCNN,
+    export_history_policy_as_jit,
+    export_history_policy_as_onnx,
+)
 
 
 DEFAULT_VISER_URDF = str(
@@ -502,8 +507,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     run_dir = os.path.dirname(resume_path)
     export_model_dir = os.path.join(run_dir, "exported")
     onnx_filename = f"{agent_cfg.experiment_name}_{os.path.basename(run_dir)}.onnx"
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
+    if isinstance(policy_nn, ActorCriticHistoryCNN):
+        # 観測履歴を見る actor は nn.Sequential ではないので標準 exporter が使えない
+        # (actor[0].in_features を見に行く)。入力は (1, history, obs_dim)。
+        export_history_policy_as_jit(policy_nn, path=export_model_dir, filename="policy.pt")
+        export_history_policy_as_onnx(policy_nn, path=export_model_dir, filename=onnx_filename)
+    else:
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
     print(f"[INFO]: Exported policy to: {os.path.join(export_model_dir, onnx_filename)}")
 
     dt = env.unwrapped.step_dt
