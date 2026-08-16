@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # walk_middle_kick の dual encoder 版 (actor が 100 フレームの観測履歴を見る) を通しで学習する。
 #
-#   Stage 1: (学習しない) 履歴入力版の walk phase checkpoint を再利用する
-#            logs/rsl_rl/k1_walk_kick_dual_walk_phase/<run>/model_<N>.pt
-#            (= train_walk_kick_dual.sh の Stage 1。無ければ both_feet 系の
-#             1 フレーム版 k1_walk_kick_both_feet_walk_phase にフォールバックし、
-#             --warm_start_from_single_frame が自動で付く)
+#   Stage 1: Isaac-Velocity-Flat-K1-Walk-Kick-Dual-Walk-Phase-v0
+#            -> k1_walk_kick_dual_walk_phase  (walk_kick_dual と共用)
+#            既定では **学習しない**。既存の checkpoint を再利用する:
+#              1. logs/rsl_rl/k1_walk_kick_dual_walk_phase/<run>/model_<N>.pt
+#              2. 無ければ both_feet 系の 1 フレーム版
+#                 k1_walk_kick_both_feet_walk_phase (--warm_start_from_single_frame
+#                 が自動で付く)
+#              3. どちらも無ければ **この場で Stage 1 から学習する**
 #   Stage 2: Isaac-Velocity-Flat-K1-Walk-Middle-Kick-Dual-v0
 #            -> k1_walk_middle_kick_dual
 #   Stage 3: Isaac-Velocity-Flat-K1-Walk-Middle-Kick-Dual-360-v0
@@ -57,6 +60,10 @@
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_kick_middle_dual.sh                # stage 2,3,4 を通しで実行
+#                                                                  # (walk phase が無ければ
+#                                                                  #  stage 1 から自動で回る)
+#   STAGE=1234 ./scripts/rsl_rl/train_walk_kick_middle_dual.sh     # walk phase から必ず回す
+#   WALK_ITER=8000 ./scripts/rsl_rl/train_walk_kick_middle_dual.sh # stage 1 の iteration
 #   ITER=5000 ./scripts/rsl_rl/train_walk_kick_middle_dual.sh      # stage 2,3 の iteration
 #   DR_ITER=6000 ./scripts/rsl_rl/train_walk_kick_middle_dual.sh   # stage 4 だけ変える
 #   STAGE=2 ./scripts/rsl_rl/train_walk_kick_middle_dual.sh        # stage 2 だけ
@@ -138,6 +145,11 @@ DR_ITER=${DR_ITER:-10000}
 # stage 1 は学習しないので、既定で stage 2,3,4 だけを回す。
 STAGE=${STAGE:-234}
 
+# walk phase (Stage 1) は walk_kick_dual と共用のタスク。checkpoint が無ければ
+# このスクリプトからそのまま学習する (下の run_walk_phase)。
+WALK_TASK=${WALK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Dual-Walk-Phase-v0"}
+WALK_ITER=${WALK_ITER:-5000}
+
 KICK_TASK=${KICK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Middle-Kick-Dual-v0"}
 KICK360_TASK=${KICK360_TASK:-"Isaac-Velocity-Flat-K1-Walk-Middle-Kick-Dual-360-v0"}
 DR_TASK=${DR_TASK:-"Isaac-Velocity-Flat-K1-Walk-Middle-Kick-Dual-360-DR-v0"}
@@ -210,6 +222,30 @@ maybe_warm_start() {
 
 SCRIPT_ARGS=("$@")
 
+# walk phase (Stage 1) をこのスクリプトから学習する。
+# 二重実行を防ぐため、同じ呼び出しの中では 1 回だけ走らせる。
+WALK_PHASE_RAN=0
+run_walk_phase() {
+    if [[ "$WALK_PHASE_RAN" == "1" ]]; then
+        return 0
+    fi
+    WALK_PHASE_RAN=1
+    echo "=============================================================="
+    echo " Stage 1/4: walk phase  (task=$WALK_TASK, iters=$WALK_ITER)"
+    echo "=============================================================="
+    $LAB_PY scripts/rsl_rl/train.py \
+        --task "$WALK_TASK" \
+        --headless \
+        --num_envs "$NUM_ENVS" \
+        --max_iterations "$WALK_ITER" \
+        "${SCRIPT_ARGS[@]}"
+}
+
+# 明示的に STAGE に 1 を含めたときは、checkpoint の有無にかかわらず回す。
+if should_run 1; then
+    run_walk_phase
+fi
+
 if should_run 2; then
     if [[ -z "${WALK_CKPT:-}" ]]; then
         # 履歴入力版の walk phase を優先。無ければ both_feet 系の 1 フレーム版へ。
@@ -222,12 +258,21 @@ if should_run 2; then
             fi
         fi
     fi
+    # どこにも walk phase が無いなら、ここで Stage 1 から回す。
+    # (以前はエラーで停止していたが、初回実行でいきなり止まるより通しで回した方が早い)
+    if [[ -z "${WALK_CKPT:-}" ]]; then
+        echo "[INFO] walk phase の checkpoint が見つかりませんでした。"
+        echo "[INFO]   探した先: $WALK_LOG_ROOT, $FALLBACK_WALK_LOG_ROOT"
+        echo "[INFO] Stage 1 (walk phase) から学習します。"
+        run_walk_phase
+        WALK_CKPT="$(find_latest_ckpt "$WALK_LOG_ROOT" 2>/dev/null || echo "")"
+    fi
     if [[ -z "${WALK_CKPT:-}" || ! -f "$WALK_CKPT" ]]; then
-        echo "[ERROR] walk phase の checkpoint がありません。" >&2
-        echo "[ERROR]   探した先: $WALK_LOG_ROOT, $FALLBACK_WALK_LOG_ROOT" >&2
-        echo "[ERROR] 先に STAGE=1 ./scripts/rsl_rl/train_walk_kick_dual.sh を回すか、" >&2
-        echo "[ERROR] both_feet 系の 1 フレーム checkpoint を WALK_CKPT=<path> で" >&2
-        echo "[ERROR] 指定してください (旧 sole_pos 系は使えません)。" >&2
+        echo "[ERROR] walk phase の checkpoint がありません ($WALK_LOG_ROOT)。" >&2
+        echo "[ERROR] Stage 1 が checkpoint を残さずに終了した可能性があります" >&2
+        echo "[ERROR] (起動直後のエラーなど。上のログを確認してください)。" >&2
+        echo "[ERROR] 既存の checkpoint を使うなら WALK_CKPT=<path> で指定できます" >&2
+        echo "[ERROR] (both_feet 系のみ。旧 sole_pos 系は使えません)。" >&2
         exit 1
     fi
     EXTRA_ARGS=()
