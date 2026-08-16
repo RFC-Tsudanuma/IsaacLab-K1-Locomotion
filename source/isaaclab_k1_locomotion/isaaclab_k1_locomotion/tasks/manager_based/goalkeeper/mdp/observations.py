@@ -269,7 +269,9 @@ def compute_target_y(
     bufs = gk_buffers(env)
     guard_x = float(env.cfg.goalkeeper.guard_x)
     if use_perceived:
-        pos, vel = _gk_perceived_goal_state(env)
+        # ★ 2026-08-16: 生の 1 フレーム観測ではなく、直近ウィンドウの最小二乗フィットを使う
+        #   (ball_fit_window_s > 0 のとき)。詳細は :func:`_gk_fitted_goal_state`。
+        pos, vel = _gk_fitted_goal_state(env)
     else:
         pos = ball_pos_goal(env)
         ball: RigidObject = env.scene["soccer_ball"]
@@ -473,6 +475,138 @@ def _gk_perceived_goal_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, to
     v = env._gkp_out_vel
     vel = torch.stack([c * v[:, 0] - s * v[:, 1], s * v[:, 0] + c * v[:, 1], torch.zeros_like(off_x)], dim=1)
     return pos, vel
+
+
+# --------------------------------------------------- ボール位置の時系列フィット
+#
+# ★ 2026-08-16 追加。**到達点予測が生の 1 フレーム観測を使っていた**のを直すもの。
+#
+#   VirtualPerception の位置ノイズは
+#       sigma = noise_a * distance + noise_b     (実機準拠プリセットで 0.124d + 0.149)
+#   で、``torch.randn_like`` によって **ビジョン更新のたびに独立にサンプル**される
+#   (perception.py の該当行を参照)。エピソード固定なのはスケール係数の ±20% だけで、
+#   ノイズ本体は白色。つまり **平均化すれば √N 分の 1 に減らせる**。
+#
+#   ところが ``compute_target_y`` の外挿
+#       y_pred = pos_y + vel_y * t
+#   は pos に生の 1 フレーム値を入れていた。飛翔時間 0.7s × ビジョン 20〜25Hz =
+#   14〜17 サンプルぶんの情報があるのに 1 個しか使っていない、という状態:
+#
+#       速度上限 3.0 → sigma(p90) 0.51m   (タッチ判定半径 touch_proximity 0.50m と同等)
+#       速度上限 6.0 → sigma(p90) 0.86m
+#
+#   これが適応カリキュラムが 2.07 m/s で止まった実体。予測誤差がタッチ半径に達すると
+#   「予測した場所へ行っても届かない」が頻発し、成功率が昇格閾値に届かなくなる。
+#
+#   ボールは等速直線運動なので、直近ウィンドウの位置履歴に **直線を最小二乗フィット**
+#   すれば位置と速度を同時に sigma/sqrt(N) の精度で得られる。学習不要・決定論的で、
+#   **実機の C++ 側にも同じものをそのまま実装できる**。
+#
+#   ★ 既定は無効 (``ball_fit_window_s = 0.0``)。有効にすると到達点予測の入力が変わるので、
+#     既存タスク・既存 ckpt の挙動を変えないため opt-in にしてある。
+#   ★ 有効にしたら **実機側にも同じフィットを実装すること**。シムだけ賢くすると
+#     そのぶんまるごと sim-to-real ギャップになる。
+
+
+def _gk_fit_buffers(env: "ManagerBasedRLEnv", capacity: int) -> None:
+    """フィット用のリングバッファを (無ければ) 確保する。"""
+    n = env.num_envs
+    buf = getattr(env, "_gk_fit_buf", None)
+    if buf is None or buf.shape[0] != n or buf.shape[1] != capacity:
+        # [x, y, valid] をゴール座標系で保持する
+        env._gk_fit_buf = torch.zeros(n, capacity, 3, device=env.device)
+        env._gk_fit_ptr = 0
+        env._gk_fit_step = -1
+        env._gk_fit_prev_active = torch.zeros(n, dtype=torch.bool, device=env.device)
+
+
+def _gk_fit_tick(env: "ManagerBasedRLEnv", capacity: int) -> None:
+    """位置履歴を 1 制御ステップ進める (冪等)。
+
+    * **検出できたフレームだけ** 積む。``vp.ball_pos_b`` は mask=0 のとき 0 を返すので、
+      それを混ぜるとフィットが原点へ引っ張られる。
+    * 新しい球が発射された瞬間 (``ball_active`` の立ち上がり) に履歴を捨てる。
+      前の球の軌道が残っていると直線フィットが致命的にずれる。
+    """
+    _gk_fit_buffers(env, capacity)
+    step = int(env.common_step_counter)
+    if env._gk_fit_step == step:
+        return
+    env._gk_fit_step = step
+
+    bufs = gk_buffers(env)
+    active = bufs["ball_active"]
+    launched = active & (~env._gk_fit_prev_active)
+    env._gk_fit_prev_active = active.clone()
+    if bool(launched.any()):
+        env._gk_fit_buf[launched] = 0.0
+
+    pos, _ = _gk_perceived_goal_state(env)
+    mask = _gk_perception(env).ball_mask            # 1 = 今フレーム検出できている
+    slot = env._gk_fit_buf[:, int(env._gk_fit_ptr)]
+    slot[:, 0] = pos[:, 0]
+    slot[:, 1] = pos[:, 1]
+    slot[:, 2] = mask * active.float()
+    env._gk_fit_ptr = (int(env._gk_fit_ptr) + 1) % env._gk_fit_buf.shape[1]
+
+
+def _gk_fitted_goal_state(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor]:
+    """位置ノイズを平均化して求めた現在位置と、既存の速度推定 (ゴール座標系, 各 (N,3))。
+
+    方式: **速度推定で各サンプルを現在時刻へ引き戻してから平均する**::
+
+        pos_now = Σ w_i (z_i − v_est · t_i) / Σ w_i        (t_i ≤ 0, 最新が t=0)
+
+    ``z_i = pos_now + v·t_i + noise`` なので引き戻すと全サンプルが ``pos_now + noise`` に
+    揃い、単純平均で分散が厳密に σ²/N になる。
+
+    ★ 2 パラメータの直線フィットではなくこの形にした理由 (実測、白色ノイズ σ、25Hz):
+
+        窓 0.5s   生 0.505m → 直線フィット 0.266m → **引き戻して平均 0.141m**
+        窓 0.8s   生 0.514m → 直線フィット 0.229m → **引き戻して平均 0.117m**
+
+      直線フィットは窓の**端** (= 現在時刻) で評価するため分散が中央の 4 倍になり、
+      せっかくの平均化効果を半分捨てていた。
+
+    ★ 速度は **フィットせず既存の推定をそのまま使う**。直線フィットから出る速度は
+      窓 0.5s / σ=0.51 で誤差 0.95 m/s あり、既存推定 (真値 + perc_vel_bias 0.05〜0.15)
+      より 1 桁悪い。実機の CVKF は運動モデル付きでもっと長い窓を使っているので、
+      それを素朴な線形回帰で置き換えるのは改悪になる。
+
+    ``ball_fit_window_s <= 0`` なら従来どおり生値を返す。有効サンプルが 2 未満の env
+    (発射直後・見失い中) も生値へフォールバックする。
+    """
+    p = env.cfg.goalkeeper
+    win_s = float(getattr(p, "ball_fit_window_s", 0.0))
+    raw_pos, raw_vel = _gk_perceived_goal_state(env)
+    if win_s <= 0.0:
+        return raw_pos, raw_vel
+
+    dt = float(env.step_dt)
+    capacity = max(3, int(round(win_s / dt)))
+    _gk_fit_tick(env, capacity)
+
+    buf = env._gk_fit_buf
+    ptr = int(env._gk_fit_ptr)
+    ordered = buf if ptr == 0 else torch.cat([buf[:, ptr:], buf[:, :ptr]], dim=1)
+    x, y, w = ordered[:, :, 0], ordered[:, :, 1], ordered[:, :, 2]
+
+    # 最新フレームを t=0 とする相対時刻 (古いほど負)
+    t = torch.arange(-(capacity - 1), 1, device=env.device, dtype=x.dtype) * dt
+
+    s0 = w.sum(dim=1)
+    ok = s0 >= 2.0
+    safe_s0 = torch.where(ok, s0, torch.ones_like(s0))
+
+    # 速度で現在時刻へ引き戻してから平均する
+    px = (w * (x - raw_vel[:, 0:1] * t)).sum(dim=1) / safe_s0
+    py = (w * (y - raw_vel[:, 1:2] * t)).sum(dim=1) / safe_s0
+
+    zero = torch.zeros_like(px)
+    pos = torch.stack(
+        [torch.where(ok, px, raw_pos[:, 0]), torch.where(ok, py, raw_pos[:, 1]), zero], dim=1
+    )
+    return pos, raw_vel
 
 
 # ---------------------------------------------------------------------------
@@ -686,13 +820,115 @@ _TASK_PHASE_STEP_ATTR = "_gk_task_gait_phase_step"
 _DRIVE_FILT_ATTR = "_gk_drive_filtered"
 _DRIVE_FILT_STEP_ATTR = "_gk_drive_filtered_step"
 
+# --- 歩行ゲートの sim2real ギャップを埋めるための状態 (2026-08-16) ---
+#
+# ★ 実機で振動した件への対処。歩行判定 (walking) の入力はシムでは
+#   ``root_lin_vel_b`` = 物理エンジンの**真値**で、静止していれば厳密に 0 が返る。
+#   実機は InEKF の推定値、しかも k1_odom_velocity_node が planar_odom の**位置を
+#   有限差分**して作った値なので、静止していてもノイズで振れる。微分はノイズを増幅する。
+#
+#   閾値 0.15 にヒステリシスが無いため、推定値がその付近でディザすると
+#   walk/stand がノイズの周期でトグルし、位相がゼロ埋めと再開を繰り返す
+#   (= 脚が出かけては止まる = 振動)。真値で学習していると、この状況を一度も経験しない。
+#
+#   ここでは (a) 相関ノイズを載せて実機相当の入力にし、(b) ヒステリシスを入れて
+#   トグル自体を起きにくくする。★ (b) は実機の C++ 側にも同じ値で実装すること。
+_BASE_VEL_NOISE_ATTR = "_gk_base_vel_noise"        # 相関ノイズの状態 (N, 2)
+_BASE_VEL_NOISE_STEP_ATTR = "_gk_base_vel_noise_step"
+_BASE_VEL_NOISE_SCALE_ATTR = "_gk_base_vel_noise_scale"  # env ごとの倍率 (N,)
+_WALK_GATE_ATTR = "_gk_walk_gate"                  # ヒステリシスの保持状態 (N,) bool
+
 
 def _gk_params_local(env: "ManagerBasedRLEnv"):
     """env cfg の GoalkeeperParamsCfg を返す (events からの import 循環を避けるため再定義)。"""
     return env.cfg.goalkeeper
 
 
-def _task_gait_phase_accum(env: "ManagerBasedRLEnv", phase_freq: float, walking: torch.Tensor) -> torch.Tensor:
+def _measured_base_speed(
+    env: "ManagerBasedRLEnv",
+    noise_amp: float,
+    noise_tau_s: float,
+    noise_scale_range: tuple[float, float],
+) -> torch.Tensor:
+    """歩行ゲートの入力にする「実機相当のベース速度推定値」(N,)。
+
+    シムの ``root_lin_vel_b`` は物理エンジンの真値で、静止していれば厳密に 0 になる。
+    実機は InEKF の推定値で、しかも位置の有限差分なので静止していても振れる。
+    その差を埋めないと「ノイズでゲートがトグルする」状況を学習中に一度も経験しない。
+
+    ノイズは **時間相関** させる。実機側の推定値は 5Hz の LPF を通っており
+    相関時間は τ = 1/(2π·5) ≒ 32ms ≒ 1.6 制御ステップある。白色ノイズだと方策が
+    平均化して簡単に無視できてしまい、実機より易しい問題になる。
+
+    ★ ノイズ幅は **実測ではない**。実機の静止時ノイズは未計測 (推論側リポジトリにも
+      数値が存在しない)。既定 0.1 は「閾値 0.15 に対し、静止時の大きさ
+      hypot(0.1, 0.1)=0.141 が閾値を超えない上限」として選んだ値。実機を 60 秒
+      静止させて /k1_inekf/velocity を記録したら、その実測に置き換えること。
+      env ごとに 0.5〜1.5 倍して振ってあるのは、実測が無いぶん幅を持たせるため。
+
+    Args:
+        noise_amp: ノイズの振幅 [m/s]。0 で無効 (真値をそのまま返す)。
+        noise_tau_s: 相関の時定数 [s]。
+        noise_scale_range: env ごとの倍率の範囲。
+    """
+    robot: Articulation = env.scene["robot"]
+    vel_b = robot.data.root_lin_vel_b[:, :2]
+    if noise_amp <= 0.0:
+        return torch.norm(vel_b, dim=1)
+
+    scale = getattr(env, _BASE_VEL_NOISE_SCALE_ATTR, None)
+    if scale is None or scale.shape != (env.num_envs,):
+        lo, hi = float(noise_scale_range[0]), float(noise_scale_range[1])
+        scale = torch.empty(env.num_envs, device=env.device).uniform_(lo, hi)
+        setattr(env, _BASE_VEL_NOISE_SCALE_ATTR, scale)
+
+    noise = getattr(env, _BASE_VEL_NOISE_ATTR, None)
+    if noise is None or noise.shape != vel_b.shape:
+        noise = torch.zeros_like(vel_b)
+        setattr(env, _BASE_VEL_NOISE_ATTR, noise)
+        setattr(env, _BASE_VEL_NOISE_STEP_ATTR, -1)
+
+    # 同一ステップ内の複数回呼び出し (policy/critic) では 1 回だけ進める
+    if getattr(env, _BASE_VEL_NOISE_STEP_ATTR, -1) != int(env.common_step_counter):
+        alpha = min(1.0, float(env.step_dt) / max(noise_tau_s, 1e-6))
+        # 1 次フィルタは振幅を sqrt(alpha/(2-alpha)) 倍に落とすので、その逆数を
+        # 入力に掛けて出力の広がりが noise_amp 相当に保たれるようにする。
+        gain = math.sqrt((2.0 - alpha) / alpha)
+        white = (torch.rand_like(noise) * 2.0 - 1.0) * (noise_amp * gain)
+        noise = noise + alpha * (white - noise)
+        setattr(env, _BASE_VEL_NOISE_ATTR, noise)
+        setattr(env, _BASE_VEL_NOISE_STEP_ATTR, int(env.common_step_counter))
+    noise = getattr(env, _BASE_VEL_NOISE_ATTR)
+
+    return torch.norm(vel_b + noise * scale.unsqueeze(1), dim=1)
+
+
+def _walk_gate(env: "ManagerBasedRLEnv", speed: torch.Tensor, lo: float, hi: float) -> torch.Tensor:
+    """ヒステリシス付きの歩行判定 (N,) bool。
+
+    停止中は ``speed >= hi`` で歩き出し、歩行中は ``speed < lo`` で止まる。
+    単一しきい値だと推定ノイズがその付近でディザしたときに walk/stand が
+    ノイズの周期でトグルし、位相のゼロ埋めと再開が繰り返されて振動になる。
+    サーモスタットと同じ考え方。
+
+    ★ 実機の C++ 側にも同じ lo/hi で実装すること。片側だけだと意味がない。
+    """
+    gate = getattr(env, _WALK_GATE_ATTR, None)
+    if gate is None or gate.shape != speed.shape:
+        gate = torch.zeros_like(speed, dtype=torch.bool)
+    gate = torch.where(gate, speed >= lo, speed >= hi)
+    # リセット直後は停止から始める (位相も 0 から始まる規約に合わせる)
+    gate = torch.where(env.episode_length_buf <= 1, torch.zeros_like(gate), gate)
+    setattr(env, _WALK_GATE_ATTR, gate)
+    return gate
+
+
+def _task_gait_phase_accum(
+    env: "ManagerBasedRLEnv",
+    phase_freq: float,
+    walking: torch.Tensor,
+    step_jitter: float = 0.0,
+) -> torch.Tensor:
     """歩行位相を **積算** して返す φ∈[0,2π) (per-env)。
 
     ★ 2026-08-15 追加。旧実装は φ = 2π·f·t (エピソード開始からの絶対時間) で毎回
@@ -708,6 +944,13 @@ def _task_gait_phase_accum(env: "ManagerBasedRLEnv", phase_freq: float, walking:
 
     Args:
         walking: 歩行中フラグ (N,)。False の env は位相を進めない。
+        step_jitter: 1 ステップあたりの位相増分に掛ける揺らぎの幅 (0 で無効)。
+            ★ 2026-08-16 追加。実機の推論ループは SingleThreadedExecutor で 50Hz タイマ・
+              ビジョン・twist・pose の全コールバックが直列化されており、ONNX 推論も
+              タイマ内でインライン実行される。しかも wall_timer は遅れた tick を
+              取り戻さない。にもかかわらず位相の積算は **定数 kDt = 1/50** を使うので、
+              ループが伸びると位相が実時間からずれる。シムは決定的に回るので
+              この状況を経験しない。ここで増分自体を揺らして耐性を付ける。
     """
     from ...locomotion.mdp.events import get_phase_freq
 
@@ -725,6 +968,8 @@ def _task_gait_phase_accum(env: "ManagerBasedRLEnv", phase_freq: float, walking:
         step = 2.0 * math.pi * float(env.step_dt) * (
             pf if torch.is_tensor(pf) else torch.full_like(phase, float(pf))
         )
+        if step_jitter > 0.0:
+            step = step * (1.0 + (torch.rand_like(step) * 2.0 - 1.0) * float(step_jitter))
         phase = (phase + torch.where(walking, step, torch.zeros_like(step))) % (2.0 * math.pi)
         # リセット直後の env は位相 0 から (locomotion と同じ規約)
         phase = torch.where(env.episode_length_buf <= 1, torch.zeros_like(phase), phase)
@@ -743,6 +988,12 @@ def task_drive_phase_obs(
     use_perceived: bool = True,
     use_measured_speed: bool = True,
     speed_threshold: float = 0.15,
+    speed_gate_lo: float | None = 0.12,
+    speed_gate_hi: float | None = 0.18,
+    speed_noise: float = 0.1,
+    speed_noise_tau_s: float = 0.08,
+    speed_noise_scale_range: tuple = (0.5, 1.5),
+    phase_step_jitter: float = 0.1,
 ) -> torch.Tensor:
     """ステージ2/3 の ``gait_phase`` スロット (4 次元)。タスク駆動の歩行位相。
 
@@ -773,23 +1024,43 @@ def task_drive_phase_obs(
       (a) がトグルを止め、(b) がトグル時の飛びを消す。両方で歩容の破綻を防ぐ。
       ``use_measured_speed=False`` で旧挙動 (既存 ckpt の再生・比較用)。
 
+    ★ 2026-08-16: **実機で振動したので (a) の sim2real ギャップを埋めた**。
+      (a) は「MCL に依存しない実測速度で判定する」ところまでは正しかったが、
+      シムの ``root_lin_vel_b`` は物理エンジンの真値で、静止していれば厳密に 0 になる。
+      実機は InEKF の推定値 (しかも位置の有限差分) なので静止していても振れる。
+      閾値が 1 本しかないため、推定値がその付近でディザすると walk/stand が
+      ノイズの周期でトグルし、位相のゼロ埋めと再開が繰り返されて振動になる。
+      **MCL 起因のトグルを潰したら、速度推定起因の同じトグルが別口から復活した**形。
+
+      対策は 2 つ:
+        * ``speed_noise``: ゲートの入力に相関ノイズを載せて実機相当にする
+        * ``speed_gate_lo`` / ``speed_gate_hi``: ヒステリシスでトグル自体を起きにくくする
+      ★ ヒステリシスは実機の C++ 側にも同じ値で実装すること。片側だけでは意味がない。
+
     Args:
         use_measured_speed: True で実測ベース速度、False で旧来の task_drive_vector 判定。
-        speed_threshold: 実測速度がこれ未満なら停止とみなす [m/s]。
+        speed_threshold: ヒステリシスを使わないとき (lo/hi が None) のしきい値 [m/s]。
             旧 cmd_threshold (0.12) は「位置ずれ [m] を 0.15s で割った速度」に対する
             閾値で単位の意味が違うため、stage1_speed_tol (0.15) と揃えてある。
+        speed_gate_lo / speed_gate_hi: ヒステリシスの下降/上昇しきい値 [m/s]。
+            どちらかが None なら ``speed_threshold`` の単一しきい値に戻る。
+        speed_noise: ゲート入力に載せるノイズの振幅 [m/s]。0 で無効。**実測ではない**
+            (:func:`_measured_base_speed` の注記参照)。
+        phase_step_jitter: 位相増分の揺らぎ幅 (:func:`_task_gait_phase_accum` 参照)。
     """
     if use_measured_speed:
-        robot: Articulation = env.scene["robot"]
-        speed = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
-        walking = speed >= speed_threshold
+        speed = _measured_base_speed(env, speed_noise, speed_noise_tau_s, speed_noise_scale_range)
+        if speed_gate_lo is None or speed_gate_hi is None:
+            walking = speed >= speed_threshold
+        else:
+            walking = _walk_gate(env, speed, float(speed_gate_lo), float(speed_gate_hi))
     else:
         drive = task_drive_vector(
             env, max_y=max_y, vx_scale=vx_scale, vy_scale=vy_scale, use_perceived=use_perceived
         )
         walking = torch.norm(drive[:, :2], dim=1) >= cmd_threshold
 
-    phase_left = _task_gait_phase_accum(env, phase_freq, walking)
+    phase_left = _task_gait_phase_accum(env, phase_freq, walking, step_jitter=phase_step_jitter)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

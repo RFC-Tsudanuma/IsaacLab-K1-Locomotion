@@ -412,9 +412,15 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         # 上げると跳躍に退行することが分かっている (だから測り方を変える)。
         #
         # speed_gate_frac=0.9 は「遅く歩いて足だけ上げる」解を報酬上ありえなくする保険。
+        #
+        # ★ 2026-08-16: weight 2.5 → 3.5 (ユーザー要望「少し上げて」)。
+        #   足リンク原点で測っていた頃は weight を上げると跳躍に退行したが、足裏基準では
+        #   **足首を水平に保つ** という速度に無影響な手段でも目標 0.03m に届くので、
+        #   圧を上げても跳躍へ逃げる必要がない。跳躍側は lin_vel_z_l2 = -2.5 が押さえる。
+        #   それでも跳躍が出たら 2.5 に戻すこと (Episode_Reward/lin_vel_z_l2 の悪化で分かる)。
         self.rewards.foot_clearance = RewTerm(
             func=foot_clearance_sole,
-            weight=2.5,
+            weight=3.5,
             params={
                 "command_name": "base_velocity",
                 "target_clearance": 0.03,
@@ -426,6 +432,23 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         )
         if self.rewards.feet_phase is not None:
             self.rewards.feet_phase.params["cmd_threshold"] = _STOP_TOL
+
+        # --- 静止時の振動ペナルティを強める (2026-08-16) ---
+        #
+        # ★ 実機で振動した件への対処。action_smoothness_l2 / action_rate_l2 は
+        #   「停止指令かつ base が実際に静止している」ときだけ penalty を
+        #   stand_still_scale 倍する仕組みを持つ (rewards._stand_still_boost)。
+        #   push を受けて base が動いた瞬間は倍率が 1.0 に戻るので、
+        #   **横移動の立ち上がりには一切ペナルティがかからない**。
+        #
+        #   ベースの weight を上げると加速そのものを罰してしまい、過去に経験した
+        #   「動かなければペナルティを踏まない」均衡 (諦め足踏み) に落ちる。
+        #   狙いは「待機中の振動」なので、この倍率だけを上げるのが正しい軸。
+        #   locomotion の既定は 3.0。ここでは goalkeeper Stage2 に限って 5.0 にする。
+        for _term in ("action_smoothness_l2", "action_rate_l2"):
+            _cfg = getattr(self.rewards, _term, None)
+            if _cfg is not None and "stand_still_scale" in _cfg.params:
+                _cfg.params["stand_still_scale"] = 5.0
 
         # --- 腰が下がりすぎるのを抑える (2026-07-31) ---
         self.rewards.base_height_penalty.params["min_height"] = 0.55

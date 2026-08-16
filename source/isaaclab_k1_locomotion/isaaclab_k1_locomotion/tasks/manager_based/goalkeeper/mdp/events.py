@@ -49,7 +49,16 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     # ★ 2026-08-15: 歩行位相のアキュムレータと指令ローパスの状態をクリアする。
     #   どちらも前エピソードの値を持ち越すと、開始直後に「途中の位相」や
     #   「前の球への指令」が出てしまう。
-    from .observations import _DRIVE_FILT_ATTR, _TASK_PHASE_ATTR
+    # ★ 2026-08-16: 歩行ゲートの sim2real 用の状態も同様にクリアする。
+    #   ノイズは前エピソードの相関を持ち越さないよう 0 から、ゲートは停止状態から
+    #   始める (位相が 0 から始まる規約に合わせる)。倍率 (_BASE_VEL_NOISE_SCALE_ATTR)
+    #   だけは env ごとの個体差なので **リセットしない** (startup DR と同じ扱い)。
+    from .observations import (
+        _BASE_VEL_NOISE_ATTR,
+        _DRIVE_FILT_ATTR,
+        _TASK_PHASE_ATTR,
+        _WALK_GATE_ATTR,
+    )
 
     phase = getattr(env, _TASK_PHASE_ATTR, None)
     if phase is not None:
@@ -57,6 +66,12 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     filt = getattr(env, _DRIVE_FILT_ATTR, None)
     if filt is not None:
         filt[env_ids] = 0.0
+    vnoise = getattr(env, _BASE_VEL_NOISE_ATTR, None)
+    if vnoise is not None:
+        vnoise[env_ids] = 0.0
+    gate = getattr(env, _WALK_GATE_ATTR, None)
+    if gate is not None:
+        gate[env_ids] = False
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:
