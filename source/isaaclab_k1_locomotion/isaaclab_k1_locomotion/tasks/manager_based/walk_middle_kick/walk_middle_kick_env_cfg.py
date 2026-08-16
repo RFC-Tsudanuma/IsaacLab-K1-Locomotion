@@ -8,8 +8,9 @@
 戦略側の要求は「5-10 m 飛ぶキックを、指令した強さで出せること」。
 :mod:`..walk_weak_kick` が「指令どおりの強さのキック」を実際に成立させたレシピなので、
 **そのレシピをそのまま使い、指令帯だけを高速側へ張り替える**のがこのタスク。
-一言でいえば **middle = weak + 帯の張り替え**であり、報酬構造・カリキュラムの窓・
-DR は weak と 1 バイトも変えていない (σ の終点だけ後述の理由で 0.5)。
+一言でいえば **middle = weak + 帯の張り替え + 軸足配置**であり、weak との差は
+指令帯・σ_velocity の終点 (0.5)・``kick_plant_foot`` の 3 点だけ。それ以外の
+報酬構造・カリキュラムの窓・DR は weak と 1 バイトも変えていない。
 
 必要な球速の較正（実機 1 点 + 転がり減速）
 ------------------------------------------
@@ -80,6 +81,40 @@ weak の 0.35 は帯 (0.25, 2.0) 用の値なのでそのままは使えない�
 これ以外 (overshoot 罰の margin 0.2 / sat 1.0 / weight −2.0×_KICK_W_SCALE、
 strong の折れ線、σ アニールの窓、ボール物性 DR) は weak と完全に同一。
 
+軸足配置 (``kick_plant_foot``) を stage 2 から入れる
+---------------------------------------------------
+weak には無い項をひとつだけ足す。狙いは **「歩幅の中で通り抜けざまに弾く」蹴り方を
+「軸足を置いてから振る」蹴り方へ寄せる**こと。
+
+この項を入れる前の実測 (``k1_walk_middle_kick_360`` の 2026-08-15 run, 最終 iteration。
+``kick_rate`` が 0.996 なのでメトリクスの値はほぼそのまま実効値)::
+
+    plant_lat  0.207   <- 目標 0.19 に対して既にほぼ理想。横は直すところが無い
+    plant_lon -0.422   <- 軸足がボールの 42cm 後方。ここだけが大きく外れている
+
+蹴り足の足首は接触時にボール中心の 11-15cm 手前なので、−0.42 は「接触の瞬間に両足が
+28cm 開いている」= 歩行のストライドの途中でボールを弾いている状態を意味する。
+下流の指標 (kick_rate 0.996 / ball_touch_count 1.007 / 方向誤差 5.0° / 追従率 0.92) は
+この蹴り方でも健全なので **これ自体が現状の失点源ではない**。それでも入れる理由は、
+止まって構えてから振る方がボール位置の観測誤差に対して鈍く、stage 4 (観測ノイズ+遅延)
+と実機での蹴り損ねに効くと見込めるため。
+
+**stage 3 以降からの後入れにしないこと。** −0.42 に収束したポリシーに対して
+σ_lon=0.10 の Gaussian は f_lon = exp(−0.39²/2·0.10²) ≈ 5e-4 で、値も勾配も死んでいる。
+「まだキックの型が決まっていない stage 2 の発見期に混ぜておく」ことがこの項の前提で、
+だからこそ :func:`_apply_middle_kick_recipe` (= stage 2/3/4 共通) に置いてある。
+
+σ_lon だけは lob (0.10 固定) と変え、``kick_velocity_scaled`` の σ と同じ流儀で
+**1.0 ではなく太い 0.30 から始めて 0.10 へ絞る** (窓は strong のフェードアウトと同じ
+1500 → 3000)。0.30 なら −0.42 でも f_lon = 0.43 と勾配が生きるので、発見期にどこへ
+転んでも引き戻せる。lat は既に目標圏内なので σ_lat = 0.06 固定のまま。
+
+この項は非負で、他のキック報酬とは **加算** で並ぶ (乗算にしない)。かつ内部で
+r_direction に乗算しているので ``kick_done`` ゲートを通り、「構えるだけで蹴らない」
+では 1 点も入らない。weight 2.0 は direction (6.0) / scaled (4.0) / strong (3.0) より
+明確に下 — 目的そのものではなく「蹴り方」の指定だからで、これを上げすぎると
+速度追従より構えの最適化に学習が引っ張られる。
+
 学習手順 (3 段。stage 1 はリポジトリ同梱の checkpoint を再利用)::
 
     ./scripts/rsl_rl/train_walk_kick_middle.sh
@@ -88,15 +123,25 @@ strong の折れ線、σ アニールの窓、ボール物性 DR) は weak と�
 ``--reset_noise_std`` は **使わないこと** (理由は walk_weak_kick の docstring と同じ)。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
+from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
     _apply_noisy_ball_obs,
     _disable_ball_obs_jitter,
+    _KICK_STATE_PARAMS,
+    _KICK_W_SCALE,
+    _SIGMA_DIRECTION,
     K1WalkKick360EnvCfg,
     K1WalkKickEnvCfg,
 )
 from ..walk_weak_kick.walk_weak_kick_env_cfg import _apply_weak_kick_recipe
+
+# steps_per_iteration = num_steps_per_env (PPO config)。基底の _spi / weak の _SPI と
+# 同じ値だが、あちらは __post_init__ のローカル変数なので参照できずリテラルで持つ。
+_SPI = 24
 
 # --------------------------------------------------------------------------- #
 # 目標ボール速度レンジ [m/s]
@@ -132,9 +177,54 @@ _SPEED_RANGE = (3.2, 4.5)
 # --------------------------------------------------------------------------- #
 _SIGMA_VELOCITY_END = 0.5
 
+# --------------------------------------------------------------------------- #
+# 軸足配置 (kick_plant_foot) の目標値・シェイピング係数・重み
+#
+# 目標値は walk_lob と同一 (K1 の実寸 K1_22dof.xml から導出。導出そのものは
+# :func:`~..walk_kick.mdp.rewards.kick_plant_foot` の docstring を参照):
+#
+#   _PLANT_LAT_TARGET = 0.19 : 股関節の横オフセット ±0.096 = 通常スタンス幅 0.192。
+#       軸足を横 0.19 に置くと蹴り足がちょうどキック線上 (横 0) に来る。
+#   _PLANT_SIGMA_LAT  = 0.06 : 下限は衝突限界。ボール半径 0.11 + 足箱の半幅 0.035 =
+#       0.145 より内側は軸足がボールに当たる。実測 plant_lat は既に 0.207 で
+#       f_lat = 0.95 なので、こちらは最初から締めたままでよい (アニールしない)。
+#   _PLANT_LON_TARGET = -0.03: body_pos_w は足リンク原点 (足首) を返すが足箱の中心は
+#       前方 +0.026。足の **中心** をボール真横に置くには足首を −0.026。
+#
+# σ_lon だけは lob の 0.10 固定から変えて、太い 0.30 で始めて 0.10 へ絞る。
+# 0.10 は現状の実測 −0.42 では f_lon ≈ 5e-4 で勾配が死んでおり、発見期の下手な配置が
+# 軒並み 0 点になってしまうため (``kick_velocity_scaled`` の σ アニールと同じ理屈)。
+# 0.30 なら −0.42 で f_lon = 0.43。窓は strong のフェードアウトと同じ 1500 → 3000 に
+# 合わせ、「強く蹴る」から「指令どおりに・正しい構えで蹴る」への移行を一体で動かす。
+#
+# 重み 2.0 は direction (6.0) / scaled (4.0) / strong (3.0) より明確に下。この項は目的
+# そのものではなく「蹴り方」の指定なので、大きくすると速度追従より構えの最適化に学習が
+# 引っ張られる。フェードインの窓は基底のキック報酬と同じ 0 → 500 で、発見期にはすでに
+# 満額で乗っている状態にする (この項の存在意義が「型が決まる前に混ぜておく」ことなので、
+# 他のキック項より遅らせてはいけない)。
+#
+# NOTE: 学習後は ``Metrics/kick_direction/plant_lon`` が −0.42 から −0.03 側へ動いたかを
+#       見ること。同時に ``kick_rate`` / ``kick_vel_ratio`` / ``ball_touch_count`` が
+#       悪化していないかも必ず併せて見る。悪化するなら重みを下げるか σ_lon の終点を
+#       緩める (この項は「蹴り方」の指定であって、キックの成立より優先しない)。
+# --------------------------------------------------------------------------- #
+_PLANT_LON_TARGET = -0.03
+_PLANT_SIGMA_LON_START = 0.30
+_PLANT_SIGMA_LON_END = 0.10
+_PLANT_LAT_TARGET = 0.19
+_PLANT_SIGMA_LAT = 0.06
+_PLANT_FOOT_WEIGHT = 2.0
+
+# σ_lon を絞る窓。weak の strong フェードアウト / overshoot フェードインと同じ。
+_PLANT_SIGMA_ANNEAL_START_ITER = 1500
+_PLANT_SIGMA_ANNEAL_END_ITER = 3000
+
 
 def _apply_middle_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
     """weak の 3 点セット + DR をそのまま適用し、指令帯と σ の終点だけ差し替える。
+
+    軸足配置 (``kick_plant_foot``) だけは weak に無い追加項。**stage 2 から入れる**
+    (理由はモジュール docstring の「軸足配置を stage 2 から入れる」節)。
 
     stage 2 (:class:`K1WalkMiddleKickEnvCfg`) と stage 3
     (:class:`K1WalkMiddleKick360EnvCfg`) で共通の処理をここに集約する。
@@ -163,6 +253,57 @@ def _apply_middle_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
     # カリキュラムで動かさず固定。strong が実蹴りを帯の上 (v ≈ 6.0) まで押し上げてから、
     # σ アニールと overshoot 罰がこの帯の中へ絞り込む、という降ろし方をする。
     cfg.commands.kick_direction.target_speed_range = _SPEED_RANGE
+
+    # -- 4. 軸足配置 (kick_plant_foot) を追加 ------------------------------ #
+    #
+    # 「蹴る瞬間に軸足がボールの真横」を狙う項。weak には無い middle だけの追加。
+    #
+    # * 他のキック報酬とは **加算** で並べる (kick_velocity_scaled 等に掛けてはいけない。
+    #   学習初期は軸足がまず合わないので、掛けると速度側の勾配がゼロ付近で死ぬ)。
+    # * 項の内部で r_direction に乗算しているので、kick_done ゲート・方向精度・胴体の
+    #   正対を全て通過した蹴りにしか払われない。「構えるだけで蹴らない」は 0 点。
+    # * 非負 (罰にしない)。外した配置は「罰される」のではなく「報われない」に留める。
+    # * sigma_direction は基底のキック項と必ず揃えること (_SIGMA_DIRECTION = 0.35)。
+    #   項ごとに違うと方位を外したときの損得が食い違って何を最適化しているのか読めなくなる。
+    #
+    # sigma_lon はここでは開始値を置くだけで、下の curriculum が毎ステップ上書きする。
+    cfg.rewards.kick_plant_foot = RewTerm(
+        func=mdp.kick_plant_foot,
+        weight=0.0,
+        params={
+            **_KICK_STATE_PARAMS,
+            "sigma_direction": _SIGMA_DIRECTION,
+            "lon_target": _PLANT_LON_TARGET,
+            "sigma_lon": _PLANT_SIGMA_LON_START,
+            "lat_target": _PLANT_LAT_TARGET,
+            "sigma_lat": _PLANT_SIGMA_LAT,
+        },
+    )
+    # フェードインは基底のキック報酬と同じ窓 (0 → 500)。発見期には満額で乗せておく。
+    cfg.curriculum.kick_plant_foot_weight = CurrTerm(
+        func=mdp.linear_reward_weight,
+        params={
+            "term_name": "kick_plant_foot",
+            "start_weight": 0.0,
+            "end_weight": _PLANT_FOOT_WEIGHT * _KICK_W_SCALE,
+            "start_step": 0,
+            "end_step": 500,
+            "steps_per_iteration": _SPI,
+        },
+    )
+    # 前後の採点を 0.30 → 0.10 へ絞る。窓は strong のフェードアウトと同じ 1500 → 3000。
+    cfg.curriculum.kick_plant_foot_sigma_lon = CurrTerm(
+        func=mdp.linear_reward_param,
+        params={
+            "term_name": "kick_plant_foot",
+            "param_name": "sigma_lon",
+            "start_value": _PLANT_SIGMA_LON_START,
+            "end_value": _PLANT_SIGMA_LON_END,
+            "start_step": _PLANT_SIGMA_ANNEAL_START_ITER,
+            "end_step": _PLANT_SIGMA_ANNEAL_END_ITER,
+            "steps_per_iteration": _SPI,
+        },
+    )
 
 
 @configclass
