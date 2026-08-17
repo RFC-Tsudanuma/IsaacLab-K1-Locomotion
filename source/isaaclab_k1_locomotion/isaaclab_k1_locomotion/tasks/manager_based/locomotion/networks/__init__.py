@@ -16,8 +16,10 @@ from .actor_critic_history_cnn import (  # noqa: F401
     export_history_policy_as_onnx,
     remap_single_frame_actor,
 )
+from .ppo_sparse_mirror import PPOSparseMirror  # noqa: F401
 
-# OnPolicyRunner._construct_algorithm は policy の class_name を
+# OnPolicyRunner._construct_algorithm は policy / algorithm の class_name を
 # `eval(class_name)` で解決する (= on_policy_runner モジュールの名前空間を引く)。
 # 自作クラスはそこに載っていないので、import 時に登録しておく。
 _on_policy_runner.ActorCriticHistoryCNN = ActorCriticHistoryCNN
+_on_policy_runner.PPOSparseMirror = PPOSparseMirror

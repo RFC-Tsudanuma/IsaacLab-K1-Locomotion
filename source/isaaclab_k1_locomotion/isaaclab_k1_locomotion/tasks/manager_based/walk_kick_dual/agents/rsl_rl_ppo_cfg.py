@@ -72,15 +72,36 @@ _CNN_STRIDES = [3, 2]
 # --------------------------------------------------------------------------- #
 _NUM_MINI_BATCHES = 8
 
+# --------------------------------------------------------------------------- #
+# PPO の実装を :class:`~...locomotion.networks.PPOSparseMirror` に差し替える。
+#
+# 素の rsl_rl は mirror loss を **全ミニバッチ** (5 epoch × 8 = 40 回/update) に
+# 掛ける。1 回あたり「観測を 2 倍にして actor をもう一度 forward + backward」
+# なので、履歴 CNN の actor では learning が実測 0.78 → 2.54 s/iteration (×3.3)。
+# PPOSparseMirror は 5 ミニバッチに 1 回 (40 回中 8 回) だけ掛けるので、
+# learning は ~1.1 s に戻る見込み。詳細は ppo_sparse_mirror.py の docstring。
+#
+# NOTE: **1 フレーム観測の both_feet 系はこの差し替えをしない** (素の PPO のまま)。
+#       あちらは観測が 1/100 で mirror loss のコストが誤差なので、間引く理由が無い。
+#       この非対称は意図的で、「dual だけ mirror の実効係数が 1/5」という違いに
+#       なる。both_feet と dual を並べて比較するときはこの点に注意すること。
+# NOTE: 間引いたぶん平均的な対称化の圧も 1/5 になるが、係数
+#       (both_feet 側の ``_MIRROR_LOSS_COEFF`` = 0.5) は据え置きにしてある。
+#       上げ下げの判断材料は ppo_sparse_mirror.py の NOTE を参照。
+# --------------------------------------------------------------------------- #
+_ALGORITHM_CLASS_NAME = "PPOSparseMirror"
+
 
 def _use_history_cnn_policy(cfg) -> None:
     """policy を :class:`~...locomotion.networks.ActorCriticHistoryCNN` に差し替える。
 
     PPO ハイパラ・MLP 幅・正規化の有無は継承元の値をそのまま引き継ぐ。**ただし
-    ``num_mini_batches`` だけは上書きする** (:data:`_NUM_MINI_BATCHES`)。関数名と
+    ``num_mini_batches`` と ``class_name`` だけは上書きする**
+    (:data:`_NUM_MINI_BATCHES` / :data:`_ALGORITHM_CLASS_NAME`)。関数名と
     役割 (ネットワークの差し替え) からは外れるが、履歴観測を使う RunnerCfg が必ず
-    通る唯一の場所なので、漏れが起きないようここに置いてある。理由は履歴観測 ×
-    mirror loss の GPU メモリで、詳細は定数のコメント参照。
+    通る唯一の場所なので、漏れが起きないようここに置いてある。理由はどちらも
+    履歴観測 × mirror loss のコスト (GPU メモリと learning 時間) で、詳細は
+    それぞれの定数のコメント参照。
 
     dual 系列の **全 stage** がこれを呼ぶ (walk_kick_dual / walk_weak_kick_dual /
     walk_middle_kick_dual)。**1 段でも呼び忘れると、そこで checkpoint の連鎖が
@@ -103,6 +124,8 @@ def _use_history_cnn_policy(cfg) -> None:
     )
     # 履歴観測 × mirror loss の OOM 対策。継承元の 4 を 8 に割る (総バッチ量は不変)。
     cfg.algorithm.num_mini_batches = _NUM_MINI_BATCHES
+    # mirror loss を 5 ミニバッチに 1 回だけ掛ける PPO に差し替える (learning の高速化)。
+    cfg.algorithm.class_name = _ALGORITHM_CLASS_NAME
 
 
 @configclass
