@@ -443,12 +443,17 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         #
         #   ベースの weight を上げると加速そのものを罰してしまい、過去に経験した
         #   「動かなければペナルティを踏まない」均衡 (諦め足踏み) に落ちる。
-        #   狙いは「待機中の振動」なので、この倍率だけを上げるのが正しい軸。
-        #   locomotion の既定は 3.0。ここでは goalkeeper Stage2 に限って 5.0 にする。
-        for _term in ("action_smoothness_l2", "action_rate_l2"):
-            _cfg = getattr(self.rewards, _term, None)
-            if _cfg is not None and "stand_still_scale" in _cfg.params:
-                _cfg.params["stand_still_scale"] = 5.0
+        #   狙いは「待機中の振動」なので、まずこの倍率を上げるのが本筋の軸。
+        #   locomotion の既定は 3.0。ここでは goalkeeper Stage2 に限って上書きする。
+        #
+        # ★ 2026-08-17 (ユーザー指示): 倍率だけでは足りなかったため、ベースの weight も
+        #   ここで上書きする。強めるほど加速そのものを罰するので、変えたら
+        #   Episode_Reward の target_reach_velocity / 横移動速度が落ちていないか要確認。
+        #   戻すときは locomotion 既定値 (-0.12 / -0.4) に置き直す。
+        self.rewards.action_smoothness_l2.weight = -0.24  # locomotion 既定 -0.12 の 2.0 倍
+        self.rewards.action_smoothness_l2.params["stand_still_scale"] = 5.0
+        self.rewards.action_rate_l2.weight = -0.6  # locomotion 既定 -0.4 の 1.5 倍
+        self.rewards.action_rate_l2.params["stand_still_scale"] = 5.0
 
         # --- 腰が下がりすぎるのを抑える (2026-07-31) ---
         self.rewards.base_height_penalty.params["min_height"] = 0.55
