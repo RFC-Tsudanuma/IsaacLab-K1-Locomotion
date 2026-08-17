@@ -451,6 +451,74 @@ def ball_avoidance(
     return f_sole * p_kick_pose * (~state["kick_done"]).float()
 
 
+def ball_avoidance_exec(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    d_contact: float = 0.18,
+    d_sat: float = 0.45,
+    sigma_pose: float = 0.3,
+) -> torch.Tensor:
+    """項5''. Ball Avoidance (execution 解釈) = f(d_mean) * p_kickPose。負の重みで使う。shape: (N,)
+
+    B-Human ポスターの Ball Avoidance ``f(d_soleToBall)·p_kickPose`` (weight −3) を、
+    :func:`approach_penalty` / :func:`ball_avoidance` とは **第 3 の向き** で読んだもの。
+    ユーザーとの議論で確定した解釈 (2026-08-17):
+
+    * ``f(d) = clamp((d − d_contact) / (d_sat − d_contact), 0, 1)``
+      : **遠いほど大きい** (接触距離で厳密に 0、d_sat 以遠で 1)
+    * ``p_kickPose = exp(−(d_to_P_kick/σ_pose)²) · p_style``
+      : **構えの一致度** (1 = P_kick に立ち蹴り方向を向いている)。
+      ``p_style`` / ``p_walk`` と同じ自然な極性で、``approach_penalty`` /
+      :func:`ball_avoidance` が使う「ズレほど大きい」反転版ではない。
+
+    積を負の重みで払うので、罰されるのは **「構えは完成しているのに足がボールから
+    遠い」** 状態だけになる。名前どおりの「ボールを避けろ」ではなく、
+    「構えたなら実行しろ (蹴り切れ)」という督促として効く。
+
+    核心は **キック接触の瞬間に距離側が 0 になり罰が消える** こと。足がボールに触れる
+    位置まで詰めれば f = 0 なので、構えが完璧でも罰は残らない。つまりこの項は
+    「構えて止まったまま」だけを罰し、蹴り抜けた瞬間に自分で消える。
+
+    d は **両足の平均** (:data:`~.kick_state` の ``d_sole_to_ball_mean``)
+    ----------------------------------------------------------------------
+    片足 min (``d_sole_to_ball``) だと「軸足を後ろに置いて蹴り足だけ突き出す」退行解が、
+    綺麗なインサイドキック (両足ともボール近傍、平均 ≈ 0.17-0.20 m) と同じ値になり
+    区別できない。平均なら退行解は ≈ 0.32 m で分離する。
+
+    パラメータ
+    ----------
+    * ``d_contact = 0.18``: ボール半径 0.11 (中心 z = 0.11) と足リンク原点
+      (接地時 z ≈ 0.038 = :data:`~.kick_state._SOLE_OFFSET`) の鉛直差 0.072 に、
+      接触時の水平距離を足したもの。綺麗なインサイドの構えでの両足平均 ≈ 0.17-0.20 に
+      当たる。ここで f が 0 に張り付くので「接触したら罰ゼロ」が成立する。
+    * ``d_sat = 0.45``: 突き出し退行解 (平均 ≈ 0.32) で f ≈ 0.5、それ以遠は飽和。
+      青天井にしないことで、遠方 (接近中) の罰が構えの一致度ぶんに抑えられる。
+
+    ``f`` を線形クランプにしてあるのは、リポジトリ既存の ``f_phi`` / ``f_loft`` /
+    ``f_lift`` (いずれも clamp 形式) と揃えるためと、Gaussian や exp では接触時に
+    厳密な 0 にならないため。
+
+    NOTE: 命名は「非負の値を返し、負の重みで使う」既存の罰項の規約
+          (:func:`approach_penalty` / :func:`ball_avoidance` /
+          :func:`kick_velocity_overshoot` / :func:`kick_pose_overshoot`) に従う。
+    NOTE: pre-latch のみ有効 (kick_done で 0 ゲート)。latch 後はボールが飛んでいくので
+          距離側が意味を失う。
+    """
+    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+
+    # 遠いほど 1。d_contact 以下 (= 接触している) で厳密に 0。
+    f_sole = torch.clamp(
+        (state["d_sole_to_ball_mean"] - d_contact) / (d_sat - d_contact), min=0.0, max=1.0
+    )
+
+    # 構えの一致度。1 = P_kick に立ち、蹴り方向を向いている (自然な極性)。
+    pose_match = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2)) * state["p_style"]
+
+    return f_sole * pose_match * (~state["kick_done"]).float()
+
+
 def extra_ball_touch(
     env: ManagerBasedRLEnv,
     r_stance: float,

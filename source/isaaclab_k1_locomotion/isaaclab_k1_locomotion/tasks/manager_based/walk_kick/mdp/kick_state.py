@@ -211,6 +211,7 @@ def kick_state(
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
             "d_sole_to_ball": torch.zeros(env.num_envs, device=device),
+            "d_sole_to_ball_mean": torch.zeros(env.num_envs, device=device),
             "p_kick_pose": torch.zeros(env.num_envs, device=device),
             "v_target": torch.zeros(env.num_envs, device=device),
         }
@@ -479,6 +480,18 @@ def kick_state(
     # (foot_pos / d_foot_to_ball は接触時足高さの計算で既に求めてある)
     # ------------------------------------------------------------------ #
     state["d_sole_to_ball"] = d_foot_to_ball.min(dim=1).values
+
+    # ------------------------------------------------------------------ #
+    # d_soleToBall (両足平均)。min 版とは **別のキー** として持つ (既存項は触らない)。
+    #
+    # min 版は「どちらか片方の足がボールの近くにあるか」しか見ないので、
+    #   * 綺麗なインサイドキックの構え (両足ともボール近傍)
+    #   * 軸足を後ろに残して蹴り足だけ突き出した退行解
+    # が同じ値になり区別できない。平均なら後者だけが大きくなる (実測見積もりで
+    # 前者 ≈ 0.17-0.20 m、後者 ≈ 0.32 m)。「構えができているのに足がボールから
+    # 遠い」ことを罰する :func:`..rewards.ball_avoidance_exec` 専用の量。
+    # ------------------------------------------------------------------ #
+    state["d_sole_to_ball_mean"] = d_foot_to_ball.mean(dim=1)
 
     state["p_style"] = p_style
     state["d_to_P_kick"] = (robot_pos - state["P_kick"]).norm(dim=-1)
