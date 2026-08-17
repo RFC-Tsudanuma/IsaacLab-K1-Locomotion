@@ -88,7 +88,8 @@ gym.register(
 # Stage 4 (middle, dual, 最終): 全方位 + 観測 DR。中身は Stage 3 と同じで、
 #   * IMU / エンコーダの遅延 DR (≤ 0.02 s)
 #   * ボール観測の遅延 DR (0.02-0.10 s) とノイズ拡大 (位置 ±0.07 m / 速度 ±0.5 m/s)
-#   * ランプの全凍結 (キック報酬 + kick_plant_foot + ball_avoidance。fine-tune 前提)
+#   * ランプの全凍結 (キック報酬 + ball_avoidance。fine-tune 前提。kick_plant_foot は
+#     dual 系列では項ごと外してあるので凍結対象に現れない)
 #   * σ_direction を Stage 3 の終値 0.15 で固定
 # だけが乗る。地形は平面のまま。ボール観測 DR は **一様ノイズ + 遅延** で、
 # ガウスの認識パイプライン (旧 Noisy-Ball 系) は不採用 (2026-08-17)。

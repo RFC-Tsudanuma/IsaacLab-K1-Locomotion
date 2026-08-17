@@ -9,6 +9,10 @@
 :func:`_use_history_cnn_policy` は :mod:`..walk_weak_kick_dual` と
 :mod:`..walk_middle_kick_dual` からも import されるので、切り出し方の定数は
 ここ 1 箇所で管理する。
+
+mirror loss (:func:`~...walk_kick_both_feet.agents.rsl_rl_ppo_cfg._use_mirror_loss`) も
+**全 stage で呼ぶ**。both_feet 側で 1 箇所管理しており、dual 3 ファミリーはそれを
+そのまま使う (観測は both_feet と同じ 55/58 次元で、履歴になっても最終軸は変わらない)。
 """
 
 from isaaclab.utils import configclass
@@ -21,6 +25,7 @@ from ...walk_kick.agents.rsl_rl_ppo_cfg import (
     K1WalkKickPPORunnerCfg,
     K1WalkKickWalkPhasePPORunnerCfg,
 )
+from ...walk_kick_both_feet.agents.rsl_rl_ppo_cfg import _use_mirror_loss
 
 # --------------------------------------------------------------------------- #
 # Actor に「そのまま」入れる直近フレーム数 K
@@ -77,6 +82,7 @@ class K1WalkKickDualWalkPhasePPORunnerCfg(K1WalkKickWalkPhasePPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_walk_phase"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)
 
 
 @configclass
@@ -95,6 +101,7 @@ class K1WalkKickDualPPORunnerCfg(K1WalkKickPPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)
 
 
 @configclass
@@ -110,6 +117,7 @@ class K1WalkKickDual360PPORunnerCfg(K1WalkKick360PPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_360"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)
 
 
 @configclass
@@ -126,3 +134,4 @@ class K1WalkKickDual360DRPPORunnerCfg(K1WalkKick360PPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_360_dr"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)

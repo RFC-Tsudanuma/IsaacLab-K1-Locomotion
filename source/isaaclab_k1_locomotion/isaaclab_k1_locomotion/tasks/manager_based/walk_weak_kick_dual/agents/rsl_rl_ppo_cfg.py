@@ -9,6 +9,12 @@ policy の差し替えは :func:`~..walk_kick_dual.agents.rsl_rl_ppo_cfg._use_hi
 に集約されている (切り出し方 K = 5 / CNN の形も含めてあちらで 1 箇所管理)。
 **全 stage で呼ぶこと**。1 段でも忘れると、そこで checkpoint の連鎖が切れる。
 
+左右対称性の mirror loss
+(:func:`~..walk_kick_both_feet.agents.rsl_rl_ppo_cfg._use_mirror_loss`) も
+**全 stage で呼ぶこと**。こちらは形が変わらないぶん忘れても起動ログに何も出ず、
+その段だけ対称化の圧が消えて蹴り足が片方へ戻る (``kick_foot_right_frac`` が
+0/1 に張り付いてから気づくことになる)。
+
 experiment_name は既存の 1 フレーム版 (``k1_walk_kick_weak`` /
 ``k1_walk_kick_360_weak`` / ``k1_walk_kick_360_weak_noisy_ball``) と別にしてあり、
 ログが混ざらない。
@@ -18,6 +24,7 @@ from isaaclab.utils import configclass
 
 # import した時点で ActorCriticHistoryCNN が rsl_rl の名前空間に登録される
 # (OnPolicyRunner は class_name を eval で解決するため)。
+from ...walk_kick_both_feet.agents.rsl_rl_ppo_cfg import _use_mirror_loss
 from ...walk_kick_dual.agents.rsl_rl_ppo_cfg import _use_history_cnn_policy
 from ...walk_weak_kick.agents.rsl_rl_ppo_cfg import (
     K1WalkKick360WeakPPORunnerCfg,
@@ -39,6 +46,7 @@ class K1WalkKickDualWeakPPORunnerCfg(K1WalkKickWeakPPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_weak"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)
 
 
 @configclass
@@ -54,6 +62,7 @@ class K1WalkKickDual360WeakPPORunnerCfg(K1WalkKick360WeakPPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_360_weak"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)
 
 
 @configclass
@@ -69,3 +78,4 @@ class K1WalkKickDual360WeakDRPPORunnerCfg(K1WalkKick360WeakPPORunnerCfg):
 
         self.experiment_name = "k1_walk_kick_dual_360_weak_dr"
         _use_history_cnn_policy(self)
+        _use_mirror_loss(self)

@@ -70,6 +70,23 @@
 # policy は同じ 55 次元なので --load_pretrained は形の上では通ってしまうが、
 # スロット 3 の意味が違うので入力の解釈がずれる (critic は次元も合わない)。
 #
+# mirror loss (左右対称データ拡張) について
+# ----------------------------------------
+# 全 stage の RunnerCfg で mirror loss を有効にしてある
+# (policy(mirror(obs)) ≈ mirror(policy(obs)) を促す MSE を PPO 損失に加算。
+#  鏡像写像は source/.../walk_kick_both_feet/symmetry.py、係数 0.5 は歩行タスクと同じ)。
+#
+# **mirror loss 導入後は stage 1 (walk phase) から回し直すこと。**
+# 既存の both_feet / dual の checkpoint は既に片足に収束していて
+# (kick_foot_right_frac が run ごとに 0.99 / 0.01 へ張り付く)、対称化の出発点として
+# 不適。そこから掛けると、対称化は「獲得済みの蹴り足を壊す」方向にしか働かない。
+#   STAGE=1234 ... で walk phase から通しで回す。
+#
+# 効果は Metrics/kick_direction/kick_foot_right_frac (0.5 付近なら両足で蹴れている) と、
+# rsl_rl のログに出る symmetry loss を併せて見る。kick_dir_error_deg / kick_rate が
+# 落ちるようなら係数 0.5 が強すぎるサイン
+# (source/.../walk_kick_both_feet/agents/rsl_rl_ppo_cfg.py の _MIRROR_LOSS_COEFF)。
+#
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_kick_dual.sh              # 4 段を通しで実行
 #   STAGE=234 ./scripts/rsl_rl/train_walk_kick_dual.sh    # 歩行学習済みなら 2,3,4 だけ

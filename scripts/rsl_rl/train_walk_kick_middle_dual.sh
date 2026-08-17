@@ -19,13 +19,19 @@
 #
 # 移植元は fewa/walk_kick_dual_encoder_tune (walk_long_pass の dual encoder 化)。
 # **4 段構成と DR の配置は fewa の 47b8863 に合わせてある。**
-# 指令帯 (3.2, 4.5) m/s・ボール配置・軸足配置・終了条件は既存の middle タスクと
+# 指令帯 (3.2, 4.5) m/s・ボール配置・終了条件は既存の middle タスクと
 # 1 バイトも変えていない。差は
 #   * 全 stage: policy 観測が 100 フレームの履歴 (actor = 直近 5 フレーム + CNN 潜在)
 #   * 全 stage: 着地 shaping 3 項 (feet_landing_impact / feet_landing_vel /
 #               feet_heel_strike) を外す + feet_phase の weight 2.0 → 0.8
 #               (fewa 実測: 未対処だと「蹴らずに歩く」が最適解になり kick_rate が
 #                0.19-0.28 で 4000 iteration 停滞した)
+#   * 全 stage: 軸足誘導 kick_plant_foot を外す (dual だけの引き算)。
+#               この項は commit 1d0fac2 で middle に足されたが、既存 middle 3 run は
+#               すべてそれ以前の学習で **一度も学習していない** (env.yaml で確認)。
+#               実機転移に成功したレシピは誘導なしなので、dual 化と交絡させないため
+#               dual 側でだけ外す (walk_middle_kick 本体には残してある)。
+#               実機で距離不足・ばらつきが出たら +誘導だけの ablation を別 run で。
 #   * Stage 3 のみ: σ_direction のアニール (方向の採点を 0.35 → 0.15 rad に締める)
 #   * Stage 4 のみ: 観測 DR = IMU/エンコーダの遅延 (≤0.02 s) + **ボール観測の遅延
 #                   (0.02-0.10 s) と一様ノイズの拡大 (位置 ±0.07 m / 速度 ±0.5 m/s)**
@@ -37,8 +43,10 @@
 #
 # NOTE: 位置ノイズは ±0.07 m を超えないこと。fewa は一度 ±0.1 m まで上げて critic が
 #       繰り返し発散した (10000 iteration 中 value loss > 50 が 230 回、最大 1.26e12)。
-# NOTE: 観測遅延は軸足配置 (kick_plant_foot) の実測値に効き得る。Stage 4 では
-#       Metrics/kick_direction/plant_lon / plant_lat を Stage 3 の run と併せて見ること。
+# NOTE: 観測遅延は軸足の置き方に効き得る。誘導報酬は外してあるが、診断メトリクス
+#       Metrics/kick_direction/plant_lon / plant_lat は出続けるので、Stage 4 では
+#       Stage 3 の run と併せて見ること (middle_360_noisy の実測は plant_lon -0.45 /
+#       sole_height_at_kick 10.6cm / 仰角 4.4° = toe-poke 気味)。
 #
 # 歩行 (stage 1) は walk_kick_dual とまったく同じなので学習し直さない。作り直すのは
 # キック側 (stage 2 以降) だけ。実機較正 a ≈ 1.0 m/s² と d = v²/2a から、
@@ -57,6 +65,23 @@
 # (k1_walk_kick_walk_phase など) は不可**: policy は同じ 55 次元なので
 # --load_pretrained は形の上では通ってしまうが、スロット 3 の意味が違うので
 # 入力の解釈がずれる (critic は次元も合わない)。
+#
+# mirror loss (左右対称データ拡張) について
+# ----------------------------------------
+# 全 stage の RunnerCfg で mirror loss を有効にしてある
+# (policy(mirror(obs)) ≈ mirror(policy(obs)) を促す MSE を PPO 損失に加算。
+#  鏡像写像は source/.../walk_kick_both_feet/symmetry.py、係数 0.5 は歩行タスクと同じ)。
+#
+# **mirror loss 導入後は stage 1 (walk phase) から回し直すこと。**
+# 既存の both_feet / dual の checkpoint は既に片足に収束していて
+# (kick_foot_right_frac が run ごとに 0.99 / 0.01 へ張り付く)、対称化の出発点として
+# 不適。そこから掛けると、対称化は「獲得済みの蹴り足を壊す」方向にしか働かない。
+#   STAGE=1234 ... で walk phase から通しで回す。
+#
+# 効果は Metrics/kick_direction/kick_foot_right_frac (0.5 付近なら両足で蹴れている) と、
+# rsl_rl のログに出る symmetry loss を併せて見る。kick_dir_error_deg / kick_rate が
+# 落ちるようなら係数 0.5 が強すぎるサイン
+# (source/.../walk_kick_both_feet/agents/rsl_rl_ppo_cfg.py の _MIRROR_LOSS_COEFF)。
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_kick_middle_dual.sh                # stage 2,3,4 を通しで実行
