@@ -46,11 +46,41 @@ _CNN_KERNEL_SIZES = [6, 4]
 _CNN_FILTERS = [32, 16]
 _CNN_STRIDES = [3, 2]
 
+# --------------------------------------------------------------------------- #
+# PPO の update 時のミニバッチ分割数。継承元 (locomotion/agents/rsl_rl_ppo_cfg.py の
+# K1RoughPPORunnerCfg.algorithm) は 4。**dual 系列だけ 8 に上げる。**
+#
+# 理由: 履歴観測 (N, 100, 55) と mirror loss の組み合わせで GPU メモリが足りない。
+# rsl_rl の PPO は mirror loss を計算する直前に、symmetry で 2 倍にした観測を
+# ``obs_batch.detach().clone()`` する (ppo.py:328)。実測 (2026-08-17、16 GB GPU):
+#
+#   4096 env × 48 steps ÷ 4 mini batch = 49,152 サンプル
+#   49,152 × (100 × 55) × 4 B ≈ 1.01 GiB          ← ミニバッチの観測
+#   symmetry でバッチ 2 倍 → clone が 2.02 GiB    ← ここで OOM
+#
+# 8 に割ると 1 回あたりの経路のピークが半分になり、~2.5 GiB 下がる。
+# **総バッチ量 (1 iteration で舐めるサンプル数) は変わらない**。分割数が増えるぶん
+# 勾配のノイズは増えるが、49,152 → 24,576 サンプルはまだ十分大きい。
+#
+# NOTE: 1 フレーム観測の both_feet 系は観測が 1/100 なので無関係。この上書きを
+#       :func:`_use_history_cnn_policy` に置いてあるのは、**履歴を使う RunnerCfg が
+#       必ずここを通る**ため (dual 3 ファミリーの 10 stage 全部)。both_feet はこの
+#       関数を呼ばないので影響しない。
+# NOTE: num_envs を減らす / 履歴長 H を縮める方向でも同じ効果は出るが、どちらも
+#       学習結果そのものを変える。ミニバッチ分割は「同じ更新を何回に分けるか」
+#       だけなので、OOM 対策として副作用がいちばん小さい。
+# --------------------------------------------------------------------------- #
+_NUM_MINI_BATCHES = 8
+
 
 def _use_history_cnn_policy(cfg) -> None:
     """policy を :class:`~...locomotion.networks.ActorCriticHistoryCNN` に差し替える。
 
-    PPO ハイパラ・MLP 幅・正規化の有無は継承元の値をそのまま引き継ぐ。
+    PPO ハイパラ・MLP 幅・正規化の有無は継承元の値をそのまま引き継ぐ。**ただし
+    ``num_mini_batches`` だけは上書きする** (:data:`_NUM_MINI_BATCHES`)。関数名と
+    役割 (ネットワークの差し替え) からは外れるが、履歴観測を使う RunnerCfg が必ず
+    通る唯一の場所なので、漏れが起きないようここに置いてある。理由は履歴観測 ×
+    mirror loss の GPU メモリで、詳細は定数のコメント参照。
 
     dual 系列の **全 stage** がこれを呼ぶ (walk_kick_dual / walk_weak_kick_dual /
     walk_middle_kick_dual)。**1 段でも呼び忘れると、そこで checkpoint の連鎖が
@@ -71,6 +101,8 @@ def _use_history_cnn_policy(cfg) -> None:
         cnn_filters=_CNN_FILTERS,
         cnn_strides=_CNN_STRIDES,
     )
+    # 履歴観測 × mirror loss の OOM 対策。継承元の 4 を 8 に割る (総バッチ量は不変)。
+    cfg.algorithm.num_mini_batches = _NUM_MINI_BATCHES
 
 
 @configclass

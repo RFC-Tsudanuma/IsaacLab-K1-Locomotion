@@ -158,6 +158,10 @@ if [[ -z "$LAB_PY" ]]; then
 fi
 echo "[INFO] python: $LAB_PY"
 
+# 履歴観測 (N, 100, 55) × mirror loss は 2 GiB 級の一時テンソルを確保する。断片化で
+# OOM しないようアロケータを可変セグメントにする (既に設定済みならそちらを尊重)。
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
+
 NUM_ENVS=${NUM_ENVS:-4096}
 # kick 系 (Stage 2/3) の iteration 数。詰めるときは 20000 まで上げる。
 ITER=${ITER:-5000}
