@@ -5,9 +5,11 @@
 
 """walk_kick の「Ball Avoidance を原典の解釈で入れ直した」版。
 
-非 dual 系の :class:`~..walk_kick.walk_kick_env_cfg.K1WalkKickEnvCfg` を継承し、
-**変更点は 2 つだけ**。他 (コマンド・ボール配置・終了条件・地形・他のキック報酬と
-そのカリキュラム) は継承元とまったく同じなので、差分がそのまま 2 点の効果になる。
+非 dual 系の :class:`~..walk_kick.walk_kick_env_cfg.K1WalkKickEnvCfg` を継承する。
+**1-2 が当初からの差分** (観測スロット 3 と接近系の罰の読み直し)、**3-5 は初回 run
+(k1_walk_kick_ball_avoid, iter 1600) の結果を受けた報酬バランスの修正**。
+他 (コマンド・ボール配置・終了条件・地形・他のキック報酬とそのカリキュラム) は
+継承元とまったく同じ。
 
 1. **観測スロット 3 = 現在のボール 3D 位置** (元は左足裏 ``sole_pos``)
 
@@ -30,6 +32,37 @@
    キック接触の瞬間に距離側が 0 になって罰が消えるのが核心。式・パラメータ・
    両足平均を使う理由は :func:`~..walk_kick.mdp.rewards.ball_avoidance_exec` の
    docstring を参照。
+
+初回 run の診断 (3-5 の前提)
+---------------------------
+キックは iter 300-400 に一度立ち上がった (kick_rate 0.19) 後、iter 1300 以降 0.00 に
+消滅した。その間 mean_reward は −4.4 → +16 と単調増加しており、勾配死ではなく
+**「蹴らない方が儲かる」を正しく学習した** 結果である。実測された経済は「蹴らずに
+生きる dense 収入 ≈ +1.6/秒」「kick_finished (latch+2 秒) の早期終了で残り 4-5 秒ぶん
+≈ +6〜8 を没収」「学習初期の蹴り 1 回の実収入 ≈ +0.3 (満額 7.8 の 4%)」で、
+**蹴る = 約 −6 の取引** になっていた。旧 ``approach_penalty`` は「ボール近傍に居ない
+こと」への恒常税だったのでこのバイアスを偶然相殺していたが、``ball_avoidance_exec``
+(構えたときだけ課税) はその仕事を引き継いでいない。
+
+3. **キック 3 項の end_weight を ×3** (:data:`_KICK_W_BOOST`)
+
+   ``kick_direction`` 1.8 → 5.4、``kick_velocity_scaled`` 1.2 → 3.6、
+   ``kick_velocity_strong`` 0.9 → 2.7。蹴り 1 回の期待収入そのものを持ち上げる。
+   B-Human ポスター stage 2 の "Higher rewards are used to speed up training" に倣う。
+   ランプ窓 (0 → 500 iteration) は継承元のまま。
+
+4. **``kick_latch_bonus`` を新設** (weight :data:`_KICK_LATCH_BONUS_WEIGHT` = 4.0)
+
+   latch からエピソード終了まで定額で払う項 (総額 ≈ weight × 2 秒 = +8)。キックの
+   巧拙を問わず、早期終了で没収される歩行収入を相殺して「蹴る/蹴らない」の選択を
+   収支中立に戻す。カリキュラムランプは付けず最初から有効。
+   :func:`~..walk_kick.mdp.rewards.kick_latch_bonus` 参照。
+
+5. **``ball_avoidance_exec`` のランプを後ろ倒し** (0 → 500 から **500 → 1000** へ)
+
+   実行圧はキック行動が確立してから掛ける税。キック 3 項と同時にランプさせた初版では、
+   蹴りの収入がまだ小さい時期に構えを課税してしまい、蹴り放棄への傾きを助長した。
+   終端 weight (−3.0) は据え置き。
 
 観測は **55 次元・並びとも継承元と同一** (critic も 61 次元のまま)。ただし
 **スロット 3 の意味が変わる**ので、既存の ``k1_walk_kick_walk_phase`` /
@@ -85,14 +118,41 @@ _BALL_AVOIDANCE_EXEC_PARAMS = {
     "sigma_pose": 0.3,
 }
 
-# 継承元 (walk_kick_env_cfg の _phase2) と同じフェードイン窓。あちらは
-# ``__post_init__`` のローカル変数なので参照できず、リテラルで持つ
-# (360 の ball_avoidance_weight も同じ流儀)。
-_PHASE2 = {"start_step": 0, "end_step": 500, "steps_per_iteration": 24}
+# ball_avoidance_exec のフェードイン窓。継承元 (walk_kick_env_cfg の _phase2) の
+# 0 → 500 に対し **500 iteration 遅らせてある**。実行圧は「キック行動が確立してから
+# 掛ける税」であって、立ち上げの補助ではないため。初版はキック 3 項と同じ 0 → 500 で
+# ランプさせたが、蹴りの収入がまだ小さい時期 (iter 0-400) に構えを課税してしまい、
+# 蹴り放棄への傾きを助長した (診断は :class:`K1WalkKickBallAvoidEnvCfg` の
+# ``__post_init__`` のコメント、およびモジュール docstring の 3-5 を参照)。
+# steps_per_iteration は継承元と同じ 24。あちらは ``__post_init__`` のローカル変数
+# なので参照できず、リテラルで持つ (360 の ball_avoidance_weight も同じ流儀)。
+_BALL_AVOIDANCE_EXEC_PHASE = {"start_step": 500, "end_step": 1000, "steps_per_iteration": 24}
 
 # ball_avoidance_exec の終端 weight。ポスターの Ball Avoidance と同じ −3
-# (継承元の approach_penalty / 360 の ball_avoidance とも同値)。
+# (継承元の approach_penalty / 360 の ball_avoidance とも同値)。窓だけ遅らせ、
+# 終端値は据え置く。
 _BALL_AVOIDANCE_EXEC_WEIGHT = -3.0
+
+# --------------------------------------------------------------------------- #
+# キック 3 項 (項1-3) の end_weight 倍率
+#
+# 継承元は 6.0/4.0/3.0 × _KICK_W_SCALE(=0.3) = 1.8 / 1.2 / 0.9。これを一律 ×3 して
+# 5.4 / 3.6 / 2.7 にする。根拠は下の「蹴らない方が儲かる」診断 (A) と、B-Human
+# ポスター stage 2 の "Higher rewards are used to speed up training"。
+# --------------------------------------------------------------------------- #
+_KICK_W_BOOST = 3.0
+
+# --------------------------------------------------------------------------- #
+# kick_latch_bonus の weight
+#
+# latch からエピソード終了までの delay_steps(100) × dt(0.02) = 2 秒に定額で払うので、
+# 1 キックあたりの総額は weight × 2.0 = +8.0。これは kick_finished による早期終了で
+# 没収される dense な歩行収入 (≈ +1.6/秒 × 残り 4-5 秒 = +6〜8) の相殺額。
+#
+# NOTE: 総額が delay_steps に連動する。継承元の _KICK_DELAY_STEPS を変えたらこの値も
+#       見直すこと (:func:`~..walk_kick.mdp.rewards.kick_latch_bonus` の NOTE 参照)。
+# --------------------------------------------------------------------------- #
+_KICK_LATCH_BONUS_WEIGHT = 4.0
 
 
 # --------------------------------------------------------------------------- #
@@ -221,9 +281,10 @@ class K1WalkKickBallAvoidEnvCfg(K1WalkKickEnvCfg):
     """Ball Avoidance (execution 解釈) 版の walk_kick (stage 2)。
 
     :class:`~..walk_kick.walk_kick_env_cfg.K1WalkKickEnvCfg` との差は
-    **観測スロット 3 と接近系の罰の 2 点だけ** (モジュール docstring 参照)。
-    ボール配置 (±60° / 0.5-0.8 m)・蹴り方向 (±45°)・他のキック報酬・カリキュラム・
-    終了条件は一切変えていない。
+    **観測スロット 3・接近系の罰・キック報酬のバランス (3 点)** だけ
+    (計 5 項目。モジュール docstring 参照)。ボール配置 (±60° / 0.5-0.8 m)・
+    蹴り方向 (±45°)・キック報酬項の中身・終了条件は一切変えていない
+    (キック 3 項は end_weight の倍率だけ、ランプ窓は継承元のまま)。
 
     学習は :class:`K1WalkKickBallAvoidWalkPhaseEnvCfg` の checkpoint から::
 
@@ -258,8 +319,60 @@ class K1WalkKickBallAvoidEnvCfg(K1WalkKickEnvCfg):
                 "term_name": "ball_avoidance_exec",
                 "start_weight": 0.0,
                 "end_weight": _BALL_AVOIDANCE_EXEC_WEIGHT,
-                **_PHASE2,
+                # 差分 5. ランプを 500 → 1000 に後ろ倒し (定数側のコメント参照)。
+                **_BALL_AVOIDANCE_EXEC_PHASE,
             },
+        )
+
+        # ------------------------------------------------------------------ #
+        # 初回 run (k1_walk_kick_ball_avoid, iter 1600) の診断
+        # (モジュール docstring の差分 3-5 の共通の前提)
+        #
+        # 症状: キックは iter 300-400 に一度立ち上がった (kick_rate 0.19) 後、
+        #       iter 1300 以降 0.00 に消滅した。その間 mean_reward は −4.4 → +16 と
+        #       単調増加しており、勾配死ではなく **「蹴らない方が儲かる」を正しく
+        #       学習した** 結果である。
+        #
+        # 実測された経済:
+        #   * 蹴らずに生きる dense 収入 (feet_phase 等の歩行系正報酬) ≈ +1.6 / 秒
+        #   * kick_finished が latch + 2 秒でエピソードを打ち切るので、蹴ると残り
+        #     4-5 秒ぶん ≈ +6〜8 を没収される
+        #   * 学習初期の蹴り 1 回の実収入 ≈ +0.3 (方向・速度が未熟で満額 7.8 の 4%)
+        #   → 蹴る = 約 −6 の取引。
+        #
+        # 旧 approach_penalty は「ボール近傍に居ないこと」への恒常税だったので、この
+        # バイアスを偶然相殺していた。ball_avoidance_exec (構えたときだけ課税) は
+        # その仕事を引き継いでいないため、下の差分 3 / 4 で明示的に埋める
+        # (差分 5 = 上の ball_avoidance_exec のランプ後ろ倒しも同じ診断から)。
+        # ------------------------------------------------------------------ #
+
+        # -- 差分 3. キック 3 項の end_weight を ×3
+        #
+        # 蹴り 1 回の期待収入そのものを持ち上げて、没収される dense 収入との差を詰める。
+        # 継承元の end_weight (6.0/4.0/3.0 × _KICK_W_SCALE) を掛け算で上書きするので、
+        # 継承元が配分や _KICK_W_SCALE を変えても比率はそのまま追随する。
+        # B-Human ポスター stage 2 の "Higher rewards are used to speed up training"
+        # に倣った処置でもある。ランプ窓 (0 → 500) は継承元のまま。
+        #   kick_direction        : 1.8 → 5.4
+        #   kick_velocity_scaled  : 1.2 → 3.6
+        #   kick_velocity_strong  : 0.9 → 2.7
+        self.curriculum.kick_direction_weight.params["end_weight"] *= _KICK_W_BOOST
+        self.curriculum.kick_velocity_scaled_weight.params["end_weight"] *= _KICK_W_BOOST
+        self.curriculum.kick_velocity_strong_weight.params["end_weight"] *= _KICK_W_BOOST
+
+        # -- 差分 4. latch 後の定額ボーナス
+        #
+        # 差分 3 だけだと「上手く蹴れたときだけ」割に合うので、方向・速度が未熟な立ち上がり
+        # 期には依然として蹴りが損になる。この項はキックの巧拙を問わず latch から
+        # エピソード終了まで定額で払い (総額 ≈ +8)、早期終了で没収される歩行収入を
+        # 相殺して「蹴る/蹴らない」の選択を収支中立に戻す。品質は項1-3 が見る。
+        #
+        # カリキュラムランプは付けない。相殺すべきバイアスは最初から存在するので、
+        # 遅らせると立ち上がり期 (まさに蹴りが消えた区間) を素通りしてしまう。
+        self.rewards.kick_latch_bonus = RewTerm(
+            func=mdp.kick_latch_bonus,
+            weight=_KICK_LATCH_BONUS_WEIGHT,
+            params={**_KICK_STATE_PARAMS},
         )
 
 
@@ -293,8 +406,9 @@ class K1WalkKickBallAvoidWalkPhaseEnvCfg(K1WalkKickWalkPhaseEnvCfg):
     入力→挙動の対応を kick phase と共通にしておくと歩容がそのまま転移する。
 
     報酬側の追加作業は無い。``approach_penalty`` とそのカリキュラムは基底が既に
-    None 化しており、``ball_avoidance_exec`` は :class:`K1WalkKickBallAvoidEnvCfg`
-    の ``__post_init__`` でしか足されない (この段は継承していない) ため。
+    None 化しており、``ball_avoidance_exec`` / ``kick_latch_bonus`` とキック 3 項の
+    weight 倍率は :class:`K1WalkKickBallAvoidEnvCfg` の ``__post_init__`` でしか
+    触られない (この段は継承していない) ため。
     """
 
     observations: K1WalkKickBallAvoidObservationsCfg = K1WalkKickBallAvoidObservationsCfg()

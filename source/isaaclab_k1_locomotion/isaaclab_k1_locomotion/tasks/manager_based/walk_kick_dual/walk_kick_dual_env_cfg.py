@@ -283,6 +283,7 @@ def enable_obs_delay(
     cfg,
     max_delay_s: float = _OBS_DELAY_MAX_S,
     ball_max_delay_s: float | None = None,
+    sources: tuple[str, ...] = ("body", "ball"),
 ) -> list[str]:
     """policy 観測の IMU / エンコーダ / ボール由来の項にセンサ遅延 DR を掛ける。
 
@@ -315,6 +316,16 @@ def enable_obs_delay(
         ball_max_delay_s: ボール観測 (視覚) の遅延上限 [s]。None なら
             :data:`_BALL_OBS_DELAY_MAX_S`。実機のカメラ遅延は内界センサより
             大きいので別パラメータにしてある。
+        sources: 遅延を掛ける source の集合。既定は両方 (= 従来の挙動)。
+
+            ``("body",)`` にすると IMU / エンコーダだけを対象にし、ボール 3 項には
+            一切触らない。**walk phase (stage 1) から呼ぶための逃げ道**で、あの段は
+            ボールをシーンごと落としたうえでボール由来のスロットに歩行コマンドを
+            載せているため、``delayed_ball_pos_vision_b`` へ差し替えると存在しない
+            剛体を読みにいって落ちる。内界センサの遅延だけは stage 1 から入れて
+            おきたい (遅延の有無で歩き方が変わるので、段の間で条件が変わると
+            checkpoint の引き継ぎの意味が薄れる) ので、source 単位で切れるように
+            してある。
 
     Returns:
         実際に遅延を掛けた観測項の名前 (スキップした項は含まない)。
@@ -324,6 +335,8 @@ def enable_obs_delay(
 
     applied: list[str] = []
     for term_name, group, func_name, source, extra in _DELAYED_OBS_TERMS:
+        if source not in sources:
+            continue
         term = getattr(cfg.observations.policy, term_name, None)
         if term is None:
             raise AttributeError(
@@ -341,6 +354,9 @@ def enable_obs_delay(
     # ボール観測のノイズを実機のカメラ由来の量に合わせて広げる
     # (_BALL_POS_NOISE / _BALL_VEL_NOISE のコメント参照)。
     # 速度は常に。位置は差し替えた (= パイプラインが載っていない) 場合だけ。
+    # ただし source として "ball" を外している段 (walk phase) では触らない。
+    if "ball" not in sources:
+        return applied
     cfg.observations.policy.ball_vel.noise = Unoise(n_min=-_BALL_VEL_NOISE, n_max=_BALL_VEL_NOISE)
     for term_name in ("ball_pos", "prev_ball_pos"):
         if term_name in applied:
