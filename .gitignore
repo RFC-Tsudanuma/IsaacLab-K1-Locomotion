@@ -96,6 +96,14 @@ logs/rsl_rl/k1_walk_kick_360_weak/*
 logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/*
 !logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/model_3000.pt
 
+# ball_avoid (観測スロット3をボール3D位置に、Ball Avoidance を実行圧解釈に差し替えた系統)
+# の stage 2 の起点。スロット3の意味が違うので既存の walk phase checkpoint は流用できない。
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/
+logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/*
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/
+logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/*
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/model_4999.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
