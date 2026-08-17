@@ -92,6 +92,9 @@ from .mdp.observations import (
 )
 from .mdp.rewards import (
     face_field,
+    # ★ 待機ゲートを差し替えた action ペナルティ (使用箇所のコメント参照)
+    gk_action_rate_l2,
+    gk_action_smoothness_l2,
     # ★ 足裏基準の足上げ報酬 (Stage2 で foot_clearance_ji を差し替える。理由は使用箇所を参照)
     foot_clearance_sole,
     hold_default_pose_after_save,
@@ -433,27 +436,48 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         if self.rewards.feet_phase is not None:
             self.rewards.feet_phase.params["cmd_threshold"] = _STOP_TOL
 
-        # --- 静止時の振動ペナルティを強める (2026-08-16) ---
+        # --- 待機中の振動ペナルティ (2026-08-17 に判定を作り直した) ---
         #
-        # ★ 実機で振動した件への対処。action_smoothness_l2 / action_rate_l2 は
-        #   「停止指令かつ base が実際に静止している」ときだけ penalty を
-        #   stand_still_scale 倍する仕組みを持つ (rewards._stand_still_boost)。
-        #   push を受けて base が動いた瞬間は倍率が 1.0 に戻るので、
-        #   **横移動の立ち上がりには一切ペナルティがかからない**。
+        # 実機・MuJoCo で「指令ゼロの待機中に小刻みに震える」件への対処。経緯:
         #
-        #   ベースの weight を上げると加速そのものを罰してしまい、過去に経験した
-        #   「動かなければペナルティを踏まない」均衡 (諦め足踏み) に落ちる。
-        #   狙いは「待機中の振動」なので、まずこの倍率を上げるのが本筋の軸。
-        #   locomotion の既定は 3.0。ここでは goalkeeper Stage2 に限って上書きする。
+        #   1. locomotion の action_smoothness_l2 / action_rate_l2 は
+        #      「停止指令かつ base が実際に静止」のとき penalty を stand_still_scale 倍
+        #      する仕組みを持つ (rewards._stand_still_boost)。まずこの倍率を 5.0 にした。
+        #   2. それでも震えが止まらないので weight も 2.0 / 1.5 倍にした (08-17)。
+        #      → **かえって悪化した**。実測 (diag_gk_standstill.py, 静止ボール条件):
+        #        待機中ベース速度 0.0124 → 0.0236 m/s、||Δaction|| 0.0443 → 0.0951。
+        #   3. 原因を計測して判明したのは、**ゲートがほぼ開いていなかった**こと:
+        #        * 静止ブーストの成立率は待機中わずか 1.1%
+        #        * 内訳を分解すると ``|ang_vel_z| < 0.2`` の成立率が 7.9%。
+        #          待機中の |ang_vel_z| は **平均 0.955 rad/s (≒55°/s)** あった。
+        #      つまり **震えているという理由で、震えを抑える罰が無効化されていた**。
+        #      weight や scale をどう上げても効かないのは当然だった。
         #
-        # ★ 2026-08-17 (ユーザー指示): 倍率だけでは足りなかったため、ベースの weight も
-        #   ここで上書きする。強めるほど加速そのものを罰するので、変えたら
-        #   Episode_Reward の target_reach_velocity / 横移動速度が落ちていないか要確認。
-        #   戻すときは locomotion 既定値 (-0.12 / -0.4) に置き直す。
-        self.rewards.action_smoothness_l2.weight = -0.24  # locomotion 既定 -0.12 の 2.0 倍
-        self.rewards.action_smoothness_l2.params["stand_still_scale"] = 5.0
-        self.rewards.action_rate_l2.weight = -0.6  # locomotion 既定 -0.4 の 1.5 倍
-        self.rewards.action_rate_l2.params["stand_still_scale"] = 5.0
+        # 対策は 2 段。どちらも「待機」を 1 つの明示的な状態として定義するもの:
+        #
+        #   (a) 指令側: is_idle_hold で指令を厳密ゼロにする (observations.py)。
+        #       脅威が無く定位置の近くに居れば、post_save_hold と同じ状態にする。
+        #   (b) 報酬側: 倍率のゲートから「ベースが静止しているか」を外す
+        #       (gk_action_smoothness_l2 / gk_action_rate_l2 の _idle_boost)。
+        #       指令が厳密ゼロなら、体が動いていること自体が抑制対象。
+        #
+        # weight は 08-17 の値を維持する。エピソード全体で見れば意図通り効いており
+        # (生のペナルティ量が smoothness -28% / rate -26%)、移動性能も落ちていない
+        # (target_reach_velocity・success_ema が同等、難易度は 3.58 → 4.30 m/s に上昇)。
+        # 壊れていたのは待機区間だけで、そこは (a)(b) で直す。
+        #
+        # ★ 調整はまず stand_still_scale で行うこと。ゲート内でしか効かないので
+        #   移動性能への影響がゼロ。weight は移動中にも効くので最後の手段。
+        self.rewards.action_smoothness_l2 = RewTerm(
+            func=gk_action_smoothness_l2,
+            weight=-0.24,  # locomotion 既定 -0.12 の 2.0 倍
+            params={"stand_still_scale": 5.0, "lin_vel_max": 0.5},
+        )
+        self.rewards.action_rate_l2 = RewTerm(
+            func=gk_action_rate_l2,
+            weight=-0.6,  # locomotion 既定 -0.4 の 1.5 倍
+            params={"stand_still_scale": 5.0, "lin_vel_max": 0.5},
+        )
 
         # --- 腰が下がりすぎるのを抑える (2026-07-31) ---
         self.rewards.base_height_penalty.params["min_height"] = 0.55

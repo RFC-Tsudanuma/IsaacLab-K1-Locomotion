@@ -54,10 +54,13 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     #   遅延バッファは 0 から始める (位相が 0 から始まる規約に合わせる)。
     #   env ごとの個体差 (_BASE_VEL_NOISE_SCALE_ATTR = ノイズ倍率、
     #   _BASE_VEL_DELAY_ATTR = 遅延段数) だけは **リセットしない** (startup DR と同じ扱い)。
+    # ★ 2026-08-17: 待機保持のヒステリシス状態もクリアする。前エピソードで保持中
+    #   だった env が、リセット直後に緩い (exit) しきい値で判定されるのを防ぐ。
     from .observations import (
         _BASE_VEL_HIST_ATTR,
         _BASE_VEL_NOISE_ATTR,
         _DRIVE_FILT_ATTR,
+        _IDLE_HOLD_ATTR,
         _TASK_PHASE_ATTR,
         _WALK_GATE_ATTR,
     )
@@ -77,6 +80,9 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     gate = getattr(env, _WALK_GATE_ATTR, None)
     if gate is not None:
         gate[env_ids] = False
+    idle = getattr(env, _IDLE_HOLD_ATTR, None)
+    if idle is not None:
+        idle[env_ids] = False
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:
@@ -634,6 +640,13 @@ def lateral_buffers(env: "ManagerBasedEnv") -> dict:
             # 今のコマンドで「指令速度の所定割合に到達した」ボーナスを払い済みか
             # (:func:`~.rewards.onset_reach_bonus` が 1 コマンドにつき 1 回だけ払うため)
             "reach_paid": torch.zeros(n, dtype=torch.bool, device=dev),
+            # 足の水平位置と 1 ステップの水平移動量 (env, foot) [m]。
+            # :func:`~.rewards.swing_ground_exposure` が「低い高さで水平に流れた距離」を
+            # 積むのに使う。リセット直後は foot_valid=False にして瞬間移動を捨てる。
+            "foot_prev_xy": torch.zeros(n, 2, 2, device=dev),
+            "foot_ds": torch.zeros(n, 2, device=dev),
+            "foot_valid": torch.zeros(n, dtype=torch.bool, device=dev),
+            "foot_ids": None,
             "last_step": -1,
         }
         setattr(env, _LATERAL_ATTR, bufs)
@@ -680,6 +693,22 @@ def update_lateral_buffers(
     bufs["ref_yaw"] = wrap_to_pi(bufs["ref_yaw"] + cmd[:, 2] * dt)
     bufs["ref_yaw"][resync] = asset.data.heading_w[resync]
 
+    # --- 足の 1 ステップ水平移動量 ---
+    # ここで前値との差を確定させておく (バッファ更新は 1 ステップ 1 回のガード内なので、
+    # 報酬側が何度読んでも同じ値になる)。
+    if bufs["foot_ids"] is None:
+        bufs["foot_ids"] = [
+            asset.find_bodies("left_foot_link")[0][0],
+            asset.find_bodies("right_foot_link")[0][0],
+        ]
+    foot_xy = asset.data.body_pos_w[:, bufs["foot_ids"], :2]          # (N, 2, 2)
+    ds = torch.norm(foot_xy - bufs["foot_prev_xy"], dim=-1)           # (N, 2)
+    # リセット直後の 1 ステップは瞬間移動なので 0 にする
+    ds = torch.where(bufs["foot_valid"].unsqueeze(1), ds, torch.zeros_like(ds))
+    bufs["foot_ds"] = ds
+    bufs["foot_prev_xy"] = foot_xy.clone()
+    bufs["foot_valid"] = torch.ones_like(bufs["foot_valid"])
+
     bufs["cmd_prev"] = cmd.clone()
     return bufs
 
@@ -696,3 +725,6 @@ def reset_lateral_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["ref_yaw"][env_ids] = 0.0
     bufs["cmd_prev"][env_ids] = 0.0
     bufs["reach_paid"][env_ids] = False
+    # 再スポーンによる瞬間移動を「足の水平移動」として数えないようにする
+    bufs["foot_valid"][env_ids] = False
+    bufs["foot_ds"][env_ids] = 0.0

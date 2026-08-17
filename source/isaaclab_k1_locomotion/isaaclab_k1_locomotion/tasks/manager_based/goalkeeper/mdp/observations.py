@@ -244,6 +244,85 @@ def post_save_hold(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return touched & (bufs["save_cd"] >= 0)
 
 
+_IDLE_HOLD_ATTR = "_gk_idle_hold"            # ヒステリシスの保持状態 (N,) bool
+_IDLE_HOLD_STEP_ATTR = "_gk_idle_hold_step"  # 同一ステップ内の多重更新を防ぐ
+
+
+def is_idle_hold(env: "ManagerBasedRLEnv", use_perceived: bool = True) -> torch.Tensor:
+    """「じっとしている」べき区間を表す bool マスク (N,)。
+
+    ★ 2026-08-17 追加。:func:`post_save_hold` (セーブ後の約3秒) を **待機全般** へ
+      広げたもの。次のどちらかで True:
+
+      * セーブ後の保持区間 (``post_save_hold``) — 従来どおり
+      * **脅威が無く、かつ定位置の近く** — 新規
+
+    脅威なし (ボールが接近していない / 非アクティブ) の状態では
+    :func:`compute_target_y` が目標 0 (ゴール中央) を返すため、定位置に居ても
+    ``dy = (0 − 自己y) / 1.0`` のような小さい指令が出続ける。ところが歩行位相の
+    停止しきい値は 0.12 なので、その帯域では **足を踏み替えられないのに寄せろと
+    言われる** 状態になり、上体だけが揺れて、ずれは直らないまま続く。
+    MuJoCo で「ボールを置いているのに小刻みに震える」のはこれ。
+
+    ここで True を返すと :func:`task_drive_vector` が指令を **厳密ゼロ** にする。
+    すると (a) 位相がゼロ埋めされて足が止まり、(b) 指令ノルム 0 なので
+    ``_stand_still_boost`` のゲートが必ず開き (実測では待機中 1.1% しか開いて
+    いなかった)、(c) 学習中に毎エピソード通る ``post_save_hold`` と同一の状態に
+    なる — 分布内の既知状態へ写せる。
+
+    しきい値は ``GoalkeeperParamsCfg.idle_hold_*``。入る/出るで別の値を使う
+    (ヒステリシス)。同値だと境界でトグルし、歩行の開始・停止を繰り返す別の
+    振動になる。
+
+    ★ 実機の C++ 側にも同じ判定を同じしきい値で実装すること。片側だけでは
+      sim と実機で指令の作り方がずれる。
+    """
+    p = _gk_params_local(env)
+    enter_m = float(getattr(p, "idle_hold_enter_m", 0.25))
+    exit_m = float(getattr(p, "idle_hold_exit_m", 0.30))
+    enter_yaw = float(getattr(p, "idle_hold_enter_yaw", 0.15))
+    exit_yaw = float(getattr(p, "idle_hold_exit_yaw", 0.22))
+
+    prev = getattr(env, _IDLE_HOLD_ATTR, None)
+    if prev is None or prev.shape[0] != env.num_envs:
+        prev = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+        setattr(env, _IDLE_HOLD_ATTR, prev)
+
+    # 同一ステップ内では複数回呼ばれる (policy 観測 / sync_task_command / 報酬)。
+    # ヒステリシスは状態を持つので、更新は 1 ステップ 1 回に限る。
+    if getattr(env, _IDLE_HOLD_STEP_ATTR, -1) == int(env.common_step_counter):
+        return prev
+
+    guard_x = float(env.cfg.goalkeeper.guard_x)
+    max_y = float(getattr(env.cfg.goalkeeper, "goal_half_width", 1.3))
+
+    if use_perceived:
+        pos, heading = robot_pose_est(env)
+    else:
+        robot: Articulation = env.scene["robot"]
+        pos, heading = robot_pos_goal(env)[:, :2], robot.data.heading_w
+
+    # 脅威判定は guard_arrival_horizon と同じ条件 (ボールが守備面へ接近中か)。
+    horizon = guard_arrival_horizon(env, use_perceived=use_perceived)
+    threat = horizon < float(_T_IDLE)
+
+    dy = (compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]).abs()
+    dx = (guard_x - pos[:, 0]).abs()
+    dyaw = heading.abs()
+
+    # 保持中は緩い (exit) しきい値、非保持中は厳しい (enter) しきい値で判定する。
+    tol_m = torch.where(prev, exit_m, enter_m)
+    tol_yaw = torch.where(prev, exit_yaw, enter_yaw)
+    near = (dy < tol_m) & (dx < tol_m) & (dyaw < tol_yaw)
+
+    idle = (~threat) & near
+    out = post_save_hold(env) | idle
+
+    setattr(env, _IDLE_HOLD_ATTR, out)
+    setattr(env, _IDLE_HOLD_STEP_ATTR, int(env.common_step_counter))
+    return out
+
+
 def compute_target_y(
     env: "ManagerBasedRLEnv",
     max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
@@ -809,6 +888,18 @@ def task_drive_vector(
             setattr(env, _DRIVE_FILT_ATTR, prev)
             setattr(env, _DRIVE_FILT_STEP_ATTR, int(env.common_step_counter))
         drive = getattr(env, _DRIVE_FILT_ATTR)
+
+    # ★ 2026-08-17: 待機保持は **ローパスの後** で厳密ゼロにする。
+    #
+    #   フィルタの前でゼロにすると、出力は tau=0.12s で減衰するだけで数百 ms は
+    #   ゼロにならない。_stand_still_boost のしきい値は 0.05 なので、その間ゲートが
+    #   開かず「じっとしているのに罰の対象外」という穴が残る。後段でゼロにすれば
+    #   保持に入った瞬間から厳密ゼロになる。
+    #
+    #   フィルタの内部状態は素の drive を追い続けるので、保持が解けた瞬間に
+    #   現在の指令へ即座に復帰する (ボール接近時の初動が遅れない)。
+    drive = torch.where(is_idle_hold(env, use_perceived=use_perceived).unsqueeze(1),
+                        torch.zeros_like(drive), drive)
 
     return drive
 

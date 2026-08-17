@@ -365,17 +365,86 @@ def hold_default_pose_after_save(
     「止めた地点で数秒間、初期姿勢のまま立つ」を学習させる。転倒しないかを
     切り分けて確認するのが目的。
 
-    区間は :func:`~.observations.post_save_hold` (タッチ〜次の球、約3.0秒)。
-    その間 :func:`~.observations.task_drive_vector` が指令をゼロにするので歩容は
-    停止し、この報酬が関節を既定姿勢へ引き戻す。
+    ★ 2026-08-17: 区間を :func:`~.observations.post_save_hold` (タッチ〜次の球、
+      約3.0秒) から :func:`~.observations.is_idle_hold` へ広げた。**脅威が無く
+      定位置の近くに居る待機全般**が対象になる。
+
+      理由: 待機中の姿勢が報酬でほとんど規定されておらず、MuJoCo で小刻みに
+      震える状態が学習中に一度も罰されていなかった (静止ブーストが開いていた
+      割合は実測 1.1%)。指令ゼロ化と対にして、待機を「既定姿勢で立つ」1 つの
+      状態に固定する。
+
+    保持区間では :func:`~.observations.task_drive_vector` が指令をゼロにするので
+    歩容は停止し、この報酬が関節を既定姿勢へ引き戻す。
     """
-    from .observations import post_save_hold
+    from .observations import is_idle_hold
 
     robot: Articulation = env.scene[asset_cfg.name]
     dev = robot.data.joint_pos - robot.data.default_joint_pos
     # 関節数で正規化して std の意味を関節あたりの平均ずれ [rad] に揃える
     err2 = torch.square(dev).mean(dim=1)
-    return torch.exp(-err2 / std**2) * post_save_hold(env).float()
+    return torch.exp(-err2 / std**2) * is_idle_hold(env).float()
+
+
+def _idle_boost(
+    env: "ManagerBasedRLEnv",
+    scale: float,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """待機保持中に action ペナルティへ掛ける倍率 (N,)。
+
+    ★ 2026-08-17 追加。locomotion の :func:`~...locomotion.mdp.rewards._stand_still_boost`
+      を GK 用に置き換えたもの。**判定から「ベースが実際に静止しているか」を外した**
+      のが違いで、これが本質。
+
+      旧ゲートは ``|lin_vel| < 0.2 かつ |ang_vel_z| < 0.2`` を要求していた。ところが
+      抑えたい対象そのもの (待機中の震え) がこの条件を満たさない。実測 (39500,
+      静止ボール条件) では待機中の ``|ang_vel_z|`` が **平均 0.955 rad/s** あり、
+      ``ang_vel < 0.2`` の成立率はわずか **7.9%** だった。
+      → **震えているという理由で、震えを抑える罰が無効化される**自己矛盾。
+      weight や scale をいくら上げても効かなかったのはこれが理由。
+
+      待機保持 (:func:`~.observations.is_idle_hold`) は「指令が厳密ゼロ」を意味する
+      ので、その区間では体が動いていること自体が抑制対象であり、静止判定は不要。
+
+    ``lin_vel_max`` だけは残してある。push イベントで大きく突き飛ばされた直後まで
+    倍率を掛けると復帰動作を罰してしまうため。閾値は旧 0.2 より緩い 0.5 で、
+    震え (実測 0.024 m/s) は確実に対象内、押された直後は対象外になる。
+    """
+    from .observations import is_idle_hold
+
+    robot: Articulation = env.scene["robot"]
+    lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+    boost = is_idle_hold(env) & (lin < lin_vel_max)
+    return torch.where(boost, torch.full_like(lin, scale), torch.ones_like(lin))
+
+
+def gk_action_smoothness_l2(
+    env: "ManagerBasedRLEnv",
+    stand_still_scale: float = 5.0,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """locomotion の ``action_smoothness_l2`` の GK 版 (待機ゲートを差し替え)。
+
+    ペナルティの式は locomotion 版と完全に同じ。違いは倍率のゲートだけで、
+    :func:`_idle_boost` を使う (理由は同関数の docstring)。
+    """
+    from ...locomotion.mdp.rewards import action_smoothness_l2
+
+    base = action_smoothness_l2(env, stand_still_scale=1.0)
+    return base * _idle_boost(env, stand_still_scale, lin_vel_max)
+
+
+def gk_action_rate_l2(
+    env: "ManagerBasedRLEnv",
+    stand_still_scale: float = 5.0,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """locomotion の ``action_rate_l2`` の GK 版 (待機ゲートを差し替え)。"""
+    from ...locomotion.mdp.rewards import action_rate_l2
+
+    base = action_rate_l2(env, stand_still_scale=1.0)
+    return base * _idle_boost(env, stand_still_scale, lin_vel_max)
 
 
 def stay_on_goal_line(
@@ -805,3 +874,114 @@ def foot_clearance_sole(
     swing_left = (~stance_left).float()
     swing_right = (~stance_right).float()
     return (rew_left * swing_left + rew_right * swing_right) * gate
+
+
+def swing_ground_exposure(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    h_target: float = 0.010,
+    cmd_threshold: float = 0.05,
+    move_threshold: float = 0.002,
+    force_threshold: float = 1.0,
+    foot_box: tuple[float, float, float, float] = (0.1195, -0.0659, 0.040, -0.0382),
+    sensor_name: str = "contact_forces",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遊脚が **地面すれすれのまま水平に流れた割合** [0, 1]。ペナルティ (負の重み) 用。
+
+    2026-08-17 の実測 (:file:`scripts/rsl_rl/eval_gk_trip_margin.py`) に基づく設計。
+    転倒の実因解析では「シム平地では足上げ不足は転倒原因ではない」と出たが、平地には
+    引っかかる対象が無いので当然で、足上げの価値は **凹凸への耐性** として測る必要がある。
+
+    そこで **露出率 f(h)** を定義した::
+
+        f(h) = (遊脚の水平移動のうちクリアランスが h 未満だった距離) / (遊脚の総水平移動)
+             = 高さ h の突起が通り道にあるとき足が当たる確率
+
+    実測 (cmd 1.3、足裏最下点・接地 p10 基準):
+
+        | h | 07-28 | 2 本目 (高足上げ) | 07-28 @cmd0.6 (速度対照) |
+        |---|---|---|---|
+        | 2mm  | 0.055 | 0.055 | 0.031 |
+        | 5mm  | 0.161 | 0.079 | 0.128 |
+        | 10mm | 0.321 | 0.120 | 0.286 |
+        | 20mm | 0.558 | 0.194 | 0.499 |
+
+    足上げは凹凸耐性を 2.0〜2.9 倍改善し、**速度を落としただけでは再現しない**
+    (07-28 を 2 本目と同程度の速度まで落としても 1.6〜2.6 倍悪いまま)。
+
+    **なぜ「目標高さの追従」ではなく「低い高さで流れた距離」なのか**:
+    07-28 の上がりきった区間の足裏 p50 は既に 13.3mm あるのに f(10mm)=0.32 で、
+    スイング水平移動の 1/3 が 10mm 以下にある。つまり **頂点は足りていて、上がり際と
+    下り際で低いまま長く流れている** のが問題。本項は「同じ高さまで速く上げて遅く下ろせ」
+    としか要求しないので、:func:`foot_clearance_sole` のように名目スイング窓いっぱい
+    浮くことを強制しない。2 本目が横速度を 1.278 → 0.710 m/s と半減させた原因
+    (頂点を 6〜7cm に引き上げた = 長く浮く必要が生じた) を構造的に避けるのが狙い。
+
+    **速度を落とす抜け道が無い**: 分母も分子も距離なので、ゆっくり歩いても比は変わらない。
+    :func:`foot_clearance_sole` が必要とした ``speed_gate_frac`` のような保険が要らない。
+
+    クリアランスの基準面は **接地している足の足裏** (支持脚基準)。足リンクの接触オフセット
+    (実測で足裏 z の接地時中央値が −4mm 程度) と地形高さの両方を自動的に相殺できる。
+    両足とも浮いている (跳躍) 間は基準が取れないので env 原点の z にフォールバックする。
+    跳べば露出は下がるが、それは物理的に正しい (跳べば越えられる)。**跳躍そのものの
+    抑制は :func:`flight_phase` と ``lin_vel_z_l2`` の担当**で、本項は関与しない。
+
+    Args:
+        h_target: この高さ未満を「露出」とみなす [m]。閾値ではなく線形ランプの上端で、
+            クリアランス c に対する重みは ``clamp((h_target - c) / h_target, 0, 1)``。
+            低いところほど強く罰するので、h_target の値そのものへの感度は低い。
+            既定 0.010 は 07-28 の足裏 p50 (13.3mm) のすぐ下 = 頂点を上げずに軌道を
+            作り直すだけで届く水準。会場の人工芝が長い場合は 0.015 へ上げる。
+        move_threshold: 遊脚の水平移動がこれ未満のステップは比が不安定なので 0 を返す [m]。
+
+    Returns:
+        (N,) の [0, 1]。1 = そのステップの遊脚移動が全部 h_target 未満だった。
+    """
+    from .events import update_lateral_buffers
+
+    bufs = update_lateral_buffers(env, command_name=command_name)
+
+    asset: Articulation = env.scene[asset_cfg.name]
+    sensor = env.scene.sensors[sensor_name]
+    left_idx = asset.find_bodies("left_foot_link")[0][0]
+    right_idx = asset.find_bodies("right_foot_link")[0][0]
+    # ☠ 接触センサの body 順は **名前で引き直す**。SceneEntityCfg を params 経由で
+    #   渡さない限り body_ids は解決されないうえ、正規表現で引くと左右の順が
+    #   アーティキュレーションの body 順に依存し、z_sole の [左, 右] とズレうる。
+    sensor_ids = [sensor.body_names.index("left_foot_link"), sensor.body_names.index("right_foot_link")]
+
+    toe_x, heel_x, half_y, sole_z = [float(v) for v in foot_box]
+    corners = torch.tensor(
+        [[toe_x, half_y, sole_z], [toe_x, -half_y, sole_z],
+         [heel_x, half_y, sole_z], [heel_x, -half_y, sole_z]],
+        device=env.device,
+    )
+    z_sole = torch.stack(
+        [_sole_min_z(asset, left_idx, corners), _sole_min_z(asset, right_idx, corners)], dim=1
+    )                                                                   # (N, 2)
+
+    # 接触は位相ではなく **実際の接地** で判定する (実スイング時間が名目の半分以下という
+    # 高デューティ歩容なので、位相ベースだと接地中の足を遊脚扱いしてしまう)。
+    forces = sensor.data.net_forces_w[:, sensor_ids, :]                 # (N, 2, 3)
+    on_ground = torch.norm(forces, dim=-1) > force_threshold            # (N, 2)
+    airborne = ~on_ground
+
+    # 基準面 = 接地している足の足裏 z (両足接地なら低い方)。無ければ env 原点 z。
+    big = torch.full_like(z_sole, float("inf"))
+    ref = torch.where(on_ground, z_sole, big).min(dim=1).values         # (N,)
+    ref = torch.where(torch.isinf(ref), env.scene.env_origins[:, 2], ref)
+
+    clearance = z_sole - ref.unsqueeze(1)                               # (N, 2)
+    ramp = torch.clamp((h_target - clearance) / max(h_target, 1e-6), 0.0, 1.0)
+
+    ds = bufs["foot_ds"] * airborne.float()                             # (N, 2)
+    denom = ds.sum(dim=1)
+    exposure = (ds * ramp).sum(dim=1) / denom.clamp(min=1e-6)
+
+    # 移動が小さいステップは比が暴れるので無効化する
+    exposure = torch.where(denom > move_threshold, exposure, torch.zeros_like(exposure))
+    # 停止指令のときは足を上げる必要がない
+    cmd = env.command_manager.get_command(command_name)
+    cmd_norm = torch.norm(cmd[:, :3], dim=1)
+    return torch.where(cmd_norm < cmd_threshold, torch.zeros_like(exposure), exposure)
