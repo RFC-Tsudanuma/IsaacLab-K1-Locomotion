@@ -8,7 +8,7 @@
 #   Stage 3: Isaac-Velocity-Flat-K1-Walk-Short-Pass-Loop-Pass-360-v0
 #            全方位 (360°/360°, 0.5-1.5m) + 回り込み。
 #   Stage 4: Isaac-Velocity-Flat-K1-Walk-Short-Pass-v0
-#            速度帯を (2.0,3.0) → (0.5,2.0) へ張り替える。
+#            速度帯を (1.0,2.5) → (0.5,2.0) へ張り替え、latch の閾値を指令追従にする。
 #
 # Stage 1-3 の中身は train_walk_loop_pass_360.sh (共用タスク) と同一だが、
 # **policy 観測を 50 フレームの履歴にした専用タスク**を使う。actor は
@@ -40,12 +40,16 @@
 # 足すとしても継承元の 1.5-2 倍 (RESET_NOISE_STD=0.12) から。
 #
 # ITER は 5000 未満にしないこと。Stage 4 の速度帯カリキュラムは公称 500 → 3000
-# iteration で (2.0,3.0) → (0.5,2.0) を動かし、その後の収束に 2000 iteration を
-# 見込んでいる。ただし帯は **kick_rate で開閉するゲート付き** なので、蹴れていない
-# 間は進まない。公称より遅れることがあるため、終了時に
-# Curriculum/kick_speed_range/alpha が 1.0 に達しているかを必ず確認し、
-# 達していなければ SHORT_ITER を伸ばすこと (alpha が長く止まったままなら、
-# その speed_max がそのスイングの実質的な上限)。
+# iteration で (1.0,2.5) → (0.5,2.0) を動かし、その後の収束に 2000 iteration を
+# 見込んでいる。帯は形式上 **kick_rate で開閉するゲート付き** だが、Stage 4 では
+# latch の閾値が指令追従なので kick_rate はほぼ 1.0 に張り付き、実際には
+# wall-clock の線形ランプとして進む (下向きの帯では「帯が実力を追い越す」失敗が
+# 起きないので、ゲートが守るものが無い)。
+#
+# したがって **alpha は進捗の指標にならない** (蹴れているかに関係なく 3000 で 1.0 に
+# 届く)。仕上がりを見るのは Episode_Reward/kick_velocity_scaled と kick_vel_ratio。
+# 帯の下端の指令に対して kick_vel_ratio が 1 を大きく超えたまま (= 指令より強く
+# 蹴っている) なら、SHORT_ITER を伸ばすか sigma_velocity を絞ること。
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_walk_short_pass.sh                  # 4 段を通しで実行
