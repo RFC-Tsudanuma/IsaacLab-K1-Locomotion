@@ -375,6 +375,101 @@ def reset_ball_shot(
 
     bufs["ball_active"][env_ids] = True
 
+    # --- 状況の多様化 (2026-08-18) ---
+    #
+    # ★ ここまでで作った球は **必ずゴールへ向かうシュート**。学習分布が
+    #   事実上 100% シュートで、「ボールは見えているが脅威ではない」状況を
+    #   方策が一度も経験していなかった。
+    #
+    #   実機で出た不具合はまさにそこ:
+    #     * 静止ボールを置いたら横移動した   → 分布外
+    #     * ボールを隠したら止まった          → ball_active=False は分布内なので正常だった
+    #   今日入れた対策 (脅威判定のゲート・待機保持・平滑化) は、分布外の状態を
+    #   手書きのルールで無害化するものだった。塞ぐたびに別の穴が出たのはそのため。
+    #
+    #   経験させれば、ルールで塞がなくても方策が対処できる。比率は
+    #   GoalkeeperParamsCfg.situation_probs で調整する。
+    _diversify_situations(env, env_ids, ball, r)
+
+
+def _diversify_situations(env, env_ids, ball, radius: float) -> None:
+    """発射済みの球の一部を **シュート以外の状況** に差し替える。
+
+    モード (比率は ``situation_probs`` = [静止, 横移動, 枠外, ボールなし]):
+
+        静止     : 見えているが動かない。実機で問題が出た状況そのもの
+        横移動   : ゴールへ向かわず横に転がる。追従 (y_track) を実際に使わせる
+        枠外     : ゴールを外れる方向へ飛ぶ。「反応しなくてよい」を学ぶ
+        ボールなし: 遠方へパークして ball_active=False (従来の保持区間と同じ状態)
+
+    残りがシュート。既定は [0.15, 0.10, 0.10, 0.05] なのでシュートは 60%。
+
+    ★ 位置は据え置き、**速度だけ差し替える** (静止/横移動/枠外)。スポーン位置の
+      サンプリングは既存の「速度 → 距離」の規則をそのまま活かす。
+    ★ 失点判定はボールがゴールラインを越えたときだけなので、シュート以外の
+      モードでは失点しない。エピソードは時間切れまで続く = 落ち着いて待つ時間を
+      長く経験できる。
+    """
+    p = _gk_params(env)
+    probs = list(getattr(p, "situation_probs", (0.15, 0.10, 0.10, 0.05)))
+    if sum(probs) <= 0.0:
+        return
+
+    bufs = gk_buffers(env)
+    n = len(env_ids)
+    u = torch.rand(n, device=env.device)
+    edges = torch.tensor(
+        [probs[0], probs[0] + probs[1], probs[0] + probs[1] + probs[2],
+         probs[0] + probs[1] + probs[2] + probs[3]],
+        device=env.device,
+    )
+    is_static = u < edges[0]
+    is_lateral = (u >= edges[0]) & (u < edges[1])
+    is_wide = (u >= edges[1]) & (u < edges[2])
+    is_none = (u >= edges[2]) & (u < edges[3])
+
+    vel = ball.data.root_vel_w[env_ids].clone()
+    speed_xy = torch.norm(vel[:, :2], dim=1, keepdim=True).clamp(min=1e-3)
+
+    # 静止: 速度をゼロに
+    vel[is_static] = 0.0
+
+    # 横移動: 速度ベクトルを 90 度回して、ゴール方向成分を消す。
+    #   ゴールは -x 側なので、vx を 0 にして vy だけ残す形にする。
+    lat_speed = torch.empty(n, device=env.device).uniform_(0.4, 1.2)
+    sign = torch.sign(torch.rand(n, device=env.device) - 0.5)
+    sign = torch.where(sign == 0, torch.ones_like(sign), sign)
+    vel[is_lateral, 0] = 0.0
+    vel[is_lateral, 1] = (lat_speed * sign)[is_lateral]
+
+    # 枠外: ゴールから離れる向き (+x) へ飛ばす
+    vel[is_wide, 0] = (speed_xy[:, 0] * 0.6)[is_wide]
+    vel[is_wide, 1] = vel[is_wide, 1] * 1.5
+
+    # 転がり整合角速度を取り直す
+    vel[:, 3] = -vel[:, 1] / radius
+    vel[:, 4] = vel[:, 0] / radius
+    vel[:, 5] = 0.0
+    ball.write_root_velocity_to_sim(vel, env_ids=env_ids)
+
+    # ボールなし: 遠方へパークして非アクティブにする
+    if bool(is_none.any()):
+        idx = env_ids[is_none]
+        m = len(idx)
+        pose = torch.zeros(m, 7, device=env.device)
+        pose[:, 0] = env.scene.env_origins[idx, 0] + float(p.park_pos[0])
+        pose[:, 1] = env.scene.env_origins[idx, 1] + float(p.park_pos[1])
+        pose[:, 2] = radius
+        pose[:, 3] = 1.0
+        ball.write_root_pose_to_sim(pose, env_ids=idx)
+        ball.write_root_velocity_to_sim(torch.zeros(m, 6, device=env.device), env_ids=idx)
+        bufs["ball_active"][idx] = False
+
+    # ★ シュート以外は「到達不能」の集計から外す (セーブ率の分母を汚さないため)
+    non_shot = is_static | is_lateral | is_wide | is_none
+    if bool(non_shot.any()):
+        bufs["unreachable"][env_ids[non_shot]] = False
+
 
 def _mark_unreachable(
     env: "ManagerBasedEnv",
