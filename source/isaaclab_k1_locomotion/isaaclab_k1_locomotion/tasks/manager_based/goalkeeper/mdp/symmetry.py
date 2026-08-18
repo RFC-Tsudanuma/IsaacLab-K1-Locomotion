@@ -67,11 +67,32 @@ _TASK_MIRROR_SIGN = [
 _CONST_CACHE: dict = {}
 
 
-def _task_sign(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    key = (device, dtype)
+# ★ 2026-08-18: ボール履歴版 (goalkeeper/ballhist/) はボール相対位置の履歴を末尾に足すため、
+#   観測が 59 + frames*3 次元になる。1 フレームは [x, y, valid] なので、反転符号は
+#   ball_pos_rel と同じ考え方で [x そのまま, y 反転, valid そのまま] の繰り返し。
+#   critic 側 (真値の履歴) も同じ形なので同一の規則で扱える。
+_HIST_FRAME_MIRROR_SIGN = [1.0, -1.0, 1.0]
+_HIST_FRAME_DIM = len(_HIST_FRAME_MIRROR_SIGN)
+
+
+def _task_sign(device: torch.device, dtype: torch.dtype, extra: int = 0) -> torch.Tensor:
+    """タスクスロット (+ ボール履歴版の履歴) に掛ける反転符号を返す。
+
+    Args:
+        extra: 末尾に足された履歴の次元数 (``frames * 3``)。0 なら直接版と同じ。
+    """
+    key = (device, dtype, extra)
     sign = _CONST_CACHE.get(key)
     if sign is None:
-        sign = torch.tensor(_TASK_MIRROR_SIGN, device=device, dtype=dtype)
+        values = list(_TASK_MIRROR_SIGN)
+        if extra:
+            if extra % _HIST_FRAME_DIM != 0:
+                raise ValueError(
+                    f"symmetry: 追加次元 {extra} が 1 フレーム {_HIST_FRAME_DIM} の倍数では"
+                    " ありません。goalkeeper/ballhist/observations.py の FRAME_DIM と揃えてください。"
+                )
+            values += _HIST_FRAME_MIRROR_SIGN * (extra // _HIST_FRAME_DIM)
+        sign = torch.tensor(values, device=device, dtype=dtype)
         _CONST_CACHE[key] = sign
     return sign
 
@@ -126,9 +147,12 @@ def _mirror_gk_critic_obs(obs: torch.Tensor) -> torch.Tensor:
     リターン」の組で学習される必要がある。policy グループだけ反転して critic を
     複製したままにすると、critic が食い違った組を学習して価値推定が壊れる。
     """
-    if obs.shape[-1] != _CRITIC_OBS_DIM:
+    # ★ 2026-08-18: ボール履歴版は末尾にボール履歴が付くので 64 + frames*3 になる。
+    extra = obs.shape[-1] - _CRITIC_OBS_DIM
+    if extra < 0 or extra % _HIST_FRAME_DIM != 0:
         raise ValueError(
-            f"symmetry: critic 観測の次元が想定 ({_CRITIC_OBS_DIM}) と異なります: {obs.shape[-1]}。"
+            f"symmetry: critic 観測の次元が想定 ({_CRITIC_OBS_DIM} または"
+            f" {_CRITIC_OBS_DIM}+frames*{_HIST_FRAME_DIM}) と異なります: {obs.shape[-1]}。"
             " goalkeeper/mdp/symmetry.py のスライス定義を K1GKDirectCriticCfg に合わせて"
             " 更新してください。"
         )
@@ -140,15 +164,21 @@ def _mirror_gk_critic_obs(obs: torch.Tensor) -> torch.Tensor:
         out[:, sl] = _mirror_joints(obs[:, sl])
     out[:, _CRITIC_GAIT_PHASE_SLICE] = obs[:, _CRITIC_GAIT_PHASE_SWAP]
     out[:, 52:54] = obs[:, 52:54] * zmp_sign
-    out[:, _CRITIC_TASK_START:] = obs[:, _CRITIC_TASK_START:] * _task_sign(obs.device, obs.dtype)
+    out[:, _CRITIC_TASK_START:] = obs[:, _CRITIC_TASK_START:] * _task_sign(obs.device, obs.dtype, extra)
     return out
 
 
 def _mirror_gk_policy_obs(obs: torch.Tensor) -> torch.Tensor:
-    """ゴールキーパーのポリシー観測 (N, 59) を矢状面に対して左右反転する。"""
-    if obs.shape[-1] != _POLICY_OBS_DIM:
+    """ゴールキーパーのポリシー観測を矢状面に対して左右反転する。
+
+    次元は直接版が 59、ボール履歴版 (末尾にボール履歴) が ``59 + frames*3``。
+    """
+    dim = obs.shape[-1]
+    extra = dim - _POLICY_OBS_DIM
+    if extra < 0 or extra % _HIST_FRAME_DIM != 0:
         raise ValueError(
-            f"symmetry: ポリシー観測の次元が想定 ({_POLICY_OBS_DIM}) と異なります: {obs.shape[-1]}。"
+            f"symmetry: ポリシー観測の次元が想定 ({_POLICY_OBS_DIM} または"
+            f" {_POLICY_OBS_DIM}+frames*{_HIST_FRAME_DIM}) と異なります: {dim}。"
             " goalkeeper/mdp/symmetry.py のスライス定義を"
             " K1GKDirectStage1PolicyCfg に合わせて更新してください。"
         )
@@ -156,8 +186,8 @@ def _mirror_gk_policy_obs(obs: torch.Tensor) -> torch.Tensor:
     out = obs.clone()
     # 先頭 49 次元 = 歩行と同一構造なので locomotion の実装に委譲
     out[:, :_WALK_OBS_DIM] = _mirror_policy_obs(obs[:, :_WALK_OBS_DIM])
-    # 残り 10 次元 = 横方向成分の符号反転
-    out[:, _WALK_OBS_DIM:] = obs[:, _WALK_OBS_DIM:] * _task_sign(out.device, out.dtype)
+    # 残り = タスクスロット 10 次元 (+ ボール履歴版の履歴) の横方向成分を符号反転
+    out[:, _WALK_OBS_DIM:] = obs[:, _WALK_OBS_DIM:] * _task_sign(out.device, out.dtype, extra)
     return out
 
 

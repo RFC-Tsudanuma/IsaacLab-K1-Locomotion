@@ -208,3 +208,6 @@ gym.register(
 ##
 
 from . import dualhist  # noqa: E402, F401
+
+# ★ ボール履歴版 (試験実装)。既存タスクには影響しない (dualhist と同じ扱い)。
+from . import ballhist  # noqa: E402, F401

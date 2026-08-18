@@ -1,0 +1,80 @@
+# Copyright (c) 2022-2026, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""ボール履歴版の報酬。**予測式を一切含まない**。
+
+直接版の ``target_reach_velocity_direct`` は「手書きの外挿で求めた到達点へ
+どれだけ速く近づいたか」を測っていた。実機の経路から外挿式を消しても、
+**報酬に残っていれば方策はその戦略を模倣する**ので、線形外挿が表現できない
+振る舞い (バウンド球、回転球、遅い球を引きつける判断) は学習されない。
+式が学習の天井として残ってしまう。
+
+ここでは予測を捨て、**ボールの真の現在位置**だけを使う潜在関数ベースの
+整形報酬にする::
+
+    φ(s) = −|robot_y − ball_y|          (ゴール座標系、真値)
+    r    = φ(s') − φ(s)                 = 横方向の距離を縮めたぶん
+
+「どう先読みするか」は指定しない。先読みが有効なら、スパース報酬
+(save_touch_bonus) との組み合わせで方策が自分で獲得する。
+
+★ 潜在関数の差分形なので、理論上は最適方策を変えない (reward shaping の
+  ポテンシャル定理)。密な誘導を与えつつ、解を歪めない形。
+★ 真値を使ってよい。報酬は実機では動かない (critic に真値を渡すのと同じ扱い)。
+"""
+
+from __future__ import annotations
+
+import torch
+from typing import TYPE_CHECKING
+
+from ..mdp.observations import ball_pos_goal, gk_buffers, robot_pos_goal
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLEnv
+
+
+_PREV_ATTR = "_gk_ballhist_prev_potential"
+_PREV_STEP_ATTR = "_gk_ballhist_prev_potential_step"
+
+
+def ball_lateral_progress(
+    env: "ManagerBasedRLEnv",
+    max_step_m: float = 0.1,
+) -> torch.Tensor:
+    """ボールとの横方向距離を縮めたぶんの報酬 (N,)。**予測を含まない**。
+
+    Args:
+        max_step_m: 1 ステップあたりの差分のクリップ [m]。リセットやボール再発射で
+            潜在関数が不連続に飛んだとき、巨大な報酬/罰が入るのを防ぐ。
+            1 制御ステップ (0.02s) で横に 0.1m 動くのは 5 m/s 相当なので、
+            正常な移動はクリップに触れない。
+
+    ★ ボール非アクティブ時は 0 を返す (追う対象が無い)。
+    """
+    bufs = gk_buffers(env)
+    active = bufs["ball_active"]
+
+    ball_y = ball_pos_goal(env)[:, 1]
+    robot_y = robot_pos_goal(env)[:, 1]
+    potential = -(robot_y - ball_y).abs()
+
+    prev = getattr(env, _PREV_ATTR, None)
+    if prev is None or prev.shape[0] != env.num_envs:
+        prev = potential.clone()
+        setattr(env, _PREV_ATTR, prev)
+
+    # 報酬は 1 ステップ 1 回しか呼ばれないが、念のため冪等にしておく
+    if getattr(env, _PREV_STEP_ATTR, -1) == int(env.common_step_counter):
+        return torch.zeros_like(potential)
+    setattr(env, _PREV_STEP_ATTR, int(env.common_step_counter))
+
+    delta = (potential - prev).clamp(-max_step_m, max_step_m)
+    setattr(env, _PREV_ATTR, potential.clone())
+
+    # リセット直後は前ステップが別エピソードの値なので無効化する
+    fresh = env.episode_length_buf < 2
+    out = torch.where(fresh | (~active), torch.zeros_like(delta), delta)
+    return out
