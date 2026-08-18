@@ -35,6 +35,7 @@ def _r_direction(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """r_direction = (f(τ_direction) − 0.5) * 2 * p_style （いずれも凍結値）。
 
@@ -57,6 +58,7 @@ def _r_direction(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     tau = state["tau_direction_frozen"]
@@ -79,6 +81,7 @@ def kick_direction(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)
 
@@ -103,6 +106,7 @@ def kick_direction(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     if v_gate_frac <= 0.0:
@@ -124,6 +128,7 @@ def kick_velocity_scaled(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
@@ -145,6 +150,7 @@ def kick_velocity_scaled(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
@@ -162,6 +168,7 @@ def kick_velocity_strong(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
     r_dir, state = _r_direction(
@@ -173,6 +180,7 @@ def kick_velocity_strong(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
     return r_dir * state["v_ball_frozen"]
 
@@ -187,6 +195,7 @@ def kick_velocity_overshoot(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項10. Kick Velocity Overshoot = clamp(v_ball − (v_target + margin), 0, sat)。
 
@@ -229,6 +238,7 @@ def kick_velocity_overshoot(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     excess = state["v_ball_frozen"] - (state["v_target"] + margin)
@@ -248,6 +258,7 @@ def kick_elevation(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
 
@@ -284,6 +295,7 @@ def kick_elevation(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     phi = state["phi_frozen"]
@@ -305,6 +317,7 @@ def kick_loft(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項7'. Loft = r_direction * clamp(vz / vz_sat, 0, 1)。shape: (N,)
 
@@ -330,6 +343,7 @@ def kick_loft(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     vz = state["v_ball_3d_frozen"] * torch.sin(state["phi_frozen"])
@@ -350,6 +364,7 @@ def kick_plant_foot(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項9. Plant Foot (軸足配置) = r_direction * f(lon) * f(lat)。shape: (N,)
 
@@ -397,6 +412,7 @@ def kick_plant_foot(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     f_lon = torch.exp(-((state["plant_lon_frozen"] - lon_target) ** 2) / (2.0 * sigma_lon**2))
@@ -414,6 +430,7 @@ def kick_foot_lift(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項11. Foot Lift (すくい上げ) = r_direction * clamp(foot_vz / vz_foot_sat, 0, 1)。shape: (N,)
 
@@ -463,6 +480,7 @@ def kick_foot_lift(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     f_lift = torch.clamp(state["foot_vz_frozen"] / vz_foot_sat, min=0.0, max=1.0)
@@ -480,6 +498,7 @@ def kick_contact_height(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項12. Contact Height (低い当たり) = r_direction * f_low。shape: (N,)
 
@@ -571,6 +590,7 @@ def kick_contact_height(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     span = max(ball_radius - h_sat, 1e-6)
@@ -589,6 +609,7 @@ def walk_speed(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項4. Walk Speed = (f(τ_walk) − 0.5) * 2 * p_walk。shape: (N,)
 
@@ -605,6 +626,7 @@ def walk_speed(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     f_walk = torch.sigmoid(state["tau_walk"] / sigma_walk)
@@ -622,6 +644,7 @@ def approach_penalty(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項5. Approach Penalty = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -639,6 +662,7 @@ def approach_penalty(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     # 遠いほど 1 に近づく
@@ -661,6 +685,7 @@ def ball_avoidance(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項5'. Ball Avoidance = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -689,6 +714,7 @@ def ball_avoidance(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     # 近いほど 1 に近づく (approach_penalty と逆)
@@ -711,6 +737,7 @@ def ball_avoidance_exec(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項5''. Ball Avoidance (execution 解釈) = f(d_mean) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -766,6 +793,7 @@ def ball_avoidance_exec(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     # 遠いほど 1。d_contact 以下 (= 接触している) で厳密に 0。
@@ -787,6 +815,7 @@ def extra_ball_touch(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項8. 2 回目以降のボール接触。発火したステップだけ 1。負の重みで使う。shape: (N,)
 
@@ -807,6 +836,7 @@ def extra_ball_touch(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
     return state["extra_touch_event"]
 
@@ -819,6 +849,7 @@ def kick_latch_bonus(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項9. Latch 後の定額ボーナス。post-latch の間ずっと 1。正の重みで使う。shape: (N,)
 
@@ -862,6 +893,7 @@ def kick_latch_bonus(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
     return state["kick_done"].float()
 
@@ -874,6 +906,7 @@ def kick_pose_overshoot(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項6. Kick Pose Overshoot。キック線 R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
@@ -891,5 +924,6 @@ def kick_pose_overshoot(
         r_max=r_max,
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
     return state["overshoot_event"]

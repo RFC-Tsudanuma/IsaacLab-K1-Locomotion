@@ -90,6 +90,7 @@ def kick_state(
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
@@ -155,7 +156,13 @@ def kick_state(
             0.0 (既定) では従来どおり「符号が反転したら即発火」。正の値を入れると、
             確定側と反対側へ **この距離まで** 入り込んでも発火しない。
 
-            NOTE: この 3 つも ``track_ball`` / ``v_thresh_target_*`` とは違い、
+        lateral_band: 終端の構え位置 (P_kick と、回り込み型 G の真後ろ極限) に
+            **横方向のあそび (帯)** を持たせる。``(下端, 上端)`` [m]、符号は
+            ``right_vec`` と同じで **正 = ロボットから見て右**。None (既定) では
+            横成分ゼロ = 従来どおり「ボールを両足の真ん中に置く一点」を指令する。
+            詳細は下の帯のブロックのコメント参照。
+
+            NOTE: この 4 つも ``track_ball`` / ``v_thresh_target_*`` とは違い、
                   **kick_state を呼ぶ全ての項に配る必要がある**。G と overshoot は
                   その step の最初の呼び出しで確定するので、項ごとに違う値を渡すと
                   結果が評価順に依存する。
@@ -198,6 +205,11 @@ def kick_state(
     if state is None:
         state = {
             "step": -1,
+            # P_kick_base: 横のあそび (lateral_band) を **足す前** の終端点。
+            # エピソード開始時のスナップショット (と track_ball の引き直し) はこちらが持ち、
+            # 報酬項が読む "P_kick" は帯の横成分を足した後の点になる。
+            # lateral_band=None のときは両者は常に同一。
+            "P_kick_base": torch.zeros(env.num_envs, 2, device=device),
             "P_kick": torch.zeros(env.num_envs, 2, device=device),
             "init_side": torch.zeros(env.num_envs, device=device),  # 0 = 未確定
             "kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
@@ -253,9 +265,9 @@ def kick_state(
     s = ((robot_pos - ball_pos) * right_vec).sum(dim=-1)
 
     if just_reset.any():
-        # P_kick: R 上、ボールから後方 r_stance の点。既定ではエピソード終了まで固定
+        # P_kick_base: R 上、ボールから後方 r_stance の点。既定ではエピソード終了まで固定
         # (track_ball=True のときだけ latch まで下のブロックが引き直す)。
-        state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
+        state["P_kick_base"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
         # init_side は未確定 (0) に戻す。確定は下の commit ブロックで行う。
         state["init_side"][just_reset] = 0.0
         state["kick_done"][just_reset] = False
@@ -286,8 +298,45 @@ def kick_state(
     # としてはそれが正しい (開始位置でも飛んでいった先でもない)。
     # ------------------------------------------------------------------ #
     if track_ball:
+        state["P_kick_base"] = torch.where(
+            state["kick_done"].unsqueeze(-1), state["P_kick_base"], ball_pos - r_stance * kick_dir
+        )
+
+    # ------------------------------------------------------------------ #
+    # 横方向の帯 (lateral_band): 終端の構えに「横のあそび」を持たせる
+    #
+    # 蹴り足をキック線 R (ボールの真後ろに伸びる直線) の上に乗せるには、base を
+    # 蹴り足と反対側へスタンス半幅 (股関節の横オフセット 0.096 m) だけずらして
+    # 立つ必要がある。ただし最適なずらし量は振り足の内転ぶんだけ小さくなるので、
+    # いくつが正解かは事前にはわからない。
+    #
+    # そこで一点 (横ずれ 0 = ボールを両足の真ん中に置く姿勢) を指令するのをやめ、
+    # **帯**で指令する。帯の中では目標がロボットの今の横位置にそのまま追従するので、
+    # 横へ引く力が消える。帯の外へ出たときだけ、いちばん近い帯の端へ引き戻す。
+    # 帯の中のどこに落ち着くかを決めるのは kick_direction (キックの正確さ) だけに
+    # なるので、学習中に方策が自分で最適な位置を見つける。
+    #
+    # 帯の端 0.096 は股関節の横オフセットそのもの = 幾何的な上限であって、
+    # チューニングで選んだ数字ではない。ログ実績で weak / long_pass 系は 9/9 右足で
+    # 蹴っているので、帯は左片側にする ((-0.096, 0.0)。right_vec は正が右なので
+    # 負が左 = 右足をキック線に乗せる側)。
+    #
+    # 凍結: 横成分も kick_done で他と一緒に凍らせる。凍らせないと蹴った後も目標が
+    # ロボットを追い続け、latch 後に固定したはずの G が漂ってしまう。
+    # kick_done はこの時点ではまだ前 step ぶんなので、track_ball と同じく
+    # 「蹴ったその step の値」で凍る。
+    # ------------------------------------------------------------------ #
+    if lateral_band is None:
+        # 既定: 横成分なし。P_kick は P_kick_base そのもの = 従来と完全に同じ点。
+        lateral = None
+        state["P_kick"] = state["P_kick_base"]
+    else:
+        s_clamped = torch.clamp(s, min=lateral_band[0], max=lateral_band[1])
+        lateral = s_clamped.unsqueeze(-1) * right_vec
         state["P_kick"] = torch.where(
-            state["kick_done"].unsqueeze(-1), state["P_kick"], ball_pos - r_stance * kick_dir
+            state["kick_done"].unsqueeze(-1),
+            state["P_kick"],
+            state["P_kick_base"] + lateral,
         )
 
     # ------------------------------------------------------------------ #
@@ -525,6 +574,14 @@ def kick_state(
             dim=-1,
         )
         G = ball_pos + rho.unsqueeze(-1) * back_rot
+        if lateral is not None:
+            # 帯の横成分を、真後ろ (φ=0) で 1、真正面 (|φ|=π) で 0 になるよう
+            # フェードさせて足す。円弧を大きく回っている間は指令の形をまったく
+            # 変えず、仕上げの真後ろでだけ帯つきの点 (= P_kick と同じ点) に
+            # 一致させるため。φ=0 では ρ=r_stance かつ back_rot=−kick_dir なので
+            # G = ball − r_stance·kick_dir + lateral となり、P_kick に厳密に一致する。
+            fade = 1.0 - phi.abs() / math.pi
+            G = G + fade.unsqueeze(-1) * lateral
     G = torch.where(kick_done.unsqueeze(-1), state["P_kick"], G)
     state["G"] = G
 

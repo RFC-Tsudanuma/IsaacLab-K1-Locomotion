@@ -273,6 +273,7 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             r_max=self.cfg.r_max,
             orbit_beta=self.cfg.orbit_beta,
             overshoot_margin=self.cfg.overshoot_margin,
+            lateral_band=self.cfg.lateral_band,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -367,5 +368,13 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
 
     :func:`..kick_state.kick_state` の同名引数を参照。``r_max`` と同じく全ての
     kick_state 利用項へ同じ値を配ること。
+    """
+
+    lateral_band: tuple[float, float] | None = None
+    """終端の構え位置に持たせる横方向のあそび (帯) ``(下端, 上端)`` [m]。正 = 右。
+
+    None (既定) で従来どおり横ずれ 0 の一点。:func:`..kick_state.kick_state` の
+    同名引数を参照。``r_max`` と同じく全ての kick_state 利用項へ同じ値を配ること
+    (G と P_kick はその step で最初に呼ばれた項の値で確定するため)。
     """
 
