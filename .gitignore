@@ -104,6 +104,13 @@ logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/*
 logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/*
 !logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/model_4999.pt
 
+# 360_weak_noisy_ball (全方位・弱いキック・ボール観測にノイズ) の checkpoint
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/
+logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/*
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/
+logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/*
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/model_2999.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
