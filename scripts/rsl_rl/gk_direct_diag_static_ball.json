@@ -1,0 +1,7 @@
+{
+  "_comment": "【待機時の震え診断】ボール初速を 0 に固定し、『ボールが見えているが接近しない』状態を作る。compute_target_y が approaching=False で目標 0 (ゴール中央) を返し、ロボットは中央へ寄ったあと指令が小さくなって停止する = MuJoCo で観測された待機状態を sim で再現する条件。diag_gk_standstill.py と一緒に使う。",
+  "env": {
+    "goalkeeper.ball_speed_min": 0.0,
+    "goalkeeper.ball_speed_max": 0.0
+  }
+}

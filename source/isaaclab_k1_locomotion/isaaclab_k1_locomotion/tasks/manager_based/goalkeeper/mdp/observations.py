@@ -306,7 +306,23 @@ def _ball_threat(
             ref = ref + a * (pos[:, :2] - ref)
             setattr(env, _BALL_REF_ATTR, ref)
             setattr(env, _BALL_REF_STEP_ATTR, int(env.common_step_counter))
-        moved = torch.norm(pos[:, :2] - getattr(env, _BALL_REF_ATTR), dim=1) > travel_min
+        # ★ 2026-08-18: 変位の判定にも **平滑化した位置** を使う。
+        #   生の知覚位置と基準点の差だと、位置ノイズ (3m 先で数十 cm) 単体で
+        #   travel_min を超えてしまい、静止ボールでも 5% の確率で脅威が誤検出された
+        #   (実測: 静止ボール + 知覚DR で「脅威なし」が 95.2%)。一度誤検出されると
+        #   待機が解除されて歩き出すので、待機判定は 43.8% まで落ちる。
+        #   速い基準点 (tau 0.15s) と遅い基準点 (tau 0.5s) の差を見れば、
+        #   両方が平滑化されているのでノイズが相殺され、実際の移動だけが残る。
+        fast = getattr(env, _BALL_FAST_ATTR, None)
+        if fast is None or fast.shape != pos[:, :2].shape:
+            fast = pos[:, :2].clone()
+            setattr(env, _BALL_FAST_ATTR, fast)
+        if getattr(env, _BALL_FAST_STEP_ATTR, -1) != int(env.common_step_counter):
+            a_f = min(1.0, float(env.step_dt) / 0.15)
+            fast = fast + a_f * (pos[:, :2] - fast)
+            setattr(env, _BALL_FAST_ATTR, fast)
+            setattr(env, _BALL_FAST_STEP_ATTR, int(env.common_step_counter))
+        moved = torch.norm(getattr(env, _BALL_FAST_ATTR) - getattr(env, _BALL_REF_ATTR), dim=1) > travel_min
         raw = raw & moved
 
     # --- 持続要求 (デバウンス) ---
@@ -343,6 +359,8 @@ def _ball_threat(
     return getattr(env, _THREAT_LATCH_ATTR), t
 
 
+_BALL_FAST_ATTR = "_gk_ball_fast"        # 速い基準点 (tau 0.15s)
+_BALL_FAST_STEP_ATTR = "_gk_ball_fast_step"
 _BALL_REF_ATTR = "_gk_ball_ref"          # 「実際に動いたか」判定の基準位置
 _BALL_REF_STEP_ATTR = "_gk_ball_ref_step"
 _THREAT_ON_ATTR = "_gk_threat_on"        # 連続成立カウンタ
@@ -469,7 +487,37 @@ def compute_target_y(
     approaching, t = _ball_threat(env, use_perceived=use_perceived)
     y_pred = (pos[:, 1] + vel[:, 1] * t).clamp(-max_y, max_y)
 
-    target = torch.where(approaching, y_pred, torch.zeros_like(y_pred))
+    # ★ 2026-08-18: 脅威が無いときの目標を「ゴール中央 (0)」から
+    #   **ボールとゴール中央を結ぶ線を守備面で切った点** に変更 (ユーザー要望:
+    #   ゴールへ近づいていなくてもボールが y 方向に動いたら追ってほしい)。
+    #
+    #       y_track = ball_y × (guard_x / ball_x)
+    #
+    #   実際の GK の「角度を切る」立ち位置そのもの。単純に target = ball_y にすると
+    #   遠いボールにも等倍で反応して不安定になるが、この式なら距離で自動的に減衰する:
+    #     * ボールが遠い (x=3m)      → 係数 0.2 → 中央寄りに立つ
+    #     * ボールが守備面まで来た    → 係数 1.0 → ボールの正面に立つ
+    #   遠方のボールの知覚ノイズが増幅されないという実用上の利点もある。
+    #
+    #   ★ 「静止ボールで動かない」性質は維持される。ball=(3.00, -0.04) なら
+    #     target_y = -0.008 で、待機保持の不感帯 0.25m の内側に収まる。
+    #   ★ ball_x は守備面より手前 (< guard_x) になり得るので下限でクランプする
+    #     (係数が 1 を超えて逆に増幅されるのを防ぐ)。
+    #   ★ 2026-08-18: 追従に使うボール位置は **平滑化したもの** を使う。
+    #     生の知覚位置だと、3m 先で数十 cm ある位置ノイズが角度係数を通って
+    #     目標 y に乗り、待機保持の不感帯 0.25m を跨ぎ続ける。実測 (静止ボール):
+    #       クリーン        待機判定 97.6% / ベース速度 0.0063 m/s
+    #       知覚DR あり     待機判定 38.4% / ベース速度 0.0890 m/s
+    #     = 静止ボールなのに 6 割の時間で指令が出てうろつく (実機の症状の再現)。
+    #     _ball_threat が持つ基準点 (tau 0.5s の EMA) をそのまま使う。追従は
+    #     速さを要求されないので、平滑化の遅れは実害にならない。
+    _ball_threat(env, use_perceived=use_perceived)   # 基準点を更新
+    ref = getattr(env, _BALL_REF_ATTR, None)
+    pos_track = pos[:, :2] if ref is None else ref
+    x_ball = pos_track[:, 0].clamp(min=guard_x)
+    y_track = (pos_track[:, 1] * (guard_x / x_ball.clamp(min=1e-3))).clamp(-max_y, max_y)
+
+    target = torch.where(approaching, y_pred, y_track)
     out = torch.where(bufs["ball_active"], target, bufs["target_y"])
 
     # ★ 2026-08-11: セーブ後は中央 (y=0) ではなく **今いる場所** を目標にする。

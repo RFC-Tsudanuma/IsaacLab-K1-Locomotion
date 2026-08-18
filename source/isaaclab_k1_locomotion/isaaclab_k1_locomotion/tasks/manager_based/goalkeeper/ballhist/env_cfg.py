@@ -205,8 +205,8 @@ class K1GKBallHistPureEnvCfg(K1GKBallHistEnvCfg):
         self.rewards.target_reach_velocity = None
         self.rewards.ball_lateral_progress = RewTerm(
             func=ball_lateral_progress,
-            weight=1500.0,  # 実測 0.035 を基準版の target_reach_velocity (1.2) と同じ桁へ
-            params={"max_step_m": 0.03},
+            weight=750.0,  # 2026-08-18: 1500 -> 750 (他項に対して支配的すぎた)
+            params={"max_step_m": 0.03, "deadband": 0.12, "stop_speed": 0.5},
         )
 
 

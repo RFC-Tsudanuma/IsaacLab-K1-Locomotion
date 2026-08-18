@@ -539,6 +539,35 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
             params={"stand_still_scale": 8.0, "lin_vel_max": 1.0},
         )
 
+        # --- 平滑化まわりの weight をここに集約 (2026-08-18) ---
+        #
+        # 元は locomotion (rough_env_cfg / flat_env_cfg) と Stage1 cfg に散らばっていて、
+        # どこを直せば何が変わるのか追いにくかった。**値は現状と同一**で、
+        # 「ここの数字を書き換えれば調整できる」形に揃えただけ (挙動は変わらない)。
+        #
+        # ★ 上の action_smoothness_l2 / action_rate_l2 との違い:
+        #     あの 2 つは **指令 (action) の時間変化** を罰する = 出力の滑らかさ。
+        #     以下は **実際の動き** を罰する = 挙動の滑らかさ。
+        #   実機の震え対策で効くのは前者、歩容の質に効くのは後者。
+        #
+        # ★ 強めるほど「動かない」方向に圧がかかる。過去に何度も落ちた
+        #   諦め足踏み・立ち尽くしの均衡に注意すること。変えたら
+        #   Episode_Reward/target_reach_velocity と success_ema が落ちていないか確認する。
+
+        # 動きの滑らかさ
+        self.rewards.com_jerk_l2.weight = -1.0e-6      # 重心の加加速度
+        self.rewards.dof_acc_l2.weight = -1.0e-6       # 関節加速度
+        self.rewards.dof_torques_l2.weight = -5.0e-5   # 関節トルク
+        self.rewards.ang_vel_xy_l2.weight = -0.25      # ロール/ピッチ角速度
+        self.rewards.lin_vel_z_l2.weight = -2.5        # 上下動 (跳躍の抑制。flat 既定 -0.8 から強化)
+        self.rewards.feet_slide.weight = -0.5          # 接地足の滑り
+
+        # 姿勢の維持
+        self.rewards.flat_orientation_l2.weight = -20.0   # 胴体の傾き
+        self.rewards.stance_foot_flat.weight = -8.0       # つま先立ち対策
+        self.rewards.joint_deviation_hip.weight = -0.4    # ガニ股矯正
+        self.rewards.ankle_deviation.weight = -0.3        # 足首の基準姿勢からの逸脱
+
         # --- 腰が下がりすぎるのを抑える (2026-07-31) ---
         self.rewards.base_height_penalty.params["min_height"] = 0.55
 

@@ -1,0 +1,14 @@
+{
+  "_comment": "【実験】挙動の平滑化まわりの weight を一律 10 倍にする。動きが滑らかになる代わりに『動かない』方向へ圧がかかるので、target_reach_velocity と success_ema が落ちないかを必ず確認すること。",
+  "_comment_scope": "action_smoothness_l2 / action_rate_l2 (= 指令の平滑化) は別枠なのでここには含めない。震え対策で効くのはそちらで、ここは歩容の質 (跳躍・滑り・傾き) に効く。",
+  "_comment_base": "既定値: com_jerk -1e-6 / dof_acc -1e-6 / dof_torques -5e-5 / ang_vel_xy -0.25 / lin_vel_z -2.5 / feet_slide -0.5",
+
+  "env": {
+    "rewards.com_jerk_l2.weight": -1.0e-5,
+    "rewards.dof_acc_l2.weight": -1.0e-5,
+    "rewards.dof_torques_l2.weight": -5.0e-4,
+    "rewards.ang_vel_xy_l2.weight": -2.5,
+    "rewards.lin_vel_z_l2.weight": -25.0,
+    "rewards.feet_slide.weight": -5.0
+  }
+}
