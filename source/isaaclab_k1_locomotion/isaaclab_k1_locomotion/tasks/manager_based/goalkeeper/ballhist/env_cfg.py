@@ -35,6 +35,8 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
 from ..goalkeeper_direct_env_cfg import (
+    GOAL_HALF_WIDTH,
+    TASK_DRIVE_VY_SCALE,
     K1GKDirectCriticCfg,
     K1GKDirectEnvCfg,
     K1GKDirectObservationsCfg,
@@ -46,6 +48,7 @@ from ..mdp.observations import zeros_obs
 from ...locomotion.rough_env_cfg import _PHASE_FREQ
 from .events import sync_engaged_command
 from .rewards import ball_lateral_progress
+from .observations import ballhist_velocity_commands
 from .observations import ballhist_ball_history, ballhist_ball_history_true, ballhist_gait_phase
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -66,7 +69,12 @@ class K1GKBallHistPolicyCfg(K1GKDirectPolicyCfg):
     """
 
     # ★ 手書きの指令を方策から隠す。次元は保つ (先頭 49 の並びを壊さないため)。
-    velocity_commands = ObsTerm(func=zeros_obs, params={"dim": 3})
+    #   確率 cmd_dropout_p で隠す形にしてあり、既定 1.0 = 常に隠す。
+    #   0 から上げていくと分布外を通らずに移行できる (立ち尽くす局所解の対策)。
+    velocity_commands = ObsTerm(
+        func=ballhist_velocity_commands,
+        params={"max_y": GOAL_HALF_WIDTH, "vy_scale": TASK_DRIVE_VY_SCALE},
+    )
 
     # ★ 歩行位相のゲートを手書きの制御則から is_engaged へ差し替える。
     #   直接版は task_drive_vector (外挿と除算を含む制御則) の大きさで位相を

@@ -234,6 +234,12 @@ class GoalkeeperParamsCfg:
     threat_min_travel_m: float = 0.15  # 基準位置からこれ以上動いていること [m]
     threat_travel_tau_s: float = 0.5   # 基準位置の追従時定数 [s]
 
+    # ★ 2026-08-18: ボール履歴版で、方策に見せる速度指令を隠す確率。
+    #   1.0 = 完全に隠す (手書きの指令を方策から見せない)。
+    #   0 から 1 へ段階的に上げて移行する (詳細は ballhist/observations.py の
+    #   ballhist_velocity_commands)。直接版では読まれない。
+    cmd_dropout_p: float = 1.0
+
     idle_hold_enter_m: float = 0.25    # このずれ未満で待機保持に入る [m]
     idle_hold_exit_m: float = 0.30     # このずれ以上で待機保持を抜ける [m]
     idle_hold_enter_yaw: float = 0.15  # 向きのずれがこの未満で入る [rad] (≒8.6°)

@@ -276,3 +276,72 @@ def ballhist_gait_phase(
         torch.sin(phase_right), torch.cos(phase_right),
     ], dim=1)
     return torch.where(walking.unsqueeze(1), phase, torch.zeros_like(phase))
+
+
+# ---------------------------------------------------------------------------
+# 指令のフェードアウト (分布外の回避 + 「動かない」局所解の脱出)
+#
+# ★ 2026-08-18: 指令スロットを最初からゼロにすると学習が立ち上がらなかった。
+#
+#   Stage1 は 15000 iter かけて「**指令ゼロ = 立て**」を学習している。そこで指令を
+#   永久にゼロにすると、方策には「ずっと待機しろ」と言われ続けているのと同じになる。
+#   しかもボール履歴の重みはゼロ初期化なので最初はボールが見えていない。
+#   実測 (Pure 版 1700 iter):
+#       feet_air_time 0.0000 / 転倒 0.0000 / std 0.06 -> 0.05 / success_ema 0.18 -> 0.16
+#   = 立ち尽くす解に固まり、探索が縮小して抜け出せなくなっていた。
+#
+#   さらに「位相は回っているのに指令はゼロ」は Stage1 が一度も見ていない入力
+#   (Stage1 では位相と指令が必ず連動する) なので、そもそも分布外だった。
+#
+#   対策: **env ごとに確率 p で指令を隠す**。p を 0 -> 1 へ上げていけば
+#     * p が小さいうち: 大半の env で指令が見えるので Stage1 の学習が効き、動ける
+#     * 指令が隠れた env: 履歴を見ないと報酬が取れないので、履歴の使い方を学ぶ
+#     * p = 1: 完全に履歴だけで動く
+#   分布外の状態を通らずに移行できる。観測ドロップアウトの標準的な使い方。
+#
+# ★ マスクは **エピソード単位** で固定する (毎ステップ切り替えると、同じ状況で
+#   指令が点滅して学習が濁る)。reset_gk_buffers 相当のタイミングで引き直す。
+# ---------------------------------------------------------------------------
+
+_CMD_MASK_ATTR = "_gk_ballhist_cmd_mask"
+_CMD_MASK_EP_ATTR = "_gk_ballhist_cmd_mask_ep"
+
+
+def ballhist_velocity_commands(
+    env: "ManagerBasedRLEnv",
+    max_y: float = 1.3,
+    vy_scale: float = 1.3,
+) -> torch.Tensor:
+    """方策に見せる速度指令 (N, 3)。確率 ``cmd_dropout_p`` で **ゼロに隠す**。
+
+    ``cmd_dropout_p = 1.0`` なら常にゼロ = 手書きの指令を完全に隠した状態。
+    しきい値は ``GoalkeeperParamsCfg.cmd_dropout_p`` (override JSON で段階的に
+    上げていく想定)。
+    """
+    from ..mdp.observations import task_drive_vector
+
+    p = float(getattr(env.cfg.goalkeeper, "cmd_dropout_p", 1.0))
+    drive = task_drive_vector(env, max_y=max_y, vy_scale=vy_scale, use_perceived=True)
+    if p <= 0.0:
+        return drive
+    if p >= 1.0:
+        return torch.zeros_like(drive)
+
+    # エピソード単位でマスクを固定する。episode_length_buf が巻き戻った env を
+    # 「新しいエピソード」とみなして引き直す (reset イベントに依存しないので、
+    # どのタスクからでも使える)。
+    ep = env.episode_length_buf
+    mask = getattr(env, _CMD_MASK_ATTR, None)
+    prev_ep = getattr(env, _CMD_MASK_EP_ATTR, None)
+    if mask is None or mask.shape[0] != env.num_envs:
+        mask = (torch.rand(env.num_envs, device=env.device) >= p)
+        setattr(env, _CMD_MASK_ATTR, mask)
+    elif prev_ep is not None:
+        fresh = ep < prev_ep
+        if bool(fresh.any()):
+            new = (torch.rand(env.num_envs, device=env.device) >= p)
+            mask = torch.where(fresh, new, mask)
+            setattr(env, _CMD_MASK_ATTR, mask)
+    setattr(env, _CMD_MASK_EP_ATTR, ep.clone())
+
+    return torch.where(mask.unsqueeze(1), drive, torch.zeros_like(drive))
