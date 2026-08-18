@@ -102,6 +102,32 @@ Stage 2 は :class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKic
    実測の射出仰角 25° は 14° に foot_vz 分が乗った値として整合する。
    **仰角を 45-60° まで持っていくには h を 0.03 m 台まで下げる必要がある。**
 
+3 段が通った後の実測 (2026-08-18、k1_walk_lob_hist/2026-08-18_09-07-17)
+-----------------------------------------------------------------------
+3 段構成で **立ち上がりは成功した** (kick_rate 0.998 / base_height 終了 0.003 /
+``kick_finished`` で正常終了)。ただし apex は it1900 で頭打ちになった::
+
+                  1000-1300  1300-1600  1600-1900  1900-2200  2200-2500  2500-2780
+    apex_height      0.256      0.281      0.319      0.360      0.361      0.352
+    elevation_deg    27.2       27.7       27.8       28.3       28.2       28.2
+    kick_vel_ratio   0.447      0.464      0.509      0.534      0.529      0.513
+    plant_lon       -0.381     -0.374     -0.378     -0.372     -0.368     -0.371
+
+狙った 3 点のうち **効いたのは kick_foot_lift だけ** (foot_vz −0.55 → +0.34)。
+``kick_plant_foot`` は目標側が 0.24 動いたのに実測は 0.01 しか動かず、f_lon が
+0.996 → 0.433 と剥がれていくだけだった。``kick_contact_height`` は
+sole_height 0.053 → 0.065 と逆行した。
+
+**原因は ``r_stance`` = 0.25 との構造的衝突** (:data:`_R_STANCE_LOB` のコメント参照)。
+歩行目標 G がボール後方 0.25 m より近づかないので、軸足は −0.37 前後で平衡する。
+``kick_plant_foot`` (weight 0.6) は、``walk_speed`` (weight 1.5) が作ったこの壁を
+より小さい重みで押し返そうとしていた。そして軸足が動かない限り「すくい上げ」と
+「低い当たり」は運動学的にトレードオフになるので、重みで勝った方へ倒れるだけになる。
+
+→ 2026-08-18 の修正: **壁の方を動かす** (r_stance 0.25 → 0.15)。あわせて軸足目標を
+届く範囲へ緩め (−0.03 → −0.15、σ 0.10 → 0.15)、重みを当たり所側へ寄せた
+(foot_lift 4.0 → 2.0、contact_height 2.0 → 3.0)。
+
 walk_lob からの変更点
 ---------------------
 1. **キック段 (stage 2) を挟む。** 上記のとおり。
@@ -129,7 +155,11 @@ walk_lob からの変更点
    下げさせる項。5 と表裏の関係で、あちらが原因側 (構え)、こちらが結果側 (当たり所)。
    線形ランプなので勾配が死なず、カリキュラム不要。
 
-7. **``kick_foot_lift`` の重みを 2.0 → 4.0 に上げる** (stage 3 のみ)。
+7. **重みを当たり所側へ寄せる** (stage 3 のみ)。``kick_contact_height`` 2.0 → 3.0、
+   ``kick_foot_lift`` は walk_lob と同じ 2.0 のまま (一度 4.0 にして失敗した)。
+
+8. **``r_stance`` を 0.25 → 0.15 に下げる** (stage 3 のみ、:func:`_set_r_stance`)。
+   5-7 が動くための前提。上の実測セクション参照。
 
 継承したまま変えないもの
 ------------------------
@@ -167,9 +197,14 @@ walk_lob からの変更点
 段の切り替え後 100-200 iteration で eplen が 400 以上へ戻らなければ、その段の
 報酬集合が前段からブートストラップできていないということ (今回の失敗と同じ形)。
 
-立ち上がった後は ``Metrics/kick_direction/`` の 4 つ:
+立ち上がった後は **まず ``plant_lon`` だけ見る**。r_stance を下げた効果が出ていれば
+最初の 1000 iteration で −0.37 から手前 (0 側) へ動き始めるはず。**動かなければ
+r_stance は原因ではなかった** ということなので、そこで止めて別を疑うこと
+(この 1 本だけで切り分けが付くように 8 を独立した変更にしてある)。
 
-* ``plant_lon``          : −0.42 から −0.03 側へ動くか (変更 5)
+そのうえで ``Metrics/kick_direction/`` の 4 つ:
+
+* ``plant_lon``          : −0.37 から −0.15 側へ動くか (変更 5・8)
 * ``sole_height_at_kick``: 0.083 から 0.03 台へ下がるか (変更 6)
 * ``kick_elevation_deg`` : 24° から上がるか
 * ``kick_apex_height``   : 0.42 m から上がるか (最終目標 0.9 m)
@@ -255,7 +290,14 @@ _KICK_FADE_IN_END_ITER = 250
 #   _PLANT_SIGMA_LON_START  = 0.25  : 出発時点の許容幅。stage 2 から引き継いだ直後の
 #       plant_lon は −0.42 ちょうどではないので、σ を広めに取って出発点のばらつきを
 #       覆う。0.25 なら −0.42 ± 0.25 = [−0.67, −0.17] で半値以上。
-#   終値は walk_lob の定数をそのまま使う (−0.03 / 0.10)。
+#   _PLANT_LON_TARGET_END   = -0.15 : **walk_lob の −0.03 から緩めた** (2026-08-18)。
+#       −0.03 は「軸足の足箱中心をボール真横」という幾何から出た値だが、r_stance を
+#       0.15 に下げてもそこまでは届かない見込み。**到達不能な目標を追わせると、
+#       目標だけが逃げて f_lon が単調に剥がれ、policy から見て「何をしても損」の
+#       信号になる** (実測 f_lon 0.996 → 0.433、このまま行くと 0.003)。まず届く範囲に
+#       置いて、実際に追随したら次の run でさらに詰める。
+#   _PLANT_SIGMA_LON_END    = 0.15  : 同じ理由で 0.10 から緩めた。終点で gap が残っても
+#       報酬が完全には消えないようにする。
 #
 #   アニール区間 [500, 4000] iteration: 開始は「キック報酬のフェードインが終わり、
 #   前段から引き継いだ蹴り方が stage 3 の報酬で一度落ち着く」ぶんの余裕を見た値。
@@ -268,9 +310,46 @@ _KICK_FADE_IN_END_ITER = 250
 #       2 本を重ねると「目標に追随できているか」がそのまま読める。
 # --------------------------------------------------------------------------- #
 _PLANT_LON_TARGET_START = -0.42
+_PLANT_LON_TARGET_END = -0.15
 _PLANT_SIGMA_LON_START = 0.25
+_PLANT_SIGMA_LON_END = 0.15
 _PLANT_ANNEAL_START_ITER = 500
 _PLANT_ANNEAL_END_ITER = 4000
+
+# --------------------------------------------------------------------------- #
+# キック立ち位置の半径 r_stance [m] (stage 3 のみ 0.25 → 0.15)
+#
+# **2026-08-18 の run (k1_walk_lob_hist/2026-08-18_09-07-17) で分かった本丸。**
+#
+# 歩行目標 G は :mod:`..walk_kick.mdp.kick_state` で
+#
+#     reach = clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
+#     G     = ball_pos - reach * kick_dir
+#
+# と定義されており、**ボール後方 r_stance より近づかない**。``walk_speed`` (weight 1.5)
+# がそこへ引き、到達すると p_walk が飽和して前進の圧力が消える。base がボール後方
+# 0.25 m に落ち着くと軸足 (足首) はさらに後ろに来るので、plant_lon は −0.37 前後で
+# 平衡する。実測がまさにこの値だった。
+#
+# つまり ``kick_plant_foot`` (weight 0.6) は **歩行報酬が作った立ち位置の壁を、
+# より小さい重みで押し返そうとしていた**。カリキュラムで目標を動かしても実測は
+# 2780 iteration で 0.01 しか動かず (目標側は 0.24 動いた)、f_lon が 0.996 → 0.433 と
+# 剥がれていくだけだった。**目標ではなく壁の方を動かす必要がある。**
+#
+# 0.15 は「軸足をボールの真横に置く」姿勢から逆算した値ではなく、**壁を 10 cm 手前へ
+# 動かす**という増分の指定。r_stance を下げすぎるとキック前にボールへ足が触れてしまう
+# (``reset_ball`` の dist_range 下限と同じ制約) ので、まず 1 段だけ動かして
+# plant_lon が追随するかを見る。
+#
+# .. warning::
+#    ``r_stance`` は **報酬 9 項・終了条件 (kick_finished)・コマンド (base_velocity)**
+#    の 3 か所に配られている。``kick_state`` は同一ステップ内で最初の呼び出しだけが
+#    状態を更新するので、**1 か所でも古い値が残っていると、その値が P_kick と G を
+#    決めてしまう**。IsaacLab の step 順では termination が reward より先に走るため、
+#    報酬側だけ変えても無意味になる。:func:`_set_r_stance` が 3 か所すべてを揃え、
+#    取りこぼしがあれば例外を投げる。
+# --------------------------------------------------------------------------- #
+_R_STANCE_LOB = 0.15
 
 # --------------------------------------------------------------------------- #
 # 接触高さ報酬 (kick_contact_height) の定数 (stage 3 のみ)
@@ -282,31 +361,38 @@ _PLANT_ANNEAL_END_ITER = 4000
 #   _CONTACT_HEIGHT_SAT         = 0.03 : 満点になる足裏高さ。法線仰角 45° 相当
 #       (asin((0.11−0.03)/0.11) = 47°)。**これより下げても得をしない** ようにして、
 #       つま先を地面へ掻き込むだけの解に動機を与えない。
-#   _CONTACT_HEIGHT_WEIGHT      = 2.0  : kick_plant_foot / kick_foot_lift と同じ。
-#       direction (6.0) / loft (5.0) / elevation (5.0) より明確に下げる。この項も
-#       目的そのものではなく **「蹴り方」の指定** なので、大きくすると高さより
-#       当たり所の最適化に学習が引っ張られる。
+#   _CONTACT_HEIGHT_WEIGHT      = 3.0  : **2.0 から上げた** (2026-08-18)。
+#       direction (6.0) / loft (5.0) / elevation (5.0) より下、という原則は保つが、
+#       kick_foot_lift (2.0) より **上** に置く。実測で仰角を作っているのは接触法線
+#       (= 当たり所の高さ) であって足の鉛直速度ではなく、foot_lift を 4.0 にした run
+#       では sole_height が 0.053 → 0.065 と逆行して apex がむしろ下がったため。
 #
 # NOTE: 線形ランプなので実測 h = 0.083 でも f_low = 0.34 が付き、勾配も生きている。
 #       kick_plant_foot と違ってカリキュラムは要らない。
 # --------------------------------------------------------------------------- #
 _CONTACT_HEIGHT_BALL_RADIUS = 0.11
 _CONTACT_HEIGHT_SAT = 0.03
-_CONTACT_HEIGHT_WEIGHT = 2.0
+_CONTACT_HEIGHT_WEIGHT = 3.0
 
 # --------------------------------------------------------------------------- #
-# すくい上げ (kick_foot_lift) の重み。walk_lob の 2.0 から引き上げる (stage 3 のみ)。
+# すくい上げ (kick_foot_lift) の重み。walk_lob と同じ 2.0 に戻す (stage 3 のみ)。
 #
-# 実測 foot_vz 0.81 m/s は vz_foot_sat 2.0 の 40% で飽和には遠く、圧力を上げる
-# 余地がある。4.0 は loft (5.0) / elevation (5.0) にほぼ並ぶ水準。
+# 一度 4.0 まで上げた (2026-08-18 の run) が、**上げすぎだった**。foot_vz は狙いどおり
+# −0.55 → +0.34 と上向きに転じた一方で、``sole_height_at_kick`` が 0.053 → 0.065 と
+# **逆行**し、apex は 0.36 で頭打ち・旧 flat run (0.426) より低くなった。
+#
+# 原因は **すくい上げと低い当たりが運動学的にトレードオフ** であること。軸足がボールの
+# 37 cm 後ろにある姿勢ではつま先をボールの下へ入れられないので、「足を上向きに動かす」と
+# 「接触点を下げる」を同時には満たせない。重みで勝っている方に倒れるだけで、4.0 は
+# foot_lift 側に倒しただけだった。
+#
+# トレードオフを解くのは軸足の位置 (:data:`_R_STANCE_LOB`) であって重み配分ではない。
+# ここは 2.0 に戻し、**当たり所側 (_CONTACT_HEIGHT_WEIGHT = 3.0) をやや上に置く**。
 #
 # NOTE: それでも direction (6.0) は超えない。方向ゲートを最上位に保つのは
 #       walk_lob から一貫した設計 (踏みつけ / かすらせ exploit を塞ぐ構造)。
-# NOTE: 単独では動かない想定。軸足が −0.42 のまま (脚が伸び切った姿勢) では
-#       蹴り足を上へ振る余地が運動学的に無いので、kick_plant_foot のカリキュラムが
-#       効いて初めてこの項が動く、という順序を見込んでいる。
 # --------------------------------------------------------------------------- #
-_FOOT_LIFT_WEIGHT = 4.0
+_FOOT_LIFT_WEIGHT = 2.0
 
 
 # --------------------------------------------------------------------------- #
@@ -374,6 +460,60 @@ def _restore_vision_ball_obs(cfg) -> None:
     policy.prev_ball_pos.noise = Unoise(n_min=-0.02, n_max=0.02)
 
 
+def _set_r_stance(cfg, value: float) -> None:
+    """キック立ち位置の半径 ``r_stance`` を **配られている全箇所** で揃える。
+
+    ``r_stance`` は「理想キック立ち位置 P_kick をボール後方どれだけに置くか」で、
+    :func:`~..walk_kick.mdp.kick_state.kick_state` が P_kick と歩行目標 G を作るのに
+    使う。値の意味と 0.15 を選んだ理由は :data:`_R_STANCE_LOB` のコメント参照。
+
+    **なぜ「全箇所」でなければならないか**: ``kick_state`` は ``common_step_counter``
+    でステップ境界を見て **同一ステップ内では最初の呼び出しだけが状態を更新する**。
+    2 番目以降の呼び出しは引数を無視してキャッシュを返す。したがって値がばらつくと
+    「そのステップで最初に評価されたマネージャの値」が P_kick と G を決める。
+    IsaacLab の step 順は termination → reward → command なので、**報酬側だけ書き換えても
+    ``kick_finished`` の古い値が毎ステップ勝つ** ことになり、まったく効かない。
+
+    配られている先は 3 種類:
+
+    1. 報酬項 (``_KICK_STATE_PARAMS`` を展開している全項)
+    2. 終了条件 ``kick_finished``
+    3. コマンド ``base_velocity`` (:class:`~..walk_kick.mdp.commands.BallFollowVelocityCommandCfg`
+       のフィールド。params ではなく cfg 直下の属性)
+
+    取りこぼしを黙って通さないよう、書き換えた箇所を数えて検算する。将来キック報酬を
+    足したときにここを通らないと例外で気づける。
+
+    NOTE: **アニールにはしていない。** 3 つのマネージャに跨る値を毎ステップ書き換える
+          カリキュラムは、上の「最初の呼び出しが勝つ」性質と噛み合わせると壊れやすい
+          (書き換えの順序とマネージャの評価順序の両方に依存する)。段の頭で 1 度だけ
+          決め打つ方が、env.yaml に残って検証もできる。
+    """
+    n = 0
+    for term_name in dir(cfg.rewards):
+        if term_name.startswith("_"):
+            continue
+        term = getattr(cfg.rewards, term_name, None)
+        params = getattr(term, "params", None)
+        if isinstance(params, dict) and "r_stance" in params:
+            params["r_stance"] = value
+            n += 1
+    if cfg.terminations.kick_finished is not None:
+        cfg.terminations.kick_finished.params["r_stance"] = value
+        n += 1
+    cfg.commands.base_velocity.r_stance = value
+    n += 1
+
+    # 2026-08-18 時点の内訳: 報酬 9 項 + kick_finished + base_velocity = 11。
+    # 報酬項の増減で変わりうるので下限だけ見る (0 や 1 で通り抜けるのを防ぐのが目的)。
+    if n < 5:
+        raise RuntimeError(
+            f"_set_r_stance: 書き換え先が {n} 箇所しかない。kick_state を共有する"
+            " 報酬 / 終了条件 / コマンドの構成が想定と違う (揃っていないと"
+            " P_kick と G が古い値で決まる)。"
+        )
+
+
 def _apply_plant_foot_curriculum(cfg) -> None:
     """``kick_plant_foot`` の ``lon_target`` と ``sigma_lon`` をアニールする。
 
@@ -388,8 +528,8 @@ def _apply_plant_foot_curriculum(cfg) -> None:
     cfg.rewards.kick_plant_foot.params["sigma_lon"] = _PLANT_SIGMA_LON_START
 
     for param_name, start, end in (
-        ("lon_target", _PLANT_LON_TARGET_START, _PLANT_LON_TARGET),
-        ("sigma_lon", _PLANT_SIGMA_LON_START, _PLANT_SIGMA_LON),
+        ("lon_target", _PLANT_LON_TARGET_START, _PLANT_LON_TARGET_END),
+        ("sigma_lon", _PLANT_SIGMA_LON_START, _PLANT_SIGMA_LON_END),
     ):
         setattr(
             cfg.curriculum,
@@ -598,6 +738,9 @@ class K1WalkLobHistEnvCfg(K1WalkLobEnvCfg):
 
         # -- walk_lob が入れたガウス認識パイプラインを外す (5 と二重掛けになるため)
         _restore_vision_ball_obs(self)
+
+        # -- 立ち位置の壁を 10 cm 手前へ動かす (これが効かないと下の 3 点も動かない)
+        _set_r_stance(self, _R_STANCE_LOB)
 
         # -- 当たり所を下げるための 3 点
         _apply_plant_foot_curriculum(self)
