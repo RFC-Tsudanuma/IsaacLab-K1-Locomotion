@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
-from .events import get_phase_freq
+from .events import get_phase_freq, get_phase_offset
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -35,7 +35,7 @@ def phase_obs(
     """
     t = env.episode_length_buf * env.step_dt
     pf = get_phase_freq(env, phase_freq)
-    phase_left = 2.0 * math.pi * pf * t
+    phase_left = 2.0 * math.pi * pf * t + get_phase_offset(env)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

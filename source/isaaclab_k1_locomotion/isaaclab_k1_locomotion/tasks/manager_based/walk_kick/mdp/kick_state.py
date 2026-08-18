@@ -84,7 +84,34 @@ def kick_state(
     command_name: str = "kick_direction",
     ball_name: str = "soccer_ball",
 ) -> dict:
-    """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。"""
+    """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
+
+    ``P_kick`` の横オフセット (``env._kick_foot``)
+    ------------------------------------------
+    ``env._kick_foot`` に ``"left"`` / ``"right"`` が入っていると、理想立ち位置
+    ``P_kick`` を **その足がボール手前に来る** ように横へずらす。未設定 (既定) なら
+    従来どおり胴体中心をキック線上に置く。設定は startup イベント
+    :func:`~...locomotion.mdp.events.set_kick_foot` で行う。
+
+    パラメータではなく env 属性にしているのは、``kick_state`` が多数の報酬項・
+    コマンド項から ``**_KICK_STATE_PARAMS`` で呼ばれ、**同一ステップでは最初の
+    呼び出しだけが実際に計算する** (以降はキャッシュを返す) ため。一部の呼び出しにだけ
+    引数を足すと、その回に誰が最初に呼んだかで挙動が変わる。
+
+            蹴り足を片方に固定して運用する場合、胴体中心を線上に置く目標は
+            **蹴り足の横オフセット r のぶんだけ間違っている**。さらに旋回しながら
+            寄ると足の接近速度に ω×r が乗るので、回り込む向きで必要な立ち位置と
+            タイミングが変わり、片側で早すぎる蹴りになる。
+    蹴り足を片方に固定して運用する場合、胴体中心を線上に置く目標は **蹴り足の横
+    オフセット r のぶんだけ間違っている**。さらに旋回しながら寄ると足の接近速度に
+    ω×r が乗るので、回り込む向きで必要な立ち位置とタイミングが変わり、片側で
+    早すぎる蹴りになる。オフセット量は決め打ちせず、リセット時の実際の足位置から測る。
+
+    NOTE: これは左右対称性を意図的に破る。``plant_lat`` を絶対値で持っている理由
+          (鏡像解を両方生かす) とは逆向きの判断なので、蹴り足を固定しない運用に
+          戻すときは ``env._kick_foot`` を設定しないこと。
+    """
+    kick_foot = getattr(env, "_kick_foot", None)
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
     if state is not None and state["step"] == step:
@@ -164,7 +191,21 @@ def kick_state(
 
     if just_reset.any():
         # P_kick: R 上、ボールから後方 r_stance の点。エピソード終了まで固定。
-        state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
+        #
+        # kick_foot を指定した場合は、胴体中心ではなく **その足** が R 上に来るよう
+        # 横へずらす。胴体が蹴り方向に正対して蹴る (p_style → 1) 前提なので、
+        # ボディフレームでの足の横オフセットがそのままキック方向フレームでの
+        # オフセットになる。
+        lat_offset = torch.zeros_like(ball_pos)
+        if kick_foot is not None:
+            foot_ids = _foot_body_ids(env, robot)
+            kf_idx = foot_ids[1] if kick_foot == "right" else foot_ids[0]
+            d_foot = robot.data.body_pos_w[:, kf_idx, :2] - robot_pos
+            # ボディフレームの右向き = forward を -90° 回したもの
+            body_right = torch.stack([torch.sin(yaw), -torch.cos(yaw)], dim=-1)
+            lat = (d_foot * body_right).sum(dim=-1)  # + = 胴体から見て右
+            lat_offset = lat.unsqueeze(-1) * right_vec
+        state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir - lat_offset)[just_reset]
         # init_side は未確定 (0) に戻す。確定は下の commit ブロックで行う。
         state["init_side"][just_reset] = 0.0
         state["kick_done"][just_reset] = False

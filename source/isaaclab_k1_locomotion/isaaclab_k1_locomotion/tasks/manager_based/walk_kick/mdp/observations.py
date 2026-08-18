@@ -20,7 +20,7 @@ import isaaclab.envs.mdp as base_mdp
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
 
-from ...locomotion.mdp.events import get_phase_freq
+from ...locomotion.mdp.events import get_phase_freq, get_phase_offset
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -86,7 +86,7 @@ def gait_phase_sincos(
     """
     t = env.episode_length_buf * env.step_dt
     pf = get_phase_freq(env, phase_freq)
-    phase = 2.0 * math.pi * pf * t
+    phase = 2.0 * math.pi * pf * t + get_phase_offset(env)
 
     phase_sincos = torch.stack([torch.sin(phase), torch.cos(phase)], dim=1)
 
@@ -416,3 +416,68 @@ def delayed_prev_ball_pos_b(
     """
     value = prev_ball_pos_b(env, ball_cfg=ball_cfg)
     return _delayed_signal(env, "prev_ball_pos_b", group, value, max_delay_s, base_delay_s)
+
+
+def delayed_ball_pos_rel(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "vision",
+    base_delay_s: float = 0.0,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """視覚由来のボール**現在**位置 (3D) を遅延させたもの。shape: (N, 3)
+
+    :func:`ball_pos_rel` は本来 critic 専用の特権情報 (遅延なしの真値) だが、
+    policy に渡すときは同じカメラ由来の他の項と同じレイテンシを負わせる。
+    :func:`prev_ball_pos_b` と違って固定 1 ステップを持たないので、実効遅延を
+    揃えるには ``base_delay_s`` を明示的に与えること (ball_vel と同じ扱い)。
+    """
+    value = ball_pos_rel(env, ball_cfg=ball_cfg)
+    return _delayed_signal(env, "ball_pos_rel", group, value, max_delay_s, base_delay_s)
+
+
+def ball_pos_rel_kick_foot(
+    env: ManagerBasedRLEnv,
+    foot_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="right_foot_link"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """**蹴り足から見た** ボールの相対位置 (yaw aligned ボディフレーム)。shape: (N, 3)
+
+    :func:`ball_pos_rel` は胴体中心を原点に取るが、「いつ振るか」を決めるのに本質的な
+    量は「ボールが蹴り足からどこにあるか」。蹴り足は胴体中心から横に r ずれているので、
+    旋回しながら寄ると足の接近速度に ω×r が乗り、**回り込む向きで符号が反転する**。
+    胴体基準の観測しか無いと、同じ「胴体から見たボール位置」でも実際の足とボールの
+    距離が向きによって違い、片側で早すぎ・反対側で遅すぎる蹴りになる (実測の症状)。
+
+    足基準で渡せばこの項が観測に織り込まれるので、「蹴り足の前方 X にボールが来たら
+    振る」という判定が回り込みの向きに依存しなくなる。
+
+    NOTE: 既定は右足 (現在のポリシーが実際に蹴っている足)。蹴り足を変えるなら
+          :data:`~..walk_long_pass.walk_long_pass_env_cfg._KICK_FOOT_BODY` と
+          ``P_kick`` の横オフセットの符号も揃えること。
+    """
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene[foot_cfg.name]
+    foot_idx = foot_cfg.body_ids[0]
+
+    rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.body_pos_w[:, foot_idx, :3]
+    return quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
+
+
+def delayed_ball_pos_rel_kick_foot(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "vision",
+    base_delay_s: float = 0.0,
+    foot_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="right_foot_link"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """:func:`ball_pos_rel_kick_foot` を視覚系の遅延つきで返す。
+
+    NOTE: 遅延させるのは「ボールの見え方」であって足の位置ではないが、ここでは差を
+          まとめて 1 本の信号として遅らせている。足の位置は自己受容感覚なので本来は
+          遅延が小さく、厳密には別々に遅らせるべき。実機のカメラ遅延 (0.02-0.08 s) の
+          間に足が動く距離を無視できないなら、ball_pos と foot_pos を別項に分けること。
+    """
+    value = ball_pos_rel_kick_foot(env, foot_cfg=foot_cfg, ball_cfg=ball_cfg)
+    return _delayed_signal(env, "ball_pos_rel_kick_foot", group, value, max_delay_s, base_delay_s)

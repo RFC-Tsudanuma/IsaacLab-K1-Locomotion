@@ -449,3 +449,123 @@ def export_history_policy_as_onnx(
         output_names=["actions"],
         dynamic_axes={},
     )
+
+
+def remap_widened_obs_actor(
+    state_dict: dict, policy: ActorCriticHistoryCNN, old_obs_dim: int
+) -> tuple[dict, list[str]]:
+    """観測次元を **末尾に足して広げた** actor へ、旧 checkpoint を無損失で移植する。
+
+    観測項を 1 つ追加すると 1 フレームの次元 D が変わり、actor の
+
+    * ``encoder.cnn.0.weight``  (out_ch, D, k)   … チャンネル = 観測次元
+    * ``mlp.0.weight``          (h, K*D + latent)
+
+    の 2 つだけ形が変わる。``--load_pretrained`` は形の合わないテンソルを黙って
+    捨てるので、この 2 本が落ちて actor が実質作り直しになる。
+
+    移植のからくり
+    --------------
+    **新しい次元は 1 フレームの末尾に足すこと** が前提。そうすると旧 D_old 列は
+    新しい並びでも各フレームの先頭 D_old 列にそのまま対応するので::
+
+        cnn.0.weight[:, :D_old, :] = 旧            残り (D_new - D_old) チャンネルは 0
+        mlp.0.weight[:, f*D_new : f*D_new + D_old] = 旧[:, f*D_old : (f+1)*D_old]
+                                                    (f = 0..K-1、余りの列は 0)
+
+    と置ける。CNN 潜在の次元は履歴長と kernel/stride だけで決まり D に依らないので、
+    潜在に掛かる列は 1 対 1 で移せる。結果、**追加した観測の寄与が初期状態でちょうど
+    0** になり、出力は旧ポリシーと完全に一致する。学習が進むとゼロ初期化した
+    チャンネル・列に勾配が入り、追加した観測を使い始める。
+
+    観測正規化器 (actor_obs_normalizer) も D 次元なので、旧統計を先頭 D_old に置き、
+    追加ぶんは mean=0 / var=1 (恒等) で埋める。
+
+    Args:
+        state_dict: 旧 checkpoint の model_state_dict。
+        policy: 移植先 (新しい D で構築済み)。
+        old_obs_dim: 旧観測の 1 フレーム次元。
+
+    Returns:
+        移植後の state_dict と、何をどう移したかの説明行のリスト。
+    """
+    if not isinstance(policy, ActorCriticHistoryCNN):
+        raise TypeError(
+            "remap_widened_obs_actor は ActorCriticHistoryCNN 用。"
+            f" 受け取った policy: {type(policy).__name__}"
+        )
+
+    encoder = policy.actor.encoder
+    new_obs_dim = encoder.obs_dim
+    if old_obs_dim > new_obs_dim:
+        raise ValueError(
+            f"old_obs_dim ({old_obs_dim}) が新しい観測次元 ({new_obs_dim}) より大きい。"
+            " この関数は次元を増やす方向専用。"
+        )
+
+    num_recent = encoder.num_recent_frames
+    live = policy.state_dict()
+
+    remapped: dict = {}
+    notes: list[str] = []
+    for key, value in state_dict.items():
+        target = live.get(key, None)
+        if target is None:
+            notes.append(f"{key}: 移植先に同名のテンソルが無いので捨てた")
+            continue
+        if value.shape == target.shape:
+            remapped[key] = value
+            continue
+
+        value = value.to(device=target.device, dtype=target.dtype)
+
+        # -- CNN 1 層目: 入力チャンネル = 観測次元
+        if key == "actor.encoder.cnn.0.weight" and value.shape[1] == old_obs_dim:
+            new_weight = torch.zeros_like(target)
+            new_weight[:, :old_obs_dim, :] = value
+            remapped[key] = new_weight
+            notes.append(
+                f"{key} {tuple(value.shape)} -> {tuple(target.shape)}:"
+                f" 先頭 {old_obs_dim} チャンネルに移植 (追加ぶんは 0)"
+            )
+            continue
+
+        # -- MLP 1 層目: [直近 K フレーム, CNN 潜在]
+        if key == "actor.mlp.0.weight":
+            latent = encoder.latent_dim
+            if value.shape[1] != num_recent * old_obs_dim + latent:
+                notes.append(f"{key}: 想定の入力幅と違うので捨てた {tuple(value.shape)}")
+                continue
+            new_weight = torch.zeros_like(target)
+            for f in range(num_recent):
+                src = value[:, f * old_obs_dim : (f + 1) * old_obs_dim]
+                dst_start = f * new_obs_dim
+                new_weight[:, dst_start : dst_start + old_obs_dim] = src
+            # CNN 潜在ぶんは 1 対 1
+            new_weight[:, num_recent * new_obs_dim :] = value[:, num_recent * old_obs_dim :]
+            remapped[key] = new_weight
+            notes.append(
+                f"{key} {tuple(value.shape)} -> {tuple(target.shape)}:"
+                f" 各フレームの先頭 {old_obs_dim} 列 + 潜在 {latent} 列に移植 (追加ぶんは 0)"
+            )
+            continue
+
+        # -- 観測正規化器: 追加ぶんは恒等 (mean 0 / var 1 / std 1) で埋める
+        #
+        # rsl_rl の EmpiricalNormalization は統計を (1, D) で持つ (_count だけスカラ)。
+        # 最終軸だけが D なので、そこを見て前詰めする。
+        if key.startswith("actor_obs_normalizer.") and value.shape[-1] == old_obs_dim:
+            # _var / _std は 1 で、_mean は 0 で埋めれば追加次元は素通しになる。
+            fill = 1.0 if ("var" in key or "std" in key) else 0.0
+            new_stat = torch.full_like(target, fill)
+            new_stat[..., :old_obs_dim] = value
+            remapped[key] = new_stat
+            notes.append(
+                f"{key} {tuple(value.shape)} -> {tuple(target.shape)}:"
+                f" 先頭 {old_obs_dim} に移植 (追加ぶんは {fill:g})"
+            )
+            continue
+
+        notes.append(f"{key}: 形が合わないので捨てた {tuple(value.shape)} vs {tuple(target.shape)}")
+
+    return remapped, notes

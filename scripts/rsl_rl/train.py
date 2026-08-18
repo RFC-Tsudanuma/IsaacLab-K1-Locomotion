@@ -41,6 +41,16 @@ parser.add_argument(
     "are silently dropped (shape/name mismatch).",
 )
 parser.add_argument(
+    "--warm_start_from_narrower_obs",
+    type=int,
+    default=None,
+    help="Treat --load_pretrained as a checkpoint trained with a SMALLER 1-frame observation dim "
+    "(pass that dim, e.g. 55) and graft it onto the current wider actor. Requires the new "
+    "observation terms to be appended at the END of the frame: the old columns then map 1:1 and "
+    "the added ones are zero-initialised, so the policy starts out behaving exactly like the "
+    "pretrained one. Without this flag the first CNN/MLP layers are silently dropped.",
+)
+parser.add_argument(
     "--allow_untransferred_actor",
     action="store_true",
     default=False,
@@ -349,6 +359,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     " 1 フレーム版の actor (actor.<N>.weight) がありません。"
                     " 既に履歴入力版の checkpoint の可能性があります (移植は何もしていません)。"
                 )
+
+        # 観測次元を末尾に広げたタスクへ、狭い観測で学習した checkpoint を移植する。
+        #
+        # 形が変わるのは actor の 1 層目 2 本 (encoder.cnn.0.weight / mlp.0.weight) と
+        # 観測正規化器だけ。何もしないと下のフィルタがそれを捨て、CNN と MLP の
+        # 入力層だけ乱数のまま学習が始まる (実測ではそれで歩行が壊れた)。
+        # 追加ぶんの重みをゼロにして移植すると初期状態の出力が旧ポリシーと一致する
+        # (詳細は remap_widened_obs_actor の docstring)。
+        if args_cli.warm_start_from_narrower_obs is not None:
+            from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
+                ActorCriticHistoryCNN,
+                remap_widened_obs_actor,
+            )
+
+            if not isinstance(policy, ActorCriticHistoryCNN):
+                raise ValueError(
+                    "--warm_start_from_narrower_obs は履歴入力の policy (ActorCriticHistoryCNN) 専用です。"
+                    f" 現在の policy: {type(policy).__name__}"
+                )
+            state_dict, notes = remap_widened_obs_actor(
+                state_dict, policy, old_obs_dim=args_cli.warm_start_from_narrower_obs
+            )
+            print(
+                f"[INFO]: Widening actor obs {args_cli.warm_start_from_narrower_obs}"
+                f" -> {policy.actor.encoder.obs_dim}:"
+            )
+            for note in notes:
+                print(f"          {note}")
 
         # 形の合うテンソルだけをロードする。
         # obs次元が違う転移では入力層 (actor.0.weight) と normalizer の形が合わないので

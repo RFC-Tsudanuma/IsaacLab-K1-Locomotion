@@ -21,7 +21,7 @@ from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
 from .observations import ball_vel as get_ball_vel
-from .events import get_phase_freq
+from .events import get_phase_freq, get_phase_offset
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -115,7 +115,7 @@ def feet_phase(
 
     pf = get_phase_freq(env, phase_freq)
     # Phase angle in [0, 2*pi) for the LEFT foot
-    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)   # [N]
+    phase_left = (2.0 * math.pi * pf * t + get_phase_offset(env)) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 
@@ -417,7 +417,7 @@ def foot_clearance_ji(
 
     # feet_phase と同一の desired-stance 判定
     t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    phase_left = (2.0 * math.pi * phase_freq * t + get_phase_offset(env)) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
@@ -460,7 +460,7 @@ def foot_clearance_ji_pen(
     # feet_phase と同一の desired-stance 判定
     t = env.episode_length_buf * env.step_dt
     pf = get_phase_freq(env, phase_freq)
-    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)
+    phase_left = (2.0 * math.pi * pf * t + get_phase_offset(env)) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
@@ -522,7 +522,7 @@ def feet_height_bezier(env: ManagerBasedRLEnv,
     t = env.episode_length_buf * env.step_dt
 
     # Phase angle in [0, 2*pi) for the LEFT foot
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)   # [N]
+    phase_left = (2.0 * math.pi * phase_freq * t + get_phase_offset(env)) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 
@@ -590,7 +590,7 @@ def feet_stride_length(
     fwd_gap = foot_rel_left[:, 0] - foot_rel_right[:, 0]
 
     t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    phase_left = (2.0 * math.pi * phase_freq * t + get_phase_offset(env)) % (2.0 * math.pi)
 
     cmd = env.command_manager.get_command(command_name)
     L = cmd[:, 0] * stance_ratio / phase_freq

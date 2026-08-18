@@ -85,6 +85,24 @@ class KickDirectionCommand(UniformVelocityCommand):
         # 蹴った瞬間の軸足の配置 (キック方向フレーム、ボール中心基準) [m]。
         self.metrics["plant_lon"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["plant_lat"] = torch.zeros(self.num_envs, device=self.device)
+        # 回り込みの向き (init_side) 別の内訳。
+        #
+        # 蹴り足を片方に固定していると、キック線のどちら側から寄ったかで
+        # 「胴体基準の同じタイミング」が物理的に別の意味になる (蹴り足は胴体中心から
+        # 横に r ずれているので、旋回の角速度 ω に対して足の接近速度に ω×r が乗り、
+        # 回り込む向きで符号が反転する)。全 env 平均だけ見ているとこの非対称が
+        # 完全に隠れるので、左右別に出す。
+        #
+        # 各メトリクスは「その側の env だけ 1、他は 0」でマスクした値なので、
+        # 平均を読むときは同じ側の kick_rate_{l,r} で割り戻すこと。
+        # env 数そのものは kick_side_ratio_r (= 右側から寄った env の割合) で分かる。
+        for _side in ("l", "r"):
+            self.metrics[f"kick_rate_{_side}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"kick_dir_error_deg_{_side}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"kick_vel_ratio_{_side}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"ball_touch_count_{_side}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"sole_height_at_kick_{_side}"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["kick_side_ratio_r"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -113,6 +131,21 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["sole_height_at_kick"] = state["sole_height_at_kick"] * kick_done
         self.metrics["plant_lon"] = state["plant_lon_frozen"] * kick_done
         self.metrics["plant_lat"] = state["plant_lat_frozen"] * kick_done
+
+        # -- 回り込みの向き別の内訳 (init_side: +1 = キック線の右側から寄った) --
+        init_side = state["init_side"]
+        on_r = (init_side > 0.0).float()
+        on_l = (init_side < 0.0).float()
+        # 未確定 (init_side == 0) の env はどちらにも数えない。
+        dir_err_deg = torch.rad2deg(state["tau_direction_frozen"])
+        ratio_masked = ratio * kick_done
+        for _side, _mask in (("l", on_l), ("r", on_r)):
+            self.metrics[f"kick_rate_{_side}"] = kick_done * _mask
+            self.metrics[f"kick_dir_error_deg_{_side}"] = dir_err_deg * kick_done * _mask
+            self.metrics[f"kick_vel_ratio_{_side}"] = ratio_masked * _mask
+            self.metrics[f"ball_touch_count_{_side}"] = state["touch_count"] * _mask
+            self.metrics[f"sole_height_at_kick_{_side}"] = state["sole_height_at_kick"] * kick_done * _mask
+        self.metrics["kick_side_ratio_r"] = on_r
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)

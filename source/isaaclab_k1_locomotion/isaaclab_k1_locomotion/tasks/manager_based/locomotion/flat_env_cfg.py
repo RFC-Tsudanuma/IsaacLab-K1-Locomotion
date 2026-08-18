@@ -15,7 +15,7 @@ from .rough_env_cfg import K1RoughEnvCfg, _PHASE_FREQ, _COMMAND_THRESHOLD
 from .velocity_env_cfg import CurriculumCfg
 import math
 from .mdp.commands import DiscreteVelocityCommandCfg
-from .mdp.events import randomize_phase_freq
+from .mdp.events import randomize_phase_freq  # noqa: F401  (randomize_phase_offset は下記 NOTE 参照)
 from .mdp.rewards import feet_landing_impact, feet_landing_vel, feet_heel_strike, com_jerk_l2
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
@@ -126,6 +126,26 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
                 "offset_range": (-0.05, 0.05),
             },
         )
+
+        # 歩行位相の初期値を エピソード毎に 0 か π のどちらかにする (= 一歩目の足の左右)。
+        #
+        # 位相は 2π*f*(episode_length_buf*dt) なので、これが無いと **全 env が必ず
+        # 位相 0 から始まり、一歩目に出る足が毎回同じ**になる。蹴りタスクでは
+        # 「その足で蹴るのが常に有利」が学習中ずっと続き、片足でしか蹴らない
+        # ポリシーに収束する (実測: 右足のみ)。詳細は randomize_phase_offset の docstring。
+        #
+        # mode="reset" (周波数の方は startup で 1 度だけ)。位相を使う観測・報酬は
+        # すべて get_phase_offset 経由でこの値を読む。
+        # NOTE: 既定では **登録しない**。get_phase_offset は未登録なら 0 を返すので、
+        #       位相計算はランダム化なし (全 env が位相 0 スタート = 一歩目の足が固定)
+        #       のまま動く。片足でしか蹴らない件は蹴り足基準の観測と P_kick の
+        #       横オフセットで直す方針にしたので、切り分けを濁さないよう外してある。
+        #       両足で蹴らせたくなったら次の 5 行を有効にする。
+        # self.events.randomize_phase_offset = EventTerm(
+        #     func=randomize_phase_offset,
+        #     mode="reset",
+        #     params={"prob_flip": 0.5},
+        # )
 
         # Flat terrain
         self.scene.terrain.terrain_type = "plane"

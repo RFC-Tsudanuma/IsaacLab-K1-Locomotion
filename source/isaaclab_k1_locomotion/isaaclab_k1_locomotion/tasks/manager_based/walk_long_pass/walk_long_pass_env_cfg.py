@@ -151,11 +151,16 @@ docstring 参照）。
 """
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
+from isaaclab.managers import EventTermCfg as EventTerm
+
 from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
+from ..locomotion.mdp.events import set_kick_foot
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
@@ -551,6 +556,154 @@ def enable_obs_delay(
     return applied
 
 
+def add_ball_pos_obs(cfg) -> None:
+    """policy 観測の **末尾に** ボール現在位置 ``ball_pos`` (3) を足して 55 -> 58 次元にする。
+
+    ``sole_pos`` は残す。:func:`replace_sole_pos_with_ball_pos` (置き換え版) は
+    スロットの意味が変わるぶん checkpoint の引き継ぎが実質無効になり、実測で
+    Stage 4 の歩行が壊れた (iteration 300 で base_height 終了 100%、1000 まで
+    回しても kick_rate 0.003 で蹴りがまったく戻らなかった)。足す方なら
+    :func:`~..locomotion.networks.remap_widened_obs_actor` で旧 checkpoint を
+    無損失に移植できるので、歩行も蹴りも壊れない。
+
+    **末尾に足すこと** が移植の前提。旧 55 列が各フレームの先頭にそのまま残るので、
+    追加ぶんの重みをゼロにすれば初期状態の出力が旧ポリシーと完全に一致する
+    (検証済み: max|新 - 旧| = 7.1e-08)。途中に挿すとこの対応が崩れる。
+
+    DR は他のボール観測と揃える (ノイズ ±:data:`_BALL_POS_NOISE`、遅延
+    :data:`_BALL_OBS_BASE_DELAY_S` + [0, :data:`_BALL_OBS_DELAY_MAX_S`] = 0.02-0.08 s、
+    vision group で乱数を共有)。理由は :func:`replace_sole_pos_with_ball_pos` と同じで、
+    真値のボール位置を 1 本渡すと他のボール観測に入れた DR を全部迂回できてしまう。
+
+    NOTE: 観測が 58 次元になるので ONNX の入力も (1, H, 58) に変わる。実機側の
+          リングバッファ幅を合わせること (末尾 3 列がボール位置)。
+    """
+    group = cfg.observations.policy
+    if hasattr(group, "ball_pos"):
+        raise AttributeError("policy 観測に既に 'ball_pos' があります (二重適用)。")
+
+    group.ball_pos = ObsTerm(
+        func=mdp.delayed_ball_pos_rel,
+        noise=Unoise(n_min=-_BALL_POS_NOISE, n_max=_BALL_POS_NOISE),
+        params={
+            "max_delay_s": _BALL_OBS_DELAY_MAX_S,
+            "base_delay_s": _BALL_OBS_BASE_DELAY_S,
+            "group": "vision",
+        },
+    )
+
+
+
+# 蹴り足。P_kick の横オフセットの向きを決める (:func:`use_fixed_kick_foot`)。
+# 現行ポリシーが実際に蹴っている足に合わせる。
+_KICK_FOOT = "right"
+
+
+def use_fixed_kick_foot(cfg) -> None:
+    """理想立ち位置 ``P_kick`` を、蹴り足がボール手前に来る位置へ横にずらす。
+
+    継承元の ``P_kick`` は ``ball - r_stance * kick_dir`` で、**胴体中心** を
+    キック線上に置く目標になっている。蹴り足は胴体中心から横に r ずれているので、
+    片足に固定して蹴る運用ではこの目標が r のぶん間違っている。さらに旋回しながら
+    寄ると足の接近速度に ω×r が乗り、**回り込む向きで符号が反転する** ため、
+    胴体基準で同じタイミングに蹴ると片側で早すぎ・反対側で遅すぎになる
+    (実測の症状: 反時計回りで回り込むとミートしない)。
+
+    オフセット量は決め打ちせず、リセット時の実際の足位置から測る
+    (:func:`~..walk_kick.mdp.kick_state.kick_state`)。
+
+    観測側の対処 (:func:`replace_sole_pos_with_ball_pos` = 蹴り足から見たボール位置)
+    と対で入れること。片方だけだと「目標は足基準・観測は胴体基準」のように
+    ちぐはぐになる。
+
+    NOTE: 左右対称性を意図的に破る。蹴り足を固定しない運用に戻すときはこの
+          イベントごと外す (``plant_lat`` を絶対値で持つ設計と逆向きの判断)。
+    """
+    cfg.events.set_kick_foot = EventTerm(
+        func=set_kick_foot,
+        mode="startup",
+        params={"foot": _KICK_FOOT},
+    )
+
+
+def replace_sole_pos_with_ball_pos(cfg, zero_fill: bool = False) -> None:
+    """policy 観測の ``sole_pos`` (3) を ボール現在位置 ``ball_pos`` (3) に差し替える。
+
+    観測の **3 番目のスロット (インデックス 6:9)** をそのまま使う。次元も 3 のままなので
+    policy 観測は 55 次元のまま変わらず、checkpoint は形の上ではそのまま繋がる
+    (ただしそのスロットの意味は変わるので、actor はその 3 列を学習し直すことになる)。
+
+    渡す値は :func:`~..walk_kick.mdp.observations.ball_pos_rel_kick_foot`
+    (**蹴り足** から見たボール相対位置、yaw aligned ボディフレーム)。胴体中心基準
+    ではなく足基準にするのは、「いつ振るか」が本質的に足とボールの相対位置で決まる
+    ため。胴体基準だと、旋回しながら寄ったときに足の接近速度へ ω×r が乗って
+    **回り込む向きで符号が反転** し、片側で早すぎる蹴りになる (実測の症状)。
+
+    critic 側は従来どおり胴体基準の ``ball_pos_rel`` (特権情報) のまま。policy に
+    渡すにあたり **他のボール観測と同じ DR を掛ける**:
+
+    * ノイズ ±:data:`_BALL_POS_NOISE`
+    * 遅延 :data:`_BALL_OBS_BASE_DELAY_S` + [0, :data:`_BALL_OBS_DELAY_MAX_S`]
+      = 0.02-0.08 s、vision group で ball_vel / prev_ball_pos と乱数を共有
+
+    DR を掛けないと、policy が真値のボール位置を 1 本持つことになり、他のボール
+    観測に入れた DR をすべて迂回できてしまう (実機で成立しない情報に頼る)。
+
+    Stage 1-4 の **全段** から呼ぶこと。段の途中で入れると、そこまでに学習した
+    checkpoint がそのスロットについて持っている重みが無意味になり、歩行が壊れる
+    (実測: Stage 3 checkpoint から Stage 4 だけ差し替えて始めたら、iteration 300 で
+    base_height 終了 100%、1000 まで回しても kick_rate 0.003 で蹴りが戻らなかった)。
+
+    Args:
+        zero_fill: True なら実際のボール位置ではなく 3 次元のゼロを入れる。
+            Stage 1 (歩行のみ) は ``scene.soccer_ball = None`` でボールがシーンに
+            存在しないので、観測関数を呼ぶと落ちる。継承元が prev_ball_pos /
+            ball_vel を歩行コマンドやゼロに差し替えているのと同じ扱いにする
+            (次元と並びは保つ)。
+
+    NOTE: configclass の instance ``__dict__`` の並びがそのまま観測の並びになる
+          (ObservationManager が ``group_cfg.__dict__.items()`` で回す)。単に
+          ``delattr`` → ``setattr`` すると新しい項が末尾に行き、実機側の詰め方と
+          ずれるので、``__dict__`` を作り直して位置を保つ。
+    """
+    group = cfg.observations.policy
+    if not hasattr(group, "sole_pos"):
+        raise AttributeError(
+            "policy 観測に 'sole_pos' がありません。継承元の観測構成が変わっています。"
+        )
+
+    if zero_fill:
+        ball_term = ObsTerm(func=mdp.zero_obs, params={"dim": 3})
+    else:
+        ball_term = ObsTerm(
+            func=mdp.delayed_ball_pos_rel_kick_foot,
+            noise=Unoise(n_min=-_BALL_POS_NOISE, n_max=_BALL_POS_NOISE),
+            params={
+                "max_delay_s": _BALL_OBS_DELAY_MAX_S,
+                "base_delay_s": _BALL_OBS_BASE_DELAY_S,
+                "group": "vision",
+                # SceneEntityCfg は **params に載せないと解決されない**。既定引数のままだと
+                # body_ids が slice(None) のままで body_ids[0] が TypeError になる
+                # ('slice' object is not subscriptable)。
+                "foot_cfg": SceneEntityCfg("robot", body_names=f"{_KICK_FOOT}_foot_link"),
+            },
+        )
+
+    rebuilt = {}
+    for name, term in list(vars(group).items()):
+        if name == "sole_pos":
+            rebuilt["ball_pos"] = ball_term
+        else:
+            rebuilt[name] = term
+    # 宣言フィールド sole_pos は None で残す。ObservationManager は None の項を
+    # 読み飛ばすので観測には出ないが、消してしまうと dataclass の __repr__ が
+    # AttributeError を投げ、cfg を repr するエラー経路 (gym.make の失敗表示など) で
+    # 本当の例外が隠れる。
+    rebuilt["sole_pos"] = None
+    group.__dict__.clear()
+    group.__dict__.update(rebuilt)
+
+
 def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
     """``before_iter`` までに立ち上がりきる報酬重みのランプを、終値の定数に潰す。
 
@@ -650,6 +803,21 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # 観測の次元も並びも変わらないので checkpoint はそのまま繋がる。
         # 対象と理由は enable_obs_delay / _OBS_DELAY_MAX_S のコメント参照。
         enable_obs_delay(self, _OBS_DELAY_MAX_S)
+
+        # -- 0b'. sole_pos (3) をボール現在位置 ball_pos (3) に差し替える
+        #
+        # Stage 1-3 (walk_long_pass_stages_env_cfg) でも同じヘルパを呼ぶ。全段で
+        # 揃えないと checkpoint の引き継ぎが壊れる (理由は関数の docstring 参照)。
+        # 観測は 55 次元のまま変わらない。
+        # enable_obs_delay の **後** に呼ぶこと (差し替えた項の遅延はこの関数が
+        # 自分で設定するので、_DELAYED_OBS_TERMS には載っていない)。
+        replace_sole_pos_with_ball_pos(self)
+
+        # -- 0b''. 理想立ち位置 P_kick を蹴り足基準にずらす
+        #
+        # 観測を蹴り足基準にしただけでは、報酬が要求する立ち位置は胴体中心のまま。
+        # 対で入れる。理由は use_fixed_kick_foot のコメント参照。
+        use_fixed_kick_foot(self)
 
         # -- 0c. 地面をランダムな軽い凹凸にする
         #
