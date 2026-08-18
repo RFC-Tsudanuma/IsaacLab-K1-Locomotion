@@ -699,3 +699,23 @@ def delayed_ball_pos_vision_b(
     return _delayed_signal(
         env, f"ball_pos_vision_{delay_steps}", group, value, max_delay_s, base_delay_s
     )
+
+
+def prev_joint_request_rsi(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """前ステップの関節指令。RSI でリセットした env は 1 ステップ目だけ注入値を返す。
+
+    ``last_action`` は ``ActionManager`` のバッファを読むが、そのバッファは reset 時に
+    0 クリアされる (しかもクリアは event の **後**)。そのため
+    :func:`~.events.reset_from_walk_states` が action_manager に直接書いても消される。
+
+    実機の walk → walk_kick 切り替えでは、この観測には walk ポリシーが直前に出した
+    関節指令が入っている。そこを 0 (= default 姿勢を要求) で始めると学習時と実機で
+    初期フレームが食い違うので、リセット直後の 1 フレームだけ注入値に差し替える。
+    イベントが未登録の環境では ``last_action`` と完全に同じ値を返す。
+    """
+    action = env.action_manager.action
+    buf = getattr(env, "_rsi_last_action", None)
+    if buf is None:
+        return action
+    first_step = (env.episode_length_buf == 0).unsqueeze(-1)
+    return torch.where(first_step, buf, action)

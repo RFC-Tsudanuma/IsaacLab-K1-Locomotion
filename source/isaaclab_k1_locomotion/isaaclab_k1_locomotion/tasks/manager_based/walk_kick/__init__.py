@@ -200,3 +200,27 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360NoisyBallPPORunnerCfg",
     },
 )
+
+# walk ポリシー (実機の歩行) の歩行状態から reset して学習する版。
+# 状態プールは scripts/rsl_rl/record_walk_states.py で作り、パスは環境変数
+# K1_WALK_STATES_NPZ で渡す。観測は Walk-Kick と同一 55 次元なので checkpoint は
+# --load_pretrained でそのまま引き継げる。
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Init-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKickWalkInitEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKickPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Init-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_kick_env_cfg:K1WalkKickWalkInitEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKickPPORunnerCfg",
+    },
+)

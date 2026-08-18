@@ -1032,3 +1032,104 @@ class K1WalkKick360NoisyBallEnvCfg_PLAY(K1WalkKick360NoisyBallEnvCfg):
         self.events.push_robot = None
 
         _disable_ball_obs_jitter(self)
+
+
+# --------------------------------------------------------------------------- #
+# Reference State Initialization: walk ポリシーの歩行状態から reset する
+# --------------------------------------------------------------------------- #
+# 実機は walk (model_34995.pt) で歩いてから walk_kick に切り替えるが、両者の歩容が
+# 違うため切り替えの瞬間に姿勢が飛ぶ。walk_kick を「walk が作る歩行状態」から reset して
+# 学習させると、その状態分布が学習中に何度も現れるので接続が滑らかになる。
+#
+# 状態プールの作り方 (model_34995.pt を学習したブランチで実行すること)::
+#
+#     _labpython2 scripts/rsl_rl/record_walk_states.py \
+#         --checkpoint checkpoint/model_34995.pt --headless \
+#         --num_envs 128 --record_time 60 --out walk_states.npz
+#
+# 学習::
+#
+#     K1_WALK_STATES_NPZ=/abs/path/walk_states.npz \
+#     ./scripts/rsl_rl/train.py --task Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Init-v0 \
+#         --headless --num_envs 4096 --load_pretrained <walk_kick の checkpoint>
+#
+# NOTE: 歩行 **周波数** の違いはこの仕組みでは埋まらない。walk 側は
+#       1.5 Hz (||cmd_xy|| <= 1.0 m/s) から 2.0 Hz (1.8 m/s) までコマンド速度で
+#       変化するのに対し、walk_kick は _PHASE_FREQ = 1.6 Hz 固定 (± startup の
+#       ランダム化) なので、接近中のケイデンスがそもそも噛み合っていない。
+#       初期姿勢を揃えても段差が残るなら、次に疑うのはここ。
+_WALK_STATES_PATH_ENV = "K1_WALK_STATES_NPZ"
+_WALK_STATES_DEFAULT = "walk_states.npz"
+
+
+def _apply_walk_state_init(
+    cfg: "K1WalkKickEnvCfg",
+    states_path: str | None = None,
+    probability: float = 1.0,
+) -> None:
+    """reset を walk ポリシーの歩行スナップショットからの初期化に差し替える。
+
+    触るのは 2 箇所だけ:
+
+    1. ``events.reset_from_walk_states`` を **追加** する。EventManager は cfg の
+       ``__dict__`` 順に term を並べるので、``__post_init__`` で後から生やしたこの項は
+       ``reset_base`` / ``reset_robot_joints`` の **後** に走り、両者が置いた
+       立ち姿勢を上書きする。x, y, yaw は温存するので ``reset_ball_in_front_of_robot``
+       とも競合しない。
+    2. ``prev_joint_request`` 観測を :func:`~.mdp.prev_joint_request_rsi` に差し替える。
+       ActionManager のバッファは reset で 0 クリアされてしまうため、リセット直後の
+       1 フレームだけ「walk ポリシーが直前に出した関節指令」を返させる。
+       観測の次元・並びは変わらないので checkpoint はそのまま載る。
+
+    Args:
+        states_path: npz のパス。``None`` なら環境変数 ``K1_WALK_STATES_NPZ``、
+            それも無ければ ``walk_states.npz``。
+        probability: RSI を適用する env の割合。1.0 未満なら残りは従来どおりの
+            立ち姿勢リセットになる。
+    """
+    import os
+
+    path = states_path or os.environ.get(_WALK_STATES_PATH_ENV, _WALK_STATES_DEFAULT)
+
+    cfg.events.reset_from_walk_states = EventTerm(
+        func=mdp.reset_from_walk_states,
+        mode="reset",
+        params={
+            "states_path": path,
+            "probability": probability,
+            "set_gait_phase": True,
+            "set_last_action": True,
+        },
+    )
+
+    for _group in (cfg.observations.policy, cfg.observations.critic):
+        term = getattr(_group, "prev_joint_request", None)
+        if term is not None:
+            term.func = mdp.prev_joint_request_rsi
+
+
+@configclass
+class K1WalkKickWalkInitEnvCfg(K1WalkKickEnvCfg):
+    """walk_kick を walk ポリシーの歩行状態から reset して学習する版。
+
+    観測・報酬・コマンドは :class:`K1WalkKickEnvCfg` と完全に同一 (次元も並びも
+    変わらない) なので、既存の walk_kick checkpoint から ``--load_pretrained`` で
+    そのまま fine-tune できる。詳細は :func:`_apply_walk_state_init`。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_walk_state_init(self)
+
+
+@configclass
+class K1WalkKickWalkInitEnvCfg_PLAY(K1WalkKickWalkInitEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
