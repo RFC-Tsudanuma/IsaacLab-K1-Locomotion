@@ -40,3 +40,16 @@ class K1WalkKick360WeakNoisyBallPPORunnerCfg(K1WalkKick360WeakPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_kick_360_weak_noisy_ball"
+
+
+@configclass
+class K1WalkKick360WeakNoisyBallWalkInitPPORunnerCfg(K1WalkKick360WeakNoisyBallPPORunnerCfg):
+    """Stage 5 (weak, 知覚ノイズ, 歩行状態からの reset)。
+
+    experiment_name を分けて、立ち姿勢リセットの run とログが混ざらないようにする。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_kick_360_weak_noisy_ball_walk_init"

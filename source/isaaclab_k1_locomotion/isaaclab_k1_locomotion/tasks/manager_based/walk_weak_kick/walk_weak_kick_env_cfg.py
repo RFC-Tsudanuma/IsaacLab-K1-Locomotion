@@ -64,6 +64,7 @@ from isaaclab.utils import configclass
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
     _apply_noisy_ball_obs,
+    _apply_walk_state_init,
     _disable_ball_obs_jitter,
     _KICK_STATE_PARAMS,
     _KICK_W_SCALE,
@@ -373,6 +374,59 @@ class K1WalkKick360WeakNoisyBallEnvCfg(K1WalkKick360WeakEnvCfg):
 
 @configclass
 class K1WalkKick360WeakNoisyBallEnvCfg_PLAY(K1WalkKick360WeakNoisyBallEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        _disable_ball_obs_jitter(self)
+
+
+@configclass
+class K1WalkKick360WeakNoisyBallWalkInitEnvCfg(K1WalkKick360WeakNoisyBallEnvCfg):
+    """Stage 5 (weak, 知覚ノイズ): 歩行ポリシーの歩行状態から reset して再学習する。
+
+    :class:`K1WalkKick360WeakNoisyBallEnvCfg` との差は **リセットの初期状態だけ**。
+    報酬・コマンド・カリキュラム・ボール観測のノイズはすべて基底のまま触らない。
+
+    狙いは実機の walk (model_34995.pt) → walk_kick 切り替えで姿勢が飛ぶのを消すこと。
+    立ち姿勢ではなく walk ポリシーが実際に作る歩行状態 (高さ・roll/pitch・base 速度・
+    脚関節・歩行位相・前ステップの関節指令) から始めるので、切り替え直後の状態が
+    学習分布の中に入る。詳細は :func:`~..walk_kick.walk_kick_env_cfg._apply_walk_state_init`。
+
+    状態プール (model_34995.pt を学習したブランチで作る)::
+
+        _labpython2 scripts/rsl_rl/record_walk_states.py \
+            --checkpoint checkpoint/model_34995.pt --headless \
+            --num_envs 128 --record_time 60 --out walk_states.npz
+
+    再学習 (k1_walk_kick_360_weak_noisy_ball の checkpoint から続ける)::
+
+        K1_WALK_STATES_NPZ=/abs/path/walk_states.npz \
+        _labpython2 scripts/rsl_rl/train.py \
+            --task Isaac-Velocity-Flat-K1-Walk-Kick-360-Weak-Noisy-Ball-Walk-Init-v0 \
+            --headless --num_envs 4096 \
+            --load_pretrained logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/<run>/model_<N>.pt
+
+    観測は 55 次元・並びとも同一なので checkpoint はそのまま載る。
+
+    NOTE: 基底のカリキュラム (0/500/1500/3000 iteration) は ``--load_pretrained`` では
+          また 0 から回る。ここでの目的は初期状態への適応だけなので、止めどころの
+          注意は :class:`K1WalkKick360WeakNoisyBallEnvCfg` の NOTE と同じ。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_walk_state_init(self)
+
+
+@configclass
+class K1WalkKick360WeakNoisyBallWalkInitEnvCfg_PLAY(K1WalkKick360WeakNoisyBallWalkInitEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
