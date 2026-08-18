@@ -40,12 +40,15 @@ from ..walk_kick.walk_kick_env_cfg import K1WalkKickEnvCfg, _BALL_RADIUS
 from . import mdp
 
 
-_MOVING_BALL_SPEED_RANGE = (0.0, 1.0)
+_MOVING_BALL_SPEED_STAGES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+_MOVING_BALL_SPEED_RANGE = (0.0, _MOVING_BALL_SPEED_STAGES[-1])
 _MOVING_BALL_SPAWN_DISTANCE_RANGE = (1.5, 3.0)
 _MOVING_BALL_SPAWN_BEARING_RANGE = (-0.87266463, 0.87266463)
 _MOVING_BALL_CLOSEST_APPROACH_RANGE = (-0.25, 0.25)
 _BALL_FRICTION_RANGE = (0.9, 1.3)
 _KICK_DETECTION_WARMUP_STEPS = 5
+# The likelihood runner collects 48 control steps per learning iteration.
+_BALL_SPEED_CURRICULUM_WARMUP_STEPS = 500 * 48
 
 
 def _leg_joints() -> SceneEntityCfg:
@@ -109,7 +112,10 @@ def _compute_domain_randomization_latent(
 
     masses = robot.root_physx_view.get_masses().to(device=env.device)
     mass = masses[:, body_id]
-    default_mass = robot.data.default_mass[:, body_id]
+    default_mass = robot.data.default_mass[:, body_id].to(
+        device=mass.device,
+        dtype=mass.dtype,
+    )
     mass_latent = ((mass - default_mass) + 1.5) / 3.0
     return torch.cat((com_latent, mass_latent.unsqueeze(-1)), dim=-1)
 
@@ -258,23 +264,26 @@ class _K1WalkKickLikelihoodBaseEnvCfg(K1WalkKickEnvCfg):
 
 @configclass
 class K1WalkKickLikelihoodEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
-    """Likelihood task with the current DirectKicking moving-ball distribution.
+    """Likelihood task with a staged DirectKicking moving-ball distribution.
 
     The existing WalkKick task and its ball asset stay unchanged.  This task
-    changes only the reset trajectory, enables pre-kick ball
-    tracking/physical-kick detection, and widens the ball's ordinary Coulomb
-    friction.  Ground material and restitution remain the target Isaac Lab
-    task's native contract; no rolling-friction model or CVKF coupling is added.
+    changes the reset trajectory, enables pre-kick ball
+    tracking/physical-kick detection, widens the ball's ordinary Coulomb
+    friction, and promotes the reset speed cap from stationary to 1.0 m/s.
+    Ground material and restitution remain the target Isaac Lab task's native
+    contract; no rolling-friction model or CVKF coupling is added.
     """
 
     def __post_init__(self) -> None:
+        from isaaclab.managers import CurriculumTermCfg as CurrTerm
+
         super().__post_init__()
 
         self.events.reset_ball.func = mdp.reset_moving_ball_trajectory
         self.events.reset_ball.params = {
             "ball_cfg": SceneEntityCfg("soccer_ball"),
             "ball_radius": _BALL_RADIUS,
-            "speed_range_mps": _MOVING_BALL_SPEED_RANGE,
+            "speed_range_mps": (0.0, _MOVING_BALL_SPEED_STAGES[0]),
             "incoming_probability": 0.5,
             "incoming_spawn_distance_range_m": _MOVING_BALL_SPAWN_DISTANCE_RANGE,
             "outgoing_spawn_distance_range_m": _MOVING_BALL_SPAWN_DISTANCE_RANGE,
@@ -287,6 +296,18 @@ class K1WalkKickLikelihoodEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
             params={
                 "asset_cfg": SceneEntityCfg("soccer_ball"),
                 "friction_range": _BALL_FRICTION_RANGE,
+            },
+        )
+        self.curriculum.moving_ball_speed = CurrTerm(
+            func=mdp.MovingBallSpeedCurriculum,
+            params={
+                "stages_mps": _MOVING_BALL_SPEED_STAGES,
+                "success_threshold": 0.80,
+                "frontier_fraction": 0.75,
+                "min_episodes_per_direction": 1000,
+                "required_consecutive_windows": 2,
+                "warmup_steps": _BALL_SPEED_CURRICULUM_WARMUP_STEPS,
+                "reset_event_name": "reset_ball",
             },
         )
 
@@ -313,3 +334,5 @@ class K1WalkKickLikelihoodEnvCfg_PLAY(K1WalkKickLikelihoodEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+        self.curriculum.moving_ball_speed = None
+        self.events.reset_ball.params["speed_range_mps"] = _MOVING_BALL_SPEED_RANGE

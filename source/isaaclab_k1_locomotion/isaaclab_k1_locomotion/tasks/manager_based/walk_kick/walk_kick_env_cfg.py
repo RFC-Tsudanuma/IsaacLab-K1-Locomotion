@@ -405,7 +405,7 @@ class K1WalkKickEnvCfg(K1FlatEnvCfg):
         # is_terminated ではなく is_terminated_term で対象項を明示する。
         self.rewards.termination_penalty = RewTerm(
             func=loco_mdp.is_terminated_term,
-            weight=-100.0,
+            weight=-500.0,
             params={"term_keys": ["base_contact", "base_height"]},
         )
 

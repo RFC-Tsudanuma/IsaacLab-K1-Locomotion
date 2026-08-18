@@ -30,6 +30,8 @@ _ALGORITHM_CLASSES = {
     "PPO": PPO,
     "DirectKickingPPO": DirectKickingPPO,
 }
+_SPEED_CURRICULUM_ENV_ATTR = "_walk_kick_likelihood_speed_curriculum"
+_SPEED_CURRICULUM_CHECKPOINT_KEY = "walk_kick_likelihood_speed_curriculum_state"
 
 
 def _resolve_class(class_name: str, classes: Mapping[str, type], kind: str) -> type:
@@ -135,6 +137,10 @@ class DirectKickingOnPolicyRunner(OnPolicyRunner):
         if callable(metadata_getter):
             saved_dict["model_metadata"] = metadata_getter()
 
+        curriculum = self._speed_curriculum()
+        if curriculum is not None:
+            saved_dict[_SPEED_CURRICULUM_CHECKPOINT_KEY] = curriculum.state_dict()
+
         if hasattr(self.alg, "rnd") and self.alg.rnd:
             saved_dict["rnd_state_dict"] = self.alg.rnd.state_dict()
             saved_dict["rnd_optimizer_state_dict"] = self.alg.rnd_optimizer.state_dict()
@@ -182,11 +188,13 @@ class DirectKickingOnPolicyRunner(OnPolicyRunner):
         if "model_state_dict" in checkpoint:
             if isinstance(self.alg.policy, DirectKickingActorCritic):
                 _validate_direct_checkpoint_metadata(self.alg.policy, checkpoint)
-            return super().load(
+            infos = super().load(
                 str(path),
                 load_optimizer=load_optimizer,
                 map_location=map_location,
             )
+            self._restore_speed_curriculum(checkpoint)
+            return infos
 
         if "model" not in checkpoint:
             return super().load(
@@ -210,6 +218,25 @@ class DirectKickingOnPolicyRunner(OnPolicyRunner):
         if checkpoint.get("iteration") is not None:
             self.current_learning_iteration = int(checkpoint["iteration"])
         return checkpoint.get("infos")
+
+    def _speed_curriculum(self):
+        env = getattr(self, "env", None)
+        unwrapped = getattr(env, "unwrapped", None)
+        if unwrapped is None:
+            return None
+        return getattr(unwrapped, _SPEED_CURRICULUM_ENV_ATTR, None)
+
+    def _restore_speed_curriculum(self, checkpoint: Mapping[str, Any]) -> None:
+        state = checkpoint.get(_SPEED_CURRICULUM_CHECKPOINT_KEY)
+        curriculum = self._speed_curriculum()
+        if state is None or curriculum is None:
+            return
+        if not isinstance(state, Mapping):
+            raise ValueError("Invalid walk-kick likelihood speed curriculum checkpoint state")
+        curriculum.load_state_dict(state)
+        # RslRlVecEnvWrapper resets once before runner.load().  Reset again so
+        # every resumed episode is sampled from the restored stage immediately.
+        self.env.reset()
 
 
 # The shorter alias is useful for task configuration while retaining a class

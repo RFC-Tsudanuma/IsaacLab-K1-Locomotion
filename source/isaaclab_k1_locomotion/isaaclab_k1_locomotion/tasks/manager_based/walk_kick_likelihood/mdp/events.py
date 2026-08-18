@@ -18,6 +18,11 @@ _VISION_FOV_YAW_RAD = 3.49065850
 _VISION_MIN_DISTANCE_M = 0.05
 _VISION_MAX_DISTANCE_M = 6.0
 
+_INITIAL_BALL_SPEED_ATTR = "_walk_kick_likelihood_initial_ball_speed"
+_BALL_INCOMING_ATTR = "_walk_kick_likelihood_ball_incoming"
+_BALL_SPEED_CAP_ATTR = "_walk_kick_likelihood_ball_speed_cap"
+_BALL_RESET_METADATA_VALID_ATTR = "_walk_kick_likelihood_ball_reset_metadata_valid"
+
 
 def _validated_range(
     values: tuple[float, float],
@@ -46,6 +51,24 @@ def _sample_uniform(
 ) -> torch.Tensor:
     lower, upper = value_range
     return lower + (upper - lower) * torch.rand(count, device=device)
+
+
+def _episode_metadata_buffer(
+    env: ManagerBasedRLEnv,
+    attribute_name: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    shape = (env.scene.num_envs,)
+    buffer = getattr(env, attribute_name, None)
+    if (
+        not isinstance(buffer, torch.Tensor)
+        or buffer.shape != shape
+        or buffer.device != torch.device(env.device)
+        or buffer.dtype != dtype
+    ):
+        buffer = torch.zeros(shape, device=env.device, dtype=dtype)
+        setattr(env, attribute_name, buffer)
+    return buffer
 
 
 def reset_moving_ball_trajectory(
@@ -142,6 +165,24 @@ def reset_moving_ball_trajectory(
     spawn_bearing = _sample_uniform(bearing_range, count, env.device)
     closest_approach_offset = _sample_uniform(offset_range, count, env.device)
     base_speed = _sample_uniform(speed_range, count, env.device)
+
+    # Keep the sampled difficulty attached to each episode.  CurriculumManager runs
+    # before the next reset event, so it can evaluate the episode that just ended
+    # without reconstructing the reset distribution from the final ball state.
+    metadata_env_ids = env_ids.to(device=env.device, dtype=torch.long)
+    speed_buffer = _episode_metadata_buffer(
+        env, _INITIAL_BALL_SPEED_ATTR, base_speed.dtype
+    )
+    incoming_buffer = _episode_metadata_buffer(env, _BALL_INCOMING_ATTR, torch.bool)
+    cap_buffer = _episode_metadata_buffer(env, _BALL_SPEED_CAP_ATTR, base_speed.dtype)
+    valid_buffer = _episode_metadata_buffer(
+        env, _BALL_RESET_METADATA_VALID_ATTR, torch.bool
+    )
+    speed_buffer[metadata_env_ids] = base_speed
+    incoming_buffer[metadata_env_ids] = incoming
+    cap_buffer[metadata_env_ids] = speed_range[1]
+    valid_buffer[metadata_env_ids] = True
+
     local_spawn_xy, local_velocity_xy = build_ball_trajectory(
         spawn_distance,
         spawn_bearing,
