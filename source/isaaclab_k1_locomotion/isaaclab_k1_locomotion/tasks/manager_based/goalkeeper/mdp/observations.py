@@ -62,6 +62,8 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         # 今飛んでいる球が「到達不能球」(hard_ball_prob で混ぜたもの) か。
         # 適応カリキュラムはこの球での失点を成功率の集計から除外する。
         env._gk_hard_ball = torch.zeros(n, dtype=torch.bool, device=env.device)
+        # 非シュート球の経過ステップ数 (situation_hold_s で撃ち直すため)
+        env._gk_situation_age = torch.zeros(n, dtype=torch.long, device=env.device)
         # 今飛んでいる球が「そのキーパー位置から物理的に取れない」か
         # (:func:`~.events._mark_unreachable` が発射時に幾何から判定する)。
         # hard_ball が確率で決め打ちするのに対し、こちらは実際の位置関係で決まる。
@@ -78,6 +80,7 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "save_quality": env._gk_save_quality,
         "unreachable": env._gk_unreachable,
         "hard_ball": env._gk_hard_ball,
+        "situation_age": env._gk_situation_age,
     }
 
 

@@ -44,6 +44,7 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["save_count"][env_ids] = 0
     bufs["save_quality"][env_ids] = 0.0
     bufs["hard_ball"][env_ids] = False
+    bufs["situation_age"][env_ids] = 0
     bufs["unreachable"][env_ids] = False
 
     # ★ 2026-08-15: 歩行位相のアキュムレータと指令ローパスの状態をクリアする。
@@ -698,6 +699,29 @@ def relaunch_ball_after_save(
     from .terminations import update_save_state
 
     update_save_state(env)
+    # ★ 2026-08-18: **非シュート球の撃ち直し**。
+    #
+    #   状況の多様化 (_diversify_situations) で入れた静止/横移動/枠外の球は
+    #   失点しないのでエピソードが終わらず、1 個の球で 20 秒が過ぎる。実測では
+    #   time_out が 74% になり、シュートの経験密度が 1/3 以下に落ちた
+    #   (ball_speed_hi も 2.49 -> 2.07 に後退)。
+    #
+    #   多様性は保ったまま経験密度を戻すため、**発射から situation_hold_s 秒
+    #   経っても脅威にならない球は撃ち直す**。ボールがゴールへ向かっていれば
+    #   (= 本物のシュート) この条件には掛からないので、シュートは従来どおり。
+    hold_s = float(getattr(_gk_params(env), "situation_hold_s", 0.0))
+    if hold_s > 0.0:
+        age = bufs["situation_age"]
+        age += 1
+        ball_vx = env.scene[ball_cfg.name].data.root_com_vel_w[:, 0]
+        # ゴール方向 (-x) へ十分な速さで動いていれば「シュート中」= 撃ち直さない
+        is_shot = ball_vx < -0.3
+        age[is_shot] = 0
+        stale = (age > int(hold_s / (env.step_dt))) & (cd < 0)
+        if bool(stale.any()):
+            cd[stale] = 1          # 次ステップで撃ち直す
+            age[stale] = 0
+
     newly_saved = (bufs["save_cd"] == 0) & (cd < 0)
     if bool(newly_saved.any()):
         cd[newly_saved] = int(respawn_delay_steps)
