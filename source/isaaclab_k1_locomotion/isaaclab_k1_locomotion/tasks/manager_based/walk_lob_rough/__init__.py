@@ -3,6 +3,13 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+"""walk_lob の履歴入力版 (平坦 3 段 + 凹凸 3 段) のタスク登録。
+
+段の構成と、なぜ 3 段なのかは :mod:`.walk_lob_rough_env_cfg` の docstring を参照。
+**まず Flat-* の 3 段を通すこと。** 凹凸 + ボールはこのリポジトリで一度も学習を
+通していない組み合わせ。
+"""
+
 import gymnasium as gym
 
 from . import agents
@@ -11,45 +18,46 @@ from . import agents
 # Register Gym environments.
 ##
 
-# Stage 2 (最終段): 凹凸地形でのロブキック。履歴入力・観測 DR つき。
-gym.register(
-    id="Isaac-Velocity-Rough-K1-Walk-Lob-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.walk_lob_rough_env_cfg:K1WalkLobRoughEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobRoughPPORunnerCfg",
-    },
-)
+_ENTRY = "isaaclab.envs:ManagerBasedRLEnv"
+_ENV = f"{__name__}.walk_lob_rough_env_cfg"
+_AGENT = f"{agents.__name__}.rsl_rl_ppo_cfg"
 
-gym.register(
-    id="Isaac-Velocity-Rough-K1-Walk-Lob-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.walk_lob_rough_env_cfg:K1WalkLobRoughEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobRoughPPORunnerCfg",
-    },
-)
+# (gym id, env cfg クラス名, RunnerCfg クラス名)
+_TASKS = [
+    # -- 平坦 3 段 -----------------------------------------------------------
+    ("Isaac-Velocity-Flat-K1-Walk-Lob-Hist-Walk-Phase-v0",
+     "K1WalkLobHistWalkPhaseEnvCfg", "K1WalkLobHistWalkPhasePPORunnerCfg"),
+    ("Isaac-Velocity-Flat-K1-Walk-Lob-Hist-Kick-v0",
+     "K1WalkLobHistKickEnvCfg", "K1WalkLobHistKickPPORunnerCfg"),
+    ("Isaac-Velocity-Flat-K1-Walk-Lob-Hist-v0",
+     "K1WalkLobHistEnvCfg", "K1WalkLobHistPPORunnerCfg"),
+    # -- 凹凸 3 段 -----------------------------------------------------------
+    ("Isaac-Velocity-Rough-K1-Walk-Lob-Walk-Phase-v0",
+     "K1WalkLobRoughWalkPhaseEnvCfg", "K1WalkLobRoughWalkPhasePPORunnerCfg"),
+    ("Isaac-Velocity-Rough-K1-Walk-Lob-Kick-v0",
+     "K1WalkLobRoughKickEnvCfg", "K1WalkLobRoughKickPPORunnerCfg"),
+    ("Isaac-Velocity-Rough-K1-Walk-Lob-v0",
+     "K1WalkLobRoughEnvCfg", "K1WalkLobRoughPPORunnerCfg"),
+]
 
-# Stage 1: 凹凸地形でボール無しの歩行だけを学習する。履歴入力なので既存の
-# walk phase タスク (1 フレーム観測) の checkpoint とは互換性が無く、別 ID で持つ。
-gym.register(
-    id="Isaac-Velocity-Rough-K1-Walk-Lob-Walk-Phase-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.walk_lob_rough_env_cfg:K1WalkLobRoughWalkPhaseEnvCfg",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobRoughWalkPhasePPORunnerCfg",
-    },
-)
-
-gym.register(
-    id="Isaac-Velocity-Rough-K1-Walk-Lob-Walk-Phase-Play-v0",
-    entry_point="isaaclab.envs:ManagerBasedRLEnv",
-    disable_env_checker=True,
-    kwargs={
-        "env_cfg_entry_point": f"{__name__}.walk_lob_rough_env_cfg:K1WalkLobRoughWalkPhaseEnvCfg_PLAY",
-        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobRoughWalkPhasePPORunnerCfg",
-    },
-)
+for _id, _env_cls, _runner_cls in _TASKS:
+    gym.register(
+        id=_id,
+        entry_point=_ENTRY,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{_ENV}:{_env_cls}",
+            "rsl_rl_cfg_entry_point": f"{_AGENT}:{_runner_cls}",
+        },
+    )
+    # PLAY 版は env cfg だけ差し替え、RunnerCfg は学習用と共通
+    # (ネットワークが違うと checkpoint が載らない)。
+    gym.register(
+        id=_id.replace("-v0", "-Play-v0"),
+        entry_point=_ENTRY,
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{_ENV}:{_env_cls}_PLAY",
+            "rsl_rl_cfg_entry_point": f"{_AGENT}:{_runner_cls}",
+        },
+    )

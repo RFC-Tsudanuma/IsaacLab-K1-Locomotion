@@ -3,14 +3,78 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""walk_lob の凹凸地形 + 履歴入力版。**歩行から通しで学習し直す 2 段構成**。
+"""walk_lob の履歴入力版。平坦 / 凹凸の両方を持つ **3 段構成**。
 
 ``k1_walk_lob/2026-08-16_08-08-20/model_11600.pt`` を実機に載せたところ「一度だけ
-大きく浮き、他の試行も浮きそうな傾向はある」という結果になった。その run の
-tfevents を読んで分かったことを起点に、**浮きの再現性** を取りにいくための系列。
+大きく浮き、他の試行も浮きそうな傾向はある」という結果になった。その run の実測を
+起点に「浮きの再現性」を取りにいくための系列。
 
-実測から分かったこと (2026-08-16 の run、iteration 9998-11624)
---------------------------------------------------------------
+なぜ 3 段なのか (2026-08-18 の失敗から)
+---------------------------------------
+最初は 2 段 (walk phase → lob) で組んで回したが、**stage 2 が立ち上がらなかった**。
+``k1_walk_lob_rough/2026-08-18_04-42-43`` の実測:
+
+    iteration    0   25   50  100  200  300  400
+    eplen     13.7 25.6 28.5 26.3 25.4 24.6 24.7
+    base_ht   0.71 1.00 1.00 1.00 0.99 0.99 0.99
+    kick_rate 0.00 0.00 0.01 0.01 0.01 0.00 0.01
+
+エピソードが 25 ステップ (0.5 秒) で ``base_height`` 終了し、400 iteration 経っても
+改善しない。つまり「蹴らない」のではなく **蹴る前に立てていない**。
+
+段の切り替え直後に一度崩れること自体は正常で、参照 run も同じ形で始まる。
+違うのは **戻ってくるかどうか**::
+
+    it            0   25   50  100  200  300  400
+    both_feet  19.7 44.5 121  256  465  455  467     base_ht 0.59 → 0.011
+    dual       47.2 56.2 62.5 202  412  431  432     base_ht 0.12 → 0.037
+    walk_lob   13.7 25.6 28.5 26.3 25.4 24.6 24.7    base_ht 0.71 → 0.991  ← 戻らない
+
+参照 2 つは 100-200 iteration で回復する。こちらだけ戻らない理由は **lob の報酬集合が
+歩行ポリシーからブートストラップできないほど疎** であること:
+
+* ``kick_velocity_scaled`` (「指令の速さでボールに当てろ」) を項ごと撤去してある。
+  これは walk_kick では **最初にボールへ触りにいく動機を作っている項** で、
+  loft / elevation は「当たった後の飛び方」しか見ないので、まだ一度も当てられない
+  段階では全部 0 のまま勾配が出ない。
+* 残る密な信号は ``approach_penalty`` (負) と ``walk_speed`` だけで、
+  ``kick_pose_overshoot`` の −50 も含めて **負の圧力が先に効く**。
+
+実際、既存の flat walk_lob で成功していた run
+(``k1_walk_lob/2026-08-16_05-46-55`` 以降) も **walk phase からではなく、
+既にボールを蹴れる checkpoint からの resume** で立ち上がっている
+(``agent.yaml``: ``resume: true`` / ``load_run: 2026-08-16_03-16-39``)。
+``train_walk_lob.sh`` の「loop_shoot / loop_pass の checkpoint から stage 2 だけ
+始めても問題ない」という NOTE はこの経緯を指している。
+**walk phase → lob の直行は平坦でも一度も成功していない。**
+
+そこで間に **キック段** を挟む::
+
+    Stage 1  walk phase        歩くだけ                         (ボール無し)
+    Stage 2  kick              walk_kick の報酬集合で「当てる」   ← 新設
+    Stage 3  lob               高さ特化の報酬集合で「上げる」
+
+Stage 2 は :class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKickBothFeetEnvCfg`
+(= walk_kick の報酬 + スロット 3 がボール 3D 位置の観測) をそのまま使う。
+これは both_feet / dual で 2 回とも立ち上がりが確認できている構成そのもの。
+**位相オフセット (両足キック化) だけは外す** (下の :func:`_disable_phase_offset`)。
+
+地形について
+------------
+**平坦版 (Flat-*) と凹凸版 (Rough-*) の両方を登録してある。まず平坦で通すこと。**
+
+凹凸地形 + ボールの組み合わせはこのリポジトリで一度も学習を通したことがない
+(``k1_walk_kick_rough`` 系の log が存在しない)。段の切り替えが失敗している状態で
+未検証の条件を重ねると切り分けができないので、
+
+1. まず ``Flat-*`` の 3 段を通して kick_rate と apex が出ることを確認する
+2. その checkpoint から ``Rough-*`` の stage 3 だけを fine-tune する
+
+の順にする。歩行だけなら凹凸でも問題なく学習できることは確認済み
+(``k1_walk_lob_rough_walk_phase``: eplen 962/1000、base_height 終了 6.4%)。
+
+実測から分かったこと (2026-08-16 の flat run、iteration 9998-11624)
+-------------------------------------------------------------------
 ======================================  ==========  ==================================
 メトリクス                                実測         備考
 ======================================  ==========  ==================================
@@ -27,109 +91,86 @@ tfevents を読んで分かったことを起点に、**浮きの再現性** を
    目標 −0.03・σ_lon = 0.10 なので f_lon = exp(−0.39²/(2·0.10²)) ≈ 5e-4。
    ガウスの裾の完全に外側で、**報酬も勾配もゼロ**。実際 1600 iteration のあいだ
    plant_lon は −0.421 → −0.433 と一切動いていない。
-   ``..walk_lob.walk_lob_env_cfg`` の ``_PLANT_LON_TARGET`` のコメントが
-   「現状が −0.25 のように大きく後方ならカリキュラムで目標を動かす方が素直」と
-   予告していたケースにそのまま該当する。
 
 2. **run 全体がプラトーしている。** it10150 以降、apex 0.402 → 0.409、
-   foot_vz 0.755 → 0.806、elevation 23.7° → 23.7°。1500 iteration 動いていない。
+   foot_vz 0.755 → 0.806、elevation 23.7° → 23.7°。
 
 3. **浮きはすくい上げで作られていない。** apex 0.425 m = 上昇 0.315 m ⇔ 打ち出し
    vz ≈ 2.49 m/s に対して ``foot_vz`` は 0.81 m/s。差分を作っているのは接触法線の
    向き、つまり「ボール中心より下に速い水平速度で当てている」ことの方。
-   足裏高さ h = 0.083 での法線仰角は asin((0.11−0.083)/0.11) = 14° で、実測の
-   射出仰角 25° は 14° に foot_vz 分が乗った値として整合する。
-
-   このメカニズム自体は運動学なので実機にも乗る。ただし **「ボール中心の 2.7 cm 下」
-   という狭い窓を当てられたときだけ** 成立するので、実機で「一度だけ浮いた」という
-   結果になる。狙うべきは窓を広げること = 当たり所をもっと下げること。
+   足裏高さ h での法線仰角は asin((0.11 − h)/0.11) なので、h = 0.083 なら 14°、
+   実測の射出仰角 25° は 14° に foot_vz 分が乗った値として整合する。
+   **仰角を 45-60° まで持っていくには h を 0.03 m 台まで下げる必要がある。**
 
 walk_lob からの変更点
 ---------------------
-1. **凹凸地形** (:func:`~..walk_kick.walk_kick_env_cfg._apply_rough_terrain`)。
-   段差・坂道なし、起伏 0-4 cm のランダムノイズのみ (``WALK_KICK_ROUGH_TERRAIN_CFG``)。
-   **stage 1 (歩行) から入れる**。段の間で地形が変わると転移した歩容が一度崩れるので、
-   通しで同じ条件にする。ボールは起伏ぶん浮かせてから落とす
-   (``reset_ball.params["spawn_clearance"]``、_apply_rough_terrain が面倒を見る)。
+1. **キック段 (stage 2) を挟む。** 上記のとおり。
 
 2. **観測履歴 100 フレーム + HistoryCNN**
-   (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。
-   これも stage 1 から。ネットワークが
-   :class:`~..locomotion.networks.ActorCriticHistoryCNN` に変わるので、
-   **1 フレーム観測の既存 checkpoint とは互換性が無い** (walk phase からやり直す
-   理由の一つ)。
+   (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。全段。
 
 3. **センサ遅延 DR** (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_delay`)。
    IMU / エンコーダは stage 1 から (``sources=("body",)``)、ボール観測 (視覚) は
-   ボールが存在する stage 2 から。遅延の有無で歩き方が変わるので、内界センサ側は
-   段をまたいで条件を揃える。
+   ボールが存在する stage 2 以降。
 
-4. **観測スロット 3 を左足裏 → ボール 3D 位置に差し替える**
-   (:class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKickBothFeetObservationsCfg`
-   をそのまま使う)。B-Human 原典の観測表では
+4. **観測スロット 3 を左足裏 → ボール 3D 位置に差し替える**。B-Human 原典の観測表では
    スロット 3 は Current Ball 3D Position で、walk_kick 系の ``sole_pos`` は
-   評価表キャプション "Left Sole" の誤読だった (詳細は walk_kick_both_feet の
-   モジュール docstring)。``sole_pos`` は joint_pos 12 次元から FK で完全に決まる
-   冗長情報なので、差し替えは論文準拠と情報量の両面で正味プラス。
-   **歩行から学習し直すこの系列では checkpoint 互換の制約が無いので、ここで直す。**
+   評価表キャプション "Left Sole" の誤読だった。``sole_pos`` は joint_pos 12 次元から
+   FK で完全に決まる冗長情報なので、差し替えは論文準拠と情報量の両面で正味プラス。
 
-   **両足キック化 (位相オフセット {0, π}) と mirror loss は入れない。** dual 系は
-   observation の変更とセットでこの 2 つも入れているが、こちらの目的は apex 高さで
-   あって両足で蹴れることではない。両足を学ばせるぶん学習が重くなるのを避ける
-   (ユーザー判断 2026-08-18)。したがって ``kick_foot_right_frac`` は 1.0 付近に
-   張り付いたままになる想定で、それは異常ではない。
+   **両足キック化 (位相オフセット {0, π}) と mirror loss は入れない。** 目的は apex
+   高さであって両足で蹴ることではない (ユーザー判断 2026-08-18)。したがって
+   ``kick_foot_right_frac`` は 1.0 付近に張り付いたままになる想定。
 
-5. **``kick_plant_foot`` の目標と σ をカリキュラムで動かす** (下の
-   ``_PLANT_*_START`` 群)。固定目標では届かないことが実測で分かったので、
-   **実測値の側から始めて目標へ引っ張る**。これが本系列の本丸。
+5. **``kick_plant_foot`` の目標と σ をカリキュラムで動かす** (stage 3 のみ)。
+   固定目標では届かないことが実測で分かったので、**実測値の側から始めて目標へ引っ張る**。
 
-6. **``kick_contact_height`` (新規) を足す**
-   (:func:`~..walk_kick.mdp.rewards.kick_contact_height`)。
-   接触時の足裏高さを直接下げさせる項。5 と表裏の関係で、あちらが原因側 (構え)、
-   こちらが結果側 (当たり所)。ガウスではなく線形ランプなので、どこから始めても
-   勾配が死なない = カリキュラム不要。
+6. **``kick_contact_height`` (新規) を足す** (stage 3 のみ)。接触時の足裏高さを直接
+   下げさせる項。5 と表裏の関係で、あちらが原因側 (構え)、こちらが結果側 (当たり所)。
+   線形ランプなので勾配が死なず、カリキュラム不要。
 
-7. **``kick_foot_lift`` の重みを 2.0 → 4.0 に上げる**。実測 foot_vz 0.81 は
-   ``vz_foot_sat`` 2.0 の 40% で飽和には遠く、圧力を上げる余地がある。ただし
-   5 が効かないと運動学的に足を上へ振れないので、単独では動かない想定。
+7. **``kick_foot_lift`` の重みを 2.0 → 4.0 に上げる** (stage 3 のみ)。
 
 継承したまま変えないもの
 ------------------------
 * ロブの報酬設計 (``kick_velocity_scaled`` 撤去 / ``vz_sat`` 5.0 / ``phi_sat`` 60° /
-  σ_direction 0.6)。walk_lob の設計をそのまま使う。
-* ``disable_landing_shaping`` / ``rebalance_gait_vs_kick`` は **呼ばない**。
-  どちらも dual 系 (fewa 由来) のレシピで、walk_lob の歩容設計とは別系統。
-  変更を「地形・履歴・遅延・当たり所」に絞って切り分けを保つ。
+  σ_direction 0.6)。**ただし撤去が stage 3 でだけ効くようになった** のが今回の要点。
+* ``disable_landing_shaping`` / ``rebalance_gait_vs_kick`` は **呼ばない**
+  (dual 系 = fewa 由来のレシピで、walk_lob の歩容設計とは別系統)。
 * ボール物性の DR。
 
   .. note::
      ボールの反発係数について。``soccer_ball`` の spawn material は
-     restitution 0.6 / combine_mode ``average`` だが、地面 (terrain) とロボットの
-     material は restitution 0.0 / combine_mode ``multiply`` で、``sim.physics_material``
-     も terrain のものが使われる。PhysX は 2 材質のうち **優先度の高い combine mode**
+     restitution 0.6 / combine_mode ``average`` だが、地面とロボットの material は
+     restitution 0.0 / combine_mode ``multiply`` で、``sim.physics_material`` も
+     terrain のものが使われる。PhysX は 2 材質のうち **優先度の高い combine mode**
      (average < min < multiply < max) を採るので実効は ``multiply`` になり、
      ボール↔地面・ボール↔足はいずれも 0.6 × 0.0 = **0.0** になるはず。
      つまり ``ball_physics_material`` の DR (restitution 0.0-0.7) は実質効いておらず、
-     すでに実機と同じ e≈0 で学習していることになる。``kick_foot_lift`` の docstring が
-     前提にしている「Isaac 既定 e≈0.6」はこの cfg には当てはまらない。
-     上の実測 3 (浮きが接触法線ジオメトリ由来である) とも整合する。
+     すでに実機と同じ e≈0 で学習していることになる。上の実測 3 とも整合する。
      **sim を動かして確かめてはいないので、物理側は今回変更していない。**
-     実測で e が 0 でないと分かった場合だけ DR 範囲を 0.0-0.2 に絞ること。
 
 学習の進め方
 ------------
-観測の意味 (スロット 3) もネットワーク (履歴 CNN) も変わるので、既存の
-``k1_walk_lob`` / ``k1_walk_lob_walk_phase`` の checkpoint は **一切流用しない**。
-walk phase から通しで学習する::
+既存の ``k1_walk_lob`` / ``k1_walk_lob_walk_phase`` の checkpoint は観測スロット 3 の
+意味も actor の形も違うので流用できない。stage 1 から通すこと::
 
-    ./scripts/rsl_rl/train_walk_lob_rough.sh
+    ./scripts/rsl_rl/train_walk_lob_hist.sh              # 平坦 3 段 (まずこちら)
+    TERRAIN=rough ./scripts/rsl_rl/train_walk_lob_hist.sh
+
+凹凸版の stage 1 (``k1_walk_lob_rough_walk_phase``) は 2026-08-17 に 8000 iteration
+学習済みで健全なので、凹凸で通すときはそれを ``WALK_CKPT`` に渡せば再学習は不要。
 
 効果の見方
 ----------
-``Metrics/kick_direction/`` の 4 つを並べて見る。
+まず ``Train/mean_episode_length`` と ``Episode_Termination/base_height``。
+段の切り替え後 100-200 iteration で eplen が 400 以上へ戻らなければ、その段の
+報酬集合が前段からブートストラップできていないということ (今回の失敗と同じ形)。
 
-* ``plant_lon``          : −0.42 から −0.03 側へ動くか (5 が効いているか)
-* ``sole_height_at_kick``: 0.083 から 0.03 台へ下がるか (6 が効いているか)
+立ち上がった後は ``Metrics/kick_direction/`` の 4 つ:
+
+* ``plant_lon``          : −0.42 から −0.03 側へ動くか (変更 5)
+* ``sole_height_at_kick``: 0.083 から 0.03 台へ下がるか (変更 6)
 * ``kick_elevation_deg`` : 24° から上がるか
 * ``kick_apex_height``   : 0.42 m から上がるか (最終目標 0.9 m)
 
@@ -153,6 +194,7 @@ from ..walk_kick.walk_kick_env_cfg import (
 from ..walk_kick_both_feet.walk_kick_both_feet_env_cfg import (
     _BALL_POS_DELAY,
     _BALL_POS_PREV_DELAY,
+    K1WalkKickBothFeetEnvCfg,
     K1WalkKickBothFeetObservationsCfg,
 )
 from ..walk_kick_dual.walk_kick_dual_env_cfg import (
@@ -172,19 +214,37 @@ from ..walk_lob.walk_lob_env_cfg import (
 # カリキュラムの時間単位
 #
 # ``linear_reward_weight`` / ``linear_reward_param`` は
-# ``step = common_step_counter // steps_per_iteration`` を使うので、
-# ``steps_per_iteration`` に 1 iteration あたりの env ステップ数 (= RunnerCfg の
-# ``num_steps_per_env``) を渡すと start/end_step が **iteration 単位** になる。
-# walk_kick 系のカリキュラムは全てこの流儀で 24 を使っている。
+# ``step = common_step_counter // steps_per_iteration`` を使う。``common_step_counter``
+# は env ステップごとに 1 増えるので、**1 iteration あたり ``num_steps_per_env``
+# だけ進む**。この系列の RunnerCfg は ``num_steps_per_env = 48``。
+#
+# walk_kick 系のカリキュラムは全て ``steps_per_iteration = 24`` を渡しているので、
+# **カリキュラムの 1 step = 0.5 iteration** になっている (48 // 24 = 2)。
+# 既存の「end_step: 500」は iteration 250 で完了する、ということ。
+#
+# ここは既存と揃えて 24 のままにし (段の間で fade-in の速さが変わる方が害が大きい)、
+# **iteration で書きたい定数は :func:`_iter` で変換する**。
+#
+# NOTE: 2026-08-18 の run で実測確認済み。it413 での
+#       ``Curriculum/kick_plant_foot_lon_target/lon_target`` は −0.384 で、
+#       (413·48//24 = 826) から計算した −0.3837 と一致する。
 # --------------------------------------------------------------------------- #
 _STEPS_PER_ITERATION = 24
+_NUM_STEPS_PER_ENV = 48
 
-# キック報酬のフェードイン (weight 0 → 最終値) が完了する iteration。
-# walk_lob から継承する全カリキュラムがこの値で、ここでも揃える。
-_KICK_FADE_IN_END_ITER = 500
+
+def _iter(n: int) -> int:
+    """iteration 数をカリキュラムの step 単位へ変換する。"""
+    return n * (_NUM_STEPS_PER_ENV // _STEPS_PER_ITERATION)
+
+
+# キック報酬のフェードイン (weight 0 → 最終値) が終わる iteration。
+# 既存の walk_lob / walk_kick は end_step=500 (= iteration 250) なので、
+# それと同じ時刻になるよう iteration で 250 と書く。
+_KICK_FADE_IN_END_ITER = 250
 
 # --------------------------------------------------------------------------- #
-# 軸足配置 (kick_plant_foot) のカリキュラム
+# 軸足配置 (kick_plant_foot) のカリキュラム (stage 3 のみ)
 #
 # **なぜ必要か**: 固定目標 (_PLANT_LON_TARGET = −0.03, _PLANT_SIGMA_LON = 0.10) では
 # 実測 plant_lon = −0.42 に対して f_lon ≈ 5e-4 で、報酬も勾配もゼロだった
@@ -192,14 +252,14 @@ _KICK_FADE_IN_END_ITER = 500
 # そこへ至る坂が無いと一切動かない。**目標の側を実測値から出発させて引っ張る。**
 #
 #   _PLANT_LON_TARGET_START = -0.42 : 2026-08-16 run の収束値。ここなら f_lon ≈ 1。
-#   _PLANT_SIGMA_LON_START  = 0.25  : 出発時点の許容幅。歩行から学習し直すので初期の
-#       plant_lon は −0.42 ちょうどではない (あの値は収束後の値)。σ を広めに取って
-#       出発点のばらつきを覆う。0.25 なら −0.42 ± 0.25 = [−0.67, −0.17] で半値以上。
+#   _PLANT_SIGMA_LON_START  = 0.25  : 出発時点の許容幅。stage 2 から引き継いだ直後の
+#       plant_lon は −0.42 ちょうどではないので、σ を広めに取って出発点のばらつきを
+#       覆う。0.25 なら −0.42 ± 0.25 = [−0.67, −0.17] で半値以上。
 #   終値は walk_lob の定数をそのまま使う (−0.03 / 0.10)。
 #
-#   アニール区間 [500, 4000] iteration: 開始をキック報酬のフェードイン完了
-#   (_KICK_FADE_IN_END_ITER) に合わせ、重みが立ち上がってから目標を動かし始める。
-#   終了 4000 は「stage 2 を 15000 iteration 回す」想定に対して前半で締め切る値。
+#   アニール区間 [500, 4000] iteration: 開始は「キック報酬のフェードインが終わり、
+#   前段から引き継いだ蹴り方が stage 3 の報酬で一度落ち着く」ぶんの余裕を見た値。
+#   終了 4000 は stage 3 を 15000 iteration 回す想定に対して前半で締め切る。
 #
 # NOTE: 目標と σ を **同時に** 動かす。目標だけ動かすと σ=0.25 のまま緩い採点が
 #       残り、σ だけ絞ると届かないまま裾の外に落ちる (元の失敗の再現)。
@@ -209,11 +269,11 @@ _KICK_FADE_IN_END_ITER = 500
 # --------------------------------------------------------------------------- #
 _PLANT_LON_TARGET_START = -0.42
 _PLANT_SIGMA_LON_START = 0.25
-_PLANT_ANNEAL_START_ITER = _KICK_FADE_IN_END_ITER
+_PLANT_ANNEAL_START_ITER = 500
 _PLANT_ANNEAL_END_ITER = 4000
 
 # --------------------------------------------------------------------------- #
-# 接触高さ報酬 (kick_contact_height) の定数
+# 接触高さ報酬 (kick_contact_height) の定数 (stage 3 のみ)
 #
 # f_low = clamp((ball_radius − h) / (ball_radius − h_sat), 0, 1)。導出と根拠は
 # :func:`~..walk_kick.mdp.rewards.kick_contact_height` の docstring 参照。
@@ -235,11 +295,10 @@ _CONTACT_HEIGHT_SAT = 0.03
 _CONTACT_HEIGHT_WEIGHT = 2.0
 
 # --------------------------------------------------------------------------- #
-# すくい上げ (kick_foot_lift) の重み。walk_lob の 2.0 から引き上げる。
+# すくい上げ (kick_foot_lift) の重み。walk_lob の 2.0 から引き上げる (stage 3 のみ)。
 #
 # 実測 foot_vz 0.81 m/s は vz_foot_sat 2.0 の 40% で飽和には遠く、圧力を上げる
-# 余地がある。4.0 は loft (5.0) / elevation (5.0) にほぼ並ぶ水準で、「浮かせろ」と
-# 「すくい上げで浮かせろ」をほぼ対等に要求する形になる。
+# 余地がある。4.0 は loft (5.0) / elevation (5.0) にほぼ並ぶ水準。
 #
 # NOTE: それでも direction (6.0) は超えない。方向ゲートを最上位に保つのは
 #       walk_lob から一貫した設計 (踏みつけ / かすらせ exploit を塞ぐ構造)。
@@ -248,6 +307,37 @@ _CONTACT_HEIGHT_WEIGHT = 2.0
 #       効いて初めてこの項が動く、という順序を見込んでいる。
 # --------------------------------------------------------------------------- #
 _FOOT_LIFT_WEIGHT = 4.0
+
+
+# --------------------------------------------------------------------------- #
+# 共通ヘルパー
+# --------------------------------------------------------------------------- #
+def _disable_phase_offset(cfg) -> None:
+    """両足キック化 (歩行位相の初期オフセット) を外す。
+
+    stage 2 の継承元 :class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKickBothFeetEnvCfg`
+    は ``randomize_phase_offset`` (mode="reset"、{0, π} の二値) を入れる。あちらの
+    目的は「両足で蹴れるようにする」ことだが、この系列の目的は apex 高さなので
+    入れない (ユーザー判断 2026-08-18)。両足を学ばせるぶん学習が重くなるのを避ける。
+
+    stage 1 (walk phase) は :class:`~..walk_lob.walk_lob_env_cfg.K1WalkLobWalkPhaseEnvCfg`
+    を継承しており位相オフセットを入れないので、ここを呼ぶ必要はない。段をまたいで
+    「常にオフセット無し」で揃うことになる。
+    """
+    cfg.events.randomize_phase_offset = None
+
+
+def _walk_phase_ball_pos_slot(cfg) -> None:
+    """walk phase 用にスロット 3 (ボール 3D 位置) を歩行コマンドへ差し替える。
+
+    ボールはこの段でシーンごと消えているため、実体を読む関数を残すと落ちる。
+    ゼロ埋めではなく歩行コマンド (vx, vy, 0) にするのは、継承元が ``prev_ball_pos``
+    に対してやっているのと同じ理由:「スロットが指す方へ歩く」という入力→挙動の
+    対応を次段と共通にしておくと歩容がそのまま転移する。
+    """
+    for group in (cfg.observations.policy, cfg.observations.critic):
+        group.ball_pos.func = mdp.walk_command_xyz
+        group.ball_pos.params = {"command_name": "base_velocity"}
 
 
 def _restore_vision_ball_obs(cfg) -> None:
@@ -269,11 +359,11 @@ def _restore_vision_ball_obs(cfg) -> None:
     * ``params`` にガウス側のキー (``jitter_std`` など) が残り、差し替え後の関数へ
       未知のキーワード引数として渡ってしまう。
 
-    どちらのモデルを採るかは思想の違いで、ガウス側 (walk_lob) は「たまに大きく外す」
-    裾を、一様+連続遅延側 (fewa) は実機で実績のある形をそれぞれ狙う。ここで後者に
-    寄せるのは、履歴入力とセンサ遅延 DR を fewa 由来の一式で揃えるため。
-    **ガウス側に戻すなら、この関数を呼ばず ``enable_obs_delay`` を
-    ``sources=("body",)`` にすること** (そうすればボール 3 項には触らない)。
+    **stage 3 (lob) だけで必要**。stage 2 の継承元 (both_feet) はガウスパイプラインを
+    入れないので呼ばなくてよいが、呼んでも冪等なので害はない。
+
+    ガウス側に戻すなら、この関数を呼ばず ``enable_obs_delay`` を
+    ``sources=("body",)`` にすること (そうすればボール 3 項には触らない)。
     """
     policy = cfg.observations.policy
     policy.ball_pos.func = mdp.delayed_ball_pos_b
@@ -297,30 +387,26 @@ def _apply_plant_foot_curriculum(cfg) -> None:
     cfg.rewards.kick_plant_foot.params["lon_target"] = _PLANT_LON_TARGET_START
     cfg.rewards.kick_plant_foot.params["sigma_lon"] = _PLANT_SIGMA_LON_START
 
-    cfg.curriculum.kick_plant_foot_lon_target = CurrTerm(
-        func=mdp.linear_reward_param,
-        params={
-            "term_name": "kick_plant_foot",
-            "param_name": "lon_target",
-            "start_value": _PLANT_LON_TARGET_START,
-            "end_value": _PLANT_LON_TARGET,
-            "start_step": _PLANT_ANNEAL_START_ITER,
-            "end_step": _PLANT_ANNEAL_END_ITER,
-            "steps_per_iteration": _STEPS_PER_ITERATION,
-        },
-    )
-    cfg.curriculum.kick_plant_foot_sigma_lon = CurrTerm(
-        func=mdp.linear_reward_param,
-        params={
-            "term_name": "kick_plant_foot",
-            "param_name": "sigma_lon",
-            "start_value": _PLANT_SIGMA_LON_START,
-            "end_value": _PLANT_SIGMA_LON,
-            "start_step": _PLANT_ANNEAL_START_ITER,
-            "end_step": _PLANT_ANNEAL_END_ITER,
-            "steps_per_iteration": _STEPS_PER_ITERATION,
-        },
-    )
+    for param_name, start, end in (
+        ("lon_target", _PLANT_LON_TARGET_START, _PLANT_LON_TARGET),
+        ("sigma_lon", _PLANT_SIGMA_LON_START, _PLANT_SIGMA_LON),
+    ):
+        setattr(
+            cfg.curriculum,
+            f"kick_plant_foot_{param_name}",
+            CurrTerm(
+                func=mdp.linear_reward_param,
+                params={
+                    "term_name": "kick_plant_foot",
+                    "param_name": param_name,
+                    "start_value": start,
+                    "end_value": end,
+                    "start_step": _iter(_PLANT_ANNEAL_START_ITER),
+                    "end_step": _iter(_PLANT_ANNEAL_END_ITER),
+                    "steps_per_iteration": _STEPS_PER_ITERATION,
+                },
+            ),
+        )
 
 
 def _add_contact_height_reward(cfg) -> None:
@@ -330,8 +416,6 @@ def _add_contact_height_reward(cfg) -> None:
     ``r_direction`` への乗算なので、方向ゲート・kick_done ゲート・胴体の正対を
     通過した蹴りにしか払われない。``sigma_direction`` は他のキック報酬と揃える
     (:data:`~..walk_lob.walk_lob_env_cfg._LOB_SIGMA_DIRECTION`)。
-
-    weight のフェードインは他のキック報酬と同じ [0, 500] iteration。
     """
     cfg.rewards.kick_contact_height = RewTerm(
         func=mdp.kick_contact_height,
@@ -350,7 +434,7 @@ def _add_contact_height_reward(cfg) -> None:
             "start_weight": 0.0,
             "end_weight": _CONTACT_HEIGHT_WEIGHT * _KICK_W_SCALE,
             "start_step": 0,
-            "end_step": _KICK_FADE_IN_END_ITER,
+            "end_step": _iter(_KICK_FADE_IN_END_ITER),
             "steps_per_iteration": _STEPS_PER_ITERATION,
         },
     )
@@ -367,12 +451,12 @@ def _raise_foot_lift_weight(cfg) -> None:
 
 
 def _apply_play_tweaks(cfg) -> None:
-    """PLAY 共通の間引き。walk_lob の PLAY と同じ内容。
+    """PLAY 共通の間引き。
 
-    ``_disable_ball_obs_jitter`` は **呼ばない**。この系列のボール観測は
-    ガウスジッタではなく一様ノイズ + 連続遅延 (:func:`_restore_vision_ball_obs`
-    と :func:`enable_obs_delay`) なので、``enable_corruption = False`` だけで
-    ノイズが落ちる。遅延は観測パイプラインの構造なので PLAY でも残る。
+    ``_disable_ball_obs_jitter`` は **呼ばない**。この系列のボール観測はガウスジッタ
+    ではなく一様ノイズ + 連続遅延 (:func:`_restore_vision_ball_obs` と
+    :func:`enable_obs_delay`) なので、``enable_corruption = False`` だけでノイズが
+    落ちる。遅延は観測パイプラインの構造なので PLAY でも残る。
     """
     cfg.scene.num_envs = 20
     cfg.scene.env_spacing = 4
@@ -382,22 +466,15 @@ def _apply_play_tweaks(cfg) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Stage 1: 歩行のみ (凹凸地形 + 履歴)
+# Stage 1: 歩行のみ (履歴入力)
 # --------------------------------------------------------------------------- #
 @configclass
-class K1WalkLobRoughWalkPhaseEnvCfg(K1WalkLobWalkPhaseEnvCfg):
-    """Stage 1: 凹凸地形の上で通常の歩行だけを学習する。履歴入力版。
+class K1WalkLobHistWalkPhaseEnvCfg(K1WalkLobWalkPhaseEnvCfg):
+    """Stage 1 (平坦): ボール無しで歩行だけを学習する。履歴入力版。
 
     観測グループを both_feet 版 (スロット 3 = ボール 3D 位置) に差し替えているので、
     継承元がボール由来スロットを歩行コマンドへ読み替える処理に **スロット 3 のぶんを
-    足す** 必要がある。ボールはこの段でシーンごと消えているため、実体を読む関数を
-    残すと落ちる。
-
-    スロット 3 をゼロ埋めではなく歩行コマンド (vx, vy, 0) にするのは、継承元が
-    ``prev_ball_pos`` に対してやっているのと同じ理由:「スロットが指す方へ歩く」という
-    入力→挙動の対応を stage 2 と共通にしておくと歩容がそのまま転移する。
-    スロット 3 と 12 は stage 2 でもほぼ同じ値 (1 フレーム違いのボール位置) なので、
-    両方に同じ値を載せるのが素直な対応になる。
+    足す** 必要がある (:func:`_walk_phase_ball_pos_slot`)。
 
     センサ遅延 DR は ``sources=("body",)`` で **IMU / エンコーダだけ**。ボール 3 項は
     歩行コマンドに化けているので触らない。
@@ -408,40 +485,108 @@ class K1WalkLobRoughWalkPhaseEnvCfg(K1WalkLobWalkPhaseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- スロット 3 (ボール 3D 位置) を歩行コマンドに差し替える
-        for _group in (self.observations.policy, self.observations.critic):
-            _group.ball_pos.func = mdp.walk_command_xyz
-            _group.ball_pos.params = {"command_name": "base_velocity"}
-
-        _apply_rough_terrain(self)
+        _walk_phase_ball_pos_slot(self)
         enable_obs_history(self)
         enable_obs_delay(self, _OBS_DELAY_MAX_S, sources=("body",))
+
+
+@configclass
+class K1WalkLobHistWalkPhaseEnvCfg_PLAY(K1WalkLobHistWalkPhaseEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
+
+
+@configclass
+class K1WalkLobRoughWalkPhaseEnvCfg(K1WalkLobHistWalkPhaseEnvCfg):
+    """Stage 1 (凹凸): 平坦版との差は地形だけ。
+
+    2026-08-17 に 8000 iteration 学習済みで健全 (eplen 962/1000、base_height 終了
+    6.4%)。凹凸で通すときはその checkpoint を使い回せる。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_rough_terrain(self)
 
 
 @configclass
 class K1WalkLobRoughWalkPhaseEnvCfg_PLAY(K1WalkLobRoughWalkPhaseEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
-
         _apply_play_tweaks(self)
 
 
 # --------------------------------------------------------------------------- #
-# Stage 2: ロブキック (凹凸地形 + 履歴 + 観測 DR + 当たり所の誘導)
+# Stage 2: キック (ブートストラップ段)
+#
+# walk_kick の報酬集合 (kick_velocity_scaled を **含む**) で「ボールに当てる」ことを
+# 先に覚えさせる段。lob の報酬集合は当たった後の飛び方しか見ないので、この段が無いと
+# 歩行ポリシーから立ち上がらない (モジュール docstring 参照)。
 # --------------------------------------------------------------------------- #
 @configclass
-class K1WalkLobRoughEnvCfg(K1WalkLobEnvCfg):
-    """Stage 2: 凹凸地形でロブキックを学習する。履歴入力・観測 DR つき。
+class K1WalkLobHistKickEnvCfg(K1WalkKickBothFeetEnvCfg):
+    """Stage 2 (平坦): 限定レンジのキックを学習する。履歴入力版。
 
-    引き継ぎ元は Stage 1 (この系列) の checkpoint のみ。観測スロット 3 の意味も
-    ネットワーク (履歴 CNN) も既存 walk_lob と違うので、``k1_walk_lob`` /
-    ``k1_walk_lob_walk_phase`` の checkpoint は **形の上でも意味の上でも載らない**。
+    継承元を both_feet 側にしてあるので観測スロット 3 は既にボール 3D 位置。
+    **位相オフセット (両足キック化) だけ外す** (:func:`_disable_phase_offset`)。
+    この構成は both_feet / dual の stage 2 で 2 回とも立ち上がりが確認できている
+    (100-200 iteration で eplen が 400 以上へ戻る)。
+
+    引き継ぎ元は Stage 1 (この系列) の checkpoint。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _disable_phase_offset(self)
+        enable_obs_history(self)
+        enable_obs_delay(self, _OBS_DELAY_MAX_S)
+
+
+@configclass
+class K1WalkLobHistKickEnvCfg_PLAY(K1WalkLobHistKickEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
+
+
+@configclass
+class K1WalkLobRoughKickEnvCfg(K1WalkLobHistKickEnvCfg):
+    """Stage 2 (凹凸): 平坦版との差は地形だけ。
+
+    .. warning::
+       凹凸地形 + ボールの組み合わせはこのリポジトリで一度も学習を通していない
+       (``k1_walk_kick_rough`` 系の log が存在しない)。**まず平坦で 3 段通すこと。**
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_rough_terrain(self)
+
+
+@configclass
+class K1WalkLobRoughKickEnvCfg_PLAY(K1WalkLobRoughKickEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 3: ロブ (最終段)
+# --------------------------------------------------------------------------- #
+@configclass
+class K1WalkLobHistEnvCfg(K1WalkLobEnvCfg):
+    """Stage 3 (平坦): 高さ特化のロブキック。履歴入力・観測 DR・当たり所の誘導つき。
+
+    引き継ぎ元は Stage 2 (この系列) の checkpoint。**Stage 1 から直接は繋がない**
+    (それが 2026-08-18 の失敗。モジュール docstring 参照)。
 
     ``__post_init__`` の順序に意味がある:
 
     1. ``super()``                     — walk_lob のロブ報酬一式 + ガウスボール観測
     2. :func:`_restore_vision_ball_obs` — ガウスパイプラインを外す (1 の後始末)
-    3. 地形・報酬の変更
+    3. 報酬の変更 (当たり所を下げる 3 点)
     4. :func:`enable_obs_history`      — 観測グループの構成が固まった後
     5. :func:`enable_obs_delay`        — 2 でパイプラインを外してあるので全項に掛かる
     """
@@ -454,9 +599,6 @@ class K1WalkLobRoughEnvCfg(K1WalkLobEnvCfg):
         # -- walk_lob が入れたガウス認識パイプラインを外す (5 と二重掛けになるため)
         _restore_vision_ball_obs(self)
 
-        # -- 凹凸地形 (ボールの spawn_clearance もここで入る)
-        _apply_rough_terrain(self)
-
         # -- 当たり所を下げるための 3 点
         _apply_plant_foot_curriculum(self)
         _add_contact_height_reward(self)
@@ -468,8 +610,27 @@ class K1WalkLobRoughEnvCfg(K1WalkLobEnvCfg):
 
 
 @configclass
+class K1WalkLobHistEnvCfg_PLAY(K1WalkLobHistEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
+
+
+@configclass
+class K1WalkLobRoughEnvCfg(K1WalkLobHistEnvCfg):
+    """Stage 3 (凹凸): 平坦版との差は地形だけ。
+
+    平坦 3 段が通ってから、その checkpoint を ``--load_pretrained`` して
+    **この段だけ fine-tune する** 使い方を想定している。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_rough_terrain(self)
+
+
+@configclass
 class K1WalkLobRoughEnvCfg_PLAY(K1WalkLobRoughEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
-
         _apply_play_tweaks(self)

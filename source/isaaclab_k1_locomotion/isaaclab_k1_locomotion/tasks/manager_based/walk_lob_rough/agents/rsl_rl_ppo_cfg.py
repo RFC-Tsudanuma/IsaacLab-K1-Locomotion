@@ -5,6 +5,12 @@
 
 """walk_lob_rough の RunnerCfg (actor を ActorCriticHistoryCNN に差し替える)。
 
+**6 つの RunnerCfg は experiment_name 以外すべて同一。** ネットワークも PPO ハイパラも
+共通なので、``k1_walk_lob_hist_walk_phase`` → ``k1_walk_lob_hist_kick`` →
+``k1_walk_lob_hist`` → (凹凸へ) と ``--load_pretrained`` でそのまま繋がる。
+継承元を段ごとに変えていないのはそのため (walk_kick / loop_shoot の RunnerCfg も
+experiment_name しか違わないので、どれを継承しても同じ値になる)。
+
 dual 系 (:mod:`...walk_kick_dual.agents.rsl_rl_ppo_cfg`) との違いは 2 点:
 
 1. **mirror loss を入れない。** この系列は両足キック化をしないので、観測に
@@ -36,10 +42,7 @@ from ...walk_kick_dual.agents.rsl_rl_ppo_cfg import (
     _CNN_STRIDES,
     _NUM_RECENT_FRAMES,
 )
-from ...walk_lob.agents.rsl_rl_ppo_cfg import (
-    K1WalkLobPPORunnerCfg,
-    K1WalkLobWalkPhasePPORunnerCfg,
-)
+from ...walk_lob.agents.rsl_rl_ppo_cfg import K1WalkLobPPORunnerCfg
 
 
 def _use_history_cnn_policy(cfg) -> None:
@@ -49,7 +52,7 @@ def _use_history_cnn_policy(cfg) -> None:
     dual 版と違い ``num_mini_batches`` と ``class_name`` は触らない
     (モジュール docstring 参照)。
 
-    **2 段とも必ず呼ぶこと。** 片方で呼び忘れると actor だけ形が違うので
+    **全段で必ず呼ぶこと。** 1 段でも呼び忘れると actor だけ形が違うので
     checkpoint の連鎖がそこで切れる。
     """
     base = cfg.policy
@@ -69,27 +72,77 @@ def _use_history_cnn_policy(cfg) -> None:
 
 
 @configclass
-class K1WalkLobRoughWalkPhasePPORunnerCfg(K1WalkLobWalkPhasePPORunnerCfg):
-    """Stage 1 (凹凸地形での歩行のみ) の履歴入力版。"""
+class _K1WalkLobHistPPORunnerCfgBase(K1WalkLobPPORunnerCfg):
+    """6 段共通の土台。派生は ``experiment_name`` を設定するだけ。"""
 
     def __post_init__(self):
         super().__post_init__()
-
-        self.experiment_name = "k1_walk_lob_rough_walk_phase"
         _use_history_cnn_policy(self)
 
 
+# --------------------------------------------------------------------------- #
+# 平坦 3 段 (まずこちらを通す)
+# --------------------------------------------------------------------------- #
 @configclass
-class K1WalkLobRoughPPORunnerCfg(K1WalkLobPPORunnerCfg):
-    """Stage 2 (凹凸地形でのロブキック) の履歴入力版。
+class K1WalkLobHistWalkPhasePPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 1 (平坦・歩行のみ)。"""
 
-    引き継ぎ元は **この系列の Stage 1** (``k1_walk_lob_rough_walk_phase``) のみ。
-    既存 walk_lob の 1 フレーム checkpoint は観測スロット 3 の意味もネットワークも
-    違うので使えない (env cfg のモジュール docstring 参照)。
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_walk_lob_hist_walk_phase"
+
+
+@configclass
+class K1WalkLobHistKickPPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 2 (平坦・キック)。引き継ぎ元は ``k1_walk_lob_hist_walk_phase``。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_walk_lob_hist_kick"
+
+
+@configclass
+class K1WalkLobHistPPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 3 (平坦・ロブ)。引き継ぎ元は ``k1_walk_lob_hist_kick``。
+
+    .. warning::
+       **Stage 1 から直接は繋がない。** ロブの報酬集合は歩行ポリシーから
+       ブートストラップできない (env cfg のモジュール docstring 参照)。
     """
 
     def __post_init__(self):
         super().__post_init__()
+        self.experiment_name = "k1_walk_lob_hist"
 
+
+# --------------------------------------------------------------------------- #
+# 凹凸 3 段
+#
+# ``k1_walk_lob_rough_walk_phase`` の名前は 2026-08-17 の学習済み run
+# (8000 iteration、健全) を再利用できるよう据え置いてある。
+# --------------------------------------------------------------------------- #
+@configclass
+class K1WalkLobRoughWalkPhasePPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 1 (凹凸・歩行のみ)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_walk_lob_rough_walk_phase"
+
+
+@configclass
+class K1WalkLobRoughKickPPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 2 (凹凸・キック)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_walk_lob_rough_kick"
+
+
+@configclass
+class K1WalkLobRoughPPORunnerCfg(_K1WalkLobHistPPORunnerCfgBase):
+    """Stage 3 (凹凸・ロブ)。平坦 3 段の checkpoint から fine-tune する想定。"""
+
+    def __post_init__(self):
+        super().__post_init__()
         self.experiment_name = "k1_walk_lob_rough"
-        _use_history_cnn_policy(self)
