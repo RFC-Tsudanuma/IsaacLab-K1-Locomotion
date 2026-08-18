@@ -82,3 +82,31 @@ gym.register(
 # NOTE: 通し実行は scripts/rsl_rl/train_walk_kick_weak.sh (stage 1 は同梱 checkpoint を再利用)。
 #       --reset_noise_std は **使わないこと** (理由は env cfg の docstring 参照)。
 # NOTE: カリキュラムが 3000 iteration で終点に着くので、--max_iterations は 3000 以上。
+
+# Stage 5 (weak): 歩行ポリシー (実機の walk) の歩行状態から reset する版。
+# stage 4 との差はリセットの初期状態だけで、報酬・コマンド・ボール観測ノイズは同一。
+# 状態プールは scripts/rsl_rl/record_walk_states.py で作り、パスは環境変数
+# K1_WALK_STATES_NPZ で渡す。観測 55 次元・並びは同一なので checkpoint はそのまま載る。
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-360-Weak-Noisy-Ball-Walk-Init-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+            f"{__name__}.walk_weak_kick_env_cfg:K1WalkKick360WeakNoisyBallWalkInitEnvCfg",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360WeakNoisyBallWalkInitPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-360-Weak-Noisy-Ball-Walk-Init-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point":
+            f"{__name__}.walk_weak_kick_env_cfg:K1WalkKick360WeakNoisyBallWalkInitEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point":
+            f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKick360WeakNoisyBallWalkInitPPORunnerCfg",
+    },
+)
