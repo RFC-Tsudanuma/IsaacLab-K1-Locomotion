@@ -32,6 +32,9 @@ def _r_direction(
     alpha: float,
     v_thresh: float,
     sigma_direction: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """r_direction = (f(τ_direction) − 0.5) * 2 * p_style （いずれも凍結値）。
 
@@ -46,7 +49,15 @@ def _r_direction(
           累積する)。クリップの代償として、方向を外したキックは「罰される」のではなく
           「報われない」(= 蹴らないのと同値) 扱いになる。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     tau = state["tau_direction_frozen"]
     f_dir = torch.exp(-(tau**2) / (2.0 * sigma_direction**2))
@@ -65,6 +76,9 @@ def kick_direction(
     sigma_direction: float = 0.35,
     v_gate_frac: float = 0.0,
     sigma_gate: float = 0.05,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)
 
@@ -80,7 +94,16 @@ def kick_direction(
     デフォルト 0.0 でゲート無効 = 従来の挙動。walk_pass のように v_target が
     かすり当ての速度域と近いタスクでのみ有効にする。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     if v_gate_frac <= 0.0:
         return r_dir
@@ -98,6 +121,9 @@ def kick_velocity_scaled(
     sigma_direction: float = 0.35,
     sigma_velocity: float = 1.0,
     use_3d_speed: bool = False,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
@@ -110,7 +136,16 @@ def kick_velocity_scaled(
     水平で測ったままだと「指令速度に届いていない」と誤判定され、φ 報酬（浮かせろ）と
     速度報酬（もっと強く）が恒常的に綱引きしてしまう。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
     v_err = v_meas - state["v_target"]
@@ -124,9 +159,21 @@ def kick_velocity_strong(
     alpha: float,
     v_thresh: float,
     sigma_direction: float = 0.35,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
     return r_dir * state["v_ball_frozen"]
 
 
@@ -137,6 +184,9 @@ def kick_velocity_overshoot(
     v_thresh: float,
     margin: float = 0.2,
     overshoot_sat: float = 1.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項10. Kick Velocity Overshoot = clamp(v_ball − (v_target + margin), 0, sat)。
 
@@ -171,7 +221,15 @@ def kick_velocity_overshoot(
     NOTE: 凍結値 (``v_ball_frozen``) を使う。飛翔中の減速後の値ではなく、
           **latch した瞬間の射出速度**が指令と比べる対象。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     excess = state["v_ball_frozen"] - (state["v_target"] + margin)
     excess = torch.clamp(excess, min=0.0, max=overshoot_sat)
@@ -187,6 +245,9 @@ def kick_elevation(
     phi_target: float = 0.52,
     sigma_phi: float = 0.25,
     phi_sat: float | None = None,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
 
@@ -214,7 +275,16 @@ def kick_elevation(
           スクープに収束する。片側飽和モードも φ_sat で頭打ちにすることでこれを防いで
           いる。飽和させずに単調増加させてはいけない。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     phi = state["phi_frozen"]
     if phi_sat is not None:
@@ -232,6 +302,9 @@ def kick_loft(
     v_thresh: float,
     sigma_direction: float = 0.35,
     vz_sat: float = 2.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項7'. Loft = r_direction * clamp(vz / vz_sat, 0, 1)。shape: (N,)
 
@@ -248,7 +321,16 @@ def kick_loft(
     * r_direction への乗算・kick_done ゲート・打ち下ろし (φ<0 → sin<0 → clamp 0) の
       扱いは kick_elevation と同じ。踏みつけ exploit 対策の設計原則を維持する。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     vz = state["v_ball_3d_frozen"] * torch.sin(state["phi_frozen"])
     f_loft = torch.clamp(vz / vz_sat, min=0.0, max=1.0)
@@ -265,6 +347,9 @@ def kick_plant_foot(
     sigma_lon: float = 0.10,
     lat_target: float = 0.19,
     sigma_lat: float = 0.06,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項9. Plant Foot (軸足配置) = r_direction * f(lon) * f(lat)。shape: (N,)
 
@@ -303,7 +388,16 @@ def kick_plant_foot(
     NOTE: 軸足がボールに接触してしまう解は、この項の σ_lat に加えて
           :func:`extra_ball_touch` (2 回目以降の接触を罰する) が既に塞いでいる。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     f_lon = torch.exp(-((state["plant_lon_frozen"] - lon_target) ** 2) / (2.0 * sigma_lon**2))
     f_lat = torch.exp(-((state["plant_lat_frozen"] - lat_target) ** 2) / (2.0 * sigma_lat**2))
@@ -317,6 +411,9 @@ def kick_foot_lift(
     v_thresh: float,
     sigma_direction: float = 0.35,
     vz_foot_sat: float = 2.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項11. Foot Lift (すくい上げ) = r_direction * clamp(foot_vz / vz_foot_sat, 0, 1)。shape: (N,)
 
@@ -357,7 +454,16 @@ def kick_foot_lift(
     * **青天井にしないこと**。飽和 (vz_foot_sat で頭打ち) が「足を全力で上へ振り抜く」
       だけの解を防いでいる (kick_elevation の NOTE と同じ原則)。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     f_lift = torch.clamp(state["foot_vz_frozen"] / vz_foot_sat, min=0.0, max=1.0)
     return r_dir * f_lift
@@ -371,6 +477,9 @@ def kick_contact_height(
     sigma_direction: float = 0.35,
     ball_radius: float = 0.11,
     h_sat: float = 0.03,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項12. Contact Height (低い当たり) = r_direction * f_low。shape: (N,)
 
@@ -453,7 +562,16 @@ def kick_contact_height(
         ball_radius: ボール半径 [m]。0 点になる足裏高さ (= ボール中心の高さ)。
         h_sat: 満点になる足裏高さ [m]。既定 0.03 は法線仰角 45° 相当。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     span = max(ball_radius - h_sat, 1e-6)
     f_low = torch.clamp((ball_radius - state["sole_height_at_kick"]) / span, min=0.0, max=1.0)
@@ -468,6 +586,9 @@ def walk_speed(
     v_thresh: float,
     sigma_walk: float = 0.5,
     sigma_walk_potential: float = 0.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項4. Walk Speed = (f(τ_walk) − 0.5) * 2 * p_walk。shape: (N,)
 
@@ -476,7 +597,15 @@ def walk_speed(
     G への接近度 (1 = 到達)。G は P_kick で下限クランプされるので、キック立ち位置に
     着いた時点で p_walk が飽和し、この項は self-gate する。凍結しない。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     f_walk = torch.sigmoid(state["tau_walk"] / sigma_walk)
     p_walk = torch.exp(-state["d_to_G"] / sigma_walk_potential)
@@ -490,6 +619,9 @@ def approach_penalty(
     v_thresh: float,
     sigma_sole: float = 0.35,
     sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項5. Approach Penalty = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -499,7 +631,15 @@ def approach_penalty(
     理想（足がボールに近い × 姿勢が P_kick と一致）で 0、最悪（遠い × ズレ）で最大の罰。
     pre-latch のみ有効（kick_done で 0 ゲート）。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     # 遠いほど 1 に近づく
     f_sole = 1.0 - torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
@@ -518,6 +658,9 @@ def ball_avoidance(
     v_thresh: float,
     sigma_sole: float = 0.35,
     sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項5'. Ball Avoidance = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -538,7 +681,15 @@ def ball_avoidance(
 
     pre-latch のみ有効（kick_done で 0 ゲート）。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     # 近いほど 1 に近づく (approach_penalty と逆)
     f_sole = torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
@@ -557,6 +708,9 @@ def ball_avoidance_exec(
     d_contact: float = 0.18,
     d_sat: float = 0.45,
     sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項5''. Ball Avoidance (execution 解釈) = f(d_mean) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -604,7 +758,15 @@ def ball_avoidance_exec(
     NOTE: pre-latch のみ有効 (kick_done で 0 ゲート)。latch 後はボールが飛んでいくので
           距離側が意味を失う。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
 
     # 遠いほど 1。d_contact 以下 (= 接触している) で厳密に 0。
     f_sole = torch.clamp(
@@ -622,6 +784,9 @@ def extra_ball_touch(
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項8. 2 回目以降のボール接触。発火したステップだけ 1。負の重みで使う。shape: (N,)
 
@@ -634,7 +799,15 @@ def extra_ball_touch(
           「蹴らない」ではなく「1 回目で蹴る」方向に動くはず。逆に重みを上げすぎると
           ボールに触ること自体を避けて kick_rate が落ちるので、Metrics で監視すること。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
     return state["extra_touch_event"]
 
 
@@ -643,6 +816,9 @@ def kick_latch_bonus(
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項9. Latch 後の定額ボーナス。post-latch の間ずっと 1。正の重みで使う。shape: (N,)
 
@@ -678,7 +854,15 @@ def kick_latch_bonus(
           weight も見直すこと。項1-3 が ``_KICK_W_SCALE`` で自動的に割り戻されるのと
           違い、こちらは手動である。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
     return state["kick_done"].float()
 
 
@@ -687,6 +871,9 @@ def kick_pose_overshoot(
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> torch.Tensor:
     """項6. Kick Pose Overshoot。キック線 R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
@@ -696,5 +883,13 @@ def kick_pose_overshoot(
     確定側から反対側へ符号が反転したら発火して latch する。戻っても解除せず、
     1 エピソード最大 1 回だけ罰する。未確定の間は発火しない。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+    )
     return state["overshoot_event"]

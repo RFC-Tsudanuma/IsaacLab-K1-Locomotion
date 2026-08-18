@@ -270,6 +270,9 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             track_ball=self.cfg.track_ball,
             v_thresh_target_frac=self.cfg.v_thresh_target_frac,
             v_thresh_floor=self.cfg.v_thresh_floor,
+            r_max=self.cfg.r_max,
+            orbit_beta=self.cfg.orbit_beta,
+            overshoot_margin=self.cfg.overshoot_margin,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -347,4 +350,22 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
 
     v_thresh_floor: float = 0.0
     """指令追従の閾値の切片 = 下限 [m/s]。``v_thresh_target_frac`` とセットで使う。"""
+
+    r_max: float | None = None
+    """None 以外で目標終端 G を回り込み型にする。ボールから G までの最大距離 [m]。
+
+    :func:`..kick_state.kick_state` の同名引数を参照。G は kick_state が 1 ステップに
+    一度だけ計算するので、**キック報酬項・``terminations.kick_finished`` にも同じ値**を
+    配ること (先に呼ばれた項の値でその step の G が確定する)。
+    """
+
+    orbit_beta: float = 0.6
+    """回り込み型 G の先読み係数 (0 < beta < 1)。``r_max`` を入れたときだけ使う。"""
+
+    overshoot_margin: float = 0.0
+    """overshoot 判定 (キック線 R の左右跨ぎ) の遊び [m]。0.0 (既定) で従来どおり。
+
+    :func:`..kick_state.kick_state` の同名引数を参照。``r_max`` と同じく全ての
+    kick_state 利用項へ同じ値を配ること。
+    """
 

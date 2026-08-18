@@ -20,6 +20,8 @@ def reset_ball_in_front_of_robot(
     ball_radius: float = 0.11,
     spawn_clearance: float = 0.0,
     speed_range: tuple[float, float] = (0.0, 0.0),
+    spin_from_speed: bool = False,
+    rand_spin_range: tuple[float, float] = (0.0, 0.0),
 ) -> None:
     """ボールをロボット前方コーン内にリセットする。
 
@@ -50,6 +52,21 @@ def reset_ball_in_front_of_robot(
             NOTE: 上限は必ず kick_state の ``v_thresh`` (既定 0.8 m/s) より **十分下**に
                   すること。初速が閾値を超えると、ロボットが触る前に値 latch が成立して
                   「蹴っていないのに τ_direction が凍結される」ことになる。
+        spin_from_speed: True にすると、初速を与えたボールに **転がりと辻褄の合う回転**
+            を乗せる。滑らずに転がるときの角速度は ω = (ẑ × v) / ball_radius なので、
+            それをそのまま入れる。False (既定) では角速度 0 = 従来どおり
+            「速度だけ持っているのに回っていない」ボールになる。
+
+            初速が 0 のボール (``speed_range`` 既定) では転がりぶんは 0 なので、
+            ``rand_spin_range`` のランダム回転だけが乗る。
+        rand_spin_range: 追加でかけるランダム回転の大きさ [rad/s] のサンプリング範囲。
+            軸は 3D の一様乱数方向。既定 ``(0.0, 0.0)`` では何も足さない。
+
+            実機のボールは前の蹴りや床の凹凸で必ず何かしら回っている。回転はマグヌス
+            効果ではなく **接触時の接線方向のインパルス** を通じて跳ね方を変えるので、
+            回転ゼロだけで学習すると足↔ボールの接触モデルに寄りかかったキックになる。
+
+            NOTE: 既定 ``(0.0, 0.0)`` は既存タスクの挙動そのまま (角速度 0)。
     """
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
@@ -80,6 +97,21 @@ def reset_ball_in_front_of_robot(
         vel_angle = torch.empty(n, device=env.device).uniform_(0.0, 2.0 * math.pi)
         state[:, 7] = speed * torch.cos(vel_angle)
         state[:, 8] = speed * torch.sin(vel_angle)
+
+        # 転がりと辻褄の合う角速度 ω = (ẑ × v) / R。
+        # ẑ × (vx, vy, 0) = (−vy, vx, 0) なので、x 軸まわりに −vy/R、y 軸まわりに +vx/R。
+        if spin_from_speed:
+            state[:, 10] = -state[:, 8] / ball_radius
+            state[:, 11] = state[:, 7] / ball_radius
+            state[:, 12] = 0.0
+
+    # ランダム回転 (3D の一様な軸まわり)。転がりぶんの上に足す。
+    if rand_spin_range[1] > 0.0:
+        spin_mag = torch.empty(n, device=env.device).uniform_(*rand_spin_range)
+        # 3D の一様ランダム方向: 正規分布のベクトルを正規化する
+        axis = torch.randn(n, 3, device=env.device)
+        axis = axis / (axis.norm(dim=-1, keepdim=True) + 1e-6)
+        state[:, 10:13] += spin_mag.unsqueeze(-1) * axis
 
     ball.write_root_state_to_sim(state, env_ids=env_ids)
 

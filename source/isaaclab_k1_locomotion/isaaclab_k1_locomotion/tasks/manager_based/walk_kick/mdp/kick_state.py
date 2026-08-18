@@ -24,6 +24,7 @@ NOTE: RewardManager は weight==0 の項をスキップするので、カリキ�
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -86,6 +87,9 @@ def kick_state(
     track_ball: bool = False,
     v_thresh_target_frac: float = 0.0,
     v_thresh_floor: float = 0.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
@@ -139,6 +143,22 @@ def kick_state(
                   配る必要はない。毎ステップ最初に走ることが保証されている
                   :func:`..terminations.kick_finished` (と、同じ値を持つ
                   :class:`..commands.BallFollowVelocityCommandCfg`) にだけ渡せばよい。
+
+        r_max: None (既定) 以外を入れると、目標終端 G の作り方を **回り込み型** に
+            切り替える。既定 (None) では従来どおり「ボールの真後ろ (キック線 R 上) を
+            ボール側へ滑る点」。詳細は下の G の計算のコメント参照。
+
+        orbit_beta: 回り込み型 G の先読み係数 (``r_max`` を入れたときだけ使う)。
+            0 < beta < 1。小さいほど G がキック線の真後ろへ強く引き寄せる。
+
+        overshoot_margin: overshoot 判定 (キック線 R の左右跨ぎ) の遊び [m]。
+            0.0 (既定) では従来どおり「符号が反転したら即発火」。正の値を入れると、
+            確定側と反対側へ **この距離まで** 入り込んでも発火しない。
+
+            NOTE: この 3 つも ``track_ball`` / ``v_thresh_target_*`` とは違い、
+                  **kick_state を呼ぶ全ての項に配る必要がある**。G と overshoot は
+                  その step の最初の呼び出しで確定するので、項ごとに違う値を渡すと
+                  結果が評価順に依存する。
 
     NOTE: ``v_thresh_target_frac`` / ``v_thresh_floor`` も ``track_ball`` と
           まったく同じ扱い。トリガー判定を行うのは kick_state 自身だけで、報酬項は
@@ -453,8 +473,58 @@ def kick_state(
     # 目標終端 G: R 上をボール側へ滑る点。latch 後は P_kick に固定して飛翔ボールを追わせない。
     # ------------------------------------------------------------------ #
     dist_robot_ball = (robot_pos - ball_pos).norm(dim=-1)
-    reach = torch.clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
-    G = ball_pos - reach.unsqueeze(-1) * kick_dir
+    if r_max is None:
+        # 従来の G: キック線 R (ボールの真後ろに伸びる直線) 上だけを動く点。
+        reach = torch.clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
+        G = ball_pos - reach.unsqueeze(-1) * kick_dir
+    else:
+        # ------------------------------------------------------------ #
+        # 回り込み型の G (r_max を入れたときだけ)
+        #
+        # 従来の G はボールの真後ろにしか置けないので、ボールの正面にいるロボットへは
+        # 「ボールを突き抜けて向こう側へ行け」という指令になる。回り込みは
+        # ball_avoidance (近づくと罰) が遠回りに追い込むことで初めて成立していた。
+        # ここでは **罰ではなく指令側** で回り込みを作る: G をボールを中心とする円弧の
+        # 上に置き、ロボットの現在位置から少しだけキック線側へ寄せた点にする。
+        # ロボットが G を追えば、そのままボールの周りを回ってキック線の後ろに着く。
+        #
+        # 記号:
+        #   u     : ボール → ロボット の単位ベクトル (今ロボットがボールのどっち側にいるか)
+        #   back  : −kick_dir。ボールから見て「キック線の後ろ」を指す単位ベクトル
+        #   φ     : back から u への符号付き角度 (−π, π]。φ=0 でロボットは真後ろに居る
+        #   φ_G   : orbit_beta * φ。beta < 1 なので G は必ずロボットより真後ろ寄りに出る
+        #   ρ     : G のボールからの距離。真後ろ (φ=0) で r_stance、真正面 (|φ|=π) で r_max
+        #
+        # 半径は r_max で **直接** 指定できる。従来の 0.5 のハードコード上限や
+        # alpha による距離連動ではなく、「正面から近づくときはボールから何 m 離れて
+        # 回るか」をそのまま数字で書ける。
+        #
+        # φ=±π (ボールの真正面) では左右どちらへ回るかが φ の符号で決まり、
+        # そこだけ G が不連続に飛ぶ。ただし真正面ちょうどはコイントスと同じで、
+        # どちらに回っても等価なので実害は小さい (少しでもどちらかへ寄れば以降は連続)。
+        # 逆に φ=0 (真後ろ、いちばん大事な仕上げの領域) では連続で、
+        # ρ → r_stance・G → 従来の P_kick に一致する。
+        # ------------------------------------------------------------ #
+        to_robot = robot_pos - ball_pos
+        u = to_robot / (to_robot.norm(dim=-1, keepdim=True) + 1e-6)
+        back = -kick_dir
+        phi = torch.atan2(
+            back[:, 0] * u[:, 1] - back[:, 1] * u[:, 0],
+            back[:, 0] * u[:, 0] + back[:, 1] * u[:, 1],
+        )
+        phi_G = orbit_beta * phi
+        rho = r_stance + (r_max - r_stance) * phi.abs() / math.pi
+        cos_g = torch.cos(phi_G)
+        sin_g = torch.sin(phi_G)
+        # back を φ_G だけ回した単位ベクトル (2D の標準的な回転)
+        back_rot = torch.stack(
+            [
+                back[:, 0] * cos_g - back[:, 1] * sin_g,
+                back[:, 0] * sin_g + back[:, 1] * cos_g,
+            ],
+            dim=-1,
+        )
+        G = ball_pos + rho.unsqueeze(-1) * back_rot
     G = torch.where(kick_done.unsqueeze(-1), state["P_kick"], G)
     state["G"] = G
 
@@ -470,7 +540,9 @@ def kick_state(
     # 前後位置・0.5m・G とは無関係。base_link の水平位置のみで判定する。
     # init_side が未確定 (0) の間は s*0=0 なので発火しない。
     # ------------------------------------------------------------------ #
-    crossed = (s * state["init_side"]) < 0.0
+    # overshoot_margin > 0 なら、確定側と反対側へこの距離まで入っても発火しない。
+    # 0.0 (既定) では従来どおり符号反転で即発火。
+    crossed = (s * state["init_side"]) < -overshoot_margin
     newly_fired = crossed & (~state["overshoot_fired"])
     state["overshoot_event"] = newly_fired.float()  # 発火したステップだけ 1 (1エピソード最大1回)
     state["overshoot_fired"] = state["overshoot_fired"] | crossed
