@@ -111,6 +111,27 @@ from .mdp.terminations import goal_conceded, robot_out_of_bounds
 # 横移動の目標速度 [m/s]。lateral_speed_bonus の正規化基準。
 LATERAL_TARGET_SPEED = 1.3
 
+# Stage2/3 の移動要求 (task_drive_vector) の横成分クリップ [m/s]。
+# ☠ **Stage1 の横指令レンジ (commands.base_velocity.ranges.lin_vel_y) と揃えること**。
+#   小さいと、下位がどれだけ速く動けても Stage2 でその速度に到達する指令が出ない。
+# ★ 2026-08-18: 1.3 → 1.5 にしたが、**1.3 に戻した**。
+#
+#   1.5 は新しい横移動ポリシー (k1_gk_lateral/2026-08-17_12-53-08) の学習レンジ ±1.5 に
+#   合わせた値で、**その系譜の Stage2 (13500 から開始) では正しい**。
+#   しかし試合 (2026-08-22、予選は 20 日の可能性) までの日数から、Stage2 を
+#   **旧系譜 (2026-08-17_10-37-49/model_35200) から継続**する判断をした。
+#   旧系譜の Stage1 は 07-28 で横指令レンジが ±1.3 なので、1.5 では
+#   **学習レンジ外の指令が出る**ことになる。上の ☠ の条件に反するため戻す。
+#
+#   新系譜へ移るときは 1.5 に戻すこと。判断材料 (2026-08-18 時点):
+#     旧系譜 = Stage2 35200 iter / aim_y_range 1.1 / ball_speed_hi 4.30 / 4.3m/s で 91〜93%
+#     新系譜 = Stage2   600 iter / aim_y_range 0.4 / ball_speed_hi 1.00 (登り直しに 2万 iter 必要)
+#   歩容 (足上げ) は新系譜が上だが、セーブ性能の積み上げが間に合わない。
+# ☠ この値は **観測 (policy/critic の velocity_commands) と sync_task_command の
+#   両方**に配ること。片方だけ変えると「ポリシーが見る指令」と「報酬の停止判定が
+#   見る指令」がズレる。
+TASK_DRIVE_VY_SCALE = 1.3
+
 
 # ---------------------------------------------------------------------------
 
@@ -167,7 +188,7 @@ class K1GKDirectPolicyCfg(K1GKDirectStage1PolicyCfg):
 
     velocity_commands = ObsTerm(
         func=task_drive_vector,
-        params={"max_y": GOAL_HALF_WIDTH, "use_perceived": True},
+        params={"max_y": GOAL_HALF_WIDTH, "use_perceived": True, "vy_scale": TASK_DRIVE_VY_SCALE},
         noise=Unoise(n_min=-0.02, n_max=0.02),
     )
     # ★ gait_phase もタスク駆動に差し替える (2026-07-24)。
@@ -179,6 +200,24 @@ class K1GKDirectPolicyCfg(K1GKDirectStage1PolicyCfg):
             # (0.05) は速度 [m/s] 用のしきい値なので、位置ずれには流用しない。
             "max_y": GOAL_HALF_WIDTH,
             "use_perceived": True,
+            # ★ 2026-08-18: 実測速度ゲートをやめ、**指令ノルム判定に戻す**。
+            #
+            #   実測速度ゲートは閉ループ (ゲート → 位相 → 方策 → 関節 → 速度 → ゲート)
+            #   の中にあり、関数の docstring 自身が「判定がハードしきい値なので
+            #   **遅延だけでも自励振動する**」と警告している。実機で問題が出た報告は
+            #   2 件ともこのゲート絡みだった (待機時の震え / 起動できないデッドゾーン)。
+            #
+            #   一方 07-28 Stage1 は指令ノルム判定 (locomotion の phase_obs) で
+            #   **実機デプロイ済み・良好**。閉ループが無いので発振しない。
+            #   シムでの ||Δaction|| は 07-28 のほうが大きい (0.2075 対 0.1326) のに
+            #   実機では静かで、シムの指標が実機の震えを予測していないことも確認済み。
+            #   → 実績のある構成に寄せる。
+            #
+            #   ★ 実測速度に移した動機 (MCL の跳びで指令が 0.12 付近をまたいでトグル)
+            #     は is_idle_hold で解消済み。待機中は指令が **厳密ゼロ**、脅威時は
+            #     drive_t_fast で飽和して 1.5 付近まで跳ねるので、ゲート入力は
+            #     「0 か、しきい値のはるか上」の二択になり、トグルする余地が無い。
+            "use_measured_speed": False,
         },
     )
     # ボール系は知覚DR (レイテンシ/更新レート/ドロップ/距離依存ノイズ) 付きの実値。
@@ -200,7 +239,8 @@ class K1GKDirectCriticCfg(K1GKDirectStage1CriticCfg):
     """Stage 2/3 の critic 観測 (真値・ノイズなし)。"""
 
     velocity_commands = ObsTerm(
-        func=task_drive_vector, params={"max_y": GOAL_HALF_WIDTH, "use_perceived": False}
+        func=task_drive_vector,
+        params={"max_y": GOAL_HALF_WIDTH, "use_perceived": False, "vy_scale": TASK_DRIVE_VY_SCALE},
     )
     # policy と同じくタスク駆動位相 (真値版)。actor/critic で位相の定義がズレると
     # 価値推定が actor の見ている状態と食い違うので必ず揃える。
@@ -212,6 +252,8 @@ class K1GKDirectCriticCfg(K1GKDirectStage1CriticCfg):
             # (0.05) は速度 [m/s] 用のしきい値なので、位置ずれには流用しない。
             "max_y": GOAL_HALF_WIDTH,
             "use_perceived": False,
+            # ★ policy 側と揃える (2026-08-18 に指令ノルム判定へ戻した。理由は policy 側参照)
+            "use_measured_speed": False,
         },
     )
     ball_pos_rel = ObsTerm(func=gk_ball_pos_rel)
@@ -384,6 +426,7 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         # --- base_velocity コマンドをタスク由来の移動要求に置き換える (2026-07-31) ---
         self.events.sync_task_command = EventTerm(
             func=sync_task_command,
+            params={"vy_scale": TASK_DRIVE_VY_SCALE},
             mode="interval",
             interval_range_s=(_dt, _dt),
             is_global_time=True,
@@ -468,15 +511,32 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         #
         # ★ 調整はまず stand_still_scale で行うこと。ゲート内でしか効かないので
         #   移動性能への影響がゼロ。weight は移動中にも効くので最後の手段。
+        # ★ 2026-08-18: scale 5.0 → 8.0、lin_vel_max 0.5 → 1.0。
+        #
+        #   実測 (diag_gk_standstill.py, 静止ボール) で震えの主因が **方策観測のノイズ**
+        #   と確定した。指令がゼロ (is_idle_hold 98%) でも、joint_pos/joint_vel/
+        #   base_ang_vel/projected_gravity のノイズに方策が反応して震える:
+        #
+        #     条件                    base_speed   ||Δaction||
+        #     クリーン                  0.0070       0.0047
+        #     知覚DR のみ                0.0194       0.0267
+        #     **方策観測ノイズのみ**      0.0313       0.1326   ← ほぼ全量を説明
+        #
+        #   このとき静止ブーストの成立率は 67.5% (クリーンなら 98.5%)。lin_vel_max=0.5 に
+        #   引っかかって **震えている env ほど圧が抜ける** 構図が残っていた。1.0 に緩めて
+        #   待機中は常時掛かるようにし、併せて倍率も上げる。
+        #
+        #   ★ どちらも is_idle_hold の中でしか効かないので、移動性能への影響はゼロ。
+        #     調整はこの 2 つで行い、weight (移動中にも効く) は触らないこと。
         self.rewards.action_smoothness_l2 = RewTerm(
             func=gk_action_smoothness_l2,
             weight=-0.24,  # locomotion 既定 -0.12 の 2.0 倍
-            params={"stand_still_scale": 5.0, "lin_vel_max": 0.5},
+            params={"stand_still_scale": 8.0, "lin_vel_max": 1.0},
         )
         self.rewards.action_rate_l2 = RewTerm(
             func=gk_action_rate_l2,
             weight=-0.6,  # locomotion 既定 -0.4 の 1.5 倍
-            params={"stand_still_scale": 5.0, "lin_vel_max": 0.5},
+            params={"stand_still_scale": 8.0, "lin_vel_max": 1.0},
         )
 
         # --- 腰が下がりすぎるのを抑える (2026-07-31) ---

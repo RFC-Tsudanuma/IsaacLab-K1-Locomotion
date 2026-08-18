@@ -60,8 +60,12 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
         _BASE_VEL_HIST_ATTR,
         _BASE_VEL_NOISE_ATTR,
         _DRIVE_FILT_ATTR,
+        _BALL_REF_ATTR,
         _IDLE_HOLD_ATTR,
         _TASK_PHASE_ATTR,
+        _THREAT_LATCH_ATTR,
+        _THREAT_OFF_ATTR,
+        _THREAT_ON_ATTR,
         _WALK_GATE_ATTR,
     )
 
@@ -83,6 +87,19 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     idle = getattr(env, _IDLE_HOLD_ATTR, None)
     if idle is not None:
         idle[env_ids] = False
+    # ★ 2026-08-18: 脅威判定のデバウンス状態もクリアする。前の球の脅威が
+    #   残っていると、次の球の開始直後に存在しない脅威で指令が出る。
+    # 基準位置は「新しい球の初期位置」から始めたいので 0 ではなくクリア扱いにする
+    #   (次のステップで現在位置に再初期化される)。
+    ref = getattr(env, _BALL_REF_ATTR, None)
+    if ref is not None:
+        ref[env_ids] = ball_pos_goal(env)[env_ids, :2]
+    for _attr, _val in (
+        (_THREAT_ON_ATTR, 0), (_THREAT_OFF_ATTR, 0), (_THREAT_LATCH_ATTR, False),
+    ):
+        _buf = getattr(env, _attr, None)
+        if _buf is not None:
+            _buf[env_ids] = _val
 
 
 def _sample_stage1_targets(env: "ManagerBasedEnv", robot_y: torch.Tensor) -> torch.Tensor:
@@ -510,6 +527,7 @@ def sync_task_command(
     # ★ env_ids にデフォルト値を付けないこと (理由は relaunch_ball_after_save 参照)。
     env_ids: torch.Tensor | None,
     command_name: str = "base_velocity",
+    vy_scale: float = 1.3,
 ):
     """``base_velocity`` コマンドをタスク由来の移動要求で上書きする毎ステップイベント。
 
@@ -520,6 +538,10 @@ def sync_task_command(
 
     ★ 併せて cfg 側で ``heading_command`` / ``rel_standing_envs`` /
       ``resampling_time_range`` を無効化すること。
+
+    ☠ ``vy_scale`` は **観測側 (velocity_commands の ObsTerm) と必ず同じ値**にすること。
+      食い違うと「ポリシーが見ている指令」と「報酬の停止判定が見ている指令」がズレる。
+      cfg 側の ``TASK_DRIVE_VY_SCALE`` から両方に配ること。
     """
     from .observations import task_drive_vector
 
@@ -534,7 +556,7 @@ def sync_task_command(
     #   エピソード内で一定なので、真値のままだとロボットが正しく定位置へ行くほど
     #   食い違いが恒久化する (平均回帰では解消できない)。このスイッチは実機に存在しない
     #   学習時だけのものなので、推定値にしても sim-to-real のリアルさは損なわれない。
-    drive = task_drive_vector(env, use_perceived=True)
+    drive = task_drive_vector(env, use_perceived=True, vy_scale=vy_scale)
     buf[:, :2] = drive[:, :2]
     # ★ 向き成分は 0 にする。feet_phase / foot_clearance の停止判定は
     buf[:, 2] = 0.0

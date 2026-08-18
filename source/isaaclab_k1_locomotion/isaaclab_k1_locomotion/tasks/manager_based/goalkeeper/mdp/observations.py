@@ -244,6 +244,113 @@ def post_save_hold(env: "ManagerBasedRLEnv") -> torch.Tensor:
     return touched & (bufs["save_cd"] >= 0)
 
 
+def _ball_threat(
+    env: "ManagerBasedRLEnv",
+    use_perceived: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ボールが脅威かどうか (N,) bool と、守備面への到達予測時間 (N,) [s] を返す。
+
+    ★ 2026-08-18 追加。``vx < -0.05`` の 1 条件だけで判定していたものを置き換えた。
+
+    実機で「静止したボールが見えていると横移動する」不具合が出た。位置履歴から作る
+    速度推定は静止ボールでも 0 の周りで揺れるため、ノイズで ``vx`` が負に振れた瞬間に
+    「接近中」と誤判定される。しかも到達時間 ``t = (x − guard_x) / (−vx)`` は
+    ``vx → 0`` で発散するので、3m 先のボールで vx = −0.06 なら t = 40 秒となり、
+    わずかな ``vy`` でも予測点が発散して **±max_y (ゴールポスト際) にクランプ**される。
+    結果として目標が飛び、全力の横移動指令が出ていた。ボールを隠すと止まるのは、
+    未検出なら ``ball_active=False`` でこの経路に入らないため。
+
+    ここでは 2 つのゲートを掛ける (しきい値は ``GoalkeeperParamsCfg``):
+
+      * ``approach_speed_min``: これ未満の接近速度は脅威とみなさない
+      * ``arrival_t_max``: 到達予測時間がこれを超えるなら脅威とみなさない
+        (t の発散を直接塞ぐ。返す t もここでクランプする)
+
+    ★ 実際のシュートは通る。スポーン距離が速度に比例して決まるので発射時の t は
+      常に 0.55〜1.4 秒であり、``arrival_t_max = 3.0`` には十分な余裕がある。
+      塞いでいるのは「ノイズ起因の偽の脅威」だけ。
+    """
+    p = _gk_params_local(env)
+    v_min = float(getattr(p, "approach_speed_min", 0.3))
+    t_max = float(getattr(p, "arrival_t_max", 3.0))
+    guard_x = float(env.cfg.goalkeeper.guard_x)
+
+    if use_perceived:
+        pos, vel = _gk_fitted_goal_state(env)
+    else:
+        pos = ball_pos_goal(env)
+        ball: RigidObject = env.scene["soccer_ball"]
+        vel = ball.data.root_com_vel_w[:, :3]
+
+    closing = -vel[:, 0]  # ゴール方向へ詰める速度 (正なら接近)
+    t = ((pos[:, 0] - guard_x) / closing.clamp(min=1e-3)).clamp(min=0.0)
+    raw = (closing > v_min) & (t < t_max) & gk_buffers(env)["ball_active"]
+    t = t.clamp(max=t_max)
+
+    # --- 「実際に動いたか」の追加条件 ---
+    #
+    # arrival_t_max は遠い球にしか効かない。ボールが守備面の近くにあると
+    # t = (x − guard_x)/closing の分子が小さく、ノイズで closing が v_min を
+    # 超えただけで t < t_max も成立してしまう (0.7m・closing 0.31 → t = 0.32s)。
+    # 速度は位置の微分でノイズが乗るが、位置は直接の観測値なので頑健。
+    # 遅く追従する基準点からの変位で「本当に動いたか」を見る。
+    travel_min = float(getattr(p, "threat_min_travel_m", 0.15))
+    if travel_min > 0.0:
+        tau_ref = float(getattr(p, "threat_travel_tau_s", 0.5))
+        ref = getattr(env, _BALL_REF_ATTR, None)
+        if ref is None or ref.shape != pos[:, :2].shape:
+            ref = pos[:, :2].clone()
+            setattr(env, _BALL_REF_ATTR, ref)
+        if getattr(env, _BALL_REF_STEP_ATTR, -1) != int(env.common_step_counter):
+            a = min(1.0, float(env.step_dt) / max(tau_ref, 1e-3))
+            ref = ref + a * (pos[:, :2] - ref)
+            setattr(env, _BALL_REF_ATTR, ref)
+            setattr(env, _BALL_REF_STEP_ATTR, int(env.common_step_counter))
+        moved = torch.norm(pos[:, :2] - getattr(env, _BALL_REF_ATTR), dim=1) > travel_min
+        raw = raw & moved
+
+    # --- 持続要求 (デバウンス) ---
+    #
+    # しきい値だけだと、ノイズが一瞬でも v_min を超えた時点で脅威が立つ。
+    # ノイズ起因の脅威は単発だが、本物のシュートは接近している限り連続して成立する。
+    # その差を使って弾く。立ち上がりを threat_on_frames だけ遅らせるが、本物の球は
+    # 発射時点で到達まで 0.55〜1.4 秒あるので実害は無い。
+    # 解除側を長くしてあるのは、接近中に検出が 1 フレーム抜けても脅威を落とさないため
+    # (落ちると目標が中央に戻り、指令が反転する)。
+    k_on = int(getattr(p, "threat_on_frames", 3))
+    k_off = int(getattr(p, "threat_off_frames", 5))
+    if k_on <= 1 and k_off <= 1:
+        return raw, t
+
+    n = env.num_envs
+    if getattr(env, _THREAT_STEP_ATTR, -1) != int(env.common_step_counter):
+        on = getattr(env, _THREAT_ON_ATTR, None)
+        if on is None or on.shape[0] != n:
+            on = torch.zeros(n, dtype=torch.int32, device=env.device)
+            off = torch.zeros(n, dtype=torch.int32, device=env.device)
+            latched = torch.zeros(n, dtype=torch.bool, device=env.device)
+        else:
+            off = getattr(env, _THREAT_OFF_ATTR)
+            latched = getattr(env, _THREAT_LATCH_ATTR)
+        on = torch.where(raw, on + 1, torch.zeros_like(on))
+        off = torch.where(raw, torch.zeros_like(off), off + 1)
+        latched = torch.where(latched, off < k_off, on >= k_on)
+        setattr(env, _THREAT_ON_ATTR, on)
+        setattr(env, _THREAT_OFF_ATTR, off)
+        setattr(env, _THREAT_LATCH_ATTR, latched)
+        setattr(env, _THREAT_STEP_ATTR, int(env.common_step_counter))
+
+    return getattr(env, _THREAT_LATCH_ATTR), t
+
+
+_BALL_REF_ATTR = "_gk_ball_ref"          # 「実際に動いたか」判定の基準位置
+_BALL_REF_STEP_ATTR = "_gk_ball_ref_step"
+_THREAT_ON_ATTR = "_gk_threat_on"        # 連続成立カウンタ
+_THREAT_OFF_ATTR = "_gk_threat_off"      # 連続不成立カウンタ
+_THREAT_LATCH_ATTR = "_gk_threat_latch"  # デバウンス後の脅威フラグ
+_THREAT_STEP_ATTR = "_gk_threat_step"    # 同一ステップ内の多重更新を防ぐ
+
+
 _IDLE_HOLD_ATTR = "_gk_idle_hold"            # ヒステリシスの保持状態 (N,) bool
 _IDLE_HOLD_STEP_ATTR = "_gk_idle_hold_step"  # 同一ステップ内の多重更新を防ぐ
 
@@ -356,9 +463,10 @@ def compute_target_y(
         ball: RigidObject = env.scene["soccer_ball"]
         vel = ball.data.root_com_vel_w[:, :3]
 
-    approaching = vel[:, 0] < approach_vx_threshold
-    # 守備面 (x=guard_x) 到達までの時間 (接近中のみ意味を持つ。ゼロ割り防止で clamp)
-    t = ((pos[:, 0] - guard_x) / (-vel[:, 0]).clamp(min=1e-3)).clamp(min=0.0)
+    # ★ 2026-08-18: 脅威判定を :func:`_ball_threat` に集約した (速度ノイズで
+    #   「接近中」に化けて目標がゴールポスト際へ飛ぶ不具合の対策。同関数の docstring 参照)。
+    #   ``t`` は arrival_t_max でクランプ済みなので、予測点はもう発散しない。
+    approaching, t = _ball_threat(env, use_perceived=use_perceived)
     y_pred = (pos[:, 1] + vel[:, 1] * t).clamp(-max_y, max_y)
 
     target = torch.where(approaching, y_pred, torch.zeros_like(y_pred))
@@ -426,20 +534,13 @@ def guard_arrival_horizon(
         t_min: 未使用 (旧「到達直前の発散防止クランプ」。互換のため引数だけ残す)。
         t_idle: ボールが脅威でないときに使う名目時間 [s]。
     """
-    bufs = gk_buffers(env)
-    if use_perceived:
-        _, vel = _gk_perceived_goal_state(env)
-    else:
-        ball: RigidObject = env.scene["soccer_ball"]
-        vel = ball.data.root_com_vel_w[:, :3]
-
-    threat = (vel[:, 0] < approach_vx_threshold) & bufs["ball_active"]
+    # ★ 2026-08-18: compute_target_y と同じ :func:`_ball_threat` を使う。
+    #   別条件だと「目標は中央のままなのに horizon だけ 0.15s になる」のような
+    #   食い違いが起き、小さいずれが全力指令に化ける。
+    threat, _ = _ball_threat(env, use_perceived=use_perceived)
     t_fast = float(getattr(env.cfg.goalkeeper, "drive_t_fast", _T_FAST))
-    return torch.where(
-        threat,
-        torch.full_like(vel[:, 0], t_fast),
-        torch.full_like(vel[:, 0], float(t_idle)),
-    )
+    out = torch.full((env.num_envs,), float(t_idle), device=env.device)
+    return torch.where(threat, torch.full_like(out, t_fast), out)
 
 
 # ---------------------------------------------------------------------------
