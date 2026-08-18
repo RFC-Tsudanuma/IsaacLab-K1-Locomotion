@@ -71,6 +71,43 @@ from ..walk_weak_kick.walk_weak_kick_env_cfg import _apply_weak_kick_recipe
 from .orbit_mods import apply_ball_param_dr, apply_orbit_params
 
 
+# --------------------------------------------------------------------------- #
+# キック正報酬の倍率
+#
+# walk_kick_ball_avoid の診断に倣う: あちらでは「蹴ると早期終了で歩行の dense 収入
+# ≈ +6〜8 を没収」「学習初期の蹴り 1 回の実収入 ≈ +0.3」で **蹴る = 約 −6 の取引**
+# になっており、キック 3 項 ×3 + kick_latch_bonus で kick_rate が 0.998 まで戻った。
+#
+# weak はそこからさらに実入りが小さい。``kick_velocity_strong`` は 3000 iteration で
+# 0 へ落ちる除去スケジュールに載っており、``kick_velocity_scaled`` は σ_velocity が
+# 1.0 → 0.35 へ絞られるので、下手なうちは満額のごく一部しか入らない。この状態で
+# ``ball_avoidance`` との比率が悪いと「広く回るが蹴らない」へ落ちる。そこで
+# **正のキック項だけ** 同じ倍率で持ち上げる。
+#
+# 負側 (``kick_velocity_overshoot``) は weak の趣旨そのものなので触らない。
+# ``kick_latch_bonus`` はここでは入れない (これでも蹴らないに落ちたら次の手)。
+# --------------------------------------------------------------------------- #
+_KICK_W_BOOST = 3.0
+
+
+def _apply_kick_weight_boost(cfg) -> None:
+    """正のキック 3 項の終端 weight を :data:`_KICK_W_BOOST` 倍する。
+
+    **必ず :func:`..walk_weak_kick.walk_weak_kick_env_cfg._apply_weak_kick_recipe`
+    の後に呼ぶこと。** ``kick_velocity_strong`` の折れ線はレシピが入れるので、
+    先に呼ぶとレシピの上書きで倍率が消える。
+    """
+    cfg.curriculum.kick_direction_weight.params["end_weight"] *= _KICK_W_BOOST
+    cfg.curriculum.kick_velocity_scaled_weight.params["end_weight"] *= _KICK_W_BOOST
+
+    # strong は単調ランプではなく折れ線 [(0,0),(500,W),(1500,W),(3000,0)] なので、
+    # 非ゼロのプラトーだけが倍になる (0 は 0 のまま、iteration の折れ点も不変)。
+    # knots はレシピ側のモジュール定数を指しているので、**新しいリストに差し替える**
+    # (in-place で書き換えると素の weak タスクまで巻き添えになる)。
+    _strong = cfg.curriculum.kick_velocity_strong_weight
+    _strong.params["knots"] = [(_it, _w * _KICK_W_BOOST) for _it, _w in _strong.params["knots"]]
+
+
 def _apply_orbit_recipe(cfg) -> None:
     """weak のレシピを掛けたうえで、回り込み G / 跨ぎの遊び / ボール DR を足す。
 
@@ -79,13 +116,17 @@ def _apply_orbit_recipe(cfg) -> None:
     1. :func:`..walk_weak_kick.walk_weak_kick_env_cfg._apply_weak_kick_recipe`
        が ``kick_velocity_overshoot`` 報酬項を新しく作り、ボール物性 DR
        (walk_loop_shoot 由来の範囲) を入れる。
-    2. :func:`.orbit_mods.apply_ball_param_dr` がボール物性 DR の範囲を
+    2. :func:`_apply_kick_weight_boost` が正のキック 3 項を ×3 する。1 が
+       ``kick_velocity_strong`` の折れ線を入れ直すので、その後でないと消える。
+    3. :func:`.orbit_mods.apply_ball_param_dr` がボール物性 DR の範囲を
        **こちらの範囲で上書きする** (1 の後でないと上書きされる側になる)。
-    3. :func:`.orbit_mods.apply_orbit_params` が回り込みのパラメータを
-       kick_state を読む **全ての項** に配る。1 で追加された
-       ``kick_velocity_overshoot`` も配布対象なので、必ず最後に呼ぶ。
+    4. :func:`.orbit_mods.apply_orbit_params` が回り込みのパラメータを
+       kick_state を読む **全ての項** に配り、``ball_avoidance`` の σ_sole を
+       0.20 に絞る。1 で追加された ``kick_velocity_overshoot`` も配布対象なので、
+       必ず最後に呼ぶ。
     """
     _apply_weak_kick_recipe(cfg)
+    _apply_kick_weight_boost(cfg)
     apply_ball_param_dr(cfg)
     apply_orbit_params(cfg)
 
@@ -128,10 +169,11 @@ class K1WalkKick360WeakOrbitEnvCfg(K1WalkKick360EnvCfg):
     元の構成では「G はボールの真後ろ (= ボールの向こう側)」を指したまま
     ``ball_avoidance`` の罰だけが遠回りを作っていた。
 
-    NOTE: ``ball_avoidance`` は **残してある**。回り込みが指令側で成立するようになった
-          ぶんこの罰は要らなくなる可能性が高いが、同時に 2 つ変えると
-          どちらが効いたのか読めなくなる。まず G だけを変えて、
-          ``Episode_Reward/ball_avoidance`` が小さいまま kick_rate が保たれるかを見る。
+    NOTE: ``ball_avoidance`` は残すが **σ_sole を 0.35 → 0.20 に絞って**、罰の届く範囲を
+          指令の円弧 (``r_max`` = 0.5) の内側へ引っ込めてある。同時に、正のキック 3 項を
+          ×3 して蹴り 1 回の実入りを上げている (:data:`_KICK_W_BOOST`)。
+          切り分けの読み方: **半径が縮まらなければ指令 (G) 側の問題**、
+          **蹴らなくなれば実入り側の問題**。
     """
 
     def __post_init__(self) -> None:

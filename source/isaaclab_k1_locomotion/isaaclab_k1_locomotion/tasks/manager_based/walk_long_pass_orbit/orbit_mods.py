@@ -43,6 +43,25 @@ _ORBIT_PARAMS = {
     "overshoot_margin": 0.25,
 }
 
+# --------------------------------------------------------------------------- #
+# 改造 1b: ball_avoidance の σ_sole を 0.35 -> 0.20 に絞る
+#
+# 回り込み半径は「罰の届く範囲」と「キック報酬の実入り」の綱引きで決まる。
+# σ=0.35 では罰が指令の円弧 (r_max=0.5) の上まで届いていて、0.5 m 地点でも
+# 係数 exp(−(0.5/0.35)²) ≈ 0.13 が残る。円弧の上に居ても罰され続けるので、
+# 外へ逃げる得が指令追従の損を上回り、半径が円弧の外へ膨らむ。
+#
+# 0.20 にすると罰が 1 割まで落ちる距離 (≈1.5σ) が 0.53 m → 0.30 m になり、
+# 円弧の上では罰が実質消える (係数 exp(−(0.5/0.20)²) ≈ 0.002)。これで
+# **半径の決定が罰から指令へ移る**。近距離では従来どおり効くので
+# 「構えないまま 0.2-0.3 m より中へ突っ込むな」というタップ潰しの仕事は残る。
+#
+# NOTE: 同じ ``sigma_sole`` という名前でも ``approach_penalty`` の方は意味が逆
+#       (近づく圧の飽和距離) なので、あちらには触らない。
+#       ``ball_avoidance_exec`` はこの系統では使っていない。
+# --------------------------------------------------------------------------- #
+_BALL_AVOIDANCE_SIGMA_SOLE = 0.20
+
 # kick_state を参照しうる報酬項の名前。cfg に無い項は getattr の None ガードで飛ばす
 # (親の構成が変わっても取りこぼさないよう、使っていない項も並べてある)。
 _KICK_STATE_REWARD_TERMS = (
@@ -89,6 +108,11 @@ def apply_orbit_params(cfg) -> None:
         _term = getattr(cfg.rewards, _name, None)
         if _term is not None:
             _term.params.update(_ORBIT_PARAMS)
+
+    # ball_avoidance の効く範囲を円弧の内側へ引っ込める (:data:`_BALL_AVOIDANCE_SIGMA_SOLE`)。
+    ball_avoidance = getattr(cfg.rewards, "ball_avoidance", None)
+    if ball_avoidance is not None:
+        ball_avoidance.params["sigma_sole"] = _BALL_AVOIDANCE_SIGMA_SOLE
 
 
 # --------------------------------------------------------------------------- #
