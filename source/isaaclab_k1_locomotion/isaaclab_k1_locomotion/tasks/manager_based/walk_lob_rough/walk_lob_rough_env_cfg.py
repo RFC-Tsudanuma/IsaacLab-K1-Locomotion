@@ -61,17 +61,20 @@ Stage 2 は :class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKic
 
 地形について
 ------------
-**平坦版 (Flat-*) と凹凸版 (Rough-*) の両方を登録してある。まず平坦で通すこと。**
+**本線は凹凸 (Rough-*)。** sim2real が目的なので凹凸で通す
+(2026-08-18 のユーザー指示「roughかつhistoryで歩行から学習したい」)。
+``train_walk_lob_hist.sh`` の ``TERRAIN`` 既定も ``rough``。
 
-凹凸地形 + ボールの組み合わせはこのリポジトリで一度も学習を通したことがない
-(``k1_walk_kick_rough`` 系の log が存在しない)。段の切り替えが失敗している状態で
-未検証の条件を重ねると切り分けができないので、
+平坦版 (Flat-*) も同じ 3 段を登録してあるが、これは **切り分け専用**。凹凸地形 +
+ボールの組み合わせはこのリポジトリで学習を通した実績が無い (``k1_walk_kick_rough``
+系の log が存在しない) ので、凹凸で立ち上がらなかったときに「地形のせいか、報酬設計の
+せいか」を分けるために平坦で同じ段を回す、という使い方をする。**既定にはしない。**
 
-1. まず ``Flat-*`` の 3 段を通して kick_rate と apex が出ることを確認する
-2. その checkpoint から ``Rough-*`` の stage 3 だけを fine-tune する
-
-の順にする。歩行だけなら凹凸でも問題なく学習できることは確認済み
+歩行だけなら凹凸でも問題なく学習できることは確認済み
 (``k1_walk_lob_rough_walk_phase``: eplen 962/1000、base_height 終了 6.4%)。
+
+観測・行動・ネットワークは地形に依存しないので、**平坦と凹凸の checkpoint は
+相互にそのまま載る**。平坦で作った段を凹凸のウォームスタートに使ってよい。
 
 実測から分かったこと (2026-08-16 の flat run、iteration 9998-11624)
 -------------------------------------------------------------------
@@ -104,8 +107,19 @@ Stage 2 は :class:`~..walk_kick_both_feet.walk_kick_both_feet_env_cfg.K1WalkKic
 
 3 段が通った後の実測 (2026-08-18、k1_walk_lob_hist/2026-08-18_09-07-17)
 -----------------------------------------------------------------------
-3 段構成で **立ち上がりは成功した** (kick_rate 0.998 / base_height 終了 0.003 /
-``kick_finished`` で正常終了)。ただし apex は it1900 で頭打ちになった::
+立ち上がりには成功した (kick_rate 0.998 / base_height 終了 0.003 /
+``kick_finished`` で正常終了)。
+
+.. warning::
+   **この run では「段の追加」と「地形 rough → flat」を同時に変えてしまったので、
+   立ち上がった原因がどちらかは分離できていない。** 失敗した 2 段 run
+   (``k1_walk_lob_rough/2026-08-18_04-42-43``) は rough、この 3 段 run は flat。
+   「3 段構成が効いた」とは言えず、**rough + ボールの組み合わせが立ち上がりを
+   壊していた可能性が同じだけ残っている** (この組み合わせはリポジトリで学習を
+   通した実績が無い)。切り分けは「3 段 × rough」を 1 本回せば付く: 立ち上がれば
+   効いたのは段、立ち上がらなければ地形。
+
+ただし apex は it1900 で頭打ちになった::
 
                   1000-1300  1300-1600  1600-1900  1900-2200  2200-2500  2500-2780
     apex_height      0.256      0.281      0.319      0.360      0.361      0.352
@@ -148,18 +162,44 @@ walk_lob からの変更点
    高さであって両足で蹴ることではない (ユーザー判断 2026-08-18)。したがって
    ``kick_foot_right_frac`` は 1.0 付近に張り付いたままになる想定。
 
-5. **``kick_plant_foot`` の目標と σ をカリキュラムで動かす** (stage 3 のみ)。
-   固定目標では届かないことが実測で分かったので、**実測値の側から始めて目標へ引っ張る**。
+5. **``kick_foot_lift`` の重みを 2.0 → 6.0 に上げる** (stage 3 のみ)。
+   **stage 3 で apex を伸ばす施策はこれ 1 本に絞ってある。** 理由は下の「反証」節。
 
-6. **``kick_contact_height`` (新規) を足す** (stage 3 のみ)。接触時の足裏高さを直接
-   下げさせる項。5 と表裏の関係で、あちらが原因側 (構え)、こちらが結果側 (当たり所)。
-   線形ランプなので勾配が死なず、カリキュラム不要。
+6. **``kick_plant_foot`` を項ごと撤去する** (stage 3 のみ、:func:`_remove_plant_foot_reward`)。
+   カリキュラムと対で消す (項だけ消すと ``linear_reward_weight`` が存在しない term を
+   引きにいって落ちる)。
 
-7. **重みを当たり所側へ寄せる** (stage 3 のみ)。``kick_contact_height`` 2.0 → 3.0、
-   ``kick_foot_lift`` は walk_lob と同じ 2.0 のまま (一度 4.0 にして失敗した)。
+反証: apex を伸ばす 3 つの仮説はすべて外れた (2026-08-18)
+---------------------------------------------------------
+軸足を前へ・当たり所を下げる・立ち位置の壁を動かす、の 3 つを試して **3 つとも
+apex を伸ばせなかった**。同 iteration (1700-2000) で並べるとこうなる::
 
-8. **``r_stance`` を 0.25 → 0.15 に下げる** (stage 3 のみ、:func:`_set_r_stance`)。
-   5-7 が動くための前提。上の実測セクション参照。
+    run                        apex   上昇   仰角  v_ratio  foot_vz  sole_h  plant_lon
+    旧 flat lob (it11500)     0.426  0.316  24.4°   0.697   +0.814   0.085    -0.422
+    hist 前回                 0.340  0.230  27.9°   0.525   +0.168   0.062    -0.378
+    hist 今回                 0.234  0.124  27.1°   0.401   -0.317   0.050    -0.365
+
+**当たり所 (sole_h) を下げた run ほど apex が低い**という逆相関になっている。
+仰角は確かに 24.4° → 27.1° と上がったが、ボール速度がそれ以上に落ちた。
+
+3 点は次の関係にほぼ完全に乗る (正規化誤差 1% 以内)::
+
+    apex 上昇 ∝ (kick_vel_ratio · sin φ)²
+
+    (v·sinφ)²  正規化   rise 正規化
+      0.0829    1.000       1.000
+      0.0602    0.726       0.726
+      0.0335    0.404       0.393
+
+仰角の変動幅 (24-28°) よりボール速度の変動幅 (0.40-0.70) の方がずっと大きいので、
+**apex は実質ボール速度が支配している**。低く当てるには立ち位置を詰めるしかなく、
+それがスイング長 = 速度を削るので、当たり所を狙う施策は構造的に自滅する。
+
+速度と競合せずに仰角を稼げる唯一の量が ``foot_vz`` (接触の瞬間の足の鉛直速度) で、
+スイングを短くせず足首・膝の軌道で上向き成分を足す。apex 最高の run が ``foot_vz``
+最大 (+0.814) だったことともつじつまが合う。だから stage 3 は
+``kick_foot_lift`` 一本に絞ってある。個々の反証の詳細と、再挑戦するときの
+出発点・落とし穴は :data:`_FOOT_LIFT_WEIGHT` の手前のコメントブロック参照。
 
 継承したまま変えないもの
 ------------------------
@@ -185,8 +225,8 @@ walk_lob からの変更点
 既存の ``k1_walk_lob`` / ``k1_walk_lob_walk_phase`` の checkpoint は観測スロット 3 の
 意味も actor の形も違うので流用できない。stage 1 から通すこと::
 
-    ./scripts/rsl_rl/train_walk_lob_hist.sh              # 平坦 3 段 (まずこちら)
-    TERRAIN=rough ./scripts/rsl_rl/train_walk_lob_hist.sh
+    ./scripts/rsl_rl/train_walk_lob_hist.sh              # 凹凸 3 段 (既定・本線)
+    TERRAIN=flat ./scripts/rsl_rl/train_walk_lob_hist.sh  # 平坦 (切り分け用)
 
 凹凸版の stage 1 (``k1_walk_lob_rough_walk_phase``) は 2026-08-17 に 8000 iteration
 学習済みで健全なので、凹凸で通すときはそれを ``WALK_CKPT`` に渡せば再学習は不要。
@@ -215,17 +255,11 @@ r_stance は原因ではなかった** ということなので、そこで止�
 入れるか) を疑うこと。
 """
 
-from isaaclab.managers import CurriculumTermCfg as CurrTerm
-from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..walk_kick import mdp
-from ..walk_kick.walk_kick_env_cfg import (
-    _apply_rough_terrain,
-    _KICK_STATE_PARAMS,
-    _KICK_W_SCALE,
-)
+from ..walk_kick.walk_kick_env_cfg import _apply_rough_terrain, _KICK_W_SCALE
 from ..walk_kick_both_feet.walk_kick_both_feet_env_cfg import (
     _BALL_POS_DELAY,
     _BALL_POS_PREV_DELAY,
@@ -237,162 +271,109 @@ from ..walk_kick_dual.walk_kick_dual_env_cfg import (
     enable_obs_delay,
     enable_obs_history,
 )
-from ..walk_lob.walk_lob_env_cfg import (
-    _LOB_SIGMA_DIRECTION,
-    _PLANT_LON_TARGET,
-    _PLANT_SIGMA_LON,
-    K1WalkLobEnvCfg,
-    K1WalkLobWalkPhaseEnvCfg,
-)
+from ..walk_lob.walk_lob_env_cfg import K1WalkLobEnvCfg, K1WalkLobWalkPhaseEnvCfg
 
 # --------------------------------------------------------------------------- #
-# カリキュラムの時間単位
+# カリキュラムの時間単位についての注意 (この段では今のところ使っていない)
 #
 # ``linear_reward_weight`` / ``linear_reward_param`` は
 # ``step = common_step_counter // steps_per_iteration`` を使う。``common_step_counter``
-# は env ステップごとに 1 増えるので、**1 iteration あたり ``num_steps_per_env``
-# だけ進む**。この系列の RunnerCfg は ``num_steps_per_env = 48``。
-#
-# walk_kick 系のカリキュラムは全て ``steps_per_iteration = 24`` を渡しているので、
+# は env ステップごとに 1 増えるので **1 iteration あたり ``num_steps_per_env`` だけ
+# 進む**。この系列の RunnerCfg は ``num_steps_per_env = 48`` である一方、walk_kick 系の
+# カリキュラムは全て ``steps_per_iteration = 24`` を渡しているので、
 # **カリキュラムの 1 step = 0.5 iteration** になっている (48 // 24 = 2)。
-# 既存の「end_step: 500」は iteration 250 で完了する、ということ。
+# 継承している ``end_step: 500`` は **iteration 250** で完了する、ということ。
 #
-# ここは既存と揃えて 24 のままにし (段の間で fade-in の速さが変わる方が害が大きい)、
-# **iteration で書きたい定数は :func:`_iter` で変換する**。
+# 2026-08-18 の run で実測確認済み: it413 での
+# ``Curriculum/kick_plant_foot_lon_target/lon_target`` が −0.384 で、
+# (413·48//24 = 826) から計算した −0.3837 と一致した。
 #
-# NOTE: 2026-08-18 の run で実測確認済み。it413 での
-#       ``Curriculum/kick_plant_foot_lon_target/lon_target`` は −0.384 で、
-#       (413·48//24 = 826) から計算した −0.3837 と一致する。
+# **この段に新しくカリキュラムを足すときは、iteration で書きたい値を 2 倍すること。**
 # --------------------------------------------------------------------------- #
-_STEPS_PER_ITERATION = 24
-_NUM_STEPS_PER_ENV = 48
-
-
-def _iter(n: int) -> int:
-    """iteration 数をカリキュラムの step 単位へ変換する。"""
-    return n * (_NUM_STEPS_PER_ENV // _STEPS_PER_ITERATION)
-
-
-# キック報酬のフェードイン (weight 0 → 最終値) が終わる iteration。
-# 既存の walk_lob / walk_kick は end_step=500 (= iteration 250) なので、
-# それと同じ時刻になるよう iteration で 250 と書く。
-_KICK_FADE_IN_END_ITER = 250
 
 # --------------------------------------------------------------------------- #
-# 軸足配置 (kick_plant_foot) のカリキュラム (stage 3 のみ)
+# 反証済みの 3 施策 (2026-08-18)。**定数だけ残して、どれも使っていない。**
 #
-# **なぜ必要か**: 固定目標 (_PLANT_LON_TARGET = −0.03, _PLANT_SIGMA_LON = 0.10) では
-# 実測 plant_lon = −0.42 に対して f_lon ≈ 5e-4 で、報酬も勾配もゼロだった
-# (モジュール docstring の実測 1)。ガウスは「正解の位置に立ったら褒める」形なので、
-# そこへ至る坂が無いと一切動かない。**目標の側を実測値から出発させて引っ張る。**
+# stage 3 で apex を伸ばすために 3 つ試して、**3 つとも外れた**。同じ道を二度通らない
+# よう、値と反証の内容をここに残す。
 #
-#   _PLANT_LON_TARGET_START = -0.42 : 2026-08-16 run の収束値。ここなら f_lon ≈ 1。
-#   _PLANT_SIGMA_LON_START  = 0.25  : 出発時点の許容幅。stage 2 から引き継いだ直後の
-#       plant_lon は −0.42 ちょうどではないので、σ を広めに取って出発点のばらつきを
-#       覆う。0.25 なら −0.42 ± 0.25 = [−0.67, −0.17] で半値以上。
-#   _PLANT_LON_TARGET_END   = -0.15 : **walk_lob の −0.03 から緩めた** (2026-08-18)。
-#       −0.03 は「軸足の足箱中心をボール真横」という幾何から出た値だが、r_stance を
-#       0.15 に下げてもそこまでは届かない見込み。**到達不能な目標を追わせると、
-#       目標だけが逃げて f_lon が単調に剥がれ、policy から見て「何をしても損」の
-#       信号になる** (実測 f_lon 0.996 → 0.433、このまま行くと 0.003)。まず届く範囲に
-#       置いて、実際に追随したら次の run でさらに詰める。
-#   _PLANT_SIGMA_LON_END    = 0.15  : 同じ理由で 0.10 から緩めた。終点で gap が残っても
-#       報酬が完全には消えないようにする。
+# 1. **軸足を前へ (kick_plant_foot + そのカリキュラム)**
+#    目標を実測 −0.42 から −0.15 へ動かすカリキュラムを入れたが、``plant_lon`` は
+#    2 run 合わせて 4500 iteration でほぼ動かなかった (−0.378 → −0.365)。
+#    カリキュラムが実測を追い越した後は **むしろ後退** した (−0.345 → −0.364)。
+#    → ``plant_lon`` は位置報酬で動く量ではない。決めているのは歩容 (歩幅と接触が
+#      起きる位相) の方で、報酬で押しても戻される。動かしたいなら歩容側の話になる。
 #
-#   アニール区間 [500, 4000] iteration: 開始は「キック報酬のフェードインが終わり、
-#   前段から引き継いだ蹴り方が stage 3 の報酬で一度落ち着く」ぶんの余裕を見た値。
-#   終了 4000 は stage 3 を 15000 iteration 回す想定に対して前半で締め切る。
+# 2. **立ち位置の壁を動かす (r_stance 0.25 → 0.15)**
+#    1 の原因を「歩行目標 G がボール後方 r_stance より近づかないこと」と読んで
+#    10 cm 動かしたが、``plant_lon`` は **1.3 cm しか動かなかった** (−0.378 → −0.365)。
+#    代わりにスイングが短くなって ``kick_vel_ratio`` が 0.525 → 0.401 へ落ちた。
+#    → 壁ではなかった。定数は残してあるが :func:`_set_r_stance` を呼んでいない。
 #
-# NOTE: 目標と σ を **同時に** 動かす。目標だけ動かすと σ=0.25 のまま緩い採点が
-#       残り、σ だけ絞ると届かないまま裾の外に落ちる (元の失敗の再現)。
-# NOTE: 効いているかは Metrics/kick_direction/plant_lon が −0.42 から離れて
-#       いくかで見る。Curriculum/kick_plant_foot/lon_target に目標側の値が出るので、
-#       2 本を重ねると「目標に追随できているか」がそのまま読める。
-# --------------------------------------------------------------------------- #
-_PLANT_LON_TARGET_START = -0.42
-_PLANT_LON_TARGET_END = -0.15
-_PLANT_SIGMA_LON_START = 0.25
-_PLANT_SIGMA_LON_END = 0.15
-_PLANT_ANNEAL_START_ITER = 500
-_PLANT_ANNEAL_END_ITER = 4000
-
-# --------------------------------------------------------------------------- #
-# キック立ち位置の半径 r_stance [m] (stage 3 のみ 0.25 → 0.15)
+# 3. **当たり所を下げる (kick_contact_height)**
+#    ``sole_height_at_kick`` は狙いどおり 0.062 → 0.050 に下がった。**しかし apex は
+#    0.340 → 0.234 に下がった。** 低く当てるには立ち位置を詰めるしかなく、それが
+#    スイング長 = ボール速度を削る。3 run を並べると当たり所が低い run ほど apex が
+#    低いという逆相関になっている。
+#    → 「当たり所を下げれば仰角が上がって apex が上がる」という仮説の反証。
 #
-# **2026-08-18 の run (k1_walk_lob_hist/2026-08-18_09-07-17) で分かった本丸。**
+# 3 run から出た定量則 (モジュール docstring の表を参照)::
 #
-# 歩行目標 G は :mod:`..walk_kick.mdp.kick_state` で
+#     apex 上昇 ∝ (kick_vel_ratio · sin φ)²      ← 3 点で正規化誤差 1% 以内
 #
-#     reach = clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
-#     G     = ball_pos - reach * kick_dir
+# 仰角の変動幅 (24-28°) よりボール速度の変動幅 (0.40-0.70) の方がずっと大きいので、
+# **apex は実質ボール速度が支配している**。速度を削る施策は全て逆効果になる。
+# 速度と競合せずに仰角を稼げるのは ``kick_foot_lift`` (すくい上げ) だけで、
+# スイングを短くせず足首・膝の軌道で上向き成分を足すため。
 #
-# と定義されており、**ボール後方 r_stance より近づかない**。``walk_speed`` (weight 1.5)
-# がそこへ引き、到達すると p_walk が飽和して前進の圧力が消える。base がボール後方
-# 0.25 m に落ち着くと軸足 (足首) はさらに後ろに来るので、plant_lon は −0.37 前後で
-# 平衡する。実測がまさにこの値だった。
+# 試した値 (再挑戦するときの出発点として):
 #
-# つまり ``kick_plant_foot`` (weight 0.6) は **歩行報酬が作った立ち位置の壁を、
-# より小さい重みで押し返そうとしていた**。カリキュラムで目標を動かしても実測は
-# 2780 iteration で 0.01 しか動かず (目標側は 0.24 動いた)、f_lon が 0.996 → 0.433 と
-# 剥がれていくだけだった。**目標ではなく壁の方を動かす必要がある。**
-#
-# 0.15 は「軸足をボールの真横に置く」姿勢から逆算した値ではなく、**壁を 10 cm 手前へ
-# 動かす**という増分の指定。r_stance を下げすぎるとキック前にボールへ足が触れてしまう
-# (``reset_ball`` の dist_range 下限と同じ制約) ので、まず 1 段だけ動かして
-# plant_lon が追随するかを見る。
+#   1. lon_target −0.42 → −0.15 / sigma_lon 0.25 → 0.15、iteration 500-4000 で線形
+#      (``mdp.linear_reward_param``)。項の weight は 2.0 × _KICK_W_SCALE。
+#   2. r_stance 0.25 → 0.15。
+#   3. kick_contact_height: ball_radius 0.11 / h_sat 0.03 / weight 2.0-3.0。
+#      報酬関数 ``mdp.kick_contact_height`` は残してある (他タスクから使える)。
 #
 # .. warning::
-#    ``r_stance`` は **報酬 9 項・終了条件 (kick_finished)・コマンド (base_velocity)**
-#    の 3 か所に配られている。``kick_state`` は同一ステップ内で最初の呼び出しだけが
-#    状態を更新するので、**1 か所でも古い値が残っていると、その値が P_kick と G を
-#    決めてしまう**。IsaacLab の step 順では termination が reward より先に走るため、
-#    報酬側だけ変えても無意味になる。:func:`_set_r_stance` が 3 か所すべてを揃え、
-#    取りこぼしがあれば例外を投げる。
+#    2 を再挑戦するときの落とし穴。``r_stance`` は **報酬 9 項だけでなく
+#    ``terminations.kick_finished.params`` と ``commands.base_velocity``
+#    (params ではなく cfg 直下の属性) にも配られていて、合計 11 箇所ある**。
+#    ``kick_state`` は ``common_step_counter`` でステップ境界を見て
+#    **同一ステップ内では最初の呼び出しだけが状態を更新する**ので、1 箇所でも古い値が
+#    残るとその値が P_kick と G を決める。IsaacLab の step 順は
+#    termination → reward → command なので、**報酬側だけ書き換えても
+#    ``kick_finished`` の値が毎ステップ勝ち、まったく効かない**。
+#    2026-08-18 の run では逆に、報酬項を足す前に一括設定したせいで
+#    後から作られた ``kick_contact_height`` だけ 0.25 が残った (実害は無かったが、
+#    終了条件を外していたら壊れていた)。**書き換えるなら全項を足し終えた後に、
+#    11 箇所すべてを一度に。**
 # --------------------------------------------------------------------------- #
-_R_STANCE_LOB = 0.15
+
 
 # --------------------------------------------------------------------------- #
-# 接触高さ報酬 (kick_contact_height) の定数 (stage 3 のみ)
+# すくい上げ (kick_foot_lift) の重み。walk_lob の 2.0 から引き上げる (stage 3 のみ)。
 #
-# f_low = clamp((ball_radius − h) / (ball_radius − h_sat), 0, 1)。導出と根拠は
-# :func:`~..walk_kick.mdp.rewards.kick_contact_height` の docstring 参照。
+# **stage 3 で唯一残っている当たりの施策。** 上の「反証済みの 3 施策」のとおり、
+# 軸足も当たり所も apex を伸ばせなかった一方で、apex は
 #
-#   _CONTACT_HEIGHT_BALL_RADIUS = 0.11 : ボール半径。ここに当てると法線が水平 = 0 点。
-#   _CONTACT_HEIGHT_SAT         = 0.03 : 満点になる足裏高さ。法線仰角 45° 相当
-#       (asin((0.11−0.03)/0.11) = 47°)。**これより下げても得をしない** ようにして、
-#       つま先を地面へ掻き込むだけの解に動機を与えない。
-#   _CONTACT_HEIGHT_WEIGHT      = 3.0  : **2.0 から上げた** (2026-08-18)。
-#       direction (6.0) / loft (5.0) / elevation (5.0) より下、という原則は保つが、
-#       kick_foot_lift (2.0) より **上** に置く。実測で仰角を作っているのは接触法線
-#       (= 当たり所の高さ) であって足の鉛直速度ではなく、foot_lift を 4.0 にした run
-#       では sole_height が 0.053 → 0.065 と逆行して apex がむしろ下がったため。
+#     apex 上昇 ∝ (kick_vel_ratio · sin φ)²
 #
-# NOTE: 線形ランプなので実測 h = 0.083 でも f_low = 0.34 が付き、勾配も生きている。
-#       kick_plant_foot と違ってカリキュラムは要らない。
+# にほぼ完全に従い、ボール速度が支配していることが 3 run で分かった。速度を削らずに
+# 仰角を上げられるのは **接触の瞬間に足自身が上へ動いていること** だけで、これは
+# スイングを短くしないので速度と競合しない。実際 apex 最高の run
+# (旧 flat lob、0.426) が ``foot_vz`` +0.814 で最大だった。
+#
+#   6.0 : loft (5.0) / elevation (5.0) を **超える** 水準。ここまで上げるのは、
+#       この項が「浮かせ方の指定」ではなく **唯一の浮かせる手段** に格上げされた
+#       ため。過去 2 run の実測は 4.0 で foot_vz +0.17、2.0 で −0.32 だったので、
+#       正へ十分振らせるには 4.0 でも足りていない。
+#   それでも direction (6.0) と同着まで。方向ゲートより上には置かない
+#       (踏みつけ / かすらせ exploit を塞ぐ構造なので、ここは崩さない)。
+#
+# NOTE: ``vz_foot_sat`` は 2.0 のまま (walk_lob 既定)。実測 foot_vz が飽和に近づいたら
+#       上げること。今は負値なので飽和の心配は無い。
 # --------------------------------------------------------------------------- #
-_CONTACT_HEIGHT_BALL_RADIUS = 0.11
-_CONTACT_HEIGHT_SAT = 0.03
-_CONTACT_HEIGHT_WEIGHT = 3.0
-
-# --------------------------------------------------------------------------- #
-# すくい上げ (kick_foot_lift) の重み。walk_lob と同じ 2.0 に戻す (stage 3 のみ)。
-#
-# 一度 4.0 まで上げた (2026-08-18 の run) が、**上げすぎだった**。foot_vz は狙いどおり
-# −0.55 → +0.34 と上向きに転じた一方で、``sole_height_at_kick`` が 0.053 → 0.065 と
-# **逆行**し、apex は 0.36 で頭打ち・旧 flat run (0.426) より低くなった。
-#
-# 原因は **すくい上げと低い当たりが運動学的にトレードオフ** であること。軸足がボールの
-# 37 cm 後ろにある姿勢ではつま先をボールの下へ入れられないので、「足を上向きに動かす」と
-# 「接触点を下げる」を同時には満たせない。重みで勝っている方に倒れるだけで、4.0 は
-# foot_lift 側に倒しただけだった。
-#
-# トレードオフを解くのは軸足の位置 (:data:`_R_STANCE_LOB`) であって重み配分ではない。
-# ここは 2.0 に戻し、**当たり所側 (_CONTACT_HEIGHT_WEIGHT = 3.0) をやや上に置く**。
-#
-# NOTE: それでも direction (6.0) は超えない。方向ゲートを最上位に保つのは
-#       walk_lob から一貫した設計 (踏みつけ / かすらせ exploit を塞ぐ構造)。
-# --------------------------------------------------------------------------- #
-_FOOT_LIFT_WEIGHT = 2.0
+_FOOT_LIFT_WEIGHT = 6.0
 
 
 # --------------------------------------------------------------------------- #
@@ -460,124 +441,26 @@ def _restore_vision_ball_obs(cfg) -> None:
     policy.prev_ball_pos.noise = Unoise(n_min=-0.02, n_max=0.02)
 
 
-def _set_r_stance(cfg, value: float) -> None:
-    """キック立ち位置の半径 ``r_stance`` を **配られている全箇所** で揃える。
+def _remove_plant_foot_reward(cfg) -> None:
+    """``kick_plant_foot`` を項ごと撤去する (カリキュラムも対で消す)。
 
-    ``r_stance`` は「理想キック立ち位置 P_kick をボール後方どれだけに置くか」で、
-    :func:`~..walk_kick.mdp.kick_state.kick_state` が P_kick と歩行目標 G を作るのに
-    使う。値の意味と 0.15 を選んだ理由は :data:`_R_STANCE_LOB` のコメント参照。
+    walk_lob が ``__post_init__`` で報酬項とカリキュラム
+    (``kick_plant_foot_weight``) の両方を登録するので、**両方消すこと**。
+    項だけ消してカリキュラムを残すと ``linear_reward_weight`` が存在しない term を
+    ``reward_manager.get_term_cfg`` で引きにいって落ちる (walk_lob が
+    ``kick_velocity_scaled`` で同じ注意書きを残している)。
 
-    **なぜ「全箇所」でなければならないか**: ``kick_state`` は ``common_step_counter``
-    でステップ境界を見て **同一ステップ内では最初の呼び出しだけが状態を更新する**。
-    2 番目以降の呼び出しは引数を無視してキャッシュを返す。したがって値がばらつくと
-    「そのステップで最初に評価されたマネージャの値」が P_kick と G を決める。
-    IsaacLab の step 順は termination → reward → command なので、**報酬側だけ書き換えても
-    ``kick_finished`` の古い値が毎ステップ勝つ** ことになり、まったく効かない。
+    撤去する理由は「反証済みの 3 施策」の 1 番。``plant_lon`` は 2 run 合わせて
+    4500 iteration 動かず、カリキュラムが実測を追い越した後は後退した。歩容が決めて
+    いる量なので位置報酬では押せない。**報われない項を置いておくと、他の項との
+    トレードオフで純粋に足を引っ張る** (実際 f_lon が剥がれていく過程は policy から
+    見て「何をしても損」の信号になる)。
 
-    配られている先は 3 種類:
-
-    1. 報酬項 (``_KICK_STATE_PARAMS`` を展開している全項)
-    2. 終了条件 ``kick_finished``
-    3. コマンド ``base_velocity`` (:class:`~..walk_kick.mdp.commands.BallFollowVelocityCommandCfg`
-       のフィールド。params ではなく cfg 直下の属性)
-
-    取りこぼしを黙って通さないよう、書き換えた箇所を数えて検算する。将来キック報酬を
-    足したときにここを通らないと例外で気づける。
-
-    NOTE: **アニールにはしていない。** 3 つのマネージャに跨る値を毎ステップ書き換える
-          カリキュラムは、上の「最初の呼び出しが勝つ」性質と噛み合わせると壊れやすい
-          (書き換えの順序とマネージャの評価順序の両方に依存する)。段の頭で 1 度だけ
-          決め打つ方が、env.yaml に残って検証もできる。
+    NOTE: ``plant_lat`` (横方向) の方は目標 0.19 に対して実測 0.17 前後で最初から
+          合っており、そもそも押す必要が無かった。前後方向だけが問題だった。
     """
-    n = 0
-    for term_name in dir(cfg.rewards):
-        if term_name.startswith("_"):
-            continue
-        term = getattr(cfg.rewards, term_name, None)
-        params = getattr(term, "params", None)
-        if isinstance(params, dict) and "r_stance" in params:
-            params["r_stance"] = value
-            n += 1
-    if cfg.terminations.kick_finished is not None:
-        cfg.terminations.kick_finished.params["r_stance"] = value
-        n += 1
-    cfg.commands.base_velocity.r_stance = value
-    n += 1
-
-    # 2026-08-18 時点の内訳: 報酬 9 項 + kick_finished + base_velocity = 11。
-    # 報酬項の増減で変わりうるので下限だけ見る (0 や 1 で通り抜けるのを防ぐのが目的)。
-    if n < 5:
-        raise RuntimeError(
-            f"_set_r_stance: 書き換え先が {n} 箇所しかない。kick_state を共有する"
-            " 報酬 / 終了条件 / コマンドの構成が想定と違う (揃っていないと"
-            " P_kick と G が古い値で決まる)。"
-        )
-
-
-def _apply_plant_foot_curriculum(cfg) -> None:
-    """``kick_plant_foot`` の ``lon_target`` と ``sigma_lon`` をアニールする。
-
-    出発値を報酬項の params に直接書き込んでおくのが要点。カリキュラムは
-    ``start_step`` 以前も ``start_value`` を書き戻すが、**最初の 1 回が走るまでは
-    cfg の初期値がそのまま使われる**ので、初期値を −0.03 / 0.10 のままにしておくと
-    その間だけ元の (届かない) 採点になる。
-
-    定数の根拠は :data:`_PLANT_LON_TARGET_START` のコメント参照。
-    """
-    cfg.rewards.kick_plant_foot.params["lon_target"] = _PLANT_LON_TARGET_START
-    cfg.rewards.kick_plant_foot.params["sigma_lon"] = _PLANT_SIGMA_LON_START
-
-    for param_name, start, end in (
-        ("lon_target", _PLANT_LON_TARGET_START, _PLANT_LON_TARGET_END),
-        ("sigma_lon", _PLANT_SIGMA_LON_START, _PLANT_SIGMA_LON_END),
-    ):
-        setattr(
-            cfg.curriculum,
-            f"kick_plant_foot_{param_name}",
-            CurrTerm(
-                func=mdp.linear_reward_param,
-                params={
-                    "term_name": "kick_plant_foot",
-                    "param_name": param_name,
-                    "start_value": start,
-                    "end_value": end,
-                    "start_step": _iter(_PLANT_ANNEAL_START_ITER),
-                    "end_step": _iter(_PLANT_ANNEAL_END_ITER),
-                    "steps_per_iteration": _STEPS_PER_ITERATION,
-                },
-            ),
-        )
-
-
-def _add_contact_height_reward(cfg) -> None:
-    """``kick_contact_height`` (接触時の足裏高さ) を足す。
-
-    既存のキック報酬とは **加算** で並べる (``kick_loft`` に掛けない)。項の内部は
-    ``r_direction`` への乗算なので、方向ゲート・kick_done ゲート・胴体の正対を
-    通過した蹴りにしか払われない。``sigma_direction`` は他のキック報酬と揃える
-    (:data:`~..walk_lob.walk_lob_env_cfg._LOB_SIGMA_DIRECTION`)。
-    """
-    cfg.rewards.kick_contact_height = RewTerm(
-        func=mdp.kick_contact_height,
-        weight=0.0,
-        params={
-            **_KICK_STATE_PARAMS,
-            "sigma_direction": _LOB_SIGMA_DIRECTION,
-            "ball_radius": _CONTACT_HEIGHT_BALL_RADIUS,
-            "h_sat": _CONTACT_HEIGHT_SAT,
-        },
-    )
-    cfg.curriculum.kick_contact_height_weight = CurrTerm(
-        func=mdp.linear_reward_weight,
-        params={
-            "term_name": "kick_contact_height",
-            "start_weight": 0.0,
-            "end_weight": _CONTACT_HEIGHT_WEIGHT * _KICK_W_SCALE,
-            "start_step": 0,
-            "end_step": _iter(_KICK_FADE_IN_END_ITER),
-            "steps_per_iteration": _STEPS_PER_ITERATION,
-        },
-    )
+    cfg.rewards.kick_plant_foot = None
+    cfg.curriculum.kick_plant_foot_weight = None
 
 
 def _raise_foot_lift_weight(cfg) -> None:
@@ -739,12 +622,12 @@ class K1WalkLobHistEnvCfg(K1WalkLobEnvCfg):
         # -- walk_lob が入れたガウス認識パイプラインを外す (5 と二重掛けになるため)
         _restore_vision_ball_obs(self)
 
-        # -- 立ち位置の壁を 10 cm 手前へ動かす (これが効かないと下の 3 点も動かない)
-        _set_r_stance(self, _R_STANCE_LOB)
-
-        # -- 当たり所を下げるための 3 点
-        _apply_plant_foot_curriculum(self)
-        _add_contact_height_reward(self)
+        # -- 効かなかった軸足誘導を撤去し、すくい上げに一本化する
+        #
+        # ここで **やっていないこと** を明示しておく (「反証済みの 3 施策」参照):
+        #   * kick_contact_height は足さない (当たり所を下げると速度が落ちて apex が下がる)
+        #   * _set_r_stance は呼ばない        (r_stance は 0.25 のまま = walk_lob 既定)
+        _remove_plant_foot_reward(self)
         _raise_foot_lift_weight(self)
 
         # -- 履歴入力とセンサ遅延 DR (内界センサ + 視覚)

@@ -15,21 +15,25 @@
 # actor の形 (ActorCriticHistoryCNN) の 2 点で walk_lob / walk_kick 系と非互換。
 #
 # 使い方:
-#   ./scripts/rsl_rl/train_walk_lob_hist.sh                   # 平坦 3 段 (まずこちら)
-#   TERRAIN=rough ./scripts/rsl_rl/train_walk_lob_hist.sh     # 凹凸 3 段
+#   ./scripts/rsl_rl/train_walk_lob_hist.sh                   # 凹凸 3 段 (既定)
+#   TERRAIN=flat ./scripts/rsl_rl/train_walk_lob_hist.sh      # 平坦 3 段 (切り分け用)
 #   STAGE=2 ./scripts/rsl_rl/train_walk_lob_hist.sh           # stage 2 だけ
 #   STAGE=23 ./scripts/rsl_rl/train_walk_lob_hist.sh          # stage 2 と 3
 #   WALK_CKPT=logs/rsl_rl/k1_walk_lob_rough_walk_phase/<run>/model_7999.pt \
 #       TERRAIN=rough STAGE=23 ./scripts/rsl_rl/train_walk_lob_hist.sh
 #   ITER=25000 ./scripts/rsl_rl/train_walk_lob_hist.sh        # lob を長く回す
 #
-# 推奨の進め方:
-#   1. TERRAIN=flat で 3 段通し、kick_rate と kick_apex_height が出ることを確認
-#   2. その stage 3 の checkpoint を LOB_CKPT に渡して TERRAIN=rough STAGE=3 で fine-tune
-#      (凹凸 + ボールの組み合わせはこのリポジトリで未検証なので、最後に足す)
+# **既定は rough。** sim2real が目的なので凹凸で通すのが本線
+# (2026-08-18 のユーザー指示「roughかつhistoryで歩行から学習したい」)。
 #
-# 凹凸の stage 1 は 2026-08-17 に 8000 iteration 学習済みで健全なので、
-# TERRAIN=rough のときは WALK_CKPT でそれを指せば stage 1 は省ける。
+# TERRAIN=flat は **切り分け専用**。凹凸 + ボールはこのリポジトリで学習を通した実績が
+# 無いので、凹凸で立ち上がらなかったときに「地形のせいか、報酬設計のせいか」を分ける
+# ために平坦で同じ段を回す、という使い方をする。既定にはしない。
+#
+# 凹凸の stage 1 は 2026-08-17 に 8000 iteration 学習済みで健全 (eplen 962/1000) なので、
+# WALK_CKPT でそれを指せば stage 1 は省ける。stage 2 も平坦版の checkpoint があるなら
+# WALK_CKPT に渡してウォームスタートできる (観測もネットワークも地形非依存で同一)。
+# その場合 KICK_ITER は既定の 5000 より短くてよい。
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -73,7 +77,7 @@ fi
 echo "[INFO] python: $LAB_PY"
 
 NUM_ENVS=${NUM_ENVS:-4096}
-TERRAIN=${TERRAIN:-flat}
+TERRAIN=${TERRAIN:-rough}
 STAGE=${STAGE:-all}
 
 # stage 1: 歩行の獲得。凹凸だと収束が遅いので平坦より長めに取ってある。
