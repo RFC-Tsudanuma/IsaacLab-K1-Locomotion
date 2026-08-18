@@ -64,7 +64,15 @@ def ball_lateral_progress(
     bufs = gk_buffers(env)
     active = bufs["ball_active"]
 
-    ball_y = ball_pos_goal(env)[:, 1]
+    # ★ 2026-08-18: ボールの y は **ゴール幅にクランプする**。
+    #
+    #   クランプしないと、枠外へ飛ぶ球 (状況の多様化で追加) の y にどこまでも
+    #   近づこうとして、フィールド境界 (±2.2m) を越えて追いかける。
+    #   実測: out_of_bounds 終了が 11.5% -> 18.6% に増え、最大の失敗要因になった。
+    #   GK が守るのはゴール幅の中なので、外へ出た球を追う必要は無い。
+    #   compute_target_y も同じ理由で ±max_y にクランプしている。
+    max_y = float(getattr(env.cfg.goalkeeper, "goal_half_width", 1.3))
+    ball_y = ball_pos_goal(env)[:, 1].clamp(-max_y, max_y)
     robot_y = robot_pos_goal(env)[:, 1]
     potential = -(robot_y - ball_y).abs()
 
