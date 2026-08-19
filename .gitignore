@@ -120,3 +120,19 @@ runs/
 
 # 手元用の仕様メモ
 source/isaaclab_k1_locomotion/docs/walk_kick.md
+
+# walk_long_pass_orbit (履歴入力 50 フレーム CNN の系統) の通し学習の checkpoint。
+# Stage 1 (walk phase, 8000 iter) と、そこから継いだ Stage 2 (loop_pass) の
+# 途中経過 3000 iter。インスタンスを作り直したときに --resume / --load_pretrained
+# の起点をここから拾えるようにしておく。
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/
+logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/
+logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/model_7999.pt
+
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/
+logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/
+logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/model_3000.pt
