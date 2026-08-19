@@ -38,6 +38,8 @@
 #   WARM_START=1 STAGE=4 STAGE3_CKPT=<共用タスクの ckpt> \
 #       ./scripts/rsl_rl/train_walk_long_pass_orbit.sh         # 1 フレーム ckpt から移植
 #   WALK_ITER=8000 ITER=5000 ./scripts/rsl_rl/train_walk_long_pass_orbit.sh
+#   GPUS=4 ./scripts/rsl_rl/train_walk_long_pass_orbit.sh       # 4 GPU で DDP
+#     (NUM_ENVS は GPU 1 枚あたり。詳細は _orbit_common.sh のコメント参照)
 
 source "$(dirname "${BASH_SOURCE[0]}")/_orbit_common.sh"
 

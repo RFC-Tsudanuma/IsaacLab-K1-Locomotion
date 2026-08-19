@@ -34,6 +34,12 @@
 #   ITER=20000 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh # 仕上げ
 #   STAGE1_CKPT=logs/.../model_4999.pt ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh
 #   NUM_ENVS=2048 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh
+#   GPUS=4 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh          # 4 GPU で DDP
+#   CUDA_VISIBLE_DEVICES=0,1 GPUS=2 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh
+#   GPUS=2 MASTER_PORT=29600 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh  # 2本同時
+#
+# NUM_ENVS は GPU 1 枚あたりの数 (合計は NUM_ENVS × GPUS)。詳細は
+# _orbit_common.sh のマルチ GPU のコメント参照。
 #   K1_WALK_STATES_NPZ=<path.npz> STAGE=5 ./scripts/rsl_rl/train_walk_weak_kick_orbit.sh
 #
 # 起動直後に必ず見ること: ログの "Loaded N tensors" / "Skipped N tensors"。
