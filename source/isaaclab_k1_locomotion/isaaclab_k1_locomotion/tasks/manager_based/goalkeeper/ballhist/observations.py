@@ -345,3 +345,86 @@ def ballhist_velocity_commands(
     setattr(env, _CMD_MASK_EP_ATTR, ep.clone())
 
     return torch.where(mask.unsqueeze(1), drive, torch.zeros_like(drive))
+
+
+# ---------------------------------------------------------------------------
+# ★ 2026-08-19: 観測ドロップアウト (ball_vel / target_y)
+#
+#   実機のビジョンフィルタの速度には 3 つの欠陥が報告されている:
+#     ① bounce 仮説の種付けで **符号が反転する** (実測: 真値 -3.9 -> 推定 +1.55)
+#     ② process_acceleration_std = 0.8 m/s^2 が小さすぎ、発射直後は真値の 11%
+#     ③ global 座標で追跡しており、**自己位置の誤差がそのまま速度に化ける**
+#        (実測: 静止ボールでも自己位置ドリフト 0.068 m/s > 接近しきい値 0.05)
+#
+#   ③ が「ボールが静止しているのにロボットが止まらない」の直接原因。
+#   そして ``target_y`` はその速度から作られる外挿なので、同じ汚染を受ける。
+#
+#   シムの ``_gkp_out_vel`` は真値に瞬時追従するため、**シムは「速度は常に正しい」と
+#   教えている**。方策はそれを鵜呑みにするよう訓練され、実機で騙される。
+#
+#   対策として、この 2 スロットを確率的に隠して「履歴だけで判断する」方策へ移行する。
+#   ``cmd_dropout_p`` と同じ **env ごと・エピソード固定** のマスクにする理由:
+#   毎ステップ切り替えると「見えたり見えなかったり」が高周波ノイズになり、
+#   方策が平均化で回避してしまう (隠した意味が無くなる)。
+#
+#   ★ 既定は 0.0 (無効) = 現状と完全に同一。override JSON で段階的に上げること。
+#     いきなり 1.0 にすると立ち尽くす解に落ちる (cmd_dropout_p で実証済み、1700 iter)。
+# ---------------------------------------------------------------------------
+
+_VEL_MASK_ATTR = "_gk_ballhist_vel_mask"
+_VEL_MASK_EP_ATTR = "_gk_ballhist_vel_mask_ep"
+_TGT_MASK_ATTR = "_gk_ballhist_tgt_mask"
+_TGT_MASK_EP_ATTR = "_gk_ballhist_tgt_mask_ep"
+
+
+def _episode_mask(env: "ManagerBasedRLEnv", p: float, attr: str, ep_attr: str) -> torch.Tensor:
+    """確率 ``p`` で True (=隠す) になる env ごとのマスク。エピソード境界で引き直す。
+
+    戻り値は **「見せる」側が True** (呼び出し側で torch.where にそのまま渡せる)。
+    """
+    ep = env.episode_length_buf
+    mask = getattr(env, attr, None)
+    prev_ep = getattr(env, ep_attr, None)
+    if mask is None or mask.shape[0] != env.num_envs:
+        mask = torch.rand(env.num_envs, device=env.device) >= p
+        setattr(env, attr, mask)
+    elif prev_ep is not None:
+        fresh = ep < prev_ep                      # エピソードが切り替わった env
+        if bool(fresh.any()):
+            new = torch.rand(env.num_envs, device=env.device) >= p
+            mask = torch.where(fresh, new, mask)
+            setattr(env, attr, mask)
+    setattr(env, ep_attr, ep.clone())
+    return mask
+
+
+def ballhist_ball_vel(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """方策に見せるボール速度 (N, 2)。確率 ``vel_dropout_p`` で **ゼロに隠す**。"""
+    from ..mdp.observations import gk_ball_vel_perceived
+
+    vel = gk_ball_vel_perceived(env)
+    p = float(getattr(env.cfg.goalkeeper, "vel_dropout_p", 0.0))
+    if p <= 0.0:
+        return vel
+    if p >= 1.0:
+        return torch.zeros_like(vel)
+    mask = _episode_mask(env, p, _VEL_MASK_ATTR, _VEL_MASK_EP_ATTR)
+    return torch.where(mask.unsqueeze(1), vel, torch.zeros_like(vel))
+
+
+def ballhist_target_y(env: "ManagerBasedRLEnv", max_y: float = 1.3) -> torch.Tensor:
+    """方策に見せる目標 y (N, 1)。確率 ``target_dropout_p`` で **ゼロに隠す**。
+
+    ★ ``ball_vel`` より **後** に隠すこと。target_y は「どこへ行くべきか」の答えその
+      ものなので、先に外すと学習が立ち上がりにくい。
+    """
+    from ..mdp.observations import gk_target_y
+
+    tgt = gk_target_y(env, max_y=max_y, use_perceived=True)
+    p = float(getattr(env.cfg.goalkeeper, "target_dropout_p", 0.0))
+    if p <= 0.0:
+        return tgt
+    if p >= 1.0:
+        return torch.zeros_like(tgt)
+    mask = _episode_mask(env, p, _TGT_MASK_ATTR, _TGT_MASK_EP_ATTR)
+    return torch.where(mask.unsqueeze(1), tgt, torch.zeros_like(tgt))

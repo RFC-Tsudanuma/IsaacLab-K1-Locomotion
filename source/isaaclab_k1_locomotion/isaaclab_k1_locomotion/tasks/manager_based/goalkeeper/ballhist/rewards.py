@@ -72,9 +72,25 @@ def ball_lateral_progress(
     #   GK が守るのはゴール幅の中なので、外へ出た球を追う必要は無い。
     #   compute_target_y も同じ理由で ±max_y にクランプしている。
     max_y = float(getattr(env.cfg.goalkeeper, "goal_half_width", 1.3))
-    ball_y = ball_pos_goal(env)[:, 1].clamp(-max_y, max_y)
     robot_y = robot_pos_goal(env)[:, 1]
-    potential = -(robot_y - ball_y).abs()
+
+    # ★ 2026-08-19: 基準を **ボールの現在位置 → 真の到達点** に変更した。
+    #
+    #   旧実装はボールの現在 y に寄る報酬だったので、真横から来る球では
+    #   「今ボールがある場所」と「守備面を横切る場所」が大きく食い違い、
+    #   方策は **後手に回る動き** (ボールを追いかける) を学習していた。
+    #   キーパーに必要なのは先回りなので、誘導の向きが逆だった。
+    #
+    #   y_cross_true は発射時に幾何で確定させた **正解の到達点** (events.reset_ball_shot)。
+    #   知覚も外挿式も通らないので、Pure 版の「手書きの式を使わない」方針を保ったまま
+    #   正しい方向へ誘導できる。式で近似するのではなく正解そのものを使う形。
+    #
+    #   nan (非シュート状況・枠外へ外れる球) のときは従来どおりボールの現在位置に
+    #   フォールバックする。守るべき到達点が存在しないため。
+    y_cross = gk_buffers(env)["y_cross_true"]
+    ball_y = ball_pos_goal(env)[:, 1].clamp(-max_y, max_y)
+    target_y_true = torch.where(torch.isnan(y_cross), ball_y, y_cross.clamp(-max_y, max_y))
+    potential = -(robot_y - target_y_true).abs()
 
     prev = getattr(env, _PREV_ATTR, None)
     if prev is None or prev.shape[0] != env.num_envs:

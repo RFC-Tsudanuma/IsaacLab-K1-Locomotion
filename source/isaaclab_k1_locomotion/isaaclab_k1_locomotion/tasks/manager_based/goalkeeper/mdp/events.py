@@ -46,6 +46,7 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["hard_ball"][env_ids] = False
     bufs["situation_age"][env_ids] = 0
     bufs["unreachable"][env_ids] = False
+    bufs["y_cross_true"][env_ids] = float("nan")
 
     # ★ 2026-08-15: 歩行位相のアキュムレータと指令ローパスの状態をクリアする。
     #   どちらも前エピソードの値を持ち越すと、開始直後に「途中の位相」や
@@ -344,6 +345,24 @@ def reset_ball_shot(
     vx = speed * dir_x / norm
     vy = speed * dir_y / norm
 
+    # ★ 2026-08-19: **真の到達点** を発射時に確定させる (Pure 版の密報酬用)。
+    #   ボールは転がり整合の ω で発射され、シムには実質的な転がり抵抗が無い
+    #   (実測 2026-08-19: 速度比 98.8% / 0.83s、dynamic_friction 0.35〜0.80 で
+    #    層別しても 98.8〜98.9% で不変)。よって軌道は直線であり、
+    #   「spawn → aim の直線」と守備面 x=guard_x の交点が実際の到達点と一致する。
+    #   等方的な減速では軌道が曲がらないので、減速の有無に関わらず厳密。
+    #   知覚も外挿式も通らないため、Pure 版は手書きの式なしでこれを採点に使える。
+    #   ☠ 将来バウンドや回転を物理に入れたらこの式は成り立たない。そのときは
+    #     実際に横切った y を記録する方式へ変えること。
+    _guard_x = float(p.guard_x)
+    _t_cross = ((spawn_x - _guard_x) / (-vx).clamp(min=1e-3)).clamp(min=0.0)
+    _y_cross = spawn_y + vy * _t_cross
+    #   枠外へ外れる球・遠ざかる球は「守るべき点」が無いので nan (報酬から除外)
+    _valid = ((-vx) > 0.05) & (_y_cross.abs() <= float(p.goal_half_width))
+    bufs["y_cross_true"][env_ids] = torch.where(
+        _valid, _y_cross, torch.full_like(_y_cross, float("nan"))
+    )
+
     # --- 「この球はこのキーパー位置から物理的に取れるか」を発射時に判定する ---
     #
     # ★ 2026-08-14 (ユーザー指示): 取れない球を成功率の集計から外すため。
@@ -374,6 +393,13 @@ def reset_ball_shot(
     vel[:, 4] = vx / r
     ball.write_root_velocity_to_sim(vel, env_ids=env_ids)
 
+    # ★ 計測用フック (2026-08-19): 発射ステップを env ごとに記録する。
+    #   ボール到達予測の誤差計測 (collect_ball_prediction.py) が発射時刻を
+    #   速度の立ち上がりから推定せずに済むようにするためだけのもので、
+    #   **学習には一切影響しない副作用のみ** (バッファへの書き込みだけ)。
+    if not hasattr(env, "_gk_shot_step"):
+        env._gk_shot_step = torch.full((env.num_envs,), -1, dtype=torch.long, device=env.device)
+    env._gk_shot_step[env_ids] = int(env.common_step_counter)
     bufs["ball_active"][env_ids] = True
 
     # --- 状況の多様化 (2026-08-18) ---

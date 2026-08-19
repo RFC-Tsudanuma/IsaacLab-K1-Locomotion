@@ -1,0 +1,24 @@
+{
+  "_comment": "ゴールキーパー Stage 2 (統合版) の設定上書き (train_gk_direct_stage2.sh --override_json)。goalkeeper.* は env cfg の GoalkeeperParamsCfg へのドットパス。ball_speed_cap は eval_goalkeeper_speed.py の提案値に差し替えること。min_time_to_line は近距離×高速の不可能球を防ぐ下限到達時間で、詰めるほど難しくなる。",
+  "_comment_perc_vel_bias": "★ 2026-07-31: 速度バイアスを cfg 既定の 0.5〜1.0 から 0.05〜0.15 に下げる。既定値は実測に基づかない設定で、ボールの横方向速度 (中央値 0.41 m/s) の 1.8 倍という『信号より大きいノイズ』だった。到達点は位置+速度×到達時間で外挿するため、速度の符号が反転すると (実測 43%) 予測が逆側の端へ飛ぶ。結果、キーパーへの指令の 38% が逆方向を向き、Stage 1 で獲得した 1.18 m/s の横移動能力が使われず指令中央値 0.35 m/s に留まっていた。0.05〜0.15 なら到達点の予測誤差は 1.04m→0.39m、接近判定の失敗は 33%→0% に改善する。実機のビジョン精度を実測したらその値に置き換えること。",
+  "_comment_speed_cap": "★ 2026-08-16: ball_speed_cap を 3.0 → 6.0 (ユーザー指示)。3.0 は『適応カリキュラムが到達できる上限』であって難易度の頭打ちではなかった。実測 (k1_gk_direct_stage2/2026-08-15_11-31-55) では iter 25186 で 3.000 に達したあと 23000 iter そこに張り付いており、設定した天井に当たっていただけ。6.0 まで開けて続きを登らせる。",
+  "_comment_guard_x": "★ guard_x はここに書かないこと。train.py は cfg 構築 (__post_init__) の **後** に override を適用するため、JSON で変えても初期配置・スポーン距離の導出が追従しない。変更は goalkeeper_env_cfg.py の既定値 (2026-08-16 時点で 0.6) を直接編集すること。",
+  "env": {
+    "goalkeeper.perc_vel_bias_range": [
+      0.05,
+      0.15
+    ],
+    "goalkeeper.ball_speed_min": 0.5,
+    "goalkeeper.ball_speed_max": 1.0,
+    "goalkeeper.ball_speed_cap": 6.0,
+    "goalkeeper.min_time_to_line": 1.2,
+    "goalkeeper.adaptive_success_threshold": 0.85,
+    "goalkeeper.adaptive_fail_threshold": 0.55,
+    "goalkeeper.adaptive_speed_delta": 0.05,
+    "goalkeeper.adaptive_ema_alpha": 0.01,
+    "goalkeeper.adaptive_warmup_episodes": 2000,
+    "goalkeeper.vel_dropout_p": 1.0,
+    "goalkeeper.target_dropout_p": 1.0
+  },
+  "_comment_dropout": "★ 2026-08-19: 観測ドロップアウトの段階 tgt10。実機のビジョンフィルタ速度の欠陥 (符号反転・発射直後11%・自己位置が速度に化ける) に 方策を依存させないための移行。既定 override をマージ済みなので perc_vel_bias_range 等は保持されている。p を上げた直後の 500 iter で Train/mean_episode_length と行動 std を確認し、縮み続けたら前段へ戻すこと。"
+}

@@ -68,6 +68,11 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         # (:func:`~.events._mark_unreachable` が発射時に幾何から判定する)。
         # hard_ball が確率で決め打ちするのに対し、こちらは実際の位置関係で決まる。
         env._gk_unreachable = torch.zeros(n, dtype=torch.bool, device=env.device)
+        # ★ 2026-08-19: **真の到達点** (守備面 x=guard_x を横切る y)。
+        #   発射時に幾何で確定する。知覚も外挿式も通らない正解値で、
+        #   Pure 版の密報酬 (ball_lateral_progress) が採点に使う。
+        #   nan = 有効な到達点が無い (非シュート状況・枠外へ外れる球)。
+        env._gk_y_cross_true = torch.full((n,), float("nan"), device=env.device)
     return {
         "target_y": env._gk_target_y,
         "ball_active": env._gk_ball_active,
@@ -79,6 +84,7 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "save_count": env._gk_save_count,
         "save_quality": env._gk_save_quality,
         "unreachable": env._gk_unreachable,
+        "y_cross_true": env._gk_y_cross_true,
         "hard_ball": env._gk_hard_ball,
         "situation_age": env._gk_situation_age,
     }
@@ -520,6 +526,14 @@ def compute_target_y(
     x_ball = pos_track[:, 0].clamp(min=guard_x)
     y_track = (pos_track[:, 1] * (guard_x / x_ball.clamp(min=1e-3))).clamp(-max_y, max_y)
 
+    # ★ 2026-08-19 (優先1): 接近していないときは **中央待機** にする。
+    #   検出ノイズ σ = 0.124d + 0.149 (3m先で 0.52m) では静止ボールでも vx 推定が
+    #   しきい値を超えうる。従来の y_track (ボール方向へ寄る) はそれ自体は発散しないが、
+    #   脅威判定が誤って立つと y_pred 側 (発散しうる) に切り替わる。closing のガードを
+    #   上げた (0.3 -> 0.5) うえで、非脅威時は中央に戻して待つ方が実機で安定する。
+    #   configs/gk_prediction.yaml の idle_center_wait: false で従来挙動に戻せる。
+    if bool(getattr(env.cfg.goalkeeper, "idle_center_wait", False)):
+        y_track = torch.zeros_like(y_track)
     target = torch.where(approaching, y_pred, y_track)
     out = torch.where(bufs["ball_active"], target, bufs["target_y"])
 
@@ -996,9 +1010,16 @@ def task_drive_vector(
     horizon = guard_arrival_horizon(env, use_perceived=use_perceived)
 
     dx = ((guard_x - pos[:, 0]) / _T_IDLE).clamp(-vx_scale, vx_scale)
-    dy = ((compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]) / horizon).clamp(
-        -vy_scale, vy_scale
-    )
+    # ★ 2026-08-19 (優先2): 明示的な不感帯。境界で不連続にならないよう、
+    #   err から不感帯幅を **引いてから** horizon で割る。
+    #       |err| < DB      -> 0
+    #       |err| >= DB     -> (err - sign(err)*DB) / horizon をクリップ
+    #   自己位置は静止中でも 4秒で 0.27m ドリフトする。旧実装 (horizon 0.15、不感帯なし)
+    #   では 0.225m のずれで全開指令になり、ドリフトがそのまま全開に化けていた。
+    err_y = compute_target_y(env, max_y=max_y, use_perceived=use_perceived) - pos[:, 1]
+    db = float(getattr(env.cfg.goalkeeper, "drive_deadband_y", 0.0))
+    err_db = torch.sign(err_y) * (err_y.abs() - db).clamp(min=0.0)
+    dy = (err_db / horizon).clamp(-vy_scale, vy_scale)
     # heading は +x を 0 とする world yaw。フィールド正面へ戻す向きを渡す。
     dyaw = ((-heading) / _T_IDLE).clamp(-1.0, 1.0)
     drive = torch.stack([dx, dy, dyaw], dim=1)

@@ -49,7 +49,10 @@ from ...locomotion.rough_env_cfg import _PHASE_FREQ
 from .events import sync_engaged_command
 from .rewards import ball_lateral_progress
 from .observations import ballhist_velocity_commands
-from .observations import ballhist_ball_history, ballhist_ball_history_true, ballhist_gait_phase
+from .observations import (
+    ballhist_ball_history, ballhist_ball_history_true, ballhist_ball_vel,
+    ballhist_gait_phase, ballhist_target_y,
+)
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
@@ -91,6 +94,11 @@ class K1GKBallHistPolicyCfg(K1GKDirectPolicyCfg):
         func=ballhist_ball_history,
         params={"frames": BALLHIST_FRAMES, "stride": BALLHIST_STRIDE},
     )
+
+    # ★ 2026-08-19: 実機のフィルタ速度に依存しないための移行スロット。
+    #   既定 (dropout 0.0) では中身も次元も従来と同一なので、既存 ckpt をそのまま使える。
+    ball_vel = ObsTerm(func=ballhist_ball_vel)
+    target_y = ObsTerm(func=ballhist_target_y, params={"max_y": GOAL_HALF_WIDTH})
 
 
 @configclass

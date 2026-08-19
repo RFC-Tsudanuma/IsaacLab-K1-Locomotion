@@ -96,6 +96,9 @@ from .mdp.rewards import (
     target_reach_velocity,
     track_target_y,
 )
+# ★ 共有定数 (configs/gk_prediction.yaml)。sim と実機デプロイの唯一の正。
+from .mdp.shared_params import drive as _shd, pred as _shp
+
 from .mdp.terminations import goal_conceded, robot_out_of_bounds, save_success
 
 # --- ゴール・ボールの幾何パラメータ (ルールブック Middle ディビジョン = M-Field) ---
@@ -137,7 +140,14 @@ class GoalkeeperParamsCfg:
     # ★ 2026-08-08: 到達猶予時間で割る方式をやめ、この固定値にした (最速で向かう)。
     #   ずれ > drive_t_fast × 1.3 [m] で常に全力。0.15 なら 0.195m 以上で全力になる。
     #   小さくするほど全力域が広がる。0 にすると停止できず振動するので下げすぎないこと。
-    drive_t_fast: float = 0.15
+    drive_t_fast: float = _shd("horizon_fast")   # ← configs/gk_prediction.yaml
+    # ★ 2026-08-19: 横方向の不感帯 [m]。自己位置の揺れ (静止中でも 4秒で 0.27m
+    #   ドリフト) がそのまま指令に化けるのを防ぐ。境界で不連続にならないよう
+    #   err からこの幅を引いてから horizon で割る (task_drive_vector 参照)。
+    drive_deadband_y: float = _shd("deadband_y")
+    # closing < approach_speed_min のとき target_y を 0 (中央待機) にするか。
+    #   False なら従来の y_track (ボール方向へ寄る)。
+    idle_center_wait: bool = _shp("idle_center_wait")
     # ★ 2026-08-15: task_drive_vector の 1 次ローパスの時定数 [s]。0 で無効。
     #   この指令は自己位置 (MCL) から作られ、しかも drive_t_fast=0.15 のせいで
     #   0.195m 以上のずれで常に全力になる。MCL の跳び (±0.5m) は必ず「全力で横へ」
@@ -195,8 +205,8 @@ class GoalkeeperParamsCfg:
     #   approach_speed_min = 0.3 も ball_speed_min = 0.5 より下なので全ての球が通る。
     #   したがって塞いでいるのは「ノイズ起因の偽の脅威」だけ。
     # ★ 実機の C++ 側にも同じ判定を同じしきい値で実装すること。
-    approach_speed_min: float = 0.3    # 脅威とみなす最低接近速度 [m/s]
-    arrival_t_max: float = 3.0         # 脅威とみなす到達予測時間の上限 [s]
+    approach_speed_min: float = _shp("closing_min")   # ← configs/gk_prediction.yaml    # 脅威とみなす最低接近速度 [m/s]
+    arrival_t_max: float = _shp("t_max")          # ← configs/gk_prediction.yaml         # 脅威とみなす到達予測時間の上限 [s]
     #
     # ★ 2026-08-18 追加: 脅威判定の **持続要求 (デバウンス)**。
     #   しきい値だけだと、ノイズが一瞬でも approach_speed_min を超えた時点で
@@ -239,6 +249,14 @@ class GoalkeeperParamsCfg:
     #   0 から 1 へ段階的に上げて移行する (詳細は ballhist/observations.py の
     #   ballhist_velocity_commands)。直接版では読まれない。
     cmd_dropout_p: float = 1.0
+    # ★ 2026-08-19: 観測ドロップアウト。実機のビジョンフィルタの速度が
+    #   ①符号反転 ②発射直後 真値の11% ③自己位置の誤差が速度に化ける
+    #   という欠陥を持つため、方策をこれらに依存させないための移行用。
+    #   **既定 0.0 = 無効 (現状と完全に同一)**。override JSON で段階的に上げる。
+    #   いきなり 1.0 にすると立ち尽くす解に落ちる (cmd_dropout_p で実証済み)。
+    #   順序は vel -> target。target_y は「答えそのもの」なので後に外す。
+    vel_dropout_p: float = 0.0      # ball_vel を隠す確率
+    target_dropout_p: float = 0.0   # target_y を隠す確率
 
     # --- 状況の多様化 (2026-08-18) ---
     #

@@ -25,6 +25,15 @@ set -e
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}"
 
+# Isaac Lab の起動スクリプト。貸し GPU (vast.ai 等) でパスが違う場合は
+# ISAACLAB_SH=/path/to/isaaclab.sh を指定する。
+ISAACLAB_SH=${ISAACLAB_SH:-/workspace/isaaclab/isaaclab.sh}
+if [[ ! -x "${ISAACLAB_SH}" ]]; then
+    echo "[ERROR] Isaac Lab の起動スクリプトが見つかりません: ${ISAACLAB_SH}" >&2
+    echo "        ISAACLAB_SH=/path/to/isaaclab.sh を指定してください。" >&2
+    exit 1
+fi
+
 OVERRIDE_JSON=${OVERRIDE_JSON:-scripts/rsl_rl/goalkeeper_stage3_overrides.json}
 
 # 基準版 (critic/報酬に外挿式を特権情報として残す) が既定。
@@ -37,7 +46,7 @@ if [[ -z "${STAGE1_CKPT}" ]]; then
     exit 1
 fi
 
-/workspace/isaaclab/isaaclab.sh -p scripts/rsl_rl/train.py \
+"${ISAACLAB_SH}" -p scripts/rsl_rl/train.py \
     --task "${TASK}" \
     --resume --checkpoint "${STAGE1_CKPT}" \
     --override_json "${OVERRIDE_JSON}" \
