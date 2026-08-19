@@ -25,36 +25,42 @@ for _bf in "${BASH_FUNCTIONS:-}" "$HOME/.bash_functions"; do
     fi
 done
 
-LAB_PY=""
+# NOTE: isaaclab.sh は "-p" を伴うので **必ず配列で持つ**。1 個の文字列にして
+#       クォート付きで渡すと "isaaclab.sh -p" という名前の実行ファイルを探しに行き、
+#       "No such file or directory" になる (既存スクリプトはクォート無し展開の
+#       単語分割に頼っているが、ここは配列で明示的に扱う)。
+LAB_PY_CMD=()
 if [[ -n "${LAB_PYTHON:-}" ]]; then
-    LAB_PY="$LAB_PYTHON"
+    # ユーザー指定は "path" でも "path -p" でもよいよう単語分割する。
+    read -r -a LAB_PY_CMD <<< "$LAB_PYTHON"
 elif type _labpython2 >/dev/null 2>&1; then
-    LAB_PY="_labpython2"
+    # bash 関数のこともあるが、配列展開でも通常のコマンド検索が走るので呼べる。
+    LAB_PY_CMD=(_labpython2)
 else
     for _cand in "$REPO_ROOT/isaaclab.sh" /workspace/isaaclab/isaaclab.sh /isaac-sim/python.sh; do
         if [[ -x "$_cand" ]]; then
             case "$_cand" in
-                *isaaclab.sh) LAB_PY="$_cand -p" ;;
-                *)            LAB_PY="$_cand" ;;
+                *isaaclab.sh) LAB_PY_CMD=("$_cand" -p) ;;
+                *)            LAB_PY_CMD=("$_cand") ;;
             esac
             break
         fi
     done
-    if [[ -z "$LAB_PY" ]]; then
+    if [[ ${#LAB_PY_CMD[@]} -eq 0 ]]; then
         for _cand in python python3; do
             if command -v "$_cand" >/dev/null 2>&1 && "$_cand" -c "import isaaclab" >/dev/null 2>&1; then
-                LAB_PY="$_cand"
+                LAB_PY_CMD=("$_cand")
                 break
             fi
         done
     fi
 fi
 
-if [[ -z "$LAB_PY" ]]; then
+if [[ ${#LAB_PY_CMD[@]} -eq 0 ]]; then
     echo "[ERROR] IsaacLab の python が見つかりません。LAB_PYTHON で明示してください。" >&2
     exit 1
 fi
-echo "[INFO] python: $LAB_PY"
+echo "[INFO] python: ${LAB_PY_CMD[*]}"
 
 NUM_ENVS=${NUM_ENVS:-4096}
 STAGE=${STAGE:-all}
@@ -92,7 +98,7 @@ run_stage() {
     [[ -n "$ckpt" ]] && echo " pretrained: $ckpt"
     echo "=============================================================="
 
-    local -a cmd=("$LAB_PY" scripts/rsl_rl/train.py
+    local -a cmd=("${LAB_PY_CMD[@]}" scripts/rsl_rl/train.py
         --task "$task" --headless
         --num_envs "$NUM_ENVS" --max_iterations "$iters")
     [[ -n "$ckpt" ]] && cmd+=(--load_pretrained "$ckpt")
