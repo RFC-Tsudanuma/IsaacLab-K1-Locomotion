@@ -104,6 +104,17 @@ class KickDirectionCommand(UniformVelocityCommand):
             self.metrics[f"sole_height_at_kick_{_side}"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_side_ratio_r"] = torch.zeros(self.num_envs, device=self.device)
 
+        # 蹴った瞬間の胴体の正対度 (1 = 蹴り方向に正対)。「蹴り急ぎ」の直接指標。
+        self.metrics["p_style_at_kick"] = torch.zeros(self.num_envs, device=self.device)
+        # 必要旋回量が大きい (> 90°) エピソードだけの内訳。
+        # 「今向いている方向と逆に蹴る」ような場面の悪化は、小さい旋回のエピソードと
+        # 平均すると埋もれてしまうので分けて出す。
+        for _grp in ("far", "near"):
+            self.metrics[f"kick_rate_{_grp}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"kick_dir_error_deg_{_grp}"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics[f"p_style_at_kick_{_grp}"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["far_ratio"] = torch.zeros(self.num_envs, device=self.device)
+
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
         # (ここで再計算するとパラメータの二重管理になる)。まだ無ければ何もしない。
@@ -146,6 +157,15 @@ class KickDirectionCommand(UniformVelocityCommand):
             self.metrics[f"ball_touch_count_{_side}"] = state["touch_count"] * _mask
             self.metrics[f"sole_height_at_kick_{_side}"] = state["sole_height_at_kick"] * kick_done * _mask
         self.metrics["kick_side_ratio_r"] = on_r
+
+        # -- 蹴り姿勢の一致と、必要旋回量が大きい場面の内訳 --
+        self.metrics["p_style_at_kick"] = state["p_style_frozen"] * kick_done
+        is_far = (state["turn_required"] > (math.pi / 2.0)).float()
+        for _grp, _m in (("far", is_far), ("near", 1.0 - is_far)):
+            self.metrics[f"kick_rate_{_grp}"] = kick_done * _m
+            self.metrics[f"kick_dir_error_deg_{_grp}"] = dir_err_deg * kick_done * _m
+            self.metrics[f"p_style_at_kick_{_grp}"] = state["p_style_frozen"] * kick_done * _m
+        self.metrics["far_ratio"] = is_far
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)

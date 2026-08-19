@@ -154,6 +154,10 @@ def kick_state(
             "v_ball_3d_frozen": torch.zeros(env.num_envs, device=device),
             "phi_frozen": torch.zeros(env.num_envs, device=device),
             "p_style_frozen": torch.zeros(env.num_envs, device=device),
+            # エピソード開始時に「胴体の向き → 蹴り方向」で必要な旋回量 [rad]。
+            # 大きく回り込む必要があるエピソードだけを切り出してメトリクスを見るのに使う
+            # (小さい旋回で薄めると、回り込みが要る場面の悪化が平均に埋もれる)。
+            "turn_required": torch.zeros(env.num_envs, device=device),
             "apex_height": torch.zeros(env.num_envs, device=device),
             "prev_v_ball": torch.zeros(env.num_envs, device=device),
             "touch_count": torch.zeros(env.num_envs, device=device),
@@ -215,6 +219,9 @@ def kick_state(
         state["v_ball_3d_frozen"][just_reset] = 0.0
         state["phi_frozen"][just_reset] = 0.0
         state["p_style_frozen"][just_reset] = 0.0
+        # forward・kick_dir とも単位ベクトルなので acos(内積) が必要旋回量。
+        cos_turn = torch.clamp((forward * kick_dir).sum(dim=-1), min=-1.0, max=1.0)
+        state["turn_required"][just_reset] = torch.acos(cos_turn)[just_reset]
         state["apex_height"][just_reset] = 0.0
         state["prev_v_ball"][just_reset] = 0.0
         state["touch_count"][just_reset] = 0.0
@@ -238,6 +245,21 @@ def kick_state(
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
     # ------------------------------------------------------------------ #
     p_style = torch.clamp((forward * kick_dir).sum(dim=-1), min=0.0, max=1.0)
+
+    # 正対度の鋭さ (env._p_style_exponent、既定 1.0 = 素の cos)。
+    #
+    # 素の cos は正対付近で平坦すぎる: 30° ずれても 0.87 (13% しか減らない)、45° で 0.71。
+    # p_style はキック報酬 (項1-3) に掛かる係数なので、この平坦さは
+    # **「あと一歩回り込めば正対できるのに、その手前で蹴っても大して損しない」** を意味する。
+    # 実機で「向いている方向と逆向きに蹴りたいとき、回り込みの途中で蹴ってしまい方向が悪い」
+    # という症状が出たのはこれが原因。
+    #
+    # 指数を掛けると正対からのズレの代償が急峻になる (k=3 なら 30° で 0.65、45° で 0.35)。
+    # p_style は pre-latch の ball_avoidance (構えるまでボールに寄るなの抑止) にも
+    # 使われているので、ここ 1 箇所を鋭くすれば「寄る」と「蹴る」の両方に効く。
+    p_style_exp = getattr(env, "_p_style_exponent", 1.0)
+    if p_style_exp != 1.0:
+        p_style = p_style**p_style_exp
 
     # ------------------------------------------------------------------ #
     # 値 latch: L = (v_ball > v_thresh) の立ち上がりで

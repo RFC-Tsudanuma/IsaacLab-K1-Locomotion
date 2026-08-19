@@ -160,7 +160,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.managers import EventTermCfg as EventTerm
 
 from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
-from ..locomotion.mdp.events import set_kick_foot
+from ..locomotion.mdp.events import set_kick_foot, set_p_style_exponent
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
@@ -599,6 +599,45 @@ def add_ball_pos_obs(cfg) -> None:
 _KICK_FOOT = "right"
 
 
+
+# キック報酬に掛かる正対度 p_style の指数。1.0 = 素の cos (継承元)。
+#
+# 実機で「今向いている方向と逆向きに蹴りたいとき、回り込みの途中で蹴ってしまい、
+# あと一歩詰めれば正確に蹴れるのに方向が悪くなる」という症状が出た。
+#
+# 原因は p_style = clamp(cos(向きのズレ), 0, 1) が正対付近で平坦なこと:
+#
+#   ズレ  0°    15°    30°    45°    60°
+#   cos   1.00  0.97   0.87   0.71   0.50      <- k=1 (従来)
+#   cos³  1.00  0.90   0.65   0.35   0.13      <- k=3
+#
+# k=1 では 30° 手前で蹴っても報酬が 13% しか減らないので、蹴り急ぎが割に合ってしまう。
+# k=3 なら 35% 減るので、あと一歩詰めて正対してから蹴る方が得になる。
+#
+# p_style はキック報酬 (項1-3) の係数であると同時に、pre-latch の ball_avoidance
+# (構えができるまでボールに寄るなの抑止) にも入っているので、この 1 箇所で
+# 「寄る」と「蹴る」の両方が締まる。
+#
+# NOTE: 上げすぎると「正対しきれないので蹴らない」に倒れる恐れがある (モジュール
+#       docstring の収支逆転と同じ機序)。帯のゲート (kick_rate_gated_speed_range) が
+#       kick_rate 低下時に速度帯を戻すので即座に破綻はしないが、kick_rate と
+#       p_style_at_kick を併せて見ること。
+_P_STYLE_EXPONENT = 3.0
+
+
+def sharpen_kick_pose_match(cfg) -> None:
+    """正対度 p_style を :data:`_P_STYLE_EXPONENT` 乗して、蹴り姿勢の一致を厳しく要求する。
+
+    Stage 4 のみに掛ける。Stage 1-3 は継承元と同じ k=1 のまま
+    (蹴り自体をまだ獲得する段なので、正対を厳しくすると学習が立ち上がらない)。
+    """
+    cfg.events.set_p_style_exponent = EventTerm(
+        func=set_p_style_exponent,
+        mode="startup",
+        params={"exponent": _P_STYLE_EXPONENT},
+    )
+
+
 def use_fixed_kick_foot(cfg) -> None:
     """理想立ち位置 ``P_kick`` を、蹴り足がボール手前に来る位置へ横にずらす。
 
@@ -818,6 +857,12 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # 観測を蹴り足基準にしただけでは、報酬が要求する立ち位置は胴体中心のまま。
         # 対で入れる。理由は use_fixed_kick_foot のコメント参照。
         use_fixed_kick_foot(self)
+
+        # -- 0b'''. 蹴り姿勢の一致 (正対度) を厳しくする
+        #
+        # Stage 4 のみ。回り込みの途中で蹴ってしまう「蹴り急ぎ」への対処。
+        # 理由と指数の意味は _P_STYLE_EXPONENT のコメント参照。
+        sharpen_kick_pose_match(self)
 
         # -- 0c. 地面をランダムな軽い凹凸にする
         #

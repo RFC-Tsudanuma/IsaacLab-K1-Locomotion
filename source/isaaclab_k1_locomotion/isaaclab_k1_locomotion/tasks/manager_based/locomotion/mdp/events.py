@@ -133,6 +133,28 @@ def set_kick_foot(
     env._kick_foot = foot
 
 
+def set_p_style_exponent(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    exponent: float = 1.0,
+):
+    """キック報酬に掛かる正対度 p_style の鋭さを設定する (startup で 1 度だけ)。
+
+    ``kick_state`` が ``p_style = clamp(cos(向きのズレ), 0, 1) ** exponent`` として使う。
+    1.0 で従来どおり素の cos。
+
+    素の cos は正対付近が平坦で、30° ずれても 0.87 しか下がらない。p_style はキック報酬の
+    係数なので、これは「あと一歩回り込めば正対できるのに手前で蹴っても大して損しない」を
+    意味し、大きく回り込む必要がある場面で蹴り急ぎ = 方向精度の悪化を招く。
+
+    Args:
+        exponent: 3.0 で 30° → 0.65 / 45° → 0.35。大きくするほど正対を厳しく要求する。
+    """
+    if exponent <= 0.0:
+        raise ValueError(f"p_style の指数は正の値にすること。受け取った値: {exponent}")
+    env._p_style_exponent = float(exponent)
+
+
 def reset_prev_high_action(
     env: "ManagerBasedEnv",
     env_ids: torch.Tensor | None,
@@ -158,5 +180,6 @@ __all__ = [
     "randomize_phase_offset",
     "get_phase_offset",
     "set_kick_foot",
+    "set_p_style_exponent",
     "reset_prev_high_action",
 ]
