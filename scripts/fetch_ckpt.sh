@@ -5,6 +5,8 @@
 #   VAST_SSH="-p 40712 root@ssh4.vast.ai" ./scripts/fetch_ckpt.sh k1_walk_kick
 #   ./scripts/fetch_ckpt.sh -H ssh4.vast.ai -P 40712 k1_walk_kick
 #   ./scripts/fetch_ckpt.sh --list k1_walk_kick     # 取ってこずに候補だけ表示
+#   ./scripts/fetch_ckpt.sh --step 2000 k1_walk_kick # model_2000.pt を取ってくる
+#   ./scripts/fetch_ckpt.sh --run 2026-08-19_08-22-05 --step 2000 k1_walk_kick
 #   ./scripts/fetch_ckpt.sh --full k1_walk_kick     # run ディレクトリ丸ごと
 #   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (policy*.onnx) も取ってくる
 #   ./scripts/fetch_ckpt.sh --video k1_walk_kick    # videos/ も取ってくる
@@ -25,6 +27,16 @@
 #   VAST_PYTHON=...         リモートの IsaacLab python を明示する
 #                           (例: VAST_PYTHON=/workspace/isaaclab/isaaclab.sh\ -p)
 #
+# run と checkpoint の選び方
+# --------------------------
+# 既定は「一番新しい run の一番大きい step」。明示したいときは:
+#   --run <名前>            run ディレクトリを指定する。完全一致が無ければ部分一致で
+#                           探し、複数当たったら一番新しいものを使う
+#                           (例: --run 2026-08-19 でその日の最後の run)
+#   --step <N>              model_<N>.pt を指定する。無い step を指定すると、その run に
+#                           ある step を並べて終わる
+# 候補を見たいときは --list (全 run と、それぞれの step を並べる)。
+#
 # run ディレクトリは YYYY-MM-DD_HH-MM-SS で始まるものだけを対象にする
 # (10525 のような非日付ディレクトリは無視される)。
 set -euo pipefail
@@ -34,6 +46,8 @@ LOCAL_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 TASK=""
 FULL=0
+RUN_ARG=""
+STEP_ARG=""
 LIST=0
 ONNX=0
 VIDEO=0
@@ -49,6 +63,8 @@ while [[ $# -gt 0 ]]; do
     -H|--host) HOST="$2"; shift 2 ;;
     -P|--port) PORT="$2"; shift 2 ;;
     --full)    FULL=1; shift ;;
+    --run)     RUN_ARG="$2"; shift 2 ;;
+    --step|-s) STEP_ARG="$2"; shift 2 ;;
     --list|-l) LIST=1; shift ;;
     --onnx)    ONNX=1; shift ;;
     --video)   VIDEO=1; shift ;;
@@ -95,17 +111,70 @@ fi
 
 REMOTE_TASK_DIR="$REMOTE_ROOT/logs/rsl_rl/$TASK"
 
-# --- 最新 run と最大 step を解決 ----------------------------------------------
+# --- --list: 候補の run と step を全部並べて終わる -----------------------------
+# 取得は一切しないので、--run / --step に何を渡せるか確かめるのに使う。
+if [[ "$LIST" -eq 1 ]]; then
+  echo "task : $TASK"
+  "${SSH[@]}" bash -s <<EOF
+set -e
+cd "$REMOTE_TASK_DIR" 2>/dev/null || { echo "リモートに $REMOTE_TASK_DIR がありません" >&2; exit 2; }
+runs=\$(ls -1d */ 2>/dev/null | tr -d '/' \
+       | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' \
+       | sort)
+[ -n "\$runs" ] || { echo "日付形式の run ディレクトリが見つかりません" >&2; exit 3; }
+printf '%s\n' "\$runs" | while read -r r; do
+  steps=\$(ls -1 "\$r"/model_*.pt 2>/dev/null \
+          | sed -e 's#.*/model_##' -e 's#\.pt\$##' | sort -n | tr '\n' ' ')
+  echo "run  : \$r"
+  if [ -n "\$steps" ]; then
+    echo "\$steps" | fold -s -w 72 | sed -e 's/^/       /'
+  else
+    echo "       (model_*.pt なし)"
+  fi
+done
+EOF
+  exit 0
+fi
+
+# --- 対象の run と step を解決 -------------------------------------------------
+# --run / --step が空なら「一番新しい run」「一番大きい step」。
 read -r RUN STEP < <("${SSH[@]}" bash -s <<EOF
 set -e
 cd "$REMOTE_TASK_DIR" 2>/dev/null || { echo "リモートに $REMOTE_TASK_DIR がありません" >&2; exit 2; }
-run=\$(ls -1d */ 2>/dev/null | tr -d '/' \
-      | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' \
-      | sort | tail -1)
-[ -n "\$run" ] || { echo "日付形式の run ディレクトリが見つかりません" >&2; exit 3; }
-step=\$(ls -1 "\$run"/model_*.pt 2>/dev/null \
-       | sed -e 's#.*/model_##' -e 's#\.pt\$##' | sort -n | tail -1)
-[ -n "\$step" ] || { echo "\$run に model_*.pt がありません" >&2; exit 4; }
+runs=\$(ls -1d */ 2>/dev/null | tr -d '/' \
+       | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}' \
+       | sort)
+[ -n "\$runs" ] || { echo "日付形式の run ディレクトリが見つかりません" >&2; exit 3; }
+
+want_run='$RUN_ARG'
+if [ -n "\$want_run" ]; then
+  # 完全一致を優先し、無ければ部分一致 (複数当たったら一番新しいもの)
+  run=\$(printf '%s\n' "\$runs" | grep -x -F -- "\$want_run" | tail -1)
+  [ -n "\$run" ] && : || run=\$(printf '%s\n' "\$runs" | grep -F -- "\$want_run" | tail -1)
+  if [ -z "\$run" ]; then
+    echo "run '\$want_run' が見つかりません。あるのは:" >&2
+    printf '  %s\n' \$runs >&2
+    exit 5
+  fi
+else
+  run=\$(printf '%s\n' "\$runs" | tail -1)
+fi
+
+steps=\$(ls -1 "\$run"/model_*.pt 2>/dev/null \
+        | sed -e 's#.*/model_##' -e 's#\.pt\$##' | sort -n)
+[ -n "\$steps" ] || { echo "\$run に model_*.pt がありません" >&2; exit 4; }
+
+want_step='$STEP_ARG'
+if [ -n "\$want_step" ]; then
+  step=\$(printf '%s\n' "\$steps" | grep -x -F -- "\$want_step" || true)
+  if [ -z "\$step" ]; then
+    echo "\$run に model_\${want_step}.pt がありません。あるのは:" >&2
+    { printf '%s\n' "\$steps" | tr '\n' ' '; echo; } | fold -s -w 72 | sed -e 's/^/  /' >&2
+    exit 6
+  fi
+else
+  step=\$(printf '%s\n' "\$steps" | tail -1)
+fi
 echo "\$run \$step"
 EOF
 )
@@ -113,8 +182,6 @@ EOF
 echo "task : $TASK"
 echo "run  : $RUN"
 echo "ckpt : model_${STEP}.pt"
-
-[[ "$LIST" -eq 1 ]] && exit 0
 
 REMOTE_RUN_DIR="$REMOTE_TASK_DIR/$RUN"
 REMOTE_CKPT="$REMOTE_RUN_DIR/model_${STEP}.pt"
