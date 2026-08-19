@@ -47,8 +47,9 @@ _MOVING_BALL_SPAWN_BEARING_RANGE = (-0.87266463, 0.87266463)
 _MOVING_BALL_CLOSEST_APPROACH_RANGE = (-0.25, 0.25)
 _BALL_FRICTION_RANGE = (0.9, 1.3)
 _KICK_DETECTION_WARMUP_STEPS = 5
-# The likelihood runner collects 48 control steps per learning iteration.
-_BALL_SPEED_CURRICULUM_WARMUP_STEPS = 500 * 48
+# Keep the ball stationary for the first 1,000 learning iterations.  The
+# likelihood runner collects 48 control steps per learning iteration.
+_BALL_SPEED_CURRICULUM_WARMUP_STEPS = 1000 * 48
 
 
 def _leg_joints() -> SceneEntityCfg:
