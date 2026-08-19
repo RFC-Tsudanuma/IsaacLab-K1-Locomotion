@@ -54,6 +54,10 @@ checkpoint はそのまま載る (改造はどれも観測にも行動空間に�
 NOTE: G の作り方が変わるのは **``follow_ball=True`` の段だけ**。stage 2 以降は
       全部そうなので、4 段すべてに同じ改造を入れてある。段によって G が変わると
       前段で覚えた歩き方・回り込み方が次の段で通用しなくなる。
+NOTE: stage 4 以降は蹴り方向の観測に自己位置推定の遅延 (0.15-0.30 s) が入る
+      (:func:`~..walk_kick.walk_kick_env_cfg.enable_localization_delay`)。
+      ボール知覚のノイズ+遅延と同じ扱いで、この段で初めて入るので、stage 3 の
+      checkpoint から続けると方向の指標が一度悪化する。
 """
 
 from isaaclab.utils import configclass
@@ -62,6 +66,7 @@ from ..walk_kick.walk_kick_env_cfg import (
     _apply_noisy_ball_obs,
     _apply_walk_state_init,
     _disable_ball_obs_jitter,
+    enable_localization_delay,
     K1WalkKick360EnvCfg,
     K1WalkKickEnvCfg,
 )
@@ -205,16 +210,39 @@ class K1WalkKick360WeakOrbitEnvCfg_PLAY(K1WalkKick360WeakOrbitEnvCfg):
 class K1WalkKick360WeakOrbitNoisyBallEnvCfg(K1WalkKick360WeakOrbitEnvCfg):
     """Stage 4 (weak, orbit): 知覚ノイズ+遅延つき。stage 3 の checkpoint から続ける。
 
-    :class:`K1WalkKick360WeakOrbitEnvCfg` との差は policy のボール位置観測だけ
-    (エピソードごとランダム遅延 2-6 ステップ + 30Hz サンプル&ホールド +
-    ガウスジッタ σ=6.7cm・クリップ ±20cm)。観測差し替えは報酬にもコマンドにも
-    触らないので、回り込みの設定はそのまま残る。
+    :class:`K1WalkKick360WeakOrbitEnvCfg` との差は policy の観測 2 スロットだけ。
+    観測の差し替えは報酬にもコマンドにも触らないので、回り込みの設定はそのまま残る。
+
+    * ``prev_ball_pos``: ボール知覚 (エピソードごとランダム遅延 2-6 ステップ +
+      30Hz サンプル&ホールド + ガウスジッタ σ=6.7cm・クリップ ±20cm)。
+    * ``kick_direction``: 自己位置推定の遅延 0.15-0.30 s
+      (:func:`~..walk_kick.walk_kick_env_cfg.enable_localization_delay`)。
     """
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
         _apply_noisy_ball_obs(self)
+
+        # -- 蹴り方向の観測に自己位置推定の遅延を掛ける
+        #
+        # 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) ででき
+        # ており、出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の
+        # 座標で与えるので、体基準に直すにはロボット自身のヨー角が要る。遅れたヨー角で
+        # 変換すると policy が見る蹴り方向が実際とずれる。既定 0.15-0.30 s で、
+        # env ごと・エピソードごとに引き直す。詳細は enable_localization_delay。
+        #
+        # 上のボール知覚とは別枠。ボール位置・速度はカメラが体基準で直接測る量で
+        # 自己位置推定を通らないので含めない。掛かるのは kick_direction 1 スロットだけ。
+        #
+        # NOTE: Stage 1-3 では掛けない。ボール知覚のノイズ+遅延と同じ扱いで、
+        #       センサ由来の遅延はこの段で初めて入る。段を跨いで条件が変わるので、
+        #       Stage 3 の checkpoint から入ると方向の指標
+        #       (Metrics/kick_direction/kick_dir_error_deg) が一度悪化する。
+        # NOTE: この系統の観測は 55 次元・1 フレームで履歴が無い。policy が使える
+        #       手掛かりは同じフレームのジャイロ (base_ang_vel) だけなので、
+        #       履歴入力を持つ walk_long_pass_orbit より条件が厳しい。
+        enable_localization_delay(self)
 
 
 @configclass

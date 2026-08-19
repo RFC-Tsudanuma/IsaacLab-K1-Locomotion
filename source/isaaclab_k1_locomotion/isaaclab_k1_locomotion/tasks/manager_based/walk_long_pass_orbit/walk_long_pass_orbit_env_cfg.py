@@ -7,14 +7,16 @@
 
 このファイルは **コミット 47b8863 時点の walk_long_pass をそのまま移植したもの**
 (履歴入力 50/100 フレーム + kick_rate ゲート付きの帯カリキュラム + 着地 shaping の
-除去 + センサ遅延 DR)。以下の 3 点だけを足してある:
+除去 + センサ遅延 DR)。以下の 4 点だけを足してある:
 
 * 回り込み型の目標終端 G (``r_max`` / ``orbit_beta``)
 * キック線を跨ぐときの遊び (``overshoot_margin``)
 * ボールまわりの 4 点ドメインランダマイゼーション
   (足の反発 / ボール物性 / 初期回転 / 転がり減速)
+* 蹴り方向の観測に自己位置推定の遅延 0.15-0.30 s (Stage 4 のみ)
 
-いずれも :mod:`.orbit_mods` にまとめてある。現在の master 側の walk_long_pass は
+上 3 点は :mod:`.orbit_mods` にまとめてある。自己位置推定の遅延だけは
+:func:`~..walk_kick.walk_kick_env_cfg.enable_localization_delay` (共用)。現在の master 側の walk_long_pass は
 別の方向 (1 フレーム観測のまま DR と短期履歴を足す) へ進んでおり、こちらとは
 **checkpoint も報酬構成も繋がらない別系統**なので、タスク ID も experiment_name も
 分けてある。
@@ -176,7 +178,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
 from ..walk_kick import mdp
 from ..walk_kick.mdp.observations import _delayed_signal, prev_ball_pos_b
-from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
+from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS, enable_localization_delay
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
 from .orbit_mods import apply_ball_param_dr, apply_orbit_params
 
@@ -697,6 +699,27 @@ class K1WalkLongPassOrbitEnvCfg(K1WalkLoopPass360EnvCfg):
         # 観測の次元も並びも変わらないので checkpoint はそのまま繋がる。
         # 対象と理由は enable_obs_delay / _OBS_DELAY_MAX_S のコメント参照。
         enable_obs_delay(self, _OBS_DELAY_MAX_S)
+
+        # -- 0b'. 蹴り方向の観測に自己位置推定の遅延を掛ける
+        #
+        # 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) ででき
+        # ており、出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の
+        # 座標で与えるので、体基準に直すにはロボット自身のヨー角が要る。遅れたヨー角で
+        # 変換すると policy が見る蹴り方向が実際とずれる。既定 0.15-0.30 s で、
+        # env ごと・エピソードごとに引き直す。詳細は enable_localization_delay。
+        #
+        # 上の 0b とは別枠。あちらは IMU / エンコーダ / カメラで、こちらは自己位置推定。
+        # 掛かるのは policy 観測の kick_direction 1 スロットだけ。ボール位置・速度は
+        # カメラが体基準で直接測る量なので含めない (0b の "vision" group が別に見る)。
+        #
+        # NOTE: Stage 1-3 では掛けない。上の enable_obs_delay と同じ扱いで、
+        #       センサ由来の遅延はこの段で初めて入る。段を跨いで条件を変えることに
+        #       なるので、Stage 3 の checkpoint から入るときは方向の指標
+        #       (Metrics/kick_direction/kick_dir_error_deg) が一度悪化する。
+        # NOTE: actor は _OBS_HISTORY_LENGTH フレームの履歴を見るので、自分が
+        #       どれだけ回ったかを履歴から読めば遅延ぶんを補正できる余地がある
+        #       (1 フレーム観測の系統より条件が良い)。
+        enable_localization_delay(self)
 
         # -- 0c. 地面をランダムな軽い凹凸にする
         #

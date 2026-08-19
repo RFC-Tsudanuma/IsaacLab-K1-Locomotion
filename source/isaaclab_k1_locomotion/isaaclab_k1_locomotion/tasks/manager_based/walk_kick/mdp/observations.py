@@ -701,6 +701,65 @@ def delayed_ball_pos_vision_b(
     )
 
 
+# --------------------------------------------------------------------------- #
+# 自己位置推定の遅延
+#
+# 上の 2 系統 (vision / imu・encoder) とはまた別枠。こちらは **ロボット自身の向き
+# (ヨー角) がいつの時点のものか** の遅れを模す。
+#
+# 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) でできており、
+# その出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の座標
+# (ゴールなど) で与えるので、体基準に直すにはこのヨー角が要る。遅れたヨー角で
+# 変換すると、policy が見る蹴り方向は実際とずれる。
+#
+# 実装は「``kick_dir_b`` の出力そのものを遅延させる」だけ。これで
+# 「古いヨー角で今の θ を変換した値」と **完全に同じ値**になる:
+#
+#   kick_dir_b(t) = R(yaw_t)^-1 · dir_w   で dir_w は θ から決まる
+#   θ は KickDirectionCommand の resampling_time_range = (1e9, 1e9) により
+#   エピソード中いっさい変わらない  →  dir_w も定数
+#   よって kick_dir_b(t - Δ) = R(yaw_{t-Δ})^-1 · dir_w
+#
+# ヨー角の履歴バッファを別に持つ必要はなく、既存の :func:`_delayed_signal` に
+# 載せられる。遅延量は env ごと・エピソードごとに引き直される。
+#
+# NOTE: θ をエピソード途中で引き直す設定にしたら、この等価性は壊れる
+#       (指令の変化そのものまで遅れることになる)。そのときはヨー角側を
+#       遅延させる実装に書き換えること。
+# NOTE: ボール位置・速度には掛けないこと。あれはカメラが体基準で直接測る量で
+#       自己位置推定を通らず、別枠の vision 遅延を既に持っている。
+#       自己位置の遅延を受ける policy 観測は ``kick_direction`` の 1 スロットだけ。
+# NOTE: policy 観測にだけ掛けること (critic は特権情報)。
+# --------------------------------------------------------------------------- #
+
+
+def delayed_kick_dir_b(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    command_name: str = "kick_direction",
+    group: str = "localization",
+    base_delay_s: float = 0.0,
+) -> torch.Tensor:
+    """自己位置推定の遅延ぶんだけ古いヨー角で変換した蹴り方向。shape: (N, 2)
+
+    実効遅延は ``base_delay_s + [0, max_delay_s]``。150-300 ms を狙うなら
+    ``base_delay_s=0.15, max_delay_s=0.15``。
+
+    Args:
+        max_delay_s: ランダム成分の上限 [s]。
+        command_name: :class:`~.commands.KickDirectionCommand` の名前。
+        group: 遅延量を共有するセンサ名。ボールの "vision" とは別にすること
+            (カメラの生画像と自己位置推定では出所も経路も違う)。
+        base_delay_s: 全 env 共通の固定遅延 [s]。
+
+    NOTE: 線形補間で単位ベクトルの長さがわずかに縮むので、返す前に正規化する。
+          `kick_dir_b` は単位ベクトルを返す規約なので、長さの情報を持たせない。
+    """
+    value = kick_dir_b(env, command_name=command_name)
+    out = _delayed_signal(env, "kick_dir_b", group, value, max_delay_s, base_delay_s)
+    return out / out.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+
+
 def prev_joint_request_rsi(env: ManagerBasedRLEnv) -> torch.Tensor:
     """前ステップの関節指令。RSI でリセットした env は 1 ステップ目だけ注入値を返す。
 

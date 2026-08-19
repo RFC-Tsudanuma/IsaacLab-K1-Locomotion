@@ -991,6 +991,93 @@ def _disable_ball_obs_jitter(cfg: "K1WalkKickEnvCfg") -> None:
     cfg.observations.policy.prev_ball_pos.params["jitter_std"] = 0.0
 
 
+# --------------------------------------------------------------------------- #
+# 自己位置推定の遅延
+#
+# 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) の組み合わせで、
+# 出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の座標
+# (ゴールなど) で与えるので、体基準に直すにはロボット自身のヨー角が要る。
+# 遅れたヨー角で変換すると policy が見る蹴り方向は実際とずれる。
+#
+# 対象は policy 観測の ``kick_direction`` **1 スロットだけ**。ボール位置・速度は
+# カメラが体基準で直接測る量で自己位置推定を通らないので含めない (あちらは
+# :func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_delay` の "vision"
+# group が別に見ている)。IMU / エンコーダも同様に別枠。
+#
+# 効き方の目安: 制御周期 dt = 0.02 s なので 0.15-0.30 s = 7.5-15 ステップ。
+# 1 rad/s で回っているとき 0.3 s では約 17° ずれる。蹴り方向報酬の幅は
+# σ = 0.35 rad ≈ 20° (:data:`_SIGMA_DIRECTION`) なので、**報酬の幅と同程度の
+# 大きさの外乱**になる。回り込みの大きい 360 系ほど強く効く。
+#
+# 帯の広さについて: policy 観測にはジャイロ (``base_ang_vel``) が入っているので、
+# 「今この速さで回っているなら古い向きはこれくらいずれている」という補正は
+# 1 フレームの情報だけで学習できる。ただしそれは遅延量が絞られている場合の話で、
+# 0.15-0.30 s のように広く振ると policy はどれだけずれているか判断できず、
+# 補正を諦めて「ゆっくり回る」逃げ方に寄りやすい。**原因の切り分けが済んだら
+# 帯を狭める** (例: base 0.25 / max 0.05) ことを検討すること。
+#
+# NOTE: これは第一段階の単純版で、実機の誤差そのものではない。InEKF は IMU と FK で
+#       高い頻度で状態を進めるので、実際に policy へ届くヨー角は 0.3 s 古いわけでは
+#       なく、「短い遅れ + ランドマークが見えない間に溜まるずれ + 見えた瞬間の飛び」
+#       という形になる。単純な遅延で挙動の変化を確かめてから、そちらへ寄せること。
+# --------------------------------------------------------------------------- #
+_LOCALIZATION_DELAY_BASE_S = 0.15
+_LOCALIZATION_DELAY_MAX_S = 0.15
+
+
+def enable_localization_delay(
+    cfg,
+    base_delay_s: float = _LOCALIZATION_DELAY_BASE_S,
+    max_delay_s: float = _LOCALIZATION_DELAY_MAX_S,
+) -> bool:
+    """policy 観測の ``kick_direction`` に自己位置推定の遅延を掛ける。
+
+    実効遅延は ``base_delay_s + [0, max_delay_s]``、既定で 0.15-0.30 s。
+    遅延量は **env ごと・エピソードごと** に引き直し、エピソード内では一定
+    (:func:`~.mdp.observations._delayed_signal` の流儀に揃えてある)。
+
+    ``enable_obs_delay`` と同じく既存の ObsTerm の ``func`` / ``params`` だけを
+    差し替えるので、観測の次元も並び順も変わらない。遅延の有無で checkpoint は
+    そのまま繋がる。
+
+    critic には掛けない。特権情報から価値を推定させる側なので、遅延させても
+    学習が難しくなるだけで得るものが無い (``enable_obs_delay`` と同じ方針)。
+
+    **walk phase では何もしない。** あの段は ``kick_direction`` コマンド自体を
+    ``None`` にして、スロットに歩行コマンドのヨー方向 (``mdp.walk_command_yaw_dir``) を
+    載せている。歩行コマンドは体基準で外から与えるもので自己位置推定を通らないので、
+    遅延を掛ける対象ではない。
+
+    中間 stage から呼ぶこともできるが、その場合は全 stage で同じ遅延にすること
+    (遅延の有無で回り込み方が変わるので、段の間で条件が変わると引き継ぎの意味が薄れる)。
+
+    Returns:
+        実際に遅延を掛けたら True、walk phase などで対象外なら False。
+    """
+    # walk phase の判定 (docstring 参照)。あの段は kick_direction コマンドを None に
+    # したうえで、観測スロットに歩行コマンドのヨー方向を載せている。観測項の func を
+    # 見て判定すると、想定外の構成のときに黙ってスキップして「遅延を掛けたつもりで
+    # 掛かっていない」状態になるので、コマンドの有無で判定する。
+    if getattr(cfg.commands, "kick_direction", None) is None:
+        return False
+
+    term = getattr(cfg.observations.policy, "kick_direction", None)
+    if term is None:
+        raise AttributeError(
+            "policy 観測に 'kick_direction' がありません。自己位置遅延の対象項名が"
+            " 継承元の観測構成と食い違っています。"
+        )
+
+    term.func = mdp.delayed_kick_dir_b
+    term.params = {
+        **term.params,
+        "base_delay_s": base_delay_s,
+        "max_delay_s": max_delay_s,
+        "group": "localization",
+    }
+    return True
+
+
 @configclass
 class K1WalkKick360NoisyBallEnvCfg(K1WalkKick360EnvCfg):
     """知覚ノイズ+遅延つき全方位版。ボール位置観測だけを実機の認識パイプライン寄りにする。
