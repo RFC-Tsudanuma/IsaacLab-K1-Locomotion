@@ -13,10 +13,10 @@
 * キック線を跨ぐときの遊び (``overshoot_margin``)
 * ボールまわりの 4 点ドメインランダマイゼーション
   (足の反発 / ボール物性 / 初期回転 / 転がり減速)
-* 蹴り方向の観測に自己位置推定の遅延 0.15-0.30 s (Stage 4 のみ)
+* 蹴り方向の観測に自己位置推定の誤差 (Stage 4 のみ、:func:`enable_localization_error`)
+  — 地図上 5-12 m 先の目標を狙う前提で、位置 0.2 m / ヨー 6° / 遅延 0.20-0.30 s
 
-上 3 点は :mod:`.orbit_mods` にまとめてある。自己位置推定の遅延だけは
-:func:`~..walk_kick.walk_kick_env_cfg.enable_localization_delay` (共用)。現在の master 側の walk_long_pass は
+上 3 点は :mod:`.orbit_mods` にまとめてある。現在の master 側の walk_long_pass は
 別の方向 (1 フレーム観測のまま DR と短期履歴を足す) へ進んでおり、こちらとは
 **checkpoint も報酬構成も繋がらない別系統**なので、タスク ID も experiment_name も
 分けてある。
@@ -169,6 +169,9 @@ docstring 参照）。
 ゲート付きカリキュラムが「今の実力の少し上」を指令し続けることで担保している。
 """
 
+import math
+import torch
+
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
@@ -178,7 +181,7 @@ from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from ..locomotion.flat_env_cfg import NOISY_FLAT_TERRAIN_CFG
 from ..walk_kick import mdp
 from ..walk_kick.mdp.observations import _delayed_signal, prev_ball_pos_b
-from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS, enable_localization_delay
+from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS
 from ..walk_loop_pass.walk_loop_pass_env_cfg import K1WalkLoopPass360EnvCfg
 from .orbit_mods import apply_ball_param_dr, apply_orbit_params
 
@@ -600,6 +603,183 @@ def enable_obs_delay(
     return applied
 
 
+# --------------------------------------------------------------------------- #
+# 自己位置推定の誤差 (地図上の目標を狙う版)
+#
+# 上の enable_obs_delay とは別枠。あちらは IMU / エンコーダ / カメラ、こちらは
+# 自己位置推定 (カメラのランドマーク認識 + InEKF)。掛かるのは policy 観測の
+# ``kick_direction`` 1 スロットだけ。ボール位置・速度はカメラが体基準で直接測る量で
+# 自己位置推定を通らないので含めない (あちらの "vision" group が別に見ている)。
+#
+# なぜ「向きをずらす」だけでは足りないか
+# --------------------------------------
+# 蹴る目標は地図上の点 (5-12 m 先) で与える。体基準の蹴り方向を出すには
+#
+#   1. 自分が地図のどこにいるか (位置 r)
+#   2. 自分がどっちを向いているか (ヨー角)
+#
+# の両方が要る。1 がずれると、目標への向きは **目標が遠いほど小さく** ずれる
+# (0.2 m のずれは 5 m 先で 2.3°、10 m 先で 1.1°)。2 がずれると距離に関係なく
+# 同じだけずれる。前者は「観測を回すだけ」のモデルでは作れないので、目標点 g を
+# 実際に置いて、誤差のある自己位置から g への向きを計算する。
+#
+# モデル
+# ------
+#   真値   : θ = angle(g − ボール位置)。報酬はこれで採点する (今までどおり)。
+#   観測   : 誤差のある自己位置 (r_est, yaw_est) から g への向きを体基準にしたもの。
+#
+#   r_est   = r(t − Δ)   + bias_pos    (2 次元、エピソードごと固定)
+#   yaw_est = yaw(t − Δ) + bias_yaw    (スカラー、エピソードごと固定)
+#
+# g はリセット時に ``ボール位置 + D · (cos θ, sin θ)`` で置く。**蹴るまでボールは
+# 動かないので θ は今までどおりエピソード中一定**で、報酬・コマンド・kick_state は
+# 一切変えなくてよい (変わるのは観測だけ)。
+#
+# 誤差の値は実機の自己位置推定の担当者から得た見積もり:
+#   位置 0.2 m / ヨー 5-6° / 遅延 250 ms 程度
+#
+# 遅延そのものの寄与も無視できない。0.5 m/s で歩いていれば 250 ms で 0.125 m 進むので、
+# 遅延ぶんのずれは 0.2 m のバイアスと同じ桁になる。ヨーも 1 rad/s で回っていれば
+# 250 ms で 14° で、5-6° のバイアスより大きい。
+#
+# NOTE: 位置とヨーは同じ推定器から出るので、**必ず同じ遅延量**を引くこと
+#       (片方だけ古い、は実機ではあり得ない)。下では 4 次元にまとめて
+#       _delayed_signal を 1 回だけ呼ぶことでそれを保証している。
+# NOTE: ヨーは ±π で折り返すので、そのまま線形補間すると跨いだ瞬間に真逆を向く。
+#       cos/sin を積んで atan2 で戻す。
+# NOTE: policy 観測にだけ掛けること。critic は特権情報なので真値のまま。
+# NOTE: D は v_target と独立に引いている。実機では「速く蹴れ = 遠くを狙っている」で
+#       両者は結び付いており (d = v²/2a、モジュール docstring の換算)、そちらへ
+#       寄せるなら _MAP_TARGET_DIST_RANGE をやめて v_target から出せばよい。
+#       D は観測の誤差の大きさを決めるだけで報酬には効かないので、まずは独立の
+#       一様サンプリングで誤差の幅を広く経験させる。
+# --------------------------------------------------------------------------- #
+_LOC_DELAY_BASE_S = 0.20
+_LOC_DELAY_JITTER_S = 0.10   # 実効遅延 = 0.20 + [0, 0.10] = 0.20-0.30 s
+_LOC_POS_ERR_MAX = 0.2       # 自己位置のずれ [m]
+_LOC_YAW_ERR_MAX = 0.105     # 自己位置のヨーのずれ [rad] = 6°
+_MAP_TARGET_DIST_RANGE = (5.0, 12.0)  # 目標点までの距離 [m]
+
+_LOC_ERR_STATE_ATTR = "_loc_err_state"
+
+
+def map_target_kick_dir_b(
+    env,
+    command_name: str = "kick_direction",
+    delay_s: float = _LOC_DELAY_BASE_S,
+    delay_jitter_s: float = _LOC_DELAY_JITTER_S,
+    pos_err_max: float = _LOC_POS_ERR_MAX,
+    yaw_err_max: float = _LOC_YAW_ERR_MAX,
+    dist_range: tuple[float, float] = _MAP_TARGET_DIST_RANGE,
+    group: str = "localization",
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """誤差のある自己位置から地図上の目標点を狙った蹴り方向。shape: (N, 2)
+
+    誤差ゼロなら :func:`~..walk_kick.mdp.observations.kick_dir_b` と完全に一致する
+    (g はコマンドの θ 上に置くので、真の自己位置から見れば向きは θ そのもの)。
+    設計と値の根拠はこの上のコメント。
+    """
+    robot = env.scene["robot"]
+    ball = env.scene[ball_cfg.name]
+    dev = robot.data.root_pos_w.device
+    num_envs = env.num_envs
+
+    r = robot.data.root_pos_w[:, :2]
+    q = robot.data.root_quat_w
+    qw, qx, qy, qz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    ball_pos = ball.data.root_pos_w[:, :2]
+
+    # -- 1. 遅延。位置とヨーを 1 本にまとめて 1 回だけ呼び、同じ遅延量を引かせる。
+    pose = torch.stack([r[:, 0], r[:, 1], torch.cos(yaw), torch.sin(yaw)], dim=-1)
+    lagged = _delayed_signal(env, "loc_pose", group, pose, delay_jitter_s, delay_s)
+    r_lag = lagged[:, :2]
+    yaw_lag = torch.atan2(lagged[:, 3], lagged[:, 2])
+
+    # -- 2. エピソードごとに固定のバイアスと目標点 g
+    cmd = env.command_manager.get_command(command_name)  # (N, 3) [sin θ, cos θ, v]
+    dir_w = torch.stack([cmd[:, 1], cmd[:, 0]], dim=-1)  # (cos θ, sin θ)
+
+    state = getattr(env, _LOC_ERR_STATE_ATTR, None)
+    if state is None or state["bias_yaw"].shape[0] != num_envs:
+        state = {
+            "bias_pos": torch.zeros(num_envs, 2, device=dev),
+            "bias_yaw": torch.zeros(num_envs, device=dev),
+            "g": torch.zeros(num_envs, 2, device=dev),
+        }
+        setattr(env, _LOC_ERR_STATE_ATTR, state)
+        fresh = torch.ones(num_envs, dtype=torch.bool, device=dev)
+    else:
+        # prev_ball_pos_b と同じ判定: episode_length_buf は step() 内で加算された後に
+        # _reset_idx で 0 に戻るので、「今このステップでリセットされた env」だけが 0。
+        fresh = env.episode_length_buf == 0
+
+    if bool(fresh.any()):
+        k = int(fresh.sum())
+        # 位置のずれは向きを一様、大きさを [0, pos_err_max] の一様で引く。
+        ang = (torch.rand(k, device=dev) * 2.0 - 1.0) * math.pi
+        mag = torch.rand(k, device=dev) * pos_err_max
+        state["bias_pos"][fresh] = torch.stack([mag * torch.cos(ang), mag * torch.sin(ang)], dim=-1)
+        state["bias_yaw"][fresh] = (torch.rand(k, device=dev) * 2.0 - 1.0) * yaw_err_max
+        lo, hi = dist_range
+        dist = torch.rand(k, device=dev) * (hi - lo) + lo
+        state["g"][fresh] = ball_pos[fresh] + dist.unsqueeze(-1) * dir_w[fresh]
+
+    # -- 3. 誤差のある自己位置
+    r_est = r_lag + state["bias_pos"]
+    yaw_est = yaw_lag + state["bias_yaw"]
+
+    # -- 4. その自己位置から見たボールの地図上の位置
+    #
+    # ボールの相対位置はカメラが体基準で測るので、ここでは正しい値が得られている
+    # ものとして扱う (カメラ側の誤差は enable_obs_delay の "vision" group の担当)。
+    # 体基準の相対位置を **推定ヨー** で地図へ戻すので、真値との差は R(yaw_est − yaw)。
+    d_yaw = yaw_est - yaw
+    cd, sd = torch.cos(d_yaw), torch.sin(d_yaw)
+    rel = ball_pos - r
+    rel_est = torch.stack([cd * rel[:, 0] - sd * rel[:, 1], sd * rel[:, 0] + cd * rel[:, 1]], dim=-1)
+    ball_est = r_est + rel_est
+
+    # -- 5. 目標への向きを推定ヨーで体基準へ落とす
+    v = state["g"] - ball_est
+    v = v / v.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+    ce, se = torch.cos(yaw_est), torch.sin(yaw_est)
+    return torch.stack([ce * v[:, 0] + se * v[:, 1], -se * v[:, 0] + ce * v[:, 1]], dim=-1)
+
+
+def enable_localization_error(cfg, **kwargs) -> bool:
+    """policy 観測の ``kick_direction`` を :func:`map_target_kick_dir_b` に差し替える。
+
+    ``kwargs`` はそのまま :func:`map_target_kick_dir_b` に渡る
+    (``delay_s`` / ``pos_err_max`` / ``yaw_err_max`` / ``dist_range`` など)。
+
+    ``enable_obs_delay`` と同じく既存の ObsTerm の ``func`` / ``params`` だけを
+    差し替えるので、観測の次元も並び順も変わらない。誤差の有無で checkpoint は
+    そのまま繋がる。critic には掛けない。
+
+    **walk phase では何もしない。** あの段は ``kick_direction`` コマンド自体を
+    ``None`` にして、スロットに歩行コマンドのヨー方向を載せている。歩行コマンドは
+    体基準で外から与えるもので自己位置推定を通らないので、対象ではない。
+
+    Returns:
+        実際に差し替えたら True、walk phase などで対象外なら False。
+    """
+    if getattr(cfg.commands, "kick_direction", None) is None:
+        return False
+
+    term = getattr(cfg.observations.policy, "kick_direction", None)
+    if term is None:
+        raise AttributeError(
+            "policy 観測に 'kick_direction' がありません。自己位置誤差の対象項名が"
+            " 継承元の観測構成と食い違っています。"
+        )
+
+    term.func = map_target_kick_dir_b
+    term.params = {**term.params, **kwargs}
+    return True
+
+
 def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
     """``before_iter`` までに立ち上がりきる報酬重みのランプを、終値の定数に潰す。
 
@@ -700,26 +880,26 @@ class K1WalkLongPassOrbitEnvCfg(K1WalkLoopPass360EnvCfg):
         # 対象と理由は enable_obs_delay / _OBS_DELAY_MAX_S のコメント参照。
         enable_obs_delay(self, _OBS_DELAY_MAX_S)
 
-        # -- 0b'. 蹴り方向の観測に自己位置推定の遅延を掛ける
+        # -- 0b'. 蹴り方向の観測に自己位置推定の誤差を入れる
         #
-        # 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) ででき
-        # ており、出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の
-        # 座標で与えるので、体基準に直すにはロボット自身のヨー角が要る。遅れたヨー角で
-        # 変換すると policy が見る蹴り方向が実際とずれる。既定 0.15-0.30 s で、
-        # env ごと・エピソードごとに引き直す。詳細は enable_localization_delay。
+        # 蹴る目標は地図上の点 (5-12 m 先)。体基準の蹴り方向を出すには自分が地図の
+        # どこにいてどっちを向いているかが要るので、自己位置推定がずれるとその向きも
+        # ずれる。位置 0.2 m / ヨー 6° / 遅延 0.20-0.30 s。設計と値の根拠は
+        # map_target_kick_dir_b の上のコメント。
         #
         # 上の 0b とは別枠。あちらは IMU / エンコーダ / カメラで、こちらは自己位置推定。
         # 掛かるのは policy 観測の kick_direction 1 スロットだけ。ボール位置・速度は
         # カメラが体基準で直接測る量なので含めない (0b の "vision" group が別に見る)。
         #
         # NOTE: Stage 1-3 では掛けない。上の enable_obs_delay と同じ扱いで、
-        #       センサ由来の遅延はこの段で初めて入る。段を跨いで条件を変えることに
+        #       センサ由来の誤差はこの段で初めて入る。段を跨いで条件を変えることに
         #       なるので、Stage 3 の checkpoint から入るときは方向の指標
         #       (Metrics/kick_direction/kick_dir_error_deg) が一度悪化する。
-        # NOTE: actor は _OBS_HISTORY_LENGTH フレームの履歴を見るので、自分が
-        #       どれだけ回ったかを履歴から読めば遅延ぶんを補正できる余地がある
-        #       (1 フレーム観測の系統より条件が良い)。
-        enable_localization_delay(self)
+        # NOTE: actor は _OBS_HISTORY_LENGTH フレームの履歴を見るので、自分がどれだけ
+        #       歩いて回ったかを履歴から読めば遅延ぶんは補正できる余地がある。ただし
+        #       位置・ヨーのバイアスはエピソード内で一定かつ観測できないので、そちらは
+        #       補正しようがない (方向の指標に下限として残る)。
+        enable_localization_error(self)
 
         # -- 0c. 地面をランダムな軽い凹凸にする
         #
