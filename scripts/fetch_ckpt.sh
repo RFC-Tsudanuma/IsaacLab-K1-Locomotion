@@ -8,15 +8,17 @@
 #   ./scripts/fetch_ckpt.sh --full k1_walk_kick     # run ディレクトリ丸ごと
 #   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (policy*.onnx) も取ってくる
 #   ./scripts/fetch_ckpt.sh --video k1_walk_kick    # videos/ も取ってくる
-#   ./scripts/fetch_ckpt.sh --tfevents k1_walk_kick # TensorBoard のログも取ってくる
+#   ./scripts/fetch_ckpt.sh --no-tfevents k1_walk_kick # TensorBoard のログは要らない
 #
 # --onnx / --video を付けたときは、**ssh 越しにリモートで生成してから回収する**
 # (既定)。リモートに古い成果物が残っていても必ず作り直す。生成には Isaac Sim の
 # 起動を伴うので数分かかる。
 #   --no-remote-exec        生成せず、無ければ従来どおり WARN だけ出す
 #
-# --tfevents は既に学習が書き出したものを回収するだけなので、リモートでの生成は
-# 伴わない (Isaac Sim も起動しない)。--full なら run ディレクトリ丸ごとなので不要。
+# TensorBoard のログ (events.out.tfevents.*) は**既定で回収する**。既に学習が
+# 書き出したものを取ってくるだけなので、リモートでの生成は伴わない (Isaac Sim も
+# 起動しない)。要らないときは --no-tfevents を付ける。--full なら run ディレクトリ
+# 丸ごとなので、いずれにせよ含まれる。
 #
 #   --gym-task <ID>         gym タスク ID の自動解決を上書きする
 #   --video-length <N>      録画するステップ数 (既定 200)
@@ -35,7 +37,7 @@ FULL=0
 LIST=0
 ONNX=0
 VIDEO=0
-TFEVENTS=0
+TFEVENTS=1
 REMOTE_EXEC=1
 GYM_TASK=""
 VIDEO_LENGTH=200
@@ -51,6 +53,7 @@ while [[ $# -gt 0 ]]; do
     --onnx)    ONNX=1; shift ;;
     --video)   VIDEO=1; shift ;;
     --tfevents) TFEVENTS=1; shift ;;
+    --no-tfevents) TFEVENTS=0; shift ;;
     --no-remote-exec) REMOTE_EXEC=0; shift ;;
     --gym-task) GYM_TASK="$2"; shift 2 ;;
     --video-length) VIDEO_LENGTH="$2"; shift 2 ;;
