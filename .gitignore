@@ -136,3 +136,11 @@ logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/*
 !logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/
 logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/*
 !logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/model_3000.pt
+
+# walk_long_pass_orbit の Stage 4 (Isaac-Velocity-Flat-K1-Walk-Long-Pass-Orbit-v0) の
+# 途中経過 4400 iter (max_iterations 5000 の run)。--resume の起点。
+!logs/rsl_rl/k1_walk_long_pass_orbit/
+logs/rsl_rl/k1_walk_long_pass_orbit/*
+!logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/
+logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/*
+!logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/model_4400.pt
