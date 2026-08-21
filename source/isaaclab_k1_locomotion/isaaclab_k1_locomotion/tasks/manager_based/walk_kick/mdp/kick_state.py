@@ -14,7 +14,9 @@
   いずれもエピソード内で一度立ったら解除しない。
 
 状態はステップごとに一度だけ更新する (``common_step_counter`` でステップ境界を検出)。
-どの項から先に呼ばれても同じ結果になるので、報酬項の評価順に依存しない。
+同じステップ内で部分 reset された行だけは新エピソードの基準値へ再初期化するが、
+他の行は再更新しない。どの項から先に呼ばれても同じ結果になるので、報酬項の評価順に
+依存しない。
 
 NOTE: RewardManager は weight==0 の項をスキップするので、カリキュラムで weight を 0 から
       立ち上げる項だけに更新を任せると Phase 1 の間ずっと状態が更新されない。そのため
@@ -76,6 +78,47 @@ _INIT_SIDE_COMMIT_DIST = 0.1
 # で決まる。R=0.11 のとき e=3.6cm (足裏接地) で 42°、e=9.1cm (足裏 5.5cm) で 10°。
 # --------------------------------------------------------------------------- #
 _SOLE_OFFSET = 0.038
+
+
+def resolve_kick_direction_w(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    ball_position_w: torch.Tensor,
+) -> torch.Tensor:
+    """Resolve a command term to a current world-frame kick unit direction.
+
+    Likelihood map-target commands implement ``direction_from_ball`` and
+    derive the direction from the current ball to their fixed global target.
+    Legacy WalkKick commands have no such method and keep the original
+    ``[sin(theta), cos(theta), speed]`` interpretation unchanged.
+    """
+    get_term = getattr(env.command_manager, "get_term", None)
+    if callable(get_term):
+        command_term = get_term(command_name)
+        resolver = getattr(command_term, "direction_from_ball", None)
+        if callable(resolver):
+            return resolver(ball_position_w)
+
+    command = env.command_manager.get_command(command_name)
+    return torch.stack((command[:, 1], command[:, 0]), dim=-1)
+
+
+def request_kick_state_reset(
+    env: ManagerBasedRLEnv,
+    env_ids,
+) -> None:
+    """Mark rows whose cached kick state must be rebuilt after an env reset.
+
+    Isaac Lab can reset a subset of environments after rewards have populated
+    the step cache, then ask the command manager to update again without
+    incrementing ``common_step_counter``.  Recording the reset explicitly keeps
+    those rows from reusing the preceding episode's geometry while retaining
+    the one-update-per-step guarantee for every other row.
+    """
+    state = getattr(env, _ATTR, None)
+    if state is None:
+        return
+    state["pending_reset"][env_ids] = True
 
 
 def kick_state(
@@ -198,7 +241,25 @@ def kick_state(
     """
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
+    pending_reset = None if state is None else state["pending_reset"].clone()
+    has_pending_reset = pending_reset is not None and bool(pending_reset.any())
     if state is not None and state["step"] == step:
+        if has_pending_reset:
+            _reset_cached_episode_rows(
+                env,
+                state,
+                pending_reset,
+                r_stance=r_stance,
+                alpha=alpha,
+                v_thresh=v_thresh,
+                command_name=command_name,
+                ball_name=ball_name,
+                v_thresh_target_frac=v_thresh_target_frac,
+                v_thresh_floor=v_thresh_floor,
+                r_max=r_max,
+                orbit_beta=orbit_beta,
+                lateral_band=lateral_band,
+            )
         return state
 
     robot = env.scene["robot"]
@@ -213,12 +274,12 @@ def kick_state(
     robot_pos = robot.data.root_pos_w[:, :2]
     robot_vel = robot.data.root_lin_vel_w[:, :2]
 
-    # kick_direction コマンドは [sin θ, cos θ, v_target] (θ は world frame)
+    # Legacy command: [sin θ, cos θ, v_target] (θ is world frame).
+    # Map-target command: [target_x_w, target_y_w, v_target], resolved through
+    # the command-term protocol against the current true ball position.
+    resolved_kick_dir = resolve_kick_direction_w(env, command_name, ball_pos)
     cmd = env.command_manager.get_command(command_name)
-    kick_dir = torch.stack([cmd[:, 1], cmd[:, 0]], dim=-1)  # (cos θ, sin θ), 単位ベクトル
     v_target = cmd[:, 2]
-    # kick_dir を水平面で -90° 回した右向き単位ベクトル: R(-90)·(x, y) = (y, -x)
-    right_vec = torch.stack([kick_dir[:, 1], -kick_dir[:, 0]], dim=-1)
 
     # ロボット胴体のヨー方向
     quat = robot.data.root_quat_w
@@ -244,6 +305,11 @@ def kick_state(
             # tau_direction_frozen は abs なので系統的な左右バイアスが見えない。
             # 報酬には使わず、メトリクス専用 (walk_kick.mdp.commands 参照)。
             "tau_signed_frozen": torch.zeros(env.num_envs, device=device),
+            # True ball-to-target direction at the kick latch.  Map-target
+            # directions change as the ball moves, so post-latch geometry must
+            # use this snapshot rather than chase the flying ball.
+            "kick_dir_frozen": torch.zeros(env.num_envs, 2, device=device),
+            "kick_dir": torch.zeros(env.num_envs, 2, device=device),
             # latch を起こした蹴りの足 (0.0 = 左, 1.0 = 右)。メトリクス専用。
             "kick_foot_frozen": torch.zeros(env.num_envs, device=device),
             "v_ball_frozen": torch.zeros(env.num_envs, device=device),
@@ -273,6 +339,11 @@ def kick_state(
             "d_sole_to_ball_mean": torch.zeros(env.num_envs, device=device),
             "p_kick_pose": torch.zeros(env.num_envs, device=device),
             "v_target": torch.zeros(env.num_envs, device=device),
+            "pending_reset": torch.zeros(
+                env.num_envs,
+                dtype=torch.bool,
+                device=device,
+            ),
         }
         setattr(env, _ATTR, state)
         # 初回はまだエピソードが始まっていないので全 env を初期化対象にする
@@ -280,10 +351,24 @@ def kick_state(
     else:
         # reward / termination は episode_length_buf の加算後、_reset_idx の前に走るので、
         # 新エピソードの 1 歩目は episode_length_buf == 1 になる。
-        just_reset = env.episode_length_buf == 1
+        just_reset = (env.episode_length_buf == 1) | state["pending_reset"]
 
     state["step"] = step
     state["v_target"] = v_target
+
+    # Before the kick, map-target direction follows the current true ball.
+    # From the first step after latch onward, all geometry/scoring shares the
+    # direction captured on the latch step.  A newly reset row must not reuse
+    # the preceding episode's latch before its flags are cleared below.
+    use_frozen_direction = state["kick_done"] & (~just_reset)
+    kick_dir = torch.where(
+        use_frozen_direction.unsqueeze(-1),
+        state["kick_dir_frozen"],
+        resolved_kick_dir,
+    )
+    state["kick_dir"] = kick_dir
+    # kick_dir rotated -90 degrees: R(-90)·(x, y) = (y, -x).
+    right_vec = torch.stack([kick_dir[:, 1], -kick_dir[:, 0]], dim=-1)
 
     # ------------------------------------------------------------------ #
     # エピソード開始時のリセット: 凍結値・フラグ・P_kick・初期側符号
@@ -301,6 +386,7 @@ def kick_state(
         state["overshoot_fired"][just_reset] = False
         state["tau_direction_frozen"][just_reset] = 0.0
         state["tau_signed_frozen"][just_reset] = 0.0
+        state["kick_dir_frozen"][just_reset] = 0.0
         state["kick_foot_frozen"][just_reset] = 0.0
         state["v_ball_frozen"][just_reset] = 0.0
         state["v_ball_3d_frozen"][just_reset] = 0.0
@@ -560,6 +646,11 @@ def kick_state(
             trigger, tau_direction, state["tau_direction_frozen"]
         )
         state["tau_signed_frozen"] = torch.where(trigger, tau_signed, state["tau_signed_frozen"])
+        state["kick_dir_frozen"] = torch.where(
+            trigger.unsqueeze(-1),
+            kick_dir,
+            state["kick_dir_frozen"],
+        )
         # 蹴った足は d_foot_to_ball の argmin (foot_ids = [left, right]) なので 1 = 右。
         state["kick_foot_frozen"] = torch.where(
             trigger, kicking_foot.float(), state["kick_foot_frozen"]
@@ -707,7 +798,170 @@ def kick_state(
     state["prev_ball_vel_xy"].copy_(ball_vel)
     state["prev_foot_pos_w"].copy_(foot_pos)
 
+    state["pending_reset"][just_reset] = False
+
     return state
+
+
+def _reset_cached_episode_rows(
+    env: ManagerBasedRLEnv,
+    state: dict,
+    reset_mask: torch.Tensor,
+    *,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    command_name: str,
+    ball_name: str,
+    v_thresh_target_frac: float,
+    v_thresh_floor: float,
+    r_max: float | None,
+    orbit_beta: float,
+    lateral_band: tuple[float, float] | None,
+) -> None:
+    """Rebase reset rows without advancing cached state for other envs.
+
+    This path is used only when Isaac Lab resets rows after the step cache was
+    already populated. It constructs the same new-episode baseline as the
+    regular ``just_reset`` path, but does not run latch/touch transitions a
+    second time for non-reset rows.
+    """
+    env_ids = reset_mask.nonzero(as_tuple=False).flatten()
+    if env_ids.numel() == 0:
+        return
+
+    robot = env.scene["robot"]
+    ball = env.scene[ball_name]
+    ball_pos_3d = ball.data.root_pos_w[env_ids, :3]
+    ball_pos = ball_pos_3d[:, :2]
+    ball_vel = ball.data.root_lin_vel_w[env_ids, :2]
+    robot_pos = robot.data.root_pos_w[env_ids, :2]
+    robot_vel = robot.data.root_lin_vel_w[env_ids, :2]
+
+    all_ball_pos = ball.data.root_pos_w[:, :2]
+    kick_dir = resolve_kick_direction_w(env, command_name, all_ball_pos)[env_ids]
+    command = env.command_manager.get_command(command_name)
+    v_target = command[env_ids, 2]
+    right_vec = torch.stack((kick_dir[:, 1], -kick_dir[:, 0]), dim=-1)
+    side = ((robot_pos - ball_pos) * right_vec).sum(dim=-1)
+
+    p_kick_base = ball_pos - r_stance * kick_dir
+    if lateral_band is None:
+        lateral = None
+        p_kick = p_kick_base
+    else:
+        lateral = torch.clamp(
+            side,
+            min=lateral_band[0],
+            max=lateral_band[1],
+        ).unsqueeze(-1) * right_vec
+        p_kick = p_kick_base + lateral
+
+    dist_robot_ball = (robot_pos - ball_pos).norm(dim=-1)
+    if r_max is None:
+        reach = torch.clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
+        approach_position = ball_pos - reach.unsqueeze(-1) * kick_dir
+    else:
+        to_robot = robot_pos - ball_pos
+        unit_to_robot = to_robot / (to_robot.norm(dim=-1, keepdim=True) + 1.0e-6)
+        back = -kick_dir
+        phi = torch.atan2(
+            back[:, 0] * unit_to_robot[:, 1] - back[:, 1] * unit_to_robot[:, 0],
+            back[:, 0] * unit_to_robot[:, 0] + back[:, 1] * unit_to_robot[:, 1],
+        )
+        phi_goal = orbit_beta * phi
+        radius = r_stance + (r_max - r_stance) * phi.abs() / math.pi
+        cos_goal = torch.cos(phi_goal)
+        sin_goal = torch.sin(phi_goal)
+        rotated_back = torch.stack(
+            (
+                back[:, 0] * cos_goal - back[:, 1] * sin_goal,
+                back[:, 0] * sin_goal + back[:, 1] * cos_goal,
+            ),
+            dim=-1,
+        )
+        approach_position = ball_pos + radius.unsqueeze(-1) * rotated_back
+        if lateral is not None:
+            fade = 1.0 - phi.abs() / math.pi
+            approach_position = approach_position + fade.unsqueeze(-1) * lateral
+
+    zero_keys = (
+        "kick_done",
+        "overshoot_fired",
+        "overshoot_event",
+        "tau_direction_frozen",
+        "tau_signed_frozen",
+        "kick_dir_frozen",
+        "kick_foot_frozen",
+        "v_ball_frozen",
+        "v_ball_3d_frozen",
+        "phi_frozen",
+        "p_style_frozen",
+        "apex_height",
+        "touch_count",
+        "touch_refractory",
+        "extra_touch_event",
+        "sole_height_last_touch",
+        "sole_height_at_kick",
+        "plant_lon_frozen",
+        "plant_lat_frozen",
+        "foot_vz_frozen",
+        "p_walk",
+        "p_kick_pose",
+    )
+    for key in zero_keys:
+        state[key][env_ids] = 0
+
+    state["init_side"][env_ids] = torch.where(
+        side.abs() > _INIT_SIDE_COMMIT_DIST,
+        torch.sign(side),
+        torch.zeros_like(side),
+    )
+    state["P_kick_base"][env_ids] = p_kick_base
+    state["P_kick"][env_ids] = p_kick
+    state["kick_dir"][env_ids] = kick_dir
+    state["G"][env_ids] = approach_position
+    state["v_target"][env_ids] = v_target
+
+    robot_quat = robot.data.root_quat_w[env_ids]
+    qw, qx, qy, qz = robot_quat.unbind(dim=-1)
+    robot_yaw = torch.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy.square() + qz.square()),
+    )
+    forward = torch.stack((torch.cos(robot_yaw), torch.sin(robot_yaw)), dim=-1)
+    state["p_style"][env_ids] = torch.clamp(
+        (forward * kick_dir).sum(dim=-1),
+        min=0.0,
+        max=1.0,
+    )
+    to_goal = approach_position - robot_pos
+    distance_to_goal = to_goal.norm(dim=-1)
+    direction_to_goal = to_goal / (distance_to_goal.unsqueeze(-1) + 1.0e-6)
+    state["tau_walk"][env_ids] = (robot_vel * direction_to_goal).sum(dim=-1)
+    state["d_to_G"][env_ids] = distance_to_goal
+    state["d_to_P_kick"][env_ids] = (robot_pos - p_kick).norm(dim=-1)
+
+    foot_ids = _foot_body_ids(env, robot)
+    foot_pos = robot.data.body_pos_w[env_ids][:, foot_ids, :]
+    foot_distances = (foot_pos - ball_pos_3d.unsqueeze(1)).norm(dim=-1)
+    state["d_sole_to_ball"][env_ids] = foot_distances.min(dim=1).values
+    state["d_sole_to_ball_mean"][env_ids] = foot_distances.mean(dim=1)
+    state["prev_v_ball"][env_ids] = ball_vel.norm(dim=-1)
+    state["prev_ball_pos_w"][env_ids] = ball_pos_3d
+    state["prev_ball_vel_xy"][env_ids] = ball_vel
+    state["prev_foot_pos_w"][env_ids] = foot_pos
+
+    if v_thresh_target_frac > 0.0:
+        v_thresh_eff = torch.clamp(
+            v_thresh_target_frac * v_target,
+            min=v_thresh_floor,
+            max=v_thresh,
+        )
+    else:
+        v_thresh_eff = torch.full_like(v_target, v_thresh)
+    state["v_thresh_eff"][env_ids] = v_thresh_eff
+    state["pending_reset"][env_ids] = False
 
 
 def _physical_kick_candidates(

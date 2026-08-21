@@ -349,7 +349,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             agent_cfg.class_name
             in {"DirectKickingOnPolicyRunner", "WalkKickLikelihoodOnPolicyRunner"}
             and isinstance(loaded, dict)
-            and "model" in loaded
         ):
             expected_metadata = policy.checkpoint_metadata()
             actual_metadata = loaded.get("model_metadata")
@@ -358,7 +357,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "DirectKicking checkpoint model_metadata does not match the configured policy. "
                     f"Expected {expected_metadata}, got {actual_metadata}"
                 )
-            state_dict = loaded["model"]
+            state_dict = loaded.get("model", loaded.get("model_state_dict", loaded))
         else:
             state_dict = loaded.get("model_state_dict", loaded)
 

@@ -16,7 +16,7 @@ from ...walk_kick.agents.rsl_rl_ppo_cfg import K1WalkKickPPORunnerCfg
 
 @configclass
 class DirectKickingActorCriticCfg(RslRlPpoActorCriticCfg):
-    """Exact model/schema values recorded in the source checkpoint metadata."""
+    """DirectKicking dimensions with the global-target v3 schema metadata."""
 
     class_name: str = "DirectKickingActorCritic"
     init_noise_std: float = math.exp(-2.0)
@@ -87,4 +87,22 @@ class K1WalkKickLikelihoodPPORunnerCfg(K1WalkKickPPORunnerCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.experiment_name = "k1_walk_kick_likelihood"
+        self.experiment_name = "k1_walk_kick_likelihood_global_target"
+
+
+@configclass
+class K1WalkKickLikelihoodWalkPhasePPORunnerCfg(K1WalkKickLikelihoodPPORunnerCfg):
+    """Stage 1 runner with the same 132D policy/checkpoint contract."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.experiment_name = "k1_walk_kick_likelihood_global_target_walk_phase"
+
+
+@configclass
+class K1WalkKickLikelihoodStationaryPPORunnerCfg(K1WalkKickLikelihoodPPORunnerCfg):
+    """Stage 2 runner for stationary-ball global-target training."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.experiment_name = "k1_walk_kick_likelihood_global_target_stationary"

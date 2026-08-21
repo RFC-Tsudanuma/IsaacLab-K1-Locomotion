@@ -182,7 +182,7 @@ class DirectKickingActorCritic(nn.Module):
     """RSL-RL 3.0.1 policy with stateless future-horizon LSTM encoders."""
 
     is_recurrent = False
-    observation_schema = "direct_kicking_horizon_lstm_direction_only_v2"
+    observation_schema = "direct_kicking_horizon_lstm_global_target_direction_v3"
 
     def __init__(
         self,

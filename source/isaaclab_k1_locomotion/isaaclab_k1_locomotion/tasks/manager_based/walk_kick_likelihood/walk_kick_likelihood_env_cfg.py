@@ -6,13 +6,13 @@
 """WalkKick variant with the DirectKicking CVKF/LSTM observation contract.
 
 This task leaves the existing 55-dimensional WalkKick task untouched and uses a
-separate moving-ball environment.  Its policy observation follows
-the 132-dimensional ``direct_kicking_horizon_lstm_direction_only_v2`` schema:
+separate staged environment family.  Its policy observation follows the
+132-dimensional ``direct_kicking_horizon_lstm_global_target_direction_v3`` schema:
 
 * 47 locomotion features;
 * 13 six-dimensional CVKF horizon tokens, relative velocity, and filter status
   (83 features in total);
-* the two-dimensional kick target direction.
+* the two-dimensional, estimated ball-to-global-target direction.
 
 The LSTM encodes the horizon tokens in the policy model.  It is not an
 environment reward and it is not recurrent across control steps.
@@ -47,9 +47,17 @@ _MOVING_BALL_SPAWN_BEARING_RANGE = (-0.87266463, 0.87266463)
 _MOVING_BALL_CLOSEST_APPROACH_RANGE = (-0.25, 0.25)
 _BALL_FRICTION_RANGE = (0.9, 1.3)
 _KICK_DETECTION_WARMUP_STEPS = 5
+_STEPS_PER_ITERATION = 48
+# Stage 2 first acquires a stationary-ball kick under clean Localization.  Once
+# the inherited 500-iteration kick-reward ramp has finished, episode-sampled
+# Localization delay/bias bounds ramp to their full values over 1,000 more
+# iterations.  This deterministic boundary is intentionally a named tuning
+# choice: the architecture only requires clean -> randomized progression.
+_LOCALIZATION_DR_START_STEPS = 500 * _STEPS_PER_ITERATION
+_LOCALIZATION_DR_END_STEPS = 1500 * _STEPS_PER_ITERATION
 # Keep the ball stationary for the first 1,000 learning iterations.  The
 # likelihood runner collects 48 control steps per learning iteration.
-_BALL_SPEED_CURRICULUM_WARMUP_STEPS = 1000 * 48
+_BALL_SPEED_CURRICULUM_WARMUP_STEPS = 1000 * _STEPS_PER_ITERATION
 
 
 def _leg_joints() -> SceneEntityCfg:
@@ -83,6 +91,76 @@ def gait_phase_cos_sin(
         cmd_threshold=cmd_threshold,
     )
     return phase_sin_cos[:, [1, 0]]
+
+
+def estimated_base_velocity_command(
+    env,
+    command_name: str = "kick_direction",
+    max_vel: float = 1.0,
+    max_ang_vel: float = 1.0,
+    r_stance: float = 0.25,
+    alpha: float = 0.5,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """Late-bind the likelihood estimator command for config-only importers."""
+    return mdp.observed_base_velocity_command(
+        env,
+        command_name=command_name,
+        max_vel=max_vel,
+        max_ang_vel=max_ang_vel,
+        r_stance=r_stance,
+        alpha=alpha,
+        robot_cfg=robot_cfg,
+        ball_cfg=ball_cfg,
+    )
+
+
+def estimated_gait_phase_cos_sin(
+    env,
+    phase_freq: float = 1.6,
+    cmd_threshold: float = 0.05,
+    command_name: str = "kick_direction",
+    max_vel: float = 1.0,
+    max_ang_vel: float = 1.0,
+    r_stance: float = 0.25,
+    alpha: float = 0.5,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """Gate gait phase with the same estimated command visible to the actor."""
+    visible_command = estimated_base_velocity_command(
+        env,
+        command_name=command_name,
+        max_vel=max_vel,
+        max_ang_vel=max_ang_vel,
+        r_stance=r_stance,
+        alpha=alpha,
+        robot_cfg=robot_cfg,
+        ball_cfg=ball_cfg,
+    )
+    phase_sin_cos = walk_kick_mdp.gait_phase_sincos(
+        env,
+        phase_freq=phase_freq,
+        cmd_threshold=cmd_threshold,
+        gate_command=visible_command,
+    )
+    return phase_sin_cos[:, [1, 0]]
+
+
+def privileged_true_kick_geometry(
+    env,
+    command_name: str = "kick_direction",
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+) -> torch.Tensor:
+    """Late-bind privileged geometry while keeping lightweight cfg imports valid."""
+    return mdp.true_kick_geometry(
+        env,
+        command_name=command_name,
+        robot_cfg=robot_cfg,
+        ball_cfg=ball_cfg,
+    )
 
 
 def _compute_domain_randomization_latent(
@@ -153,11 +231,6 @@ def base_height(
     return robot.data.root_pos_w[:, 2:3] - env.scene.env_origins[:, 2:3]
 
 
-def zero_external_wrench(env) -> torch.Tensor:
-    """Represent the current task's zero continuous force/torque contract."""
-    return torch.zeros((env.num_envs, 6), device=env.device)
-
-
 def true_ball_velocity(
     env,
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
@@ -192,8 +265,16 @@ class K1WalkKickLikelihoodPolicyCfg(ObsGroup):
         params={"robot_cfg": SceneEntityCfg("robot"), "ball_cfg": SceneEntityCfg("soccer_ball")},
     )
     velocity_commands = ObsTerm(
-        func=loco_mdp.generated_commands,
-        params={"command_name": "base_velocity"},
+        func=estimated_base_velocity_command,
+        params={
+            "command_name": "kick_direction",
+            "max_vel": 1.0,
+            "max_ang_vel": 1.0,
+            "r_stance": 0.25,
+            "alpha": 0.5,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ball_cfg": SceneEntityCfg("soccer_ball"),
+        },
     )
     gait_phase = ObsTerm(
         func=gait_phase_cos_sin,
@@ -233,20 +314,27 @@ class K1WalkKickLikelihoodPolicyCfg(ObsGroup):
 
 @configclass
 class K1WalkKickLikelihoodCriticCfg(ObsGroup):
-    """Twenty privileged features appended to policy observations by the runner."""
+    """Twenty privileged truth features appended to the actor observation."""
 
     domain_randomization = ObsTerm(
         func=DomainRandomizationLatent,
         params={"asset_cfg": _trunk()},
     )
-    base_lin_vel = ObsTerm(func=loco_mdp.base_lin_vel, noise=Gnoise(std=0.10))
-    base_height = ObsTerm(func=base_height, noise=Gnoise(std=0.02))
-    external_wrench = ObsTerm(func=zero_external_wrench)
+    base_lin_vel = ObsTerm(func=loco_mdp.base_lin_vel)
+    base_height = ObsTerm(func=base_height)
+    kick_geometry = ObsTerm(
+        func=privileged_true_kick_geometry,
+        params={
+            "command_name": "kick_direction",
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ball_cfg": SceneEntityCfg("soccer_ball"),
+        },
+    )
     ball_velocity = ObsTerm(func=true_ball_velocity)
     feet_position = ObsTerm(func=feet_position_xy, params={"asset_cfg": _feet()})
 
     def __post_init__(self) -> None:
-        self.enable_corruption = True
+        self.enable_corruption = False
         self.concatenate_terms = True
 
 
@@ -258,14 +346,168 @@ class K1WalkKickLikelihoodObservationsCfg(ObservationsCfg):
 
 @configclass
 class _K1WalkKickLikelihoodBaseEnvCfg(K1WalkKickEnvCfg):
-    """Unregistered observation/model base used by the moving-ball task."""
+    """Shared 132D model and global-target command contract for all stages."""
 
     observations: K1WalkKickLikelihoodObservationsCfg = K1WalkKickLikelihoodObservationsCfg()
+    localization_dr_start_step: int = _LOCALIZATION_DR_START_STEPS
+    localization_dr_end_step: int = _LOCALIZATION_DR_END_STEPS
+    localization_dr_force_full: bool = False
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        previous = self.commands.kick_direction
+        self.commands.kick_direction = mdp.GlobalTargetKickCommandCfg(
+            asset_name=previous.asset_name,
+            resampling_time_range=previous.resampling_time_range,
+            rel_standing_envs=previous.rel_standing_envs,
+            rel_heading_envs=previous.rel_heading_envs,
+            heading_command=previous.heading_command,
+            heading_control_stiffness=previous.heading_control_stiffness,
+            debug_vis=previous.debug_vis,
+            ranges=previous.ranges,
+            target_speed_range=previous.target_speed_range,
+            low_speed_threshold=previous.low_speed_threshold,
+            target_distance_range=(5.0, 12.0),
+            ball_asset_name="soccer_ball",
+        )
+
+
+def _freeze_kick_reward_curricula_at_final(cfg) -> None:
+    """Keep Stage 2's converged reward contract when Stage 3 starts at step 0."""
+    curriculum_names = {
+        "track_lin_vel_xy_exp": "track_lin_vel_weight",
+        "track_ang_vel_z_exp": "track_ang_vel_weight",
+        "kick_direction": "kick_direction_weight",
+        "kick_velocity_scaled": "kick_velocity_scaled_weight",
+        "kick_velocity_strong": "kick_velocity_strong_weight",
+        "walk_speed": "walk_speed_weight",
+        "approach_penalty": "approach_penalty_weight",
+        "kick_pose_overshoot": "kick_pose_overshoot_weight",
+    }
+    for reward_name, curriculum_name in curriculum_names.items():
+        curriculum = getattr(cfg.curriculum, curriculum_name, None)
+        if curriculum is None:
+            continue
+        getattr(cfg.rewards, reward_name).weight = float(curriculum.params["end_weight"])
+        setattr(cfg.curriculum, curriculum_name, None)
+
+
+def _align_kick_curricula_with_runner(cfg) -> None:
+    """Use the likelihood runner's actual rollout length for Stage 2 ramps."""
+    for curriculum_name in (
+        "track_lin_vel_weight",
+        "track_ang_vel_weight",
+        "kick_direction_weight",
+        "kick_velocity_scaled_weight",
+        "kick_velocity_strong_weight",
+        "walk_speed_weight",
+        "approach_penalty_weight",
+        "kick_pose_overshoot_weight",
+    ):
+        curriculum = getattr(cfg.curriculum, curriculum_name, None)
+        if curriculum is not None:
+            curriculum.params["steps_per_iteration"] = _STEPS_PER_ITERATION
 
 
 @configclass
-class K1WalkKickLikelihoodEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
-    """Likelihood task with a staged DirectKicking moving-ball distribution.
+class K1WalkKickLikelihoodWalkPhaseEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
+    """Stage 1: DirectKicking-compatible locomotion without a ball or kick."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.commands.base_velocity.follow_ball = False
+        self.commands.base_velocity.kick_direction_command_name = None
+        self.commands.kick_direction = None
+
+        # Preserve exactly 132 actor + 20 privileged values.  The explicit
+        # velocity-command prefix remains observable; ball/target slots are
+        # neutral because no estimator or target exists in this stage.
+        self.observations.policy.base_ang_vel.func = loco_mdp.base_ang_vel
+        self.observations.policy.base_ang_vel.noise = Gnoise(std=0.15)
+        self.observations.policy.base_ang_vel.params = {}
+        self.observations.policy.velocity_commands.func = loco_mdp.generated_commands
+        self.observations.policy.velocity_commands.params = {"command_name": "base_velocity"}
+        self.observations.policy.belief.func = walk_kick_mdp.zero_obs
+        self.observations.policy.belief.params = {"dim": 83}
+        self.observations.policy.target_direction.func = walk_kick_mdp.zero_obs
+        self.observations.policy.target_direction.params = {"dim": 2}
+        self.observations.critic.kick_geometry.func = walk_kick_mdp.zero_obs
+        self.observations.critic.kick_geometry.params = {"dim": 6}
+        self.observations.critic.ball_velocity.func = walk_kick_mdp.zero_obs
+        self.observations.critic.ball_velocity.params = {"dim": 2}
+
+        self.scene.soccer_ball = None
+        self.scene.contact_balls_left = None
+        self.scene.contact_balls_right = None
+        self.events.reset_ball = None
+
+        self.rewards.track_lin_vel_xy_exp.weight = 3.5
+        self.rewards.track_ang_vel_z_exp.weight = 2.0
+        for term_name in (
+            "kick_direction",
+            "kick_velocity_scaled",
+            "kick_velocity_strong",
+            "walk_speed",
+            "approach_penalty",
+            "kick_pose_overshoot",
+        ):
+            setattr(self.rewards, term_name, None)
+            setattr(self.curriculum, f"{term_name}_weight", None)
+        self.curriculum.track_lin_vel_weight = None
+        self.curriculum.track_ang_vel_weight = None
+        self.terminations.kick_finished = None
+        self.episode_length_s = 20.0
+
+
+@configclass
+class K1WalkKickLikelihoodWalkPhaseEnvCfg_PLAY(K1WalkKickLikelihoodWalkPhaseEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkKickLikelihoodStationaryEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
+    """Stage 2: stationary-ball kick with clean-to-full Localization DR."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _align_kick_curricula_with_runner(self)
+        base_velocity = self.commands.base_velocity
+        self.observations.policy.gait_phase.func = estimated_gait_phase_cos_sin
+        self.observations.policy.gait_phase.params = {
+            "phase_freq": _PHASE_FREQ,
+            "cmd_threshold": _COMMAND_THRESHOLD,
+            "command_name": base_velocity.kick_direction_command_name,
+            "max_vel": base_velocity.max_vel,
+            "max_ang_vel": base_velocity.max_ang_vel,
+            "r_stance": base_velocity.r_stance,
+            "alpha": base_velocity.alpha,
+            "robot_cfg": SceneEntityCfg("robot"),
+            "ball_cfg": SceneEntityCfg("soccer_ball"),
+        }
+
+
+@configclass
+class K1WalkKickLikelihoodStationaryEnvCfg_PLAY(K1WalkKickLikelihoodStationaryEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1WalkKickLikelihoodEnvCfg(K1WalkKickLikelihoodStationaryEnvCfg):
+    """Stage 3: full estimator DR plus a moving-ball speed curriculum.
 
     The existing WalkKick task and its ball asset stay unchanged.  This task
     changes the reset trajectory, enables pre-kick ball
@@ -275,10 +517,13 @@ class K1WalkKickLikelihoodEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
     contract; no rolling-friction model or CVKF coupling is added.
     """
 
+    localization_dr_force_full: bool = True
+
     def __post_init__(self) -> None:
         from isaaclab.managers import CurriculumTermCfg as CurrTerm
 
         super().__post_init__()
+        _freeze_kick_reward_curricula_at_final(self)
 
         self.events.reset_ball.func = mdp.reset_moving_ball_trajectory
         self.events.reset_ball.params = {

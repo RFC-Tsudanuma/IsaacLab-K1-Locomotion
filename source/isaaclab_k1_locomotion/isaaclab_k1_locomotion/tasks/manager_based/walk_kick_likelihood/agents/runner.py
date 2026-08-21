@@ -48,7 +48,7 @@ def _validate_direct_checkpoint_metadata(
     policy: DirectKickingActorCritic,
     checkpoint: Mapping[str, Any],
 ) -> None:
-    """Require an exact match for the source model's explicit input schema."""
+    """Require an exact match for the configured model's explicit input schema."""
     actual = checkpoint.get("model_metadata")
     if actual is None:
         raise ValueError(

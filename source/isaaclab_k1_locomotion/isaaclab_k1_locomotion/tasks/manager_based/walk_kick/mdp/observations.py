@@ -76,6 +76,7 @@ def gait_phase_sincos(
     phase_freq: float = 1.6,
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.05,
+    gate_command: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """歩行位相を (sin, cos) で返す。shape: (N, 2)
 
@@ -94,7 +95,13 @@ def gait_phase_sincos(
 
     phase_sincos = torch.stack([torch.sin(phase), torch.cos(phase)], dim=1)
 
-    cmd = env.command_manager.get_command(command_name)
+    # Estimator-driven tasks can provide the exact command exposed to their
+    # actor. Existing tasks omit it and retain the generated-command behavior.
+    cmd = (
+        env.command_manager.get_command(command_name)
+        if gate_command is None
+        else gate_command
+    )
     cmd_speed = torch.norm(cmd[:, :3], dim=1, keepdim=True)
     is_stopped = cmd_speed < cmd_threshold
     return torch.where(is_stopped, torch.zeros_like(phase_sincos), phase_sincos)

@@ -292,10 +292,22 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
         self.vel_command_b[:, 0] = torch.clamp(to_G_b[:, 0], -max_vel, max_vel)
         self.vel_command_b[:, 1] = torch.clamp(to_G_b[:, 1], -max_vel, max_vel)
 
-        # wz: ロボットのヨー角と kick_direction の角度誤差
+        # wz: robot yaw versus the direction resolved by kick_state.  This is
+        # deliberately not reconstructed from the raw command XY: likelihood
+        # map-target commands expose global target coordinates there, and their
+        # ball-to-target direction changes until it is frozen at kick latch.
         if self.cfg.kick_direction_command_name:
-            kick_cmd = self._env.command_manager.get_command(self.cfg.kick_direction_command_name)
-            kick_theta = torch.atan2(kick_cmd[:, 0], kick_cmd[:, 1])
+            command_name = self.cfg.kick_direction_command_name
+            get_term = getattr(self._env.command_manager, "get_term", None)
+            command_term = get_term(command_name) if callable(get_term) else None
+            if callable(getattr(command_term, "direction_from_ball", None)):
+                kick_dir = state["kick_dir"]
+                kick_theta = torch.atan2(kick_dir[:, 1], kick_dir[:, 0])
+            else:
+                # Preserve the legacy [sin(theta), cos(theta), speed]
+                # behavior, including its freshly resampled reset command.
+                command = self._env.command_manager.get_command(command_name)
+                kick_theta = torch.atan2(command[:, 0], command[:, 1])
 
             quat = robot.data.root_quat_w
             w, x, y, z = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
