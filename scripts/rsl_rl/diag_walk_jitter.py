@@ -100,6 +100,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         if hasattr(r, "heading"):
             r.heading = None
     env_cfg.commands.base_velocity.resampling_time_range = (1.0e9, 1.0e9)
+    # ☠ 2026-08-21: 指令レンジのカリキュラムを切る。
+    #
+    #   K1FlatEnvCfg には lin_vel_command カリキュラムがあり、**毎エピソード
+    #   ranges.lin_vel_x/y をステージ値で上書きする**。上でレンジを 1 点に潰しても
+    #   カリキュラムが元に戻すので --cmd が一切効かず、指令を変えても数値が
+    #   1 ビットも変わらない (実測: vy=0.66 / 1.0 / 1.3 で完全同一)。
+    #   停止指令の測定は rel_standing_envs=1.0 が指令を強制ゼロにするため
+    #   この不具合の影響を受けない (過去の測定結果は有効)。
+    if getattr(getattr(env_cfg, "curriculum", None), "lin_vel_command", None) is not None:
+        env_cfg.curriculum.lin_vel_command = None
+        print("[cfg] lin_vel_command カリキュラムを無効化しました (指令固定のため)")
 
     log_root_path = os.path.abspath(os.path.join("logs", "rsl_rl", agent_cfg.experiment_name))
     resume_path = retrieve_file_path(args_cli.checkpoint) if args_cli.checkpoint else \

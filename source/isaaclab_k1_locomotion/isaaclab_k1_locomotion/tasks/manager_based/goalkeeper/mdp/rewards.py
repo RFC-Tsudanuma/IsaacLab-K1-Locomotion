@@ -1150,3 +1150,62 @@ def action_jitter_ratio(
     d1, d2 = _action_diffs(env)
     ratio = d2 / (d1 + float(eps))
     return torch.where(d1 > float(move_threshold), ratio, torch.zeros_like(ratio))
+
+
+def standstill_jitter(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    d2_ref: float = 0.05,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """**停止指令中の高周波の振れ幅**を有界に罰する (N,)。weight < 0 で使う。
+
+    ``d2 / (d2 + d2_ref)`` を返す。値域は ``[0, 1)`` で有界。
+
+    ☠☠ **倍率 (stand_still_scale) で実現してはいけない**、というのが 6 本目
+      (2026-08-21) の失敗から得た教訓。停止 env だけ 100 倍の圧を掛けたところ、
+      **PPO が壊れた** (iter 500 をピークに mean_reward 69 → 35、転倒増、
+      カリキュラムは stage 0 のまま)。同一バッチ内で報酬スケールが env 間で
+      100 倍違うと、少数の巨大な負の advantage が更新を支配し価値関数も壊れる。
+      1 本目が ``action_smoothness_l2 = -12.0`` で学習できたのは **全 env 一様**
+      だったから。→ 圧は倍率でなく **有界な独立項** で与える。
+
+    なぜこの量か (2026-08-21 の実測、diag_walk_jitter.py の停止指令):
+
+        ポリシー        ‖Δa‖     2階差分   実機
+        1 本目          0.0089   **0.0055**  **振動しない**
+        3 本目 m4999    0.0133   0.0124    ?
+        07-28           0.0332   **0.0407**  **振動する**
+        4 本目          0.0394   0.0417    (07-28 と同値)
+
+      比 (周波数) の差は 2 倍だが **2階差分の絶対値は 7.4 倍**。振動は物理的な
+      振れ幅なので、周波数より **振幅** が効く。目標は **≤ 0.01**。
+
+    ☆ 移動中はゲートで 0 になるので **速度コストは構造的にゼロ**。
+      移動中の高周波は :func:`action_jitter_ratio` (振幅非依存の比) が担当する。
+      1 本目は停止時・移動中の **両方** が滑らかだったので、両方要る。
+
+    Args:
+        d2_ref: 圧縮の基準 [action 単位]。0.05 なら 07-28 (0.0407) で 0.45、
+            目標 (0.0055) で 0.10 と、**運転範囲の全域で勾配が残る**。
+            ☠ tanh でなく ``x/(x+ref)`` を使うのは、学習初期に d2 が大きい
+            (0.5 級) ときに tanh だと完全に飽和して勾配が消えるため。
+    """
+    _, d2 = _action_diffs(env)
+    pen = d2 / (d2 + float(d2_ref))
+    return pen * _stop_mask(env, command_name, cmd_threshold, lin_vel_max)
+
+
+def _stop_mask(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """停止指令中なら 1.0、それ以外 0.0 (N,)。:func:`_stopped_boost` と同じ判定。"""
+    cmd = env.command_manager.get_command(command_name)[:, :3]
+    is_stopped = torch.norm(cmd, dim=1) < float(cmd_threshold)
+    robot: Articulation = env.scene["robot"]
+    lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+    return (is_stopped & (lin < float(lin_vel_max))).float()
