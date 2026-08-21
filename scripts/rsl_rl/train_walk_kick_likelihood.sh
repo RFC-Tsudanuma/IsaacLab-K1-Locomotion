@@ -69,6 +69,10 @@ fi
 
 echo "[INFO] python: $LAB_PY"
 
+# The 4,096-env PPO mini-batch feeds 49,152 forecast sequences to each LSTM.
+# Let the CUDA allocator grow its segments instead of fragmenting a 3+ GiB workspace.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 NUM_ENVS=${NUM_ENVS:-4096}
 ITER=${ITER:-20000}
 WALK_ITER=${WALK_ITER:-$ITER}
