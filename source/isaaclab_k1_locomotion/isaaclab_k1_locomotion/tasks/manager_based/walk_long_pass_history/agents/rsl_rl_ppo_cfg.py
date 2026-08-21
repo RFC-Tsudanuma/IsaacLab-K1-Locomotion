@@ -24,14 +24,15 @@ class K1WalkLongPassHistoryPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
     experiment_name だけ分けて、他のキック run とログが混ざらないようにする。
 
     観測スロットの意味が左足裏からボール位置へ変わるため、旧 checkpoint を
-    拡張しても親との挙動一致は保証されない。既定 iteration は従来どおり 3000。
+    拡張しても親との挙動一致は保証されない。ゲート付き球速カリキュラムの停止・後退と、
+    最終帯到達後の仕上げを見込んで既定 iteration は 5000。
     """
 
     def __post_init__(self):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_long_pass_history"
-        self.max_iterations = 3000
+        self.max_iterations = 5000
         self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
             use_data_augmentation=False,
             use_mirror_loss=True,

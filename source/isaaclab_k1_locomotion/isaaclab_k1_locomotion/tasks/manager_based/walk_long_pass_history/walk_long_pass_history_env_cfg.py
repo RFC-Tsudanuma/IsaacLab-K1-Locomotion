@@ -6,12 +6,16 @@
 """K1 ロングパス + 短期 I/O 履歴 (short history) 環境。
 
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
-**短期履歴 + 左右対称学習用** バリアント。報酬・コマンド分布・カリキュラム・
-行動空間は変えず、policy 観測の本体状態 5 項に 0.1 秒ぶんの履歴を付ける。
-さらに、左足裏だけを見る 3 次元スロットをミラー可能なボール 3D 位置へ
-差し替える。蹴り方向は、固定global目標と遅延・DR済み自己位置からactor用のlocal方向を
-計算し、キックlatch時に凍結する。観測フィールド名と順序は継承元のままなので、
-policy / critic の次元は 223 / 61 を維持する。
+**短期履歴 + 左右対称学習用** バリアント。報酬定義と行動空間は継承し、policy 観測の
+本体状態 5 項に 0.1 秒ぶんの履歴を付ける。さらに、左足裏だけを見る 3 次元スロットを
+ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、固定global目標と遅延・DR済み
+自己位置からactor用のlocal方向を計算し、キックlatch時に凍結する。観測フィールド名と
+順序は継承元のままなので、policy / critic の次元は 223 / 61 を維持する。
+
+観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
+親から変更する。親の早期報酬 weight ランプは終値に固定する一方、目標球速は
+``(2.0, 3.0)`` から始め、キック成立率が十分な間だけ ``(3.2, 5.0)`` へ進める。
+多重接触罰は最終速度帯へ到達した後に立ち上げる。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -101,9 +105,11 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 利用する場合は近似的な初期化として扱うこと。通し実行は
 ``./scripts/rsl_rl/train_walk_long_pass_history.sh`` だが、これも同じ近似初期化を使う。
 
-カリキュラムは :func:`~..walk_long_pass.walk_long_pass_env_cfg._freeze_curricula_at_final`
-で全部終値に固定してあるので、``common_step_counter`` が 0 でも iter 0 から親タスクの
-収束状態で始まる。``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
+``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
+500 iteration までに終わる報酬 weight のランプだけは終値に固定する。球速帯は
+キック成立率 EMA が 0.80 以上なら進み、0.50 未満なら 2 倍速で戻る。最終帯へ到達した
+後だけ ``extra_ball_touch`` を 500 iteration かけて 0 → -50 へ立ち上げる。
+``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
 
 見るべきもの
 ------------
@@ -116,13 +122,16 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
   暴れないか。暴れるなら learning_rate を下げる。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
     _LONG_PASS_SPEED_RANGE,
+    _LONG_PASS_SPEED_RANGE_START,
+    _SPEED_RAMP_END_ITER,
+    _SPEED_RAMP_START_ITER,
     K1WalkLongPassEnvCfg,
-    _freeze_curricula_at_final,
 )
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
@@ -164,6 +173,16 @@ if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
         f"{_HISTORY_LEN} != {_SYMMETRY_HISTORY_LEN}"
     )
 
+# PPO runner の num_steps_per_env。カリキュラムの step を iteration へ換算する値なので、
+# runner 側を変えた場合はここも同時に変えること。
+_STEPS_PER_ITERATION = 48
+
+# 球速帯を進退させるキック成立率のヒステリシス。成立率が中間帯にある間は停止し、
+# 崩れた場合は進行時の 2 倍速で成立していた帯まで戻す。
+_SPEED_GATE_ADVANCE_ABOVE = 0.80
+_SPEED_GATE_RETREAT_BELOW = 0.50
+_SPEED_GATE_RETREAT_SCALE = 2.0
+
 # --------------------------------------------------------------------------- #
 # 履歴を付ける policy 観測項 (K1WalkKickPolicyCfg の項名)
 #
@@ -183,6 +202,33 @@ _HISTORY_TERMS = (
     "joint_vel",           # 12
     "prev_joint_request",  # 12  ← actions (前ステップの目標関節角)
 )
+
+
+def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
+    """``before_iter`` までに終わる報酬 weight のランプだけを終値に固定する。
+
+    継続学習の開始時にキック報酬を 0 へ戻すと、適応期間中に「蹴らない方が得」という
+    収支を作ってしまう。一方、球速帯と後段の多重接触罰は今回の復旧順序に必要なので、
+    ``mdp.linear_reward_weight`` かつ早期に終わる項だけを対象にする。
+
+    Returns:
+        定数化した curriculum term の名前。
+    """
+    frozen: list[str] = []
+    for name in dir(cfg.curriculum):
+        if name.startswith("_"):
+            continue
+        term = getattr(cfg.curriculum, name, None)
+        if term is None or getattr(term, "func", None) is not mdp.linear_reward_weight:
+            continue
+        params = term.params
+        if "end_step" not in params or params["end_step"] > before_iter:
+            continue
+        if params["start_weight"] == params["end_weight"]:
+            continue
+        params["start_weight"] = params["end_weight"]
+        frozen.append(name)
+    return frozen
 
 
 @configclass
@@ -241,12 +287,39 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. カリキュラムを終値で固定する（継続学習タスクなので必須）
+        # -- 1. 継続学習用の復旧カリキュラム
         #
-        # --load_pretrained は common_step_counter を 0 のままにするので、放置すると
-        # キック報酬の weight も速度帯も親のランプをやり直してしまう。理由の詳細は
-        # _freeze_curricula_at_final の docstring 参照。
-        _freeze_curricula_at_final(self)
+        # 観測の意味変更へ適応する間は、親の最終速度帯を最初から要求しない。
+        # 親の早期報酬 weight は終値に保ち、成立率を見ながら球速帯を進退させる。
+        # 多重接触罰は最終帯に届いてから立ち上げ、接触自体を避ける逃げ道を作らない。
+        self.curriculum.extra_ball_touch_weight = CurrTerm(
+            func=mdp.linear_reward_weight_after_speed_gate,
+            params={
+                "term_name": "extra_ball_touch",
+                "start_weight": 0.0,
+                "end_weight": -50.0,
+                "command_name": "kick_direction",
+                "ramp_iterations": 500,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+            },
+        )
+
+        _freeze_fade_in_curricula(self, before_iter=_SPEED_RAMP_START_ITER)
+
+        self.curriculum.kick_speed_range = CurrTerm(
+            func=mdp.kick_rate_gated_speed_range,
+            params={
+                "command_name": "kick_direction",
+                "start_range": _LONG_PASS_SPEED_RANGE_START,
+                "end_range": _LONG_PASS_SPEED_RANGE,
+                "start_step": _SPEED_RAMP_START_ITER,
+                "end_step": _SPEED_RAMP_END_ITER,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+                "advance_above": _SPEED_GATE_ADVANCE_ABOVE,
+                "retreat_below": _SPEED_GATE_RETREAT_BELOW,
+                "retreat_scale": _SPEED_GATE_RETREAT_SCALE,
+            },
+        )
 
         # -- 2. policy 観測の本体状態 5 項に履歴を付ける
         #
