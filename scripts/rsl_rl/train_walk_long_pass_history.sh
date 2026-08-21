@@ -4,7 +4,9 @@
 # **継続学習**。学習済みの walk_long_pass ポリシーを出発点に、policy 観測の本体状態
 # 5 項 (projected_gravity / base_ang_vel / joint_pos / joint_vel / prev_joint_request)
 # に 0.1 秒 = 5 ステップの履歴を付ける。arXiv:2401.16889 の short history 相当。
-# ネットワーク構造・報酬・コマンド分布・カリキュラム・行動空間・critic 観測は変えない。
+# ネットワーク構造・報酬・コマンド分布・カリキュラム・行動空間は変えない。
+# ミラー可能にするため、policy / critic の左足裏 3D スロットはボール位置へ変える。
+# PPO には係数 0.5 の mirror loss を追加し、data augmentation は使わない。
 #
 # 他の train_*.sh と決定的に違う点: **checkpoint をそのまま渡せない**。
 # policy 観測が 55 -> 223 次元になるので、train.py の --load_pretrained
@@ -15,8 +17,9 @@
 # ゼロを足すだけだが、履歴化は各項をその場で 5 倍に展開するので 55 次元の並びが
 # 223 次元の中に散らばる (joint_pos は index 11-22 -> 35-94 へ移動)。
 # 専用の expand_checkpoint_history.py が列を並べ替える。元の重みは各履歴ブロックの
-# 最新スロットに入り、過去 4 スロットは 0 なので、拡張直後のポリシーは元と挙動が
-# 完全に一致する。
+# 最新スロットに入り、過去 4 スロットは 0 になる。ただし旧 sole_pos の重みと
+# 正規化統計が新しい ball_pos に適用されるため、これは形状互換な近似初期化であり、
+# 元のポリシーとの挙動一致は保証しない。
 #
 # --resume ではなく --load_pretrained を使う理由: experiment_name が
 # k1_walk_long_pass_history と別なので --resume では元 run を検出できない。代わりに env cfg
@@ -34,8 +37,7 @@
 #   ITER=5000 ./scripts/rsl_rl/train_walk_long_pass_history.sh    # 長く回す
 #
 # 見るべきもの (TensorBoard):
-#   Metrics/kick_direction/kick_rate       … 0.99 付近を維持するはず。
-#                                            iter 0 から低いなら checkpoint 拡張の失敗
+#   Metrics/kick_direction/kick_rate       … 観測変更と mirror loss 導入の過渡を監視
 #   Metrics/kick_direction/kick_vel_ratio  … 履歴で改善するか
 #   Metrics/kick_direction/kick_dir_error_deg … 同上
 #   Train/mean_episode_length              … 転倒が減れば伸びる

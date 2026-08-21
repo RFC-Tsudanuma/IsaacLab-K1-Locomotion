@@ -5,23 +5,26 @@
 
 from isaaclab.utils import configclass
 
+from isaaclab_rl.rsl_rl import RslRlSymmetryCfg
+
 from ...walk_long_pass.agents.rsl_rl_ppo_cfg import K1WalkLongPassPPORunnerCfg
+from ..symmetry import compute_symmetric_states
+
+_MIRROR_LOSS_COEFF = 0.5
 
 
 @configclass
 class K1WalkLongPassHistoryPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
     """ロングパス + 短期 I/O 履歴用。
 
-    **ネットワーク構造は long_pass と同一に保つ** (これがこのタスクの前提)。隠れ層も
-    活性化も PPO ハイパラも触らない。変わるのは actor 入力層の幅 55 → 223 だけで、
-    それは cfg ではなく観測側が決める。
+    **ネットワーク構造は long_pass と同一に保つ**。隠れ層・活性化・
+    PPO 本体のハイパラは変えない。変更点は actor 入力幅 55 → 223 と、
+    係数 0.5 の mirror loss だけ。data augmentation は使わない。
 
     experiment_name だけ分けて、他のキック run とログが混ざらないようにする。
 
-    ITER は控えめでよい。報酬もコマンド分布も行動空間も変えていないので、増えた仕事は
-    「増えた入力を使うかどうか」だけ。拡張直後は過去フレームの重みが 0 なので親と
-    完全に同じ挙動から始まり、履歴が効くなら 1000-2000 iteration で
-    kick_vel_ratio / kick_dir_error が動き出すはず。既定は余裕を見て 3000。
+    観測スロットの意味が左足裏からボール位置へ変わるため、旧 checkpoint を
+    拡張しても親との挙動一致は保証されない。既定 iteration は従来どおり 3000。
     """
 
     def __post_init__(self):
@@ -29,3 +32,9 @@ class K1WalkLongPassHistoryPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
 
         self.experiment_name = "k1_walk_long_pass_history"
         self.max_iterations = 3000
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_symmetric_states,
+            mirror_loss_coeff=_MIRROR_LOSS_COEFF,
+        )

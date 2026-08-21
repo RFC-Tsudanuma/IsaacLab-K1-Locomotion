@@ -14,7 +14,7 @@
     項                       before      after
     projected_gravity        0-2         0-14      (5 スロット)
     base_ang_vel             3-5         15-29     (5 スロット)
-    sole_pos                 6-8         30-32
+    sole_pos -> ball_pos     6-8         30-32
     gait_phase               9-10        33-34
     joint_pos                11-22       35-94     (5 スロット)
     joint_vel                23-34       95-154    (5 スロット)
@@ -35,21 +35,25 @@ checkpoint を渡すと ``actor.0.weight`` (512, 55) と ``actor_obs_normalizer.
    元の列を各履歴ブロックの **最新スロット** (ブロック末尾) に置き、残り H-1 スロットは
    **0** で埋める。CircularBuffer は「古い順・最新が末尾」で flatten するので、
    最新スロット = 従来の 1 フレーム観測そのもの。
-   → **拡張直後のポリシーは元の checkpoint と挙動が完全に一致する** (過去フレームは
-   重み 0 で無視される)。ここから fine-tune するのが安全な出発点。
+   過去フレームは重み 0 で無視される。ただし、旧 ``sole_pos`` 列の重みは
+   新タスクのボール位置スロットに入るため、**挙動は一致しない**。
 
 2. ``actor_obs_normalizer.{_mean,_var,_std}`` (1, 55) → (1, 223)。
    こちらは 0/1 埋めではなく **元の統計を全スロットに複製する**。履歴スロットに流れる
-   のは最新スロットと同じ分布 (同じ項の 1-4 ステップ前) なので、複製が正しい統計。
+   のは最新スロットと同じ分布 (同じ項の 1-4 ステップ前) なので、複製する。
+   例外は ``sole_pos -> ball_pos`` で、形状を合わせるため旧統計をそのまま渡すが、
+   物理量の分布としては互換でない。
 
    flag 版が新しい次元を 0/1 で埋めていたのは「そこに未知の量が来る」からで、事情が違う。
    ``count`` を触らない点は同じ (EmpiricalNormalization は rate = batch/count で
    更新するので、収束済み checkpoint の count では足した次元の統計が実質動かない。
-   正しい値を最初から入れておく必要がある)。
+   変更していない履歴項は元統計の複製が必要。ball_pos の真の統計は
+   元 checkpoint にないため、この近似初期化では復元できない)。
 
 3. それ以外 (隠れ層・出力層・``std``・``critic.*``・``critic_obs_normalizer.*``) は
-   **そのまま**。walk_long_pass_history は行動 12 次元も critic 観測 61 次元も
-   変えていない。
+   **そのまま**。行動 12 次元と critic 61 次元の形状は変えないが、critic の
+   同じ 3 次元スロットも左足裏からボール位置へ変わる。このスクリプトは
+   **形状互換な近似初期化**を作るだけで、意味的互換性は作らない。
 
 使い方::
 
@@ -88,7 +92,7 @@ import torch
 _POLICY_TERMS: tuple[tuple[str, int, bool], ...] = (
     ("projected_gravity", 3, True),
     ("base_ang_vel", 3, True),
-    ("sole_pos", 3, False),
+    ("sole_pos_to_ball_pos", 3, False),
     ("gait_phase", 2, False),
     ("joint_pos", 12, True),
     ("joint_vel", 12, True),
@@ -102,7 +106,7 @@ _POLICY_TERMS: tuple[tuple[str, int, bool], ...] = (
 
 # walk_long_pass_history_env_cfg._HISTORY_LEN と同じ値。
 DEFAULT_HISTORY_LEN = 5
-# critic 観測は変えないので、この幅で来ているかだけ確認する (policy 55 + 特権 6)。
+# critic 観測の幅は変えないので、この値だけ確認する (policy 55 + 特権 6)。
 EXPECTED_CRITIC_DIM = 61
 
 
@@ -220,13 +224,14 @@ def expand(msd: dict[str, torch.Tensor], history_len: int) -> list[str]:
             file=sys.stderr,
         )
 
-    # -- critic は据え置き。幅だけ検算して、想定外なら気づけるようにする。
+    # -- critic の重み形状は据え置き。幅だけ検算し、想定外なら気づけるようにする。
     c_first, _ = _layer_indices(msd, "critic")
     critic_shape = tuple(msd[f"critic.{c_first}.weight"].shape)
     if critic_shape[1] != EXPECTED_CRITIC_DIM:
         print(
             f"[WARN] critic 入力幅が {critic_shape[1]} です ({EXPECTED_CRITIC_DIM} を期待)。\n"
-            "       walk_long_pass_history は critic を変更しないので、このまま渡すと\n"
+            "       walk_long_pass_history の critic 入力幅は 61 のままなので、"
+            " このまま渡すと\n"
             "       critic 側だけ形が合わず --load_pretrained に捨てられます。",
             file=sys.stderr,
         )

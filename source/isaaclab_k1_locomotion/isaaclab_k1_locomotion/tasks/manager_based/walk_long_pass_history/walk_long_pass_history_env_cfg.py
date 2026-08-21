@@ -6,8 +6,11 @@
 """K1 ロングパス + 短期 I/O 履歴 (short history) 環境。
 
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
-**継続学習用** バリアント。報酬・コマンド分布・カリキュラム・行動空間・critic 観測は
-一切変えず、**policy 観測の本体状態 5 項に 0.1 秒ぶんの履歴を付ける** だけ。
+**短期履歴 + 左右対称学習用** バリアント。報酬・コマンド分布・カリキュラム・
+行動空間は変えず、policy 観測の本体状態 5 項に 0.1 秒ぶんの履歴を付ける。
+さらに、左足裏だけを見る 3 次元スロットをミラー可能なボール 3D 位置へ
+差し替える。観測フィールド名と順序は継承元のままなので、policy / critic の
+次元は 223 / 61 を維持する。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -57,9 +60,8 @@ term                    dim   意味
 * ``ball_vel`` / ``prev_ball_pos`` … **既に履歴になっている**。``prev_ball_pos`` は
   遅延させたボール位置そのもの、``ball_vel`` はその差分。ここに history_length を
   重ねると同じ情報を二重に持つことになる (指示の「既存の ball history と重複しない」)。
-* ``sole_pos`` … 本体状態ではあるが今回の対象リストに入っていない。
-  履歴化したければ ``_HISTORY_TERMS`` に ``"sole_pos"`` を足すだけでよい
-  (policy 223 → 235 次元。checkpoint 拡張スクリプト側の表も同時に直すこと)。
+* ``sole_pos`` … 順序保持のため属性名だけを残した、1 ステップ遅延の
+  **ボール 3D 位置**。既存の ``prev_ball_pos`` / ``ball_vel`` と同様に履歴化しない。
 
 次元
 ----
@@ -71,9 +73,9 @@ critic    61      61       変更なし
 action    12      12       変更なし
 ========  ======  =======  ==============================================
 
-critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延なしボール位置を
-特権情報として持っており、履歴が埋めるはずの「観測できない状態」を直接見ている
-ため。value の精度が上がる余地が小さい割に、次元が 305 に膨らむ。
+critic に履歴は付けない。左足裏スロットだけは遅延なしボール位置へ
+置換するが、既存の特権情報 ``ball_pos_rel`` も残し、61 次元と checkpoint の
+形状契約を変えない。どちらもミラー写像では (x, y, z) → (x, −y, z) とする。
 
 既存 checkpoint からの引き継ぎ (重要)
 --------------------------------------
@@ -90,10 +92,11 @@ critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延
         logs/rsl_rl/k1_walk_long_pass/<run>/model_<N>.pt \\
         -o /tmp/long_pass_history_init.pt
 
-元の重み列を各履歴ブロックの **最新スロット** に置き、残り 4 スロットを 0 で埋めるので、
-拡張直後のポリシーは **元と挙動が完全に一致する** (過去フレームは無視される)。
-そこから fine-tune する。通し実行は
-``./scripts/rsl_rl/train_walk_long_pass_history.sh``。
+このスクリプトは履歴ブロックの列を拡張して **形状上は** 読み込めるようにする。
+ただし、元 checkpoint の左足裏スロットの重みと正規化統計は、新タスクでは
+ボール位置に対して適用される。したがって **意味的に互換ではなく、挙動も一致しない**。
+利用する場合は近似的な初期化として扱うこと。通し実行は
+``./scripts/rsl_rl/train_walk_long_pass_history.sh`` だが、これも同じ近似初期化を使う。
 
 カリキュラムは :func:`~..walk_long_pass.walk_long_pass_env_cfg._freeze_curricula_at_final`
 で全部終値に固定してあるので、``common_step_counter`` が 0 でも iter 0 から親タスクの
@@ -101,8 +104,8 @@ critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延
 
 見るべきもの
 ------------
-* ``Metrics/kick_direction/kick_rate`` … 0.99 付近を維持するはず。拡張が正しければ
-  iter 0 の時点で親と同じ値が出る。ここが最初から低いなら checkpoint 拡張の失敗。
+* ``Metrics/kick_direction/kick_rate`` … 観測の意味変更と mirror loss 導入時の過渡を
+  監視する。旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
 * ``Metrics/kick_direction/kick_vel_ratio`` / ``kick_dir_error_deg`` … 履歴で改善するか。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
@@ -110,13 +113,22 @@ critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延
   暴れないか。暴れるなら learning_rate を下げる。
 """
 
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
     _LONG_PASS_SPEED_RANGE,
     K1WalkLongPassEnvCfg,
     _freeze_curricula_at_final,
 )
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import (
+    K1WalkKickCriticCfg,
+    K1WalkKickObservationsCfg,
+    K1WalkKickPolicyCfg,
+)
+from .symmetry import HISTORY_LEN as _SYMMETRY_HISTORY_LEN
 
 # --------------------------------------------------------------------------- #
 # 短期履歴の長さ
@@ -134,6 +146,11 @@ _SIM_DT = 0.005
 _DECIMATION = 4
 _CTRL_DT = _SIM_DT * _DECIMATION  # 0.02 s = 50 Hz
 _HISTORY_LEN = max(4, round(_HISTORY_S / _CTRL_DT))  # 5
+if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
+    raise ValueError(
+        "walk_long_pass_history の履歴長と mirror 写像が一致しません: "
+        f"{_HISTORY_LEN} != {_SYMMETRY_HISTORY_LEN}"
+    )
 
 # --------------------------------------------------------------------------- #
 # 履歴を付ける policy 観測項 (K1WalkKickPolicyCfg の項名)
@@ -157,8 +174,41 @@ _HISTORY_TERMS = (
 
 
 @configclass
+class K1WalkLongPassHistoryPolicyCfg(K1WalkKickPolicyCfg):
+    """223 次元 actor 観測の 1 フレーム分の定義。
+
+    ``sole_pos`` は継承元の項順を保つための属性名。値は左足裏ではなく、
+    実機 vision の遅延を表す 1 制御ステップ前のボール 3D 位置である。
+    """
+
+    sole_pos = ObsTerm(
+        func=mdp.delayed_ball_pos_b,
+        noise=Unoise(n_min=-0.02, n_max=0.02),
+        params={"delay_steps": 1, "dim": 3},
+    )
+
+
+@configclass
+class K1WalkLongPassHistoryCriticCfg(K1WalkKickCriticCfg):
+    """61 次元 critic 観測。同じスロットを遅延なしボール位置に置換する。"""
+
+    sole_pos = ObsTerm(
+        func=mdp.delayed_ball_pos_b,
+        params={"delay_steps": 0, "dim": 3},
+    )
+
+
+@configclass
+class K1WalkLongPassHistoryObservationsCfg(K1WalkKickObservationsCfg):
+    policy: K1WalkLongPassHistoryPolicyCfg = K1WalkLongPassHistoryPolicyCfg()
+    critic: K1WalkLongPassHistoryCriticCfg = K1WalkLongPassHistoryCriticCfg()
+
+
+@configclass
 class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
-    """ロングパス + 短期 I/O 履歴。蹴り方そのものは long_pass と同一。"""
+    """ロングパス + 短期 I/O 履歴 + ミラー可能な観測。"""
+
+    observations: K1WalkLongPassHistoryObservationsCfg = K1WalkLongPassHistoryObservationsCfg()
 
     def __post_init__(self) -> None:
         super().__post_init__()
