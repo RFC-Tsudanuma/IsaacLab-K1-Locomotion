@@ -9,8 +9,9 @@
 **短期履歴 + 左右対称学習用** バリアント。報酬・コマンド分布・カリキュラム・
 行動空間は変えず、policy 観測の本体状態 5 項に 0.1 秒ぶんの履歴を付ける。
 さらに、左足裏だけを見る 3 次元スロットをミラー可能なボール 3D 位置へ
-差し替える。観測フィールド名と順序は継承元のままなので、policy / critic の
-次元は 223 / 61 を維持する。
+差し替える。蹴り方向は、固定global目標と遅延・DR済み自己位置からactor用のlocal方向を
+計算し、キックlatch時に凍結する。観測フィールド名と順序は継承元のままなので、
+policy / critic の次元は 223 / 61 を維持する。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -51,10 +52,12 @@ term                    dim   意味
 ``prev_joint_request``  12    **actions** (前ステップの目標関節角)
 ======================  ====  =========================================
 
-付けない (タスク条件付け項 = 履歴化しても情報が増えない):
+付けない (タスク条件付け項):
 
-* ``kick_direction`` / ``target_kick_velocity`` … エピソード中ずっと定数。
-  履歴を取ると同じ値が 5 回並ぶだけ。
+* ``kick_direction`` … 自己位置の遅延・DRにより時変だが、223次元と既存mirror/checkpoint
+  契約を維持するため現在値だけを渡す。actorには遅延を厳密に復元させるのではなく、
+  誤差に対してロバストな動作を学習させる。
+* ``target_kick_velocity`` … エピソード中ずっと定数。履歴を取ると同じ値が5回並ぶだけ。
 * ``gait_phase`` / ``gait_phase_factor_offset`` … 位相は時刻の決定的関数なので、
   履歴は現在値から復元できる。
 * ``ball_vel`` / ``prev_ball_pos`` … **既に履歴になっている**。``prev_ball_pos`` は
@@ -115,7 +118,6 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
-from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
     _LONG_PASS_SPEED_RANGE,
@@ -127,6 +129,16 @@ from ..walk_kick.walk_kick_env_cfg import (
     K1WalkKickCriticCfg,
     K1WalkKickObservationsCfg,
     K1WalkKickPolicyCfg,
+)
+from .observations import (
+    BALL_POSITION_NOISE_MAX_M,
+    LOCALIZATION_DELAY_BASE_S,
+    LOCALIZATION_DELAY_JITTER_S,
+    LOCALIZATION_POSITION_ERROR_MAX_M,
+    LOCALIZATION_YAW_ERROR_MAX_RAD,
+    MAP_TARGET_DISTANCE_RANGE_M,
+    FrozenMapTargetKickDirection,
+    SharedDelayedBallPosition,
 )
 from .symmetry import HISTORY_LEN as _SYMMETRY_HISTORY_LEN
 
@@ -178,13 +190,29 @@ class K1WalkLongPassHistoryPolicyCfg(K1WalkKickPolicyCfg):
     """223 次元 actor 観測の 1 フレーム分の定義。
 
     ``sole_pos`` は継承元の項順を保つための属性名。値は左足裏ではなく、
-    実機 vision の遅延を表す 1 制御ステップ前のボール 3D 位置である。
+    実機 vision の遅延を表す1制御ステップ前のボール3D位置である。
+    ``prev_ball_pos`` と ``kick_direction`` の計算も同じノイズ標本を共有する。
     """
 
     sole_pos = ObsTerm(
-        func=mdp.delayed_ball_pos_b,
-        noise=Unoise(n_min=-0.02, n_max=0.02),
-        params={"delay_steps": 1, "dim": 3},
+        func=SharedDelayedBallPosition,
+        params={"delay_steps": 1, "dim": 3, "noise_max": BALL_POSITION_NOISE_MAX_M},
+    )
+    kick_direction = ObsTerm(
+        func=FrozenMapTargetKickDirection,
+        params={
+            "command_name": "kick_direction",
+            "delay_s": LOCALIZATION_DELAY_BASE_S,
+            "delay_jitter_s": LOCALIZATION_DELAY_JITTER_S,
+            "pos_err_max": LOCALIZATION_POSITION_ERROR_MAX_M,
+            "yaw_err_max": LOCALIZATION_YAW_ERROR_MAX_RAD,
+            "dist_range": MAP_TARGET_DISTANCE_RANGE_M,
+            "ball_noise_max": BALL_POSITION_NOISE_MAX_M,
+        },
+    )
+    prev_ball_pos = ObsTerm(
+        func=SharedDelayedBallPosition,
+        params={"delay_steps": 1, "dim": 2, "noise_max": BALL_POSITION_NOISE_MAX_M},
     )
 
 
