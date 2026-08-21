@@ -93,6 +93,10 @@ _KICK_STATE_REWARD_TERMS = (
     # getattr の None ガードで飛ばされる = 完全に no-op。
     "kick_inside_contact",
     "inside_foot_orient",
+    # 軸足の前後位置だけを線形テントで誘導する項 (walk_inside_kick のみ)。
+    # kick_plant_foot とは別項で、あちらは触らない。他タスクの cfg には属性が
+    # 存在しないので、上と同じく getattr の None ガードで飛ばされる = 完全に no-op。
+    "kick_plant_lon",
     # 脚同士の接近ペナルティの「キック中だけ緩める」版。locomotion 版
     # (feet_close_penalty / knee_close_penalty) とは **項名を分けてある**。
     # あちらは kick_state を呼ばないので、同じ名前でこのリストに入れると

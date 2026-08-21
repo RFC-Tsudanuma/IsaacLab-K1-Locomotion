@@ -1179,6 +1179,150 @@ def inside_foot_orient(
     return f_near * f_perp * (~state["kick_done"]).float()
 
 
+def kick_plant_lon(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    lon_target: float = -0.03,
+    lon_span: float = 0.45,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項15. Plant Longitudinal (軸足の前後位置だけを線形で誘導) = r_direction * f_lon。shape: (N,)
+
+    latch 時に凍結した軸足 (蹴っていない方の足) の **前後位置** を、キック方向フレームで
+    採点する。``plant_lon_frozen`` は ``(軸足 − ボール) · kick_dir`` なので
+    **+ = 軸足がボールより前**、負が「軸足がボールより手前 (後ろ)」。
+
+    狙いは巻き込み事故の防止である。実機のインサイドキック (run 2026-08-21_05-00-22、
+    foot_kick_dot ≈ 0 / ball_side 0.145 / vel_ratio 0.91 = インサイドの型としては
+    成立していた) で「振りが手前すぎてボールを巻き込んで転ぶ」事故が出た。軸足が
+    ボールより後ろにあると振り足もボールの手前側を通るので、ボール認識が 3cm ずれた
+    だけでボールが足の内側 = 進行方向に残り、そこへ踏み込んで転ぶ。軸足がボールの
+    真横にあれば、同じ量ずれてもボールは体の横を抜けていく。
+
+    * ``f_lon = clamp(1 − |plant_lon_frozen − lon_target| / lon_span, 0, 1)``
+      : 目標を頂点、半幅 ``lon_span`` で 0 に落ちる **線形のテント**。
+    * ``lon_target = -0.03`` [m]: ``body_pos_w`` が返すのは足リンク原点 (= 足首) だが、
+      足箱の中心はそこから前方 +0.026 にある。**足の中心をボール真横に置くには
+      足首を −0.026**。:func:`kick_plant_foot` とまったく同じ導出で、目標そのものは
+      あちらと同じ値。
+    * ``lon_span = 0.45`` [m]: 下の「線形テントにする理由」参照。
+
+    なぜ線形テントで、Gaussian にしてはいけないのか
+    ----------------------------------------------
+    軸足を報酬で誘導する試みは :func:`kick_plant_foot` (f_lon が σ_lon = 0.10 の
+    Gaussian) が先行しており、walk_lob 系 5 run で反証されている。ただし **死因は
+    特定できている**: Gaussian の σ の外では値も勾配もゼロになる、という形の問題である。
+    当時の実測 plant_lon ≈ −0.42 に対し、σ = 0.10 の Gaussian は
+    ``exp(−0.39² / (2·0.10²)) ≈ 5e-4``。ポリシーが立っている場所で報酬関数が真っ平ら
+    だったのだから、動かないのは当然だった。
+
+    同じタスクの :func:`kick_inside_contact` の f_perp (線形クランプ・発見期から満額) は
+    ``foot_kick_dot`` を 0.9 → 0.0 まで動かし切っている。線形なら遠いところでも
+    傾きが一定で残るからで、この項もその流儀に合わせる。
+
+    半幅 0.45 での各基準点の値 (これが「勾配が生きている」の中身):
+
+    * plant_lon = −0.42 (lob / middle の実測 = 発見期の最悪値) → f_lon = 0.13
+    * plant_lon = −0.23 (inside の収束値、run 2026-08-21_05-00-22) → f_lon = 0.56
+    * plant_lon = −0.03 (目標 = 足箱の中心がボール真横) → f_lon = 1.00
+
+    半幅を詰めるほど「正解の近くだけ急」になるが、その代償として発見期に居る
+    −0.4 付近が 0 に潰れる。0.45 は **最悪値でもまだ 1 割強が残る** 最小限の広さ。
+
+    なぜ r_stance を詰めるのではなく、足を測る項を足すのか
+    ------------------------------------------------------
+    先に「報酬を足さずに指令側だけ動かす」を試して失敗している。
+    ``r_stance`` (P_kick = 胴体の終着指令をボール後方どれだけに置くか) を
+    0.20 → 0.10 に詰め、model_4999 から ``--resume`` で 6700 iteration の
+    fine-tune を回した (run 2026-08-21_10-41-17)。結果 **plant_lon は −0.23 のまま
+    完全に不動** (他の指標は無傷: vel_ratio 0.94 / dir_error 4.2° / touch 1.03)。
+
+    理由は報酬の流れを追うと分かる。P_kick は報酬にほとんど流れていない:
+
+    * キック報酬 (項1-3 とその乗算項) は **飛翔の凍結値** で採点されるので、
+      胴体がどこに立っていたかを一切見ない。
+    * ``p_style`` はこのタスクでは帯 (``style_halfwidth`` = 40°) にしてあるので、
+      帯の中では胴体の向きも報酬に効かない。
+    * P_kick へ体を寄せる圧は ``ball_avoidance`` の pose_match 経由だけで、実測は
+      −0.01 / episode しかない。
+
+    過去に見えていた「r_stance → plant_lon」の相関 (0.25 → −0.39、0.20 → −0.23) は
+    **ゼロから学習した run 同士の比較**であって、発見期に接近の誘導が型を形作った
+    結果である。収束済みポリシーを動かすレバーではない。
+
+    そこで設計原則を分ける: **``r_stance`` は胴体の終着指令であり、その役割は
+    「望む構えを妨害しないこと」まで。軸足の誘導は足そのものを測る別の項が持つ。**
+    この項がその「別の項」で、``r_stance`` は 0.10 のまま触らない。
+
+    なぜ未計測ガードが要らないのか
+    ------------------------------
+    :func:`kick_inside_contact` は ``touch_count > 0`` のガードを持つが、この項は
+    要らない。pre-latch は ``p_style_frozen`` が 0 なので ``r_direction`` が 0 になり
+    (:func:`_r_direction` の kick_done ゲートも掛かる)、そもそも 1 円も払われない。
+    latch 後は ``plant_lon_frozen`` が必ず **その蹴りの実測値** で、初期値 0 が
+    残っている状態は存在しない (:mod:`.kick_state` が trigger と同じステップで
+    現在値を凍結する)。「未計測が満点側に写る」失敗モードがそもそも無い。
+
+    なぜ lat (横) を混ぜないのか
+    ----------------------------
+    :func:`kick_plant_foot` は f_lon と f_lat の積だったが、この項は **lon だけ**。
+    inside の実測 ``plant_lat`` は 0.30 (通常スタンス幅 0.192 よりかなり広い) で、
+    これはこれで別の課題だが、いま塞ぎたいのは巻き込み事故であって、その原因は
+    前後方向だけである。lat を掛けると「横が外れているあいだ lon の勾配も死ぬ」
+    という :func:`kick_plant_foot` の失敗をもう一度作ることになる。
+    横を誘導したくなったら、この項に掛けるのではなく **別の項を加算で並べる**こと。
+
+    設計上の約束 (:func:`kick_inside_contact` / :func:`kick_plant_foot` と同じ)
+    --------------------------------------------------------------------------
+    * **r_direction への乗算**であること。加算にすると「方向を無視して軸足だけ前に
+      置く」で報酬が取れてしまう。乗算なら kick_done ゲート・方向精度 (τ_direction)・
+      胴体の向き (帯つき p_style) を全て通過した蹴りにしか払われない。
+      ``sigma_direction`` は同じタスクの他のキック項と **必ず同じ値** にすること。
+    * **他のキック報酬とは加算で並べる** (乗算にしない)。学習初期は軸足がまず合わない
+      ので、他項に掛けるとそちらの勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。手前すぎる軸足は「罰される」のではなく「報われない」に
+      留める。負の dense 払いにすると :func:`_r_direction` の NOTE と同じ
+      「外したら早く転んで損切り」の抜け道が復活する。
+
+    NOTE: この項を使っているタスクは **walk_inside_kick だけ**。
+          ``_KICK_STATE_REWARD_TERMS`` に名前があるのはパラメータ配布先の名簿で、
+          項そのものを足しているのは walk_inside_kick の cfg のみ (他タスクの cfg には
+          属性が無いので None ガードで飛ばされる)。
+
+    Args:
+        lon_target: 軸足の目標前後位置 [m] (ボール基準、+ が前)。既定 −0.03 で
+            足箱の中心がボールの真横。もっと前に踏み込ませたければ 0 側へ、
+            チップ気味に後ろへ残したければ下げる。
+        lon_span: テントの半幅 [m]。目標からこの距離離れると 0 点。
+            **狭くするほど発見期の位置 (−0.4 付近) が 0 に潰れて勾配が死ぬ**ので、
+            下げるときは上の「線形テントにする理由」の表を読んでから。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+
+    span = max(lon_span, 1e-6)
+    gap = (state["plant_lon_frozen"] - lon_target).abs()
+    f_lon = torch.clamp(1.0 - gap / span, min=0.0, max=1.0)
+    return r_dir * f_lon
+
+
 # --------------------------------------------------------------------------- #
 # 脚同士の接近ペナルティの「キック中だけ緩める」版
 #
