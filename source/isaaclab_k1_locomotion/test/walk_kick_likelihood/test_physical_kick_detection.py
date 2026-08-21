@@ -34,6 +34,7 @@ class _FakeRobot:
             root_lin_vel_w=torch.zeros(num_envs, 3),
             root_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(num_envs, 1),
             body_pos_w=torch.zeros(num_envs, 2, 3),
+            body_lin_vel_w=torch.zeros(num_envs, 2, 3),
         )
 
     def find_bodies(self, name):

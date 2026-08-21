@@ -28,6 +28,10 @@ def kick_finished(
     kick_detection_min_foot_speed_towards_ball: float = 0.2,
     kick_detection_velocity_change_threshold: float = 0.5,
     kick_detection_warmup_steps: int = 5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """キック成立 (kick_done) から delay_steps 後にエピソードを終了する。shape: (N,) bool
 
@@ -42,6 +46,12 @@ def kick_finished(
     ``track_ball``、``v_thresh_target_*``、``physical_kick_detection`` とその閾値群は
     :func:`kick_state` にそのまま渡す。**この項が毎ステップ最初に kick_state を呼ぶ**
     ので、ここに渡せばその step の状態全体に効く。
+
+    ``r_max`` / ``orbit_beta`` (回り込み型の G) と ``overshoot_margin``、
+    ``lateral_band`` (終端の構えの横のあそび) も同じく :func:`kick_state` にそのまま
+    渡すが、こちらは **報酬項側にも同じ値を配ること**。既定
+    (``r_max=None`` / ``overshoot_margin=0.0`` / ``lateral_band=None``) では
+    従来の挙動と完全に一致する。
     """
     state = kick_state(
         env,
@@ -56,6 +66,10 @@ def kick_finished(
         kick_detection_min_foot_speed_towards_ball=kick_detection_min_foot_speed_towards_ball,
         kick_detection_velocity_change_threshold=kick_detection_velocity_change_threshold,
         kick_detection_warmup_steps=kick_detection_warmup_steps,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
     )
 
     if not hasattr(env, "_kick_done_counter"):

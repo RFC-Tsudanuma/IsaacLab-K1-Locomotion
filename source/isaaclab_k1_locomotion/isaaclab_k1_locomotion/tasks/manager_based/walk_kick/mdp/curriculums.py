@@ -1,7 +1,11 @@
 # mdp/curriculums.py
 from __future__ import annotations
+import os
 import torch
 from typing import TYPE_CHECKING
+
+# K1_GATE_DEBUG=1 で kick_rate_gated_speed_range の内部状態を定期的に print する。
+_GATE_DEBUG = os.environ.get("K1_GATE_DEBUG", "") not in ("", "0")
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -247,3 +251,191 @@ def linear_command_speed_range(
     term.cfg.target_speed_range = (speed_min, speed_max)
 
     return {"speed_min": speed_min, "speed_max": speed_max}
+
+
+# --------------------------------------------------------------------------- #
+# 以下 2 つは fewa/walk_kick_dual_encoder_tune (walk_long_pass の dual encoder 化) からの
+# 移植。walk_kick / walk_weak_kick / walk_middle_kick の既存タスクはどれも
+# ``target_speed_range`` を動かすカリキュラムを持たない (weak は基底の帯のまま、
+# middle は最初から終点固定) ので、**現時点でこの 2 つを使っているタスクは無い**。
+# 帯を動かす新しい段を dual 系に足すときの受け皿としてここに置いてある。
+#
+# 使うときの注意: ``steps_per_iteration`` は PPO の ``num_steps_per_env`` と
+# 一致させること。locomotion/agents/rsl_rl_ppo_cfg.py は 48 なので 48 が正しい
+# (walk_kick 系の既存ランプは 24 で書かれており、実際には書いてある iteration の
+#  半分で終わっている。既存の収束済み挙動を変えないため、そちらは触っていない)。
+# --------------------------------------------------------------------------- #
+
+
+def linear_reward_weight_after_speed_gate(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    command_name: str,
+    ramp_iterations: int,
+    steps_per_iteration: int = 0,
+    gate_alpha_min: float = 1.0,
+) -> dict[str, float]:
+    """:func:`kick_rate_gated_speed_range` の帯が目標に届いてから重みをランプする。
+
+    :func:`linear_reward_weight` の壁時計版と違い、開始時刻を **帯カリキュラムの
+    到達** に紐付ける。ゲート付きの帯は「蹴れている間しか進まない」ので目標に届く
+    iteration が事前に決まらず、壁時計で後段の項を立ち上げると、帯がまだ途中の
+    ポリシーに追加の圧力を掛けてしまう。
+
+    ``command_name`` のゲートの α が ``gate_alpha_min`` に達した時点を 0 として、
+    ``ramp_iterations`` かけて ``start_weight`` → ``end_weight`` へ動かす。
+    帯がそこまで進まなければ重みは ``start_weight`` のまま (= 立ち上がらない)。
+
+    Returns:
+        ``Curriculum/<term_name>/`` 以下に出る現在の重みと経過 iteration。
+    """
+    if steps_per_iteration > 0:
+        now = env.common_step_counter / steps_per_iteration
+    else:
+        now = float(env.common_step_counter)
+
+    gate = getattr(env, "_kick_speed_gate_state", {}).get(command_name, None)
+    state = getattr(env, "_gated_weight_ramp_state", None)
+    if state is None:
+        state = {}
+        env._gated_weight_ramp_state = state
+
+    # 帯が到達した瞬間の iteration を一度だけ記録する (以降は戻っても取り消さない。
+    # 一度立ち上げた罰を帯の揺り戻しで出し入れすると、報酬の定義が振動する)。
+    if term_name not in state and gate is not None and gate["alpha"] >= gate_alpha_min:
+        state[term_name] = now
+
+    started_at = state.get(term_name, None)
+    if started_at is None:
+        new_weight = start_weight
+        elapsed = 0.0
+    else:
+        elapsed = max(0.0, now - started_at)
+        alpha = 1.0 if ramp_iterations <= 0 else min(elapsed / ramp_iterations, 1.0)
+        new_weight = start_weight + (end_weight - start_weight) * alpha
+
+    term = env.reward_manager.get_term_cfg(term_name)
+    if abs(term.weight - new_weight) > 1e-8:
+        term.weight = new_weight
+
+    return {"weight": new_weight, "iterations_since_gate": elapsed}
+
+
+def kick_rate_gated_speed_range(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    start_range: tuple[float, float],
+    end_range: tuple[float, float],
+    start_step: int,
+    end_step: int,
+    steps_per_iteration: int = 0,
+    advance_above: float = 0.80,
+    retreat_below: float = 0.50,
+    ema_alpha: float = 0.01,
+    retreat_scale: float = 2.0,
+) -> dict[str, float]:
+    """キック成立率で開閉するゲート付きの ``target_speed_range`` カリキュラム。
+
+    :func:`linear_command_speed_range` の壁時計版に対して、**帯を進めるかどうかを
+    ポリシーの実績で決める**。進捗 ``progress`` は iteration と同じ単位の内部時計で、
+    直近のキック成立率 (EMA) が
+
+    * ``advance_above`` 以上 … 経過ぶんだけ進む (= 壁時計版と同じ速さ)
+    * ``retreat_below`` 未満 … ``retreat_scale`` 倍の速さで戻る
+    * その間             … その場で止まる
+
+    と動く。α は ``progress`` を ``start_step`` → ``end_step`` に写した値。
+
+    **なぜ壁時計ではだめか**
+
+    壁時計の線形ランプは「ポリシーがこの速さで付いてくる」という賭けで、外れたときに
+    自己回復しない。帯がスイングの実力を追い越すと ``kick_velocity_scaled`` の Gaussian と
+    ``kick_direction`` の片側速度ゲートが揃って ~0 を返し、一方で ``kick_finished`` は
+    latch の 2 秒後にエピソードを終わらせるので、キックは「残りの歩行報酬を捨てる」
+    コストだけが残る。収支が逆転してポリシーは「蹴らずに time_out まで歩く」へ落ち、
+    探索 std も潰れるので iteration を足しても戻ってこない
+    (:func:`linear_command_speed_range` の docstring の失敗記録)。壁時計はそのまま
+    帯を上げ続けるため、この局所最適から抜ける道が塞がれる。
+
+    ゲート付きなら、キックが崩れた時点で帯が止まり、崩れ続ければ**キックが成立していた
+    帯まで戻る**。報酬信号が復活するので、ポリシーは自力で戻れる。
+
+    **kick_rate の読み方**
+
+    ``env.command_manager`` の ``kick_rate`` メトリクスは「そのエピソードで値 latch が
+    起きたか」の 0/1 を env ごとに持ち、``CommandManager.reset`` が平均を取ってから
+    ゼロ化する。``ManagerBasedRLEnv._reset_idx`` は **curriculum → command reset** の順に
+    呼ぶので、ここで ``env_ids`` を見れば、これから
+    ``Metrics/kick_direction/kick_rate`` として記録されるのと同じ値
+    (= 今終わったエピソード群の成立率) をゼロ化前に読める。
+
+    EMA の初期値は 1.0。``start_step`` までは帯が動かないので、そこまでに実測値へ
+    十分収束する (4096 env なら 1 iteration あたり数百エピソードが終わる)。
+
+    Returns:
+        TensorBoard に ``Curriculum/<term_name>/`` 以下で出る値。``alpha`` が止まって
+        いるのに ``kick_rate_ema`` が低いままなら、その帯がスイングの実質的な上限。
+    """
+    if end_step <= start_step:
+        raise ValueError(f"end_step ({end_step}) は start_step ({start_step}) より大きくすること。")
+
+    if steps_per_iteration > 0:
+        now = env.common_step_counter / steps_per_iteration
+    else:
+        now = float(env.common_step_counter)
+
+    state = getattr(env, "_kick_speed_gate_state", None)
+    if state is None:
+        state = {}
+        env._kick_speed_gate_state = state
+    if command_name not in state:
+        state[command_name] = {"alpha": 0.0, "kick_rate_ema": 1.0, "last_now": now}
+    gate = state[command_name]
+
+    # -- 直近に終わったエピソード群のキック成立率を EMA に入れる
+    command_term = env.command_manager.get_term(command_name)
+    metric = command_term.metrics.get("kick_rate", None)
+    if metric is not None and env_ids is not None and len(env_ids) > 0:
+        kick_rate = float(metric[env_ids].mean())
+        gate["kick_rate_ema"] += ema_alpha * (kick_rate - gate["kick_rate_ema"])
+
+    # -- ゲートの開閉に応じて α を進める / 戻す
+    #
+    # start_step までは触らない (fine-tune 直後の、履歴入力と std リセットに慣れるまでの
+    # 落ち着き期間)。その後の公称速度は壁時計版と同じ 1/(end_step - start_step) / iteration。
+    elapsed = max(0.0, now - gate["last_now"])
+    gate["last_now"] = now
+    ema = gate["kick_rate_ema"]
+    if now >= start_step:
+        delta = elapsed / (end_step - start_step)
+        if ema >= advance_above:
+            gate["alpha"] += delta
+        elif ema < retreat_below:
+            gate["alpha"] -= delta * retreat_scale
+        # advance_above > ema >= retreat_below は据え置き (ヒステリシス)。
+        gate["alpha"] = min(max(gate["alpha"], 0.0), 1.0)
+
+    if _GATE_DEBUG:
+        gate["calls"] = gate.get("calls", 0) + 1
+        if gate["calls"] <= 5 or gate["calls"] % 25 == 0:
+            print(
+                f"[gate] calls={gate['calls']} now={now:.3f} elapsed={elapsed:.5f}"
+                f" alpha={gate['alpha']:.6f} ema={ema:.4f} id(env)={id(env)}"
+            )
+
+    alpha = gate["alpha"]
+    speed_min = start_range[0] + (end_range[0] - start_range[0]) * alpha
+    speed_max = start_range[1] + (end_range[1] - start_range[1]) * alpha
+
+    command_term.cfg.target_speed_range = (speed_min, speed_max)
+
+    return {
+        "speed_min": speed_min,
+        "speed_max": speed_max,
+        "alpha": alpha,
+        "kick_rate_ema": ema,
+    }

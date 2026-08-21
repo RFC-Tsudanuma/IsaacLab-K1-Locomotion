@@ -31,3 +31,13 @@ class K1WalkMiddleKick360PPORunnerCfg(K1WalkKick360PPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_middle_kick_360"
+
+
+@configclass
+class K1WalkMiddleKick360NoisyBallPPORunnerCfg(K1WalkMiddleKick360PPORunnerCfg):
+    """Stage 4 (middle, 知覚ノイズ)。k1_walk_middle_kick_360 の checkpoint から始める前提。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_middle_kick_360_noisy_ball"

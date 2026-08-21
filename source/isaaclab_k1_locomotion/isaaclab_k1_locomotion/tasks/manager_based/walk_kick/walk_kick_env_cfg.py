@@ -546,9 +546,14 @@ class K1WalkKickWalkPhaseEnvCfg(K1WalkKickEnvCfg):
             _group.ball_vel.params = {"dim": 2}
             _group.target_kick_velocity.func = mdp.zero_obs
             _group.target_kick_velocity.params = {"dim": 1}
-        # critic の特権情報のボール位置もゼロ埋め (次元は 3 のまま)
-        self.observations.critic.ball_pos_rel.func = mdp.zero_obs
-        self.observations.critic.ball_pos_rel.params = {"dim": 3}
+        # critic の特権情報のボール位置もゼロ埋め (次元は 3 のまま)。
+        # NOTE: 派生タスクによっては critic がこのスロットを持たない。両足キック版
+        #       (walk_kick_both_feet) は観測スロット 3 自体がボール位置なので、critic は
+        #       そこを delay_steps=0 の真値にして特権スロットを畳んでいる。
+        #       スロット構成に依存しないよう、有無を見てから触る。
+        if getattr(self.observations.critic, "ball_pos_rel", None) is not None:
+            self.observations.critic.ball_pos_rel.func = mdp.zero_obs
+            self.observations.critic.ball_pos_rel.params = {"dim": 3}
 
         # -- ボールをシーンから取り除く（観測にも報酬にも現れないため）
         self.scene.soccer_ball = None
@@ -923,12 +928,154 @@ class K1WalkKick360MovingBallEnvCfg_PLAY(K1WalkKick360MovingBallEnvCfg):
 #   (2, 6) = 40-120ms @50Hz。実機の遅延計測ができたら「計測値 + マージン」に絞ること。
 # * _BALL_OBS_CAMERA_HZ: 実機の vision レート。ホールドのぶん実効遅延はさらに
 #   0〜1 フレーム (0-33ms) 伸びる。
-# * _BALL_OBS_JITTER: フレーム更新時に引き直す一様ノイズ [m]。ホールド中は同じ実現値が
-#   保持されるので、毎ステップ独立な Unoise より濾しにくい (実機の誤差系列に近い)。
+# * _BALL_OBS_JITTER_STD / _CLIP: フレーム更新時に引き直すガウスノイズ [m] とその
+#   クリップ点。ホールド中は同じ実現値が保持されるので、毎ステップ独立な Unoise より
+#   濾しにくい (実機の誤差系列に近い)。
+#
+#   実機の計測値は約 3cm だが、std はその倍以上の 0.067 を取る。実機の誤差は「たまに
+#   大きく外す」裾を持ち、蹴り損ねを起こしているのはその裾の側だと考えられるため、
+#   ±20cm 級の外れも学習中に見せておく。3σ = 0.2 = クリップ点なので、
+#   99.7% のサンプルはクリップされずに通る (= 実質的な最大が ±20cm)。
+#
+#   一様分布にしないこと。一様 ±20cm は「常時 20cm 級に外れている」ことになり、
+#   ボール半径 0.11m を超える誤差が定常化して位置信号そのものが壊れる (方策が
+#   ボール観測を信用しなくなる)。ガウスなら質量が 0 付近に集まり、
+#   「普段は正確・たまに大外し」という実機の分布形に近くなる。
 # --------------------------------------------------------------------------- #
 _BALL_OBS_DELAY_STEP_RANGE = (2, 6)
 _BALL_OBS_CAMERA_HZ = 30.0
-_BALL_OBS_JITTER = 0.05
+_BALL_OBS_JITTER_STD = 0.067
+_BALL_OBS_JITTER_CLIP = 0.2
+
+
+def _apply_noisy_ball_obs(cfg: "K1WalkKickEnvCfg") -> None:
+    """policy のボール位置観測だけを実機の認識パイプライン寄りに差し替える。
+
+    固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) を
+    :func:`.mdp.observations.noisy_ball_pos_b` (エピソードごとランダム遅延 +
+    30Hz サンプル&ホールド + フレーム同期ジッタ) に置き換える。
+
+    観測の次元・並び・他の全ての項に触れないので、既存の checkpoint をそのまま
+    ``--load_pretrained`` できる。weak / middle など他系統の 360 タスクからも呼べる
+    (レシピ側が触るのは報酬・カリキュラム・コマンド帯・DR だけで、観測は無関係)。
+    ``__post_init__`` の最後 (基底クラスの設定が全部済んだ後) に呼ぶこと。
+
+    触らないもの:
+
+    * **critic の ``prev_ball_pos``**: 従来どおり :func:`.mdp.prev_ball_pos_b`
+      (ノイズ無し 1 ステップ遅延)。critic は特権情報 (``ball_pos_rel``) も持つ
+      asymmetric 構成なので、ここを汚す理由がない。
+    * **``ball_vel``**: 静止ボールではほぼ 0 で、遅延・ホールドを掛けても実質変わらない。
+      転がるボール (moving_ball ablation) と組むときは同じパイプラインを通すこと。
+    """
+    term = cfg.observations.policy.prev_ball_pos
+    term.func = mdp.noisy_ball_pos_b
+    term.params = {
+        "delay_step_range": _BALL_OBS_DELAY_STEP_RANGE,
+        "camera_hz": _BALL_OBS_CAMERA_HZ,
+        "jitter_std": _BALL_OBS_JITTER_STD,
+        "jitter_clip": _BALL_OBS_JITTER_CLIP,
+    }
+    # ジッタは関数内でフレーム同期に付与する (ホールド中は同じ実現値を保持する) ので、
+    # 毎ステップ独立の Unoise は外す。残すと二重にノイズが乗る。
+    term.noise = None
+
+
+def _disable_ball_obs_jitter(cfg: "K1WalkKickEnvCfg") -> None:
+    """PLAY 用: 関数内ジッタを切る。遅延 + サンプル&ホールドは残す。
+
+    ``enable_corruption = False`` は ObsTerm の ``noise`` しか切らないので、
+    :func:`_apply_noisy_ball_obs` が関数側に移したジッタはそれに合わせて別途切る。
+    遅延とサンプル&ホールドは観測パイプラインの構造 (= PLAY で見たいもの) なので残す。
+    """
+    cfg.observations.policy.prev_ball_pos.params["jitter_std"] = 0.0
+
+
+# --------------------------------------------------------------------------- #
+# 自己位置推定の遅延
+#
+# 実機の自己位置推定はカメラのランドマーク認識と InEKF (FK + IMU) の組み合わせで、
+# 出力が policy に届くまでに遅れがある。蹴り方向はフィールド地図上の座標
+# (ゴールなど) で与えるので、体基準に直すにはロボット自身のヨー角が要る。
+# 遅れたヨー角で変換すると policy が見る蹴り方向は実際とずれる。
+#
+# 対象は policy 観測の ``kick_direction`` **1 スロットだけ**。ボール位置・速度は
+# カメラが体基準で直接測る量で自己位置推定を通らないので含めない (あちらは
+# :func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_delay` の "vision"
+# group が別に見ている)。IMU / エンコーダも同様に別枠。
+#
+# 効き方の目安: 制御周期 dt = 0.02 s なので 0.15-0.30 s = 7.5-15 ステップ。
+# 1 rad/s で回っているとき 0.3 s では約 17° ずれる。蹴り方向報酬の幅は
+# σ = 0.35 rad ≈ 20° (:data:`_SIGMA_DIRECTION`) なので、**報酬の幅と同程度の
+# 大きさの外乱**になる。回り込みの大きい 360 系ほど強く効く。
+#
+# 帯の広さについて: policy 観測にはジャイロ (``base_ang_vel``) が入っているので、
+# 「今この速さで回っているなら古い向きはこれくらいずれている」という補正は
+# 1 フレームの情報だけで学習できる。ただしそれは遅延量が絞られている場合の話で、
+# 0.15-0.30 s のように広く振ると policy はどれだけずれているか判断できず、
+# 補正を諦めて「ゆっくり回る」逃げ方に寄りやすい。**原因の切り分けが済んだら
+# 帯を狭める** (例: base 0.25 / max 0.05) ことを検討すること。
+#
+# NOTE: これは第一段階の単純版で、実機の誤差そのものではない。InEKF は IMU と FK で
+#       高い頻度で状態を進めるので、実際に policy へ届くヨー角は 0.3 s 古いわけでは
+#       なく、「短い遅れ + ランドマークが見えない間に溜まるずれ + 見えた瞬間の飛び」
+#       という形になる。単純な遅延で挙動の変化を確かめてから、そちらへ寄せること。
+# --------------------------------------------------------------------------- #
+_LOCALIZATION_DELAY_BASE_S = 0.15
+_LOCALIZATION_DELAY_MAX_S = 0.15
+
+
+def enable_localization_delay(
+    cfg,
+    base_delay_s: float = _LOCALIZATION_DELAY_BASE_S,
+    max_delay_s: float = _LOCALIZATION_DELAY_MAX_S,
+) -> bool:
+    """policy 観測の ``kick_direction`` に自己位置推定の遅延を掛ける。
+
+    実効遅延は ``base_delay_s + [0, max_delay_s]``、既定で 0.15-0.30 s。
+    遅延量は **env ごと・エピソードごと** に引き直し、エピソード内では一定
+    (:func:`~.mdp.observations._delayed_signal` の流儀に揃えてある)。
+
+    ``enable_obs_delay`` と同じく既存の ObsTerm の ``func`` / ``params`` だけを
+    差し替えるので、観測の次元も並び順も変わらない。遅延の有無で checkpoint は
+    そのまま繋がる。
+
+    critic には掛けない。特権情報から価値を推定させる側なので、遅延させても
+    学習が難しくなるだけで得るものが無い (``enable_obs_delay`` と同じ方針)。
+
+    **walk phase では何もしない。** あの段は ``kick_direction`` コマンド自体を
+    ``None`` にして、スロットに歩行コマンドのヨー方向 (``mdp.walk_command_yaw_dir``) を
+    載せている。歩行コマンドは体基準で外から与えるもので自己位置推定を通らないので、
+    遅延を掛ける対象ではない。
+
+    中間 stage から呼ぶこともできるが、その場合は全 stage で同じ遅延にすること
+    (遅延の有無で回り込み方が変わるので、段の間で条件が変わると引き継ぎの意味が薄れる)。
+
+    Returns:
+        実際に遅延を掛けたら True、walk phase などで対象外なら False。
+    """
+    # walk phase の判定 (docstring 参照)。あの段は kick_direction コマンドを None に
+    # したうえで、観測スロットに歩行コマンドのヨー方向を載せている。観測項の func を
+    # 見て判定すると、想定外の構成のときに黙ってスキップして「遅延を掛けたつもりで
+    # 掛かっていない」状態になるので、コマンドの有無で判定する。
+    if getattr(cfg.commands, "kick_direction", None) is None:
+        return False
+
+    term = getattr(cfg.observations.policy, "kick_direction", None)
+    if term is None:
+        raise AttributeError(
+            "policy 観測に 'kick_direction' がありません。自己位置遅延の対象項名が"
+            " 継承元の観測構成と食い違っています。"
+        )
+
+    term.func = mdp.delayed_kick_dir_b
+    term.params = {
+        **term.params,
+        "base_delay_s": base_delay_s,
+        "max_delay_s": max_delay_s,
+        "group": "localization",
+    }
+    return True
 
 
 @configclass
@@ -938,7 +1085,7 @@ class K1WalkKick360NoisyBallEnvCfg(K1WalkKick360EnvCfg):
     :class:`K1WalkKick360EnvCfg` との差は policy の ``prev_ball_pos`` 項だけ:
     固定 1 ステップ遅延 + 毎ステップ独立 Unoise(±2cm) を、
     :func:`.mdp.observations.noisy_ball_pos_b` (エピソードごとランダム遅延 2-6 ステップ +
-    30Hz サンプル&ホールド + フレーム同期ジッタ ±5cm) に差し替える。
+    30Hz サンプル&ホールド + フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm) に差し替える。
     walk_kick_360 の checkpoint からの fine-tune 前提::
 
         _labpython2 scripts/rsl_rl/train.py \\
@@ -946,28 +1093,18 @@ class K1WalkKick360NoisyBallEnvCfg(K1WalkKick360EnvCfg):
             --headless --num_envs 4096 \\
             --load_pretrained logs/rsl_rl/k1_walk_kick_360/<run>/model_<N>.pt
 
-    観測は 55 次元・並びとも同一なので checkpoint はそのまま載る。触らないもの:
+    観測は 55 次元・並びとも同一なので checkpoint はそのまま載る。
+    差し替えの詳細と「触らないもの」は :func:`_apply_noisy_ball_obs` を参照。
 
-    * **critic の ``prev_ball_pos``**: 従来どおり :func:`.mdp.prev_ball_pos_b`
-      (ノイズ無し 1 ステップ遅延)。critic は特権情報 (``ball_pos_rel``) も持つ
-      asymmetric 構成なので、ここを汚す理由がない。
-    * **``ball_vel``**: 静止ボールではほぼ 0 で、遅延・ホールドを掛けても実質変わらない。
-      転がるボール (moving_ball ablation) と組むときは同じパイプラインを通すこと。
+    同じ観測差し替えを weak / middle の帯に適用したものが
+    :class:`~..walk_weak_kick.walk_weak_kick_env_cfg.K1WalkKick360WeakNoisyBallEnvCfg` /
+    :class:`~..walk_middle_kick.walk_middle_kick_env_cfg.K1WalkMiddleKick360NoisyBallEnvCfg`。
     """
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        term = self.observations.policy.prev_ball_pos
-        term.func = mdp.noisy_ball_pos_b
-        term.params = {
-            "delay_step_range": _BALL_OBS_DELAY_STEP_RANGE,
-            "camera_hz": _BALL_OBS_CAMERA_HZ,
-            "jitter": _BALL_OBS_JITTER,
-        }
-        # ジッタは関数内でフレーム同期に付与する (ホールド中は同じ実現値を保持する) ので、
-        # 毎ステップ独立の Unoise は外す。残すと二重にノイズが乗る。
-        term.noise = None
+        _apply_noisy_ball_obs(self)
 
 
 @configclass
@@ -981,6 +1118,105 @@ class K1WalkKick360NoisyBallEnvCfg_PLAY(K1WalkKick360NoisyBallEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
-        # enable_corruption=False は ObsTerm の noise しか切らない。関数内ジッタも
-        # それに合わせて切る。遅延 + サンプル&ホールドは観測パイプラインの構造なので残す。
-        self.observations.policy.prev_ball_pos.params["jitter"] = 0.0
+        _disable_ball_obs_jitter(self)
+
+
+# --------------------------------------------------------------------------- #
+# Reference State Initialization: walk ポリシーの歩行状態から reset する
+# --------------------------------------------------------------------------- #
+# 実機は walk (model_34995.pt) で歩いてから walk_kick に切り替えるが、両者の歩容が
+# 違うため切り替えの瞬間に姿勢が飛ぶ。walk_kick を「walk が作る歩行状態」から reset して
+# 学習させると、その状態分布が学習中に何度も現れるので接続が滑らかになる。
+#
+# 状態プールの作り方 (model_34995.pt を学習したブランチで実行すること)::
+#
+#     _labpython2 scripts/rsl_rl/record_walk_states.py \
+#         --checkpoint checkpoint/model_34995.pt --headless \
+#         --num_envs 128 --record_time 60 --out walk_states.npz
+#
+# 学習::
+#
+#     K1_WALK_STATES_NPZ=/abs/path/walk_states.npz \
+#     ./scripts/rsl_rl/train.py --task Isaac-Velocity-Flat-K1-Walk-Kick-Walk-Init-v0 \
+#         --headless --num_envs 4096 --load_pretrained <walk_kick の checkpoint>
+#
+# NOTE: 歩行 **周波数** の違いはこの仕組みでは埋まらない。walk 側は
+#       1.5 Hz (||cmd_xy|| <= 1.0 m/s) から 2.0 Hz (1.8 m/s) までコマンド速度で
+#       変化するのに対し、walk_kick は _PHASE_FREQ = 1.6 Hz 固定 (± startup の
+#       ランダム化) なので、接近中のケイデンスがそもそも噛み合っていない。
+#       初期姿勢を揃えても段差が残るなら、次に疑うのはここ。
+_WALK_STATES_PATH_ENV = "K1_WALK_STATES_NPZ"
+_WALK_STATES_DEFAULT = "walk_states.npz"
+
+
+def _apply_walk_state_init(
+    cfg: "K1WalkKickEnvCfg",
+    states_path: str | None = None,
+    probability: float = 1.0,
+) -> None:
+    """reset を walk ポリシーの歩行スナップショットからの初期化に差し替える。
+
+    触るのは 2 箇所だけ:
+
+    1. ``events.reset_from_walk_states`` を **追加** する。EventManager は cfg の
+       ``__dict__`` 順に term を並べるので、``__post_init__`` で後から生やしたこの項は
+       ``reset_base`` / ``reset_robot_joints`` の **後** に走り、両者が置いた
+       立ち姿勢を上書きする。x, y, yaw は温存するので ``reset_ball_in_front_of_robot``
+       とも競合しない。
+    2. ``prev_joint_request`` 観測を :func:`~.mdp.prev_joint_request_rsi` に差し替える。
+       ActionManager のバッファは reset で 0 クリアされてしまうため、リセット直後の
+       1 フレームだけ「walk ポリシーが直前に出した関節指令」を返させる。
+       観測の次元・並びは変わらないので checkpoint はそのまま載る。
+
+    Args:
+        states_path: npz のパス。``None`` なら環境変数 ``K1_WALK_STATES_NPZ``、
+            それも無ければ ``walk_states.npz``。
+        probability: RSI を適用する env の割合。1.0 未満なら残りは従来どおりの
+            立ち姿勢リセットになる。
+    """
+    import os
+
+    path = states_path or os.environ.get(_WALK_STATES_PATH_ENV, _WALK_STATES_DEFAULT)
+
+    cfg.events.reset_from_walk_states = EventTerm(
+        func=mdp.reset_from_walk_states,
+        mode="reset",
+        params={
+            "states_path": path,
+            "probability": probability,
+            "set_gait_phase": True,
+            "set_last_action": True,
+        },
+    )
+
+    for _group in (cfg.observations.policy, cfg.observations.critic):
+        term = getattr(_group, "prev_joint_request", None)
+        if term is not None:
+            term.func = mdp.prev_joint_request_rsi
+
+
+@configclass
+class K1WalkKickWalkInitEnvCfg(K1WalkKickEnvCfg):
+    """walk_kick を walk ポリシーの歩行状態から reset して学習する版。
+
+    観測・報酬・コマンドは :class:`K1WalkKickEnvCfg` と完全に同一 (次元も並びも
+    変わらない) なので、既存の walk_kick checkpoint から ``--load_pretrained`` で
+    そのまま fine-tune できる。詳細は :func:`_apply_walk_state_init`。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        _apply_walk_state_init(self)
+
+
+@configclass
+class K1WalkKickWalkInitEnvCfg_PLAY(K1WalkKickWalkInitEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None

@@ -25,6 +25,7 @@ NOTE: RewardManager は weight==0 の項をスキップするので、カリキ�
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
 
@@ -92,6 +93,10 @@ def kick_state(
     kick_detection_min_foot_speed_towards_ball: float = 0.2,
     kick_detection_velocity_change_threshold: float = 0.5,
     kick_detection_warmup_steps: int = 5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
@@ -163,10 +168,33 @@ def kick_state(
         kick_detection_warmup_steps: エピソード開始後に物理判定を遮断するステップ数。
             既定 5 は標準の 50 Hz 制御で 0.1 秒。
 
-    NOTE: すべてのトリガー設定は ``track_ball`` とまったく同じ扱い。トリガー判定を
-          行うのは kick_state 自身だけで、報酬項は結果 (``kick_done`` と凍結値) を
-          読むだけなので、報酬項の signature を増やす必要はない。``kick_finished`` と
-          ``base_velocity`` の 2 か所に **同じ値**を配ること。
+        r_max: None (既定) 以外を入れると、目標終端 G の作り方を **回り込み型** に
+            切り替える。既定 (None) では従来どおり「ボールの真後ろ (キック線 R 上) を
+            ボール側へ滑る点」。詳細は下の G の計算のコメント参照。
+
+        orbit_beta: 回り込み型 G の先読み係数 (``r_max`` を入れたときだけ使う)。
+            0 < beta < 1。小さいほど G がキック線の真後ろへ強く引き寄せる。
+
+        overshoot_margin: overshoot 判定 (キック線 R の左右跨ぎ) の遊び [m]。
+            0.0 (既定) では従来どおり「符号が反転したら即発火」。正の値を入れると、
+            確定側と反対側へ **この距離まで** 入り込んでも発火しない。
+
+        lateral_band: 終端の構え位置 (P_kick と、回り込み型 G の真後ろ極限) に
+            **横方向のあそび (帯)** を持たせる。``(下端, 上端)`` [m]、符号は
+            ``right_vec`` と同じで **正 = ロボットから見て右**。None (既定) では
+            横成分ゼロ = 従来どおり「ボールを両足の真ん中に置く一点」を指令する。
+            詳細は下の帯のブロックのコメント参照。
+
+            NOTE: この 4 つも ``track_ball`` / ``v_thresh_target_*`` とは違い、
+                  **kick_state を呼ぶ全ての項に配る必要がある**。G と overshoot は
+                  その step の最初の呼び出しで確定するので、項ごとに違う値を渡すと
+                  結果が評価順に依存する。
+
+    NOTE: ``track_ball`` / ``v_thresh_target_*`` / ``physical_kick_detection`` と
+          その閾値群はトリガーと latch だけを設定するため、``kick_finished`` と
+          ``base_velocity`` の 2 か所に同じ値を配ればよい。一方、``r_max`` /
+          ``orbit_beta`` / ``overshoot_margin`` / ``lateral_band`` は G や overshoot を
+          変えるため、kick_state を呼ぶ全項に同じ値を配ること。
     """
     step = int(env.common_step_counter)
     state = getattr(env, _ATTR, None)
@@ -201,6 +229,11 @@ def kick_state(
     if state is None:
         state = {
             "step": -1,
+            # P_kick_base: 横のあそび (lateral_band) を **足す前** の終端点。
+            # エピソード開始時のスナップショット (と track_ball の引き直し) はこちらが持ち、
+            # 報酬項が読む "P_kick" は帯の横成分を足した後の点になる。
+            # lateral_band=None のときは両者は常に同一。
+            "P_kick_base": torch.zeros(env.num_envs, 2, device=device),
             "P_kick": torch.zeros(env.num_envs, 2, device=device),
             "init_side": torch.zeros(env.num_envs, device=device),  # 0 = 未確定
             "kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
@@ -231,10 +264,13 @@ def kick_state(
             # plant_lon: キック方向成分 (+ = ボールより前)。plant_lat: 横方向の **絶対値**。
             "plant_lon_frozen": torch.zeros(env.num_envs, device=device),
             "plant_lat_frozen": torch.zeros(env.num_envs, device=device),
+            # 蹴り足のワールド鉛直速度 [m/s]。値 latch で凍結する。+ = すくい上げ。
+            "foot_vz_frozen": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
             "p_walk": torch.zeros(env.num_envs, device=device),
             "tau_walk": torch.zeros(env.num_envs, device=device),
             "d_sole_to_ball": torch.zeros(env.num_envs, device=device),
+            "d_sole_to_ball_mean": torch.zeros(env.num_envs, device=device),
             "p_kick_pose": torch.zeros(env.num_envs, device=device),
             "v_target": torch.zeros(env.num_envs, device=device),
         }
@@ -256,9 +292,9 @@ def kick_state(
     s = ((robot_pos - ball_pos) * right_vec).sum(dim=-1)
 
     if just_reset.any():
-        # P_kick: R 上、ボールから後方 r_stance の点。既定ではエピソード終了まで固定
+        # P_kick_base: R 上、ボールから後方 r_stance の点。既定ではエピソード終了まで固定
         # (track_ball=True のときだけ latch まで下のブロックが引き直す)。
-        state["P_kick"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
+        state["P_kick_base"][just_reset] = (ball_pos - r_stance * kick_dir)[just_reset]
         # init_side は未確定 (0) に戻す。確定は下の commit ブロックで行う。
         state["init_side"][just_reset] = 0.0
         state["kick_done"][just_reset] = False
@@ -278,6 +314,7 @@ def kick_state(
         state["sole_height_at_kick"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
+        state["foot_vz_frozen"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
     # 転がるボール用: latch 前は P_kick を現在のボール位置から毎ステップ引き直す。
@@ -288,8 +325,45 @@ def kick_state(
     # としてはそれが正しい (開始位置でも飛んでいった先でもない)。
     # ------------------------------------------------------------------ #
     if track_ball:
+        state["P_kick_base"] = torch.where(
+            state["kick_done"].unsqueeze(-1), state["P_kick_base"], ball_pos - r_stance * kick_dir
+        )
+
+    # ------------------------------------------------------------------ #
+    # 横方向の帯 (lateral_band): 終端の構えに「横のあそび」を持たせる
+    #
+    # 蹴り足をキック線 R (ボールの真後ろに伸びる直線) の上に乗せるには、base を
+    # 蹴り足と反対側へスタンス半幅 (股関節の横オフセット 0.096 m) だけずらして
+    # 立つ必要がある。ただし最適なずらし量は振り足の内転ぶんだけ小さくなるので、
+    # いくつが正解かは事前にはわからない。
+    #
+    # そこで一点 (横ずれ 0 = ボールを両足の真ん中に置く姿勢) を指令するのをやめ、
+    # **帯**で指令する。帯の中では目標がロボットの今の横位置にそのまま追従するので、
+    # 横へ引く力が消える。帯の外へ出たときだけ、いちばん近い帯の端へ引き戻す。
+    # 帯の中のどこに落ち着くかを決めるのは kick_direction (キックの正確さ) だけに
+    # なるので、学習中に方策が自分で最適な位置を見つける。
+    #
+    # 帯の端 0.096 は股関節の横オフセットそのもの = 幾何的な上限であって、
+    # チューニングで選んだ数字ではない。ログ実績で weak / long_pass 系は 9/9 右足で
+    # 蹴っているので、帯は左片側にする ((-0.096, 0.0)。right_vec は正が右なので
+    # 負が左 = 右足をキック線に乗せる側)。
+    #
+    # 凍結: 横成分も kick_done で他と一緒に凍らせる。凍らせないと蹴った後も目標が
+    # ロボットを追い続け、latch 後に固定したはずの G が漂ってしまう。
+    # kick_done はこの時点ではまだ前 step ぶんなので、track_ball と同じく
+    # 「蹴ったその step の値」で凍る。
+    # ------------------------------------------------------------------ #
+    if lateral_band is None:
+        # 既定: 横成分なし。P_kick は P_kick_base そのもの = 従来と完全に同じ点。
+        lateral = None
+        state["P_kick"] = state["P_kick_base"]
+    else:
+        s_clamped = torch.clamp(s, min=lateral_band[0], max=lateral_band[1])
+        lateral = s_clamped.unsqueeze(-1) * right_vec
         state["P_kick"] = torch.where(
-            state["kick_done"].unsqueeze(-1), state["P_kick"], ball_pos - r_stance * kick_dir
+            state["kick_done"].unsqueeze(-1),
+            state["P_kick"],
+            state["P_kick_base"] + lateral,
         )
 
     # ------------------------------------------------------------------ #
@@ -418,6 +492,22 @@ def kick_state(
     plant_lon = (d_sup * kick_dir).sum(dim=-1)
     plant_lat = torch.abs((d_sup * right_vec).sum(dim=-1))
 
+    # ------------------------------------------------------------------ #
+    # 蹴り足のワールド鉛直速度 v_z [m/s]。値 latch で凍結する (foot_vz_frozen)。
+    #
+    # + = 接触の瞬間に足が上へ動いている = 「すくい上げ」。ボールを浮かせる運動量が
+    # 反発 (ボールの restitution) ではなく **足の運動** から来ていることの直接の指標。
+    # Isaac (e≈0.6) と MuJoCo/実機 (e≈0) で挙動が割れるのは、反発に頼った解が
+    # 反発係数の消える環境で浮かなくなるため。この量を報酬に使うことで、浮かせる
+    # メカニズムを反発非依存 (運動学依存) の側へ寄せる (:func:`..rewards.kick_foot_lift`)。
+    #
+    # NOTE: 足リンク原点の速度をそのまま採る。足裏中心は原点から z = −_SOLE_OFFSET に
+    #       あるので厳密には足の角速度ぶん (ω × r) だけずれるが、sole_z (足裏高さ) を
+    #       「リンク原点 − _SOLE_OFFSET」で近似しているのと同じ扱いに揃えてある。
+    # ------------------------------------------------------------------ #
+    foot_vel = robot.data.body_lin_vel_w[:, foot_ids, :]  # (N, 2, 3)
+    foot_vz = foot_vel[torch.arange(env.num_envs, device=device), kicking_foot, 2]
+
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
     state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
@@ -489,6 +579,10 @@ def kick_state(
         # 瞬間に接地しているので、キック本体のステップの値がそのまま構えを表す。
         state["plant_lon_frozen"] = torch.where(trigger, plant_lon, state["plant_lon_frozen"])
         state["plant_lat_frozen"] = torch.where(trigger, plant_lat, state["plant_lat_frozen"])
+        # 蹴り足の鉛直速度も plant_* と同じく **latch したステップの現在値** を採る。
+        # latch = ボールが動き出した瞬間なので、そのステップの足速度がすくい上げの
+        # 有無をそのまま表す。
+        state["foot_vz_frozen"] = torch.where(trigger, foot_vz, state["foot_vz_frozen"])
         state["kick_done"] = state["kick_done"] | trigger
 
     kick_done = state["kick_done"]
@@ -505,8 +599,66 @@ def kick_state(
     # 目標終端 G: R 上をボール側へ滑る点。latch 後は P_kick に固定して飛翔ボールを追わせない。
     # ------------------------------------------------------------------ #
     dist_robot_ball = (robot_pos - ball_pos).norm(dim=-1)
-    reach = torch.clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
-    G = ball_pos - reach.unsqueeze(-1) * kick_dir
+    if r_max is None:
+        # 従来の G: キック線 R (ボールの真後ろに伸びる直線) 上だけを動く点。
+        reach = torch.clamp(alpha * dist_robot_ball, min=r_stance, max=0.5)
+        G = ball_pos - reach.unsqueeze(-1) * kick_dir
+    else:
+        # ------------------------------------------------------------ #
+        # 回り込み型の G (r_max を入れたときだけ)
+        #
+        # 従来の G はボールの真後ろにしか置けないので、ボールの正面にいるロボットへは
+        # 「ボールを突き抜けて向こう側へ行け」という指令になる。回り込みは
+        # ball_avoidance (近づくと罰) が遠回りに追い込むことで初めて成立していた。
+        # ここでは **罰ではなく指令側** で回り込みを作る: G をボールを中心とする円弧の
+        # 上に置き、ロボットの現在位置から少しだけキック線側へ寄せた点にする。
+        # ロボットが G を追えば、そのままボールの周りを回ってキック線の後ろに着く。
+        #
+        # 記号:
+        #   u     : ボール → ロボット の単位ベクトル (今ロボットがボールのどっち側にいるか)
+        #   back  : −kick_dir。ボールから見て「キック線の後ろ」を指す単位ベクトル
+        #   φ     : back から u への符号付き角度 (−π, π]。φ=0 でロボットは真後ろに居る
+        #   φ_G   : orbit_beta * φ。beta < 1 なので G は必ずロボットより真後ろ寄りに出る
+        #   ρ     : G のボールからの距離。真後ろ (φ=0) で r_stance、真正面 (|φ|=π) で r_max
+        #
+        # 半径は r_max で **直接** 指定できる。従来の 0.5 のハードコード上限や
+        # alpha による距離連動ではなく、「正面から近づくときはボールから何 m 離れて
+        # 回るか」をそのまま数字で書ける。
+        #
+        # φ=±π (ボールの真正面) では左右どちらへ回るかが φ の符号で決まり、
+        # そこだけ G が不連続に飛ぶ。ただし真正面ちょうどはコイントスと同じで、
+        # どちらに回っても等価なので実害は小さい (少しでもどちらかへ寄れば以降は連続)。
+        # 逆に φ=0 (真後ろ、いちばん大事な仕上げの領域) では連続で、
+        # ρ → r_stance・G → 従来の P_kick に一致する。
+        # ------------------------------------------------------------ #
+        to_robot = robot_pos - ball_pos
+        u = to_robot / (to_robot.norm(dim=-1, keepdim=True) + 1e-6)
+        back = -kick_dir
+        phi = torch.atan2(
+            back[:, 0] * u[:, 1] - back[:, 1] * u[:, 0],
+            back[:, 0] * u[:, 0] + back[:, 1] * u[:, 1],
+        )
+        phi_G = orbit_beta * phi
+        rho = r_stance + (r_max - r_stance) * phi.abs() / math.pi
+        cos_g = torch.cos(phi_G)
+        sin_g = torch.sin(phi_G)
+        # back を φ_G だけ回した単位ベクトル (2D の標準的な回転)
+        back_rot = torch.stack(
+            [
+                back[:, 0] * cos_g - back[:, 1] * sin_g,
+                back[:, 0] * sin_g + back[:, 1] * cos_g,
+            ],
+            dim=-1,
+        )
+        G = ball_pos + rho.unsqueeze(-1) * back_rot
+        if lateral is not None:
+            # 帯の横成分を、真後ろ (φ=0) で 1、真正面 (|φ|=π) で 0 になるよう
+            # フェードさせて足す。円弧を大きく回っている間は指令の形をまったく
+            # 変えず、仕上げの真後ろでだけ帯つきの点 (= P_kick と同じ点) に
+            # 一致させるため。φ=0 では ρ=r_stance かつ back_rot=−kick_dir なので
+            # G = ball − r_stance·kick_dir + lateral となり、P_kick に厳密に一致する。
+            fade = 1.0 - phi.abs() / math.pi
+            G = G + fade.unsqueeze(-1) * lateral
     G = torch.where(kick_done.unsqueeze(-1), state["P_kick"], G)
     state["G"] = G
 
@@ -522,7 +674,9 @@ def kick_state(
     # 前後位置・0.5m・G とは無関係。base_link の水平位置のみで判定する。
     # init_side が未確定 (0) の間は s*0=0 なので発火しない。
     # ------------------------------------------------------------------ #
-    crossed = (s * state["init_side"]) < 0.0
+    # overshoot_margin > 0 なら、確定側と反対側へこの距離まで入っても発火しない。
+    # 0.0 (既定) では従来どおり符号反転で即発火。
+    crossed = (s * state["init_side"]) < -overshoot_margin
     newly_fired = crossed & (~state["overshoot_fired"])
     state["overshoot_event"] = newly_fired.float()  # 発火したステップだけ 1 (1エピソード最大1回)
     state["overshoot_fired"] = state["overshoot_fired"] | crossed
@@ -532,6 +686,18 @@ def kick_state(
     # (foot_pos / d_foot_to_ball は接触時足高さの計算で既に求めてある)
     # ------------------------------------------------------------------ #
     state["d_sole_to_ball"] = d_foot_to_ball.min(dim=1).values
+
+    # ------------------------------------------------------------------ #
+    # d_soleToBall (両足平均)。min 版とは **別のキー** として持つ (既存項は触らない)。
+    #
+    # min 版は「どちらか片方の足がボールの近くにあるか」しか見ないので、
+    #   * 綺麗なインサイドキックの構え (両足ともボール近傍)
+    #   * 軸足を後ろに残して蹴り足だけ突き出した退行解
+    # が同じ値になり区別できない。平均なら後者だけが大きくなる (実測見積もりで
+    # 前者 ≈ 0.17-0.20 m、後者 ≈ 0.32 m)。「構えができているのに足がボールから
+    # 遠い」ことを罰する :func:`..rewards.ball_avoidance_exec` 専用の量。
+    # ------------------------------------------------------------------ #
+    state["d_sole_to_ball_mean"] = d_foot_to_ball.mean(dim=1)
 
     state["p_style"] = p_style
     state["d_to_P_kick"] = (robot_pos - state["P_kick"]).norm(dim=-1)

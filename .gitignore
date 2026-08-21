@@ -76,6 +76,41 @@ logs/rsl_rl/k1_walk_long_pass/*
 logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/*
 !logs/rsl_rl/k1_walk_long_pass/2026-08-09_11-03-31/model_4000.pt
 
+# middle_kick_360 の checkpoint (stage 3, middle)。帯 (3.2, 4.5) m/s = 実機 5-10 m 相当。
+# 知覚ノイズ版 (Walk-Middle-Kick-360-Noisy-Ball, stage 4) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_middle_kick_360/
+logs/rsl_rl/k1_walk_middle_kick_360/*
+!logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/
+logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/*
+!logs/rsl_rl/k1_walk_middle_kick_360/2026-08-15_07-54-29/model_4999.pt
+
+# walk_kick_360_weak の checkpoint (stage 3, weak)。カリキュラム (0/500/1500/3000) は
+# 走り切った後の状態 (strong=0 / σ=0.35 / overshoot 満額)。
+# sim 実測 (iter 3000): kick_rate 0.973 / kick_vel_ratio 1.098 / kick_dir_error 6.6°、
+# 低指令域は成功率 0.96 / 追従率 1.40 (まだ蹴りすぎ)。
+# 5000 まで延長する --resume 元、および知覚ノイズ版
+# (Walk-Kick-360-Weak-Noisy-Ball, stage 4) の --load_pretrained 元。
+!logs/rsl_rl/k1_walk_kick_360_weak/
+logs/rsl_rl/k1_walk_kick_360_weak/*
+!logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/
+logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/*
+!logs/rsl_rl/k1_walk_kick_360_weak/2026-08-14_13-28-13/model_3000.pt
+
+# ball_avoid (観測スロット3をボール3D位置に、Ball Avoidance を実行圧解釈に差し替えた系統)
+# の stage 2 の起点。スロット3の意味が違うので既存の walk phase checkpoint は流用できない。
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/
+logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/*
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/
+logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/*
+!logs/rsl_rl/k1_walk_kick_ball_avoid_walk_phase/2026-08-17_15-29-56/model_4999.pt
+
+# 360_weak_noisy_ball (全方位・弱いキック・ボール観測にノイズ) の checkpoint
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/
+logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/*
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/
+logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/*
+!logs/rsl_rl/k1_walk_kick_360_weak_noisy_ball/2026-08-16_10-53-44/model_2999.pt
+
 # Isaac Sim
 _isaac_sim/
 data/
@@ -85,3 +120,27 @@ runs/
 
 # 手元用の仕様メモ
 source/isaaclab_k1_locomotion/docs/walk_kick.md
+
+# walk_long_pass_orbit (履歴入力 50 フレーム CNN の系統) の通し学習の checkpoint。
+# Stage 1 (walk phase, 8000 iter) と、そこから継いだ Stage 2 (loop_pass) の
+# 途中経過 3000 iter。インスタンスを作り直したときに --resume / --load_pretrained
+# の起点をここから拾えるようにしておく。
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/
+logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/
+logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_walk_phase/2026-08-19_01-21-50/model_7999.pt
+
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/
+logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/
+logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/*
+!logs/rsl_rl/k1_walk_long_pass_orbit_loop_pass/2026-08-19_08-22-05/model_3000.pt
+
+# walk_long_pass_orbit の Stage 4 (Isaac-Velocity-Flat-K1-Walk-Long-Pass-Orbit-v0) の
+# 途中経過 4400 iter (max_iterations 5000 の run)。--resume の起点。
+!logs/rsl_rl/k1_walk_long_pass_orbit/
+logs/rsl_rl/k1_walk_long_pass_orbit/*
+!logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/
+logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/*
+!logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/model_4400.pt

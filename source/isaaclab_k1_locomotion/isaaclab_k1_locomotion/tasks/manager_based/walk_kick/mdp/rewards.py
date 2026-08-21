@@ -32,6 +32,10 @@ def _r_direction(
     alpha: float,
     v_thresh: float,
     sigma_direction: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """r_direction = (f(τ_direction) − 0.5) * 2 * p_style （いずれも凍結値）。
 
@@ -46,7 +50,16 @@ def _r_direction(
           累積する)。クリップの代償として、方向を外したキックは「罰される」のではなく
           「報われない」(= 蹴らないのと同値) 扱いになる。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     tau = state["tau_direction_frozen"]
     f_dir = torch.exp(-(tau**2) / (2.0 * sigma_direction**2))
@@ -65,6 +78,10 @@ def kick_direction(
     sigma_direction: float = 0.35,
     v_gate_frac: float = 0.0,
     sigma_gate: float = 0.05,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)
 
@@ -80,7 +97,17 @@ def kick_direction(
     デフォルト 0.0 でゲート無効 = 従来の挙動。walk_pass のように v_target が
     かすり当ての速度域と近いタスクでのみ有効にする。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     if v_gate_frac <= 0.0:
         return r_dir
@@ -98,6 +125,10 @@ def kick_velocity_scaled(
     sigma_direction: float = 0.35,
     sigma_velocity: float = 1.0,
     use_3d_speed: bool = False,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
@@ -110,7 +141,17 @@ def kick_velocity_scaled(
     水平で測ったままだと「指令速度に届いていない」と誤判定され、φ 報酬（浮かせろ）と
     速度報酬（もっと強く）が恒常的に綱引きしてしまう。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
     v_err = v_meas - state["v_target"]
@@ -124,9 +165,23 @@ def kick_velocity_strong(
     alpha: float,
     v_thresh: float,
     sigma_direction: float = 0.35,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
     return r_dir * state["v_ball_frozen"]
 
 
@@ -137,6 +192,10 @@ def kick_velocity_overshoot(
     v_thresh: float,
     margin: float = 0.2,
     overshoot_sat: float = 1.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項10. Kick Velocity Overshoot = clamp(v_ball − (v_target + margin), 0, sat)。
 
@@ -171,7 +230,16 @@ def kick_velocity_overshoot(
     NOTE: 凍結値 (``v_ball_frozen``) を使う。飛翔中の減速後の値ではなく、
           **latch した瞬間の射出速度**が指令と比べる対象。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     excess = state["v_ball_frozen"] - (state["v_target"] + margin)
     excess = torch.clamp(excess, min=0.0, max=overshoot_sat)
@@ -187,6 +255,10 @@ def kick_elevation(
     phi_target: float = 0.52,
     sigma_phi: float = 0.25,
     phi_sat: float | None = None,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
 
@@ -214,7 +286,17 @@ def kick_elevation(
           スクープに収束する。片側飽和モードも φ_sat で頭打ちにすることでこれを防いで
           いる。飽和させずに単調増加させてはいけない。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     phi = state["phi_frozen"]
     if phi_sat is not None:
@@ -232,6 +314,10 @@ def kick_loft(
     v_thresh: float,
     sigma_direction: float = 0.35,
     vz_sat: float = 2.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項7'. Loft = r_direction * clamp(vz / vz_sat, 0, 1)。shape: (N,)
 
@@ -248,7 +334,17 @@ def kick_loft(
     * r_direction への乗算・kick_done ゲート・打ち下ろし (φ<0 → sin<0 → clamp 0) の
       扱いは kick_elevation と同じ。踏みつけ exploit 対策の設計原則を維持する。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     vz = state["v_ball_3d_frozen"] * torch.sin(state["phi_frozen"])
     f_loft = torch.clamp(vz / vz_sat, min=0.0, max=1.0)
@@ -265,6 +361,10 @@ def kick_plant_foot(
     sigma_lon: float = 0.10,
     lat_target: float = 0.19,
     sigma_lat: float = 0.06,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項9. Plant Foot (軸足配置) = r_direction * f(lon) * f(lat)。shape: (N,)
 
@@ -303,11 +403,200 @@ def kick_plant_foot(
     NOTE: 軸足がボールに接触してしまう解は、この項の σ_lat に加えて
           :func:`extra_ball_touch` (2 回目以降の接触を罰する) が既に塞いでいる。
     """
-    r_dir, state = _r_direction(env, r_stance, alpha, v_thresh, sigma_direction)
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     f_lon = torch.exp(-((state["plant_lon_frozen"] - lon_target) ** 2) / (2.0 * sigma_lon**2))
     f_lat = torch.exp(-((state["plant_lat_frozen"] - lat_target) ** 2) / (2.0 * sigma_lat**2))
     return r_dir * f_lon * f_lat
+
+
+def kick_foot_lift(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    vz_foot_sat: float = 2.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """項11. Foot Lift (すくい上げ) = r_direction * clamp(foot_vz / vz_foot_sat, 0, 1)。shape: (N,)
+
+    latch 時に凍結した **蹴り足の鉛直速度** (``foot_vz_frozen``、+ = 上向き) を評価する。
+    狙いは **「ボールが浮くメカニズムを反発係数依存から運動学依存へ移す」** こと。
+
+    walk_lob は Isaac Sim では浮くのに MuJoCo・実機では浮かない。原因はボールの反発係数で、
+    Isaac の既定 (e≈0.6) では「足を水平に突っ込んでボールを地面との間で弾ませる」だけで
+    vz が出てしまうのに対し、MuJoCo・実機 (e≈0) ではその成分が丸ごと消える。
+    ``kick_loft`` / ``kick_elevation`` は **結果** (ボールの vz・仰角) だけを見るので、
+    どちらの機構で浮いたかを区別できず、シミュレータ固有の解を選んでも満点が出る。
+
+    この項は **原因側** (接触の瞬間に足自身が上へ動いているか) を直接報酬にする。
+    足の上向き運動量から移る vz は反発係数に依存しないので、この項で誘導した解は
+    e が消える環境でもそのまま残る。``kick_loft`` (結果) と並べて置くことで、
+    「上げろ」と「すくい上げで上げろ」を同時に要求する形になる。
+
+    * f_lift = clamp(foot_vz / vz_foot_sat, 0, 1)。**打ち下ろし (foot_vz < 0) は 0**。
+      踏みつけ型の解にはこの項から一切払われない。
+    * ``vz_foot_sat = 2.0`` [m/s] はボール vz 目標 (walk_lob の ``vz_sat`` = 5.0) に対して
+      運動学的に必要な足速度の目安。剛体衝突では質量比と接触法線で伝達率が決まるので
+      1:1 では移らないが、飽和型 (線形ランプ) なので厳密な値である必要はない。届かない
+      値を置いても勾配は死なず、逆に飽和させると圧力が消える (``kick_loft`` と同じ)。
+      実測は ``Metrics/kick_direction/foot_vz`` で見て、飽和しているようなら上げること。
+
+    設計上の約束 (kick_loft / kick_plant_foot と同じ):
+
+    * **r_direction への乗算**であること。加算にすると「方向を無視して足を上に振る」だけで
+      報酬が取れてしまう。乗算なら kick_done ゲート・方向精度 (τ_direction)・胴体の正対
+      (p_style) を全て通過した蹴りにしか払われない。``sigma_direction`` は同じタスクの
+      他のキック報酬と **必ず同じ値** にすること (項ごとに違うと方位を外したときの損得が
+      食い違って何を最適化しているのか読めなくなる)。
+    * **他のキック報酬とは加算で並べる**。``kick_loft`` に掛けてはいけない。学習初期は
+      すくい上げがまず出ないので、掛けると loft の勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。すくい上げのない蹴りは「罰される」のではなく「報われない」に
+      留める。負の dense 払いにすると、_r_direction の NOTE と同じ「外したら早く転んで
+      損切り」の抜け道が復活する。
+    * **青天井にしないこと**。飽和 (vz_foot_sat で頭打ち) が「足を全力で上へ振り抜く」
+      だけの解を防いでいる (kick_elevation の NOTE と同じ原則)。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+
+    f_lift = torch.clamp(state["foot_vz_frozen"] / vz_foot_sat, min=0.0, max=1.0)
+    return r_dir * f_lift
+
+
+def kick_contact_height(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    ball_radius: float = 0.11,
+    h_sat: float = 0.03,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """項12. Contact Height (低い当たり) = r_direction * f_low。shape: (N,)
+
+    latch 時に凍結した **蹴り足の足裏高さ** (``sole_height_at_kick`` [m]) を評価する。
+    低いほど良い = ボールの下側に当てているほど良い。
+
+    なぜ要るか (walk_lob 2026-08-16 の実測から)
+    -------------------------------------------
+    ``kick_apex_height`` 0.425 m はボール中心の絶対高さなので、静止時 0.11 m から
+    上昇 0.315 m ⇔ 打ち出し vz ≈ 2.49 m/s。ところが同じ run の ``foot_vz`` は
+    0.81 m/s しかない。**すくい上げ (足自身の鉛直速度) では説明が付かない** 量が出て
+    いるということで、実際に浮きを作っているのは接触法線の向き — つまり
+    「ボール中心より下に、速い水平速度で当てている」ことの方である。
+
+    剛体・反発ゼロの衝突では、ボールは接触点からボール中心へ向かう法線方向に飛ぶ。
+    足裏高さ h でボール (半径 R) に当てたときの法線仰角は asin((R − h) / R) なので、
+
+        h = 0.083 (実測) → 14°     h = 0.055 → 30°
+        h = 0.032        → 45°     h = 0.011 → 84°
+
+    実測の射出仰角 25° はこの 14° に foot_vz のぶんが乗った値として整合する。
+    **仰角を 45-60° まで持っていくには h を 0.03 m 台まで下げる必要がある**、
+    というのがこの項の根拠。``kick_loft`` / ``kick_elevation`` は結果 (ボールの vz・
+    仰角) しか見ないので「どこに当てて浮かせたか」を指定できず、``kick_foot_lift`` は
+    別機構 (足の鉛直速度) を指定する項なので、接触点の高さはどの項からも直接の
+    圧力を受けていなかった。
+
+    ``kick_plant_foot`` (軸足を前へ) とは **同じことの表と裏** である。軸足がボールの
+    後方に残ったまま蹴ると蹴り足は伸び切った姿勢でボールの向こう側の高い位置に届く
+    ので、h は下がりようがない。あちらが原因側 (構え)、こちらが結果側 (当たり所) を
+    直接押さえる。両方入れて構わない (walk_lob 系は実際に両方入れる)。
+
+    f_low の形
+    ----------
+    ``f_low = clamp((ball_radius − h) / (ball_radius − h_sat), 0, 1)``
+
+    * h ≥ ``ball_radius`` (ボール中心以上の高さに当てた) → 0。打ち下ろし気味の
+      当たりにはこの項から一切払われない。
+    * h ≤ ``h_sat`` → 1 で頭打ち。既定 0.03 は上の表の 45° 相当。
+      **飽和させるのは「つま先を地面へめり込ませる」方向へ青天井に引かないため**
+      (kick_elevation / kick_foot_lift と同じ原則)。h_sat より下げても得をしないので、
+      地面を掻くだけの解に動機が生まれない。
+
+    設計上の約束 (kick_plant_foot / kick_foot_lift と同じ):
+
+    * **r_direction への乗算**であること。加算にすると「方向を無視して足を低く出す」
+      だけで報酬が取れてしまう。乗算なら kick_done ゲート・方向精度 (τ_direction)・
+      胴体の正対 (p_style) を全て通過した蹴りにしか払われない。``sigma_direction`` は
+      同じタスクの他のキック報酬と **必ず同じ値** にすること。
+    * **他のキック報酬とは加算で並べる**。``kick_loft`` に掛けてはいけない。学習初期は
+      低い当たりがまず出ないので、掛けると loft の勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。高い当たりは「罰される」のではなく「報われない」に留める。
+
+    NOTE: ``sole_height_at_kick`` は **latch を起こした接触** (= キック本体) の
+          足裏高さで、最初の接触ではない。多重接触があるときに蹴る前の偶発的な接触を
+          拾わないための作りで、詳細は :mod:`.kick_state` の該当箇所を参照。
+
+    NOTE: ``touch_count > 0`` でゲートしている。この項は他のキック報酬と違って
+          **凍結値の初期値 0.0 が「満点」側に写る** (f_low(0) = 1) ので、接触が
+          一度も記録されないまま latch した場合に払ってしまう。``kick_foot_lift``
+          (foot_vz=0 → 0 点) や ``kick_plant_foot`` (目標から遠い → 0 点) は初期値が
+          自然に無得点側なのでこのゲートが要らない。
+          実際には latch のトリガー (ボール速度 > v_thresh) を満たす dv は同じ
+          ステップの接触検出も満たすので通常は起きないが、未計測が満点になる向きの
+          失敗モードは残さない。
+
+    .. warning::
+       **walk_lob でこの項は反証されている (2026-08-18)。現在どのタスクからも
+       使われていない。** ``sole_height_at_kick`` は狙いどおり 0.062 → 0.050 に
+       下がったが、**同じ run で apex は 0.340 → 0.234 に下がった**。低く当てるには
+       立ち位置を詰めるしかなく、それがスイング長 = ボール速度を削るため。
+       3 run を並べると apex 上昇 ∝ (ball_vel · sinφ)² にほぼ完全に乗り、仰角より
+       ボール速度の変動の方が支配的だった (詳細は
+       :mod:`~...walk_lob_rough.walk_lob_rough_env_cfg` のモジュール docstring)。
+       **「浮かせたい」目的でこの項を足すときは、ボール速度が落ちていないかを
+       ``kick_vel_ratio`` で必ず確認すること。** 上の「なぜ要るか」の推論は
+       接触法線の幾何としては正しいが、速度とのトレードオフを勘定に入れていない。
+
+    Args:
+        ball_radius: ボール半径 [m]。0 点になる足裏高さ (= ボール中心の高さ)。
+        h_sat: 満点になる足裏高さ [m]。既定 0.03 は法線仰角 45° 相当。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+
+    span = max(ball_radius - h_sat, 1e-6)
+    f_low = torch.clamp((ball_radius - state["sole_height_at_kick"]) / span, min=0.0, max=1.0)
+    measured = (state["touch_count"] > 0.0).float()
+    return r_dir * f_low * measured
 
 
 def walk_speed(
@@ -317,6 +606,10 @@ def walk_speed(
     v_thresh: float,
     sigma_walk: float = 0.5,
     sigma_walk_potential: float = 0.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項4. Walk Speed = (f(τ_walk) − 0.5) * 2 * p_walk。shape: (N,)
 
@@ -325,7 +618,16 @@ def walk_speed(
     G への接近度 (1 = 到達)。G は P_kick で下限クランプされるので、キック立ち位置に
     着いた時点で p_walk が飽和し、この項は self-gate する。凍結しない。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     f_walk = torch.sigmoid(state["tau_walk"] / sigma_walk)
     p_walk = torch.exp(-state["d_to_G"] / sigma_walk_potential)
@@ -339,6 +641,10 @@ def approach_penalty(
     v_thresh: float,
     sigma_sole: float = 0.35,
     sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項5. Approach Penalty = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -348,7 +654,16 @@ def approach_penalty(
     理想（足がボールに近い × 姿勢が P_kick と一致）で 0、最悪（遠い × ズレ）で最大の罰。
     pre-latch のみ有効（kick_done で 0 ゲート）。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     # 遠いほど 1 に近づく
     f_sole = 1.0 - torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
@@ -367,6 +682,10 @@ def ball_avoidance(
     v_thresh: float,
     sigma_sole: float = 0.35,
     sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項5'. Ball Avoidance = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -387,7 +706,16 @@ def ball_avoidance(
 
     pre-latch のみ有効（kick_done で 0 ゲート）。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
 
     # 近いほど 1 に近づく (approach_penalty と逆)
     f_sole = torch.exp(-((state["d_sole_to_ball"] / sigma_sole) ** 2))
@@ -398,11 +726,96 @@ def ball_avoidance(
     return f_sole * p_kick_pose * (~state["kick_done"]).float()
 
 
+def ball_avoidance_exec(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    d_contact: float = 0.18,
+    d_sat: float = 0.45,
+    sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """項5''. Ball Avoidance (execution 解釈) = f(d_mean) * p_kickPose。負の重みで使う。shape: (N,)
+
+    B-Human ポスターの Ball Avoidance ``f(d_soleToBall)·p_kickPose`` (weight −3) を、
+    :func:`approach_penalty` / :func:`ball_avoidance` とは **第 3 の向き** で読んだもの。
+    ユーザーとの議論で確定した解釈 (2026-08-17):
+
+    * ``f(d) = clamp((d − d_contact) / (d_sat − d_contact), 0, 1)``
+      : **遠いほど大きい** (接触距離で厳密に 0、d_sat 以遠で 1)
+    * ``p_kickPose = exp(−(d_to_P_kick/σ_pose)²) · p_style``
+      : **構えの一致度** (1 = P_kick に立ち蹴り方向を向いている)。
+      ``p_style`` / ``p_walk`` と同じ自然な極性で、``approach_penalty`` /
+      :func:`ball_avoidance` が使う「ズレほど大きい」反転版ではない。
+
+    積を負の重みで払うので、罰されるのは **「構えは完成しているのに足がボールから
+    遠い」** 状態だけになる。名前どおりの「ボールを避けろ」ではなく、
+    「構えたなら実行しろ (蹴り切れ)」という督促として効く。
+
+    核心は **キック接触の瞬間に距離側が 0 になり罰が消える** こと。足がボールに触れる
+    位置まで詰めれば f = 0 なので、構えが完璧でも罰は残らない。つまりこの項は
+    「構えて止まったまま」だけを罰し、蹴り抜けた瞬間に自分で消える。
+
+    d は **両足の平均** (:data:`~.kick_state` の ``d_sole_to_ball_mean``)
+    ----------------------------------------------------------------------
+    片足 min (``d_sole_to_ball``) だと「軸足を後ろに置いて蹴り足だけ突き出す」退行解が、
+    綺麗なインサイドキック (両足ともボール近傍、平均 ≈ 0.17-0.20 m) と同じ値になり
+    区別できない。平均なら退行解は ≈ 0.32 m で分離する。
+
+    パラメータ
+    ----------
+    * ``d_contact = 0.18``: ボール半径 0.11 (中心 z = 0.11) と足リンク原点
+      (接地時 z ≈ 0.038 = :data:`~.kick_state._SOLE_OFFSET`) の鉛直差 0.072 に、
+      接触時の水平距離を足したもの。綺麗なインサイドの構えでの両足平均 ≈ 0.17-0.20 に
+      当たる。ここで f が 0 に張り付くので「接触したら罰ゼロ」が成立する。
+    * ``d_sat = 0.45``: 突き出し退行解 (平均 ≈ 0.32) で f ≈ 0.5、それ以遠は飽和。
+      青天井にしないことで、遠方 (接近中) の罰が構えの一致度ぶんに抑えられる。
+
+    ``f`` を線形クランプにしてあるのは、リポジトリ既存の ``f_phi`` / ``f_loft`` /
+    ``f_lift`` (いずれも clamp 形式) と揃えるためと、Gaussian や exp では接触時に
+    厳密な 0 にならないため。
+
+    NOTE: 命名は「非負の値を返し、負の重みで使う」既存の罰項の規約
+          (:func:`approach_penalty` / :func:`ball_avoidance` /
+          :func:`kick_velocity_overshoot` / :func:`kick_pose_overshoot`) に従う。
+    NOTE: pre-latch のみ有効 (kick_done で 0 ゲート)。latch 後はボールが飛んでいくので
+          距離側が意味を失う。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+
+    # 遠いほど 1。d_contact 以下 (= 接触している) で厳密に 0。
+    f_sole = torch.clamp(
+        (state["d_sole_to_ball_mean"] - d_contact) / (d_sat - d_contact), min=0.0, max=1.0
+    )
+
+    # 構えの一致度。1 = P_kick に立ち、蹴り方向を向いている (自然な極性)。
+    pose_match = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2)) * state["p_style"]
+
+    return f_sole * pose_match * (~state["kick_done"]).float()
+
+
 def extra_ball_touch(
     env: ManagerBasedRLEnv,
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項8. 2 回目以降のボール接触。発火したステップだけ 1。負の重みで使う。shape: (N,)
 
@@ -415,8 +828,74 @@ def extra_ball_touch(
           「蹴らない」ではなく「1 回目で蹴る」方向に動くはず。逆に重みを上げすぎると
           ボールに触ること自体を避けて kick_rate が落ちるので、Metrics で監視すること。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
     return state["extra_touch_event"]
+
+
+def kick_latch_bonus(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """項9. Latch 後の定額ボーナス。post-latch の間ずっと 1。正の重みで使う。shape: (N,)
+
+    目的: 「1 エピソード = 1 キック」構成が生む **長生きバイアス** の相殺
+    ------------------------------------------------------------------
+    このタスクは latch から ``kick_finished`` の ``delay_steps`` (既定 100 step = 2 秒)
+    でエピソードを打ち切る。一方 dense な歩行系の正報酬 (feet_phase 等) は生きている間
+    ずっと入るので、**蹴った瞬間に「残り時間ぶんの歩行収入」を没収される**。
+
+    k1_walk_kick_ball_avoid の初回 run (iter 1600) で実測された経済:
+
+    * 蹴らずに歩き続ける dense 収入 ≈ **+1.6 / 秒**
+    * 蹴ると残り 4-5 秒 ≈ **+6〜8** を失う
+    * 学習初期の蹴り 1 回の実収入 ≈ **+0.3** (方向・速度が未熟で満額 7.8 の 4%)
+
+    差し引き「蹴る = 約 −6 の取引」で、キックは iter 300-400 に一度立ち上がった
+    (kick_rate 0.19) 後 iter 1300 以降 0.00 に消滅した。その間 mean_reward は
+    −4.4 → +16 と単調増加しており、勾配死ではなく **「蹴らない方が儲かる」を正しく
+    学習した** 結果である。
+
+    旧 :func:`approach_penalty` は「ボール近傍に居ないこと」への恒常税だったので、この
+    バイアスを偶然相殺していた。:func:`ball_avoidance_exec` は「構えたときだけ課税」する
+    ので、その仕事を引き継いでいない。そこで没収ぶんを **キックの成否によらない定額**
+    で払い戻し、「蹴る/蹴らない」の選択を収支中立に戻す。方向・速度の巧拙は項1-3 が
+    見るので、この項は意図的に品質を問わない。
+
+    ``kick_done`` は latch からエピソード終了まで 1 を返し、RewardManager は
+    ``value = func * weight * dt`` で払うので、1 キックあたりの総額は
+    **``weight × delay_steps × dt``** になる (weight=4.0, 100 step, dt=0.02 なら +8)。
+
+    NOTE: 総額が ``kick_finished`` の ``delay_steps``
+          (``..walk_kick_env_cfg._KICK_DELAY_STEPS``) に比例するので、猶予窓を変えたら
+          weight も見直すこと。項1-3 が ``_KICK_W_SCALE`` で自動的に割り戻されるのと
+          違い、こちらは手動である。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    return state["kick_done"].float()
 
 
 def kick_pose_overshoot(
@@ -424,6 +903,10 @@ def kick_pose_overshoot(
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
     """項6. Kick Pose Overshoot。キック線 R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
@@ -433,5 +916,14 @@ def kick_pose_overshoot(
     確定側から反対側へ符号が反転したら発火して latch する。戻っても解除せず、
     1 エピソード最大 1 回だけ罰する。未確定の間は発火しない。
     """
-    state = kick_state(env, r_stance=r_stance, alpha=alpha, v_thresh=v_thresh)
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
     return state["overshoot_event"]

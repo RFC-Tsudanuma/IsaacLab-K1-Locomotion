@@ -32,6 +32,24 @@ parser.add_argument(
     help="Path to a pretrained checkpoint (.pt) to initialize weights (strict=False, for transfer learning)."
 )
 parser.add_argument(
+    "--warm_start_from_single_frame",
+    action="store_true",
+    default=False,
+    help="Treat --load_pretrained as a 1-frame-observation checkpoint and graft its actor onto the "
+    "history-input actor (ActorCriticHistoryCNN). The policy starts out behaving exactly like the "
+    "pretrained one and learns to use the history from there. Without this flag the actor weights "
+    "are silently dropped (shape/name mismatch).",
+)
+parser.add_argument(
+    "--allow_untransferred_actor",
+    action="store_true",
+    default=False,
+    help="Allow --load_pretrained to proceed even when no actor tensor could be transferred "
+    "(the actor stays randomly initialized). Off by default because a silently random actor "
+    "looks like a normal run in the logs but restarts locomotion from scratch, which quietly "
+    "invalidates every fine-tuning curriculum. Only pass this when critic-only transfer is intended.",
+)
+parser.add_argument(
     "--distributed", action="store_true", default=False, help="Run training with multiple GPUs or nodes."
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
@@ -344,6 +362,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         else:
             state_dict = loaded.get("model_state_dict", loaded)
 
+        # 1 フレーム観測の checkpoint を履歴入力の actor へ移植する。
+        #
+        # 素の ActorCritic の actor は名前 (actor.0.* vs actor.mlp.0.*) も 1 層目の入力次元も
+        # 違うので、何もしないと下のフィルタに全部捨てられ、actor だけゼロから学習になる。
+        # 移植すると初期状態の出力が旧ポリシーと一致するので、歩き方・蹴り方を保ったまま
+        # 履歴の使い方だけを追加で学習できる (詳細は remap_single_frame_actor の docstring)。
+        if args_cli.warm_start_from_single_frame:
+            from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
+                ActorCriticHistoryCNN,
+                remap_single_frame_actor,
+            )
+
+            if not isinstance(policy, ActorCriticHistoryCNN):
+                raise ValueError(
+                    "--warm_start_from_single_frame は履歴入力の policy (ActorCriticHistoryCNN) 専用です。"
+                    f" 現在の policy: {type(policy).__name__}"
+                )
+            state_dict, notes = remap_single_frame_actor(state_dict, policy)
+            if any("->" in note for note in notes):
+                print("[INFO]: Grafting 1-frame actor onto the history actor:")
+                for note in notes:
+                    print(f"          {note}")
+            else:
+                print(
+                    "[WARN]: --warm_start_from_single_frame が指定されましたが、checkpoint に"
+                    " 1 フレーム版の actor (actor.<N>.weight) がありません。"
+                    " 既に履歴入力版の checkpoint の可能性があります (移植は何もしていません)。"
+                )
+
         # 形の合うテンソルだけをロードする。
         # obs次元が違う転移では入力層 (actor.0.weight) と normalizer の形が合わないので
         # 自動的に除外され、新しい次元で初期化されたままになる。
@@ -363,6 +410,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO]: Skipped {len(skipped)} tensors (shape mismatch / unknown key):")
             for s in skipped:
                 print(f"          {s}")
+
+        # actor が 1 本も引き継げていないなら止める。
+        #
+        # このフィルタは形の合わないテンソルを黙って捨てるので、1 フレーム観測の
+        # checkpoint を履歴入力タスクへ --warm_start_from_single_frame 無しで渡すと
+        # 「critic と正規化統計と std だけ載って actor は乱数のまま」で学習が始まる。
+        # ログ上は正常な起動に見えるうえ、歩けないところからのやり直しなので
+        # fine-tune 前提のカリキュラム (キック報酬のランプ / 帯のランプ) が全部空振りする。
+        # 実際 k1_walk_long_pass/2026-08-11_16-31-27 はこれで 5000 iteration を潰した
+        # (base_height 終了 99.9%、kick_rate ≈ 0 のまま歩行だけを再獲得)。
+        actor_loaded = [k for k in filtered if k.startswith("actor.")]
+        if not actor_loaded:
+            message = (
+                "[ERROR]: 引き継いだテンソルに actor が 1 本も含まれていません"
+                " (critic / 正規化統計 / std だけがロードされました)。\n"
+                "         このまま学習すると actor は乱数初期化のままなので、歩行から"
+                " やり直しになります。\n"
+                "         1 フレーム観測の checkpoint を履歴入力タスクへ渡した場合は"
+                " --warm_start_from_single_frame を付けてください。\n"
+                "         critic だけを引き継ぐのが意図どおりなら"
+                " --allow_untransferred_actor を付けてください。"
+            )
+            if not args_cli.allow_untransferred_actor:
+                raise RuntimeError(message)
+            print(message.replace("[ERROR]", "[WARN] "))
 
         result = policy.load_state_dict(filtered, strict=False)
         if isinstance(result, tuple):
