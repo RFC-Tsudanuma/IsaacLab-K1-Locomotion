@@ -144,3 +144,14 @@ logs/rsl_rl/k1_walk_long_pass_orbit/*
 !logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/
 logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/*
 !logs/rsl_rl/k1_walk_long_pass_orbit/2026-08-19_23-10-52/model_4400.pt
+
+# walk_inside_kick (右足インサイドキック) の完成 checkpoint 4999 iter。
+# run 2026-08-21_05-00-22 は foot_kick_dot ≈ 0 (足がキック方向に直角) /
+# ball_side 0.145 (内側面でフラットに接触) / kick_vel_ratio 0.91 / 方向誤差 6.2° まで
+# 到達した最初のインサイドキック。r_stance を 0.20 -> 0.10 に詰める fine-tune の
+# 起点として --load_pretrained で参照するので追跡する。
+!logs/rsl_rl/k1_walk_inside_kick/
+logs/rsl_rl/k1_walk_inside_kick/*
+!logs/rsl_rl/k1_walk_inside_kick/2026-08-21_05-00-22/
+logs/rsl_rl/k1_walk_inside_kick/2026-08-21_05-00-22/*
+!logs/rsl_rl/k1_walk_inside_kick/2026-08-21_05-00-22/model_4999.pt
