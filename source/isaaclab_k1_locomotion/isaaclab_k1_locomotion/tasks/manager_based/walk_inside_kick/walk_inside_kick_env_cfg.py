@@ -46,10 +46,10 @@
 
        r_direction × f_perp × f_side × (右足で蹴った) × (接触が計測済み)
        f_perp = clamp((1 − |足の前方向·kick_dir|) / (1 − 0.34), 0, 1)
-       f_side = (ボールが足のローカル +y 側にあった)
+       f_side = clamp(ボールの足ローカル y / 0.035, 0, 1)
 
-なぜ f_perp が線形クランプなのか (Gaussian にしないこと)
--------------------------------------------------------
+なぜ f_perp と f_side が線形クランプなのか (Gaussian・階段にしないこと)
+----------------------------------------------------------------------
 ``d_sat = 0.34`` = cos70°。足がキック方向から 70° 以上横を向いた当たりで満点、
 そこから連続に落ちて、|dot| = 1 (完全なトーキック) でようやく 0 になる。
 **学習の出発点であるトーキックの位置に、値は小さくても勾配が残る**ことが肝。
@@ -58,6 +58,13 @@ Gaussian にすると σ の外で勾配が完全に死ぬ。walk_lob 系 5 run 
 ``kick_plant_foot`` (f_lon が Gaussian) で実際にこれが起きていて、plant_lon は
 −0.36〜−0.43 に居座ったまま一度も目標へ寄らず、σ を広げて目標を引っ張った版でも
 gap が開いただけだった。同じ失敗を繰り返さないため、この形は変えないこと。
+
+f_side も同じ理由で線形。初回 run (2026-08-21_03-49-24) では f_side を
+``ball_side > 0`` の 0/1 にしてしまっており、「当たり所をもう少し内側へ寄せる」
+方向に勾配がまったく無かった。結果、内側で当たった割合
+(``kick_inside_contact`` を ``kick_direction`` と右足率で割り戻した値) は
+iter 320 の 0.073 から iter 997 の 0.036 へ **半減** し、トーキックへ戻っていった。
+分母の 0.035 は足箱の半幅で、ボール中心が足のローカル +y へ半幅ぶん入ったら満点。
 
 なぜ kick_plant_foot を外すのか
 -------------------------------
@@ -117,6 +124,7 @@ from ..walk_kick.walk_kick_env_cfg import (
     K1WalkKickEnvCfg,
 )
 from ..walk_middle_kick.walk_middle_kick_env_cfg import _apply_middle_kick_recipe
+from ..walk_weak_kick.walk_weak_kick_env_cfg import _STRONG_W
 from ..walk_weak_kick_orbit.orbit_mods import (
     _KICK_STATE_REWARD_TERMS,
     apply_ball_param_dr,
@@ -151,6 +159,18 @@ _SPI = 24
 #   ボールに近づいて構える。0.20 は足箱の前後長 (足首から前へ 0.116) と
 #   ボール半径 0.11 から、足の側面がボールに接する立ち位置の目安。
 #
+# overshoot_margin = 0.30:
+#   overshoot 罰 (キック線 R を跨いで反対側へ入ったら 1 エピソードに 1 回だけ罰) の
+#   遊び [m]。orbit の既定 0.25 は lateral_band が (-0.096, 0.0) だった頃の値で、
+#   「指令が許す立ち位置 (帯の端 0.096) を越えてから、さらに 0.154 までは跨ぎを許す」
+#   という配分だった。このタスクは帯の下限を -0.15 へ広げたのに 0.25 を据え置いた
+#   ので、跨ぎの余裕が 0.25 − 0.15 = 0.10 しか残っておらず、**指令どおり左へ寄って
+#   構えるだけで罰の 2/3 まで使い切る** 状態になっていた。実際、初回 run
+#   (2026-08-21_03-49-24) の overshoot 発火率は範囲拡大と右足率の上昇に沿って
+#   3.3% → 7.0% へ増えている。
+#   0.30 = 0.15 (新しい帯の端) + 0.154 (元の余裕) で、トーキック時代と同じ余裕に戻す。
+#   罰の目的である「回り直し」(反対側までぐるっと行き直す動き) は 0.30 でも十分捕まる。
+#
 # style_halfwidth = 0.698:
 #   p_style を帯で採点する半幅 [rad] = 40°。インサイドキックは胴体が蹴り方向から
 #   30-45° ずれた向きで構えるのが自然な形なので、その中央を取る。
@@ -161,6 +181,7 @@ _SPI = 24
 _INSIDE_PARAMS = {
     "lateral_band": (-0.15, 0.0),
     "r_stance": 0.20,
+    "overshoot_margin": 0.30,
     "style_halfwidth": 0.698,
 }
 
@@ -178,6 +199,39 @@ _INSIDE_PARAMS = {
 # トーキックの位置で f_perp が小さく、勾配が細いところから始めることになる)。
 # --------------------------------------------------------------------------- #
 _INSIDE_CONTACT_WEIGHT = 4.0
+
+# --------------------------------------------------------------------------- #
+# kick_velocity_strong の折れ線 (このタスク用に「下り」を前倒しした版)
+#
+# weak/middle のレシピが入れる既定は [(0,0), (500,W), (1500,W), (3000,0)]
+# (:data:`~..walk_weak_kick.walk_weak_kick_env_cfg._STRONG_KNOTS`)。
+# **上り (0 → 500) はそのまま、満額の維持を打ち切って 500 → 1200 で 0 へ落とす。**
+#
+# strong は「r_dir × v_ball」の青天井項で、速く蹴るほど得。これは 0 から学習し直す
+# タスクで **キックという行動そのものを発見させる** ための項であって、当たり所の
+# 型を決める項ではない。そして「いちばん強く振れる蹴り方」はつま先で突く形
+# (トーキック) なので、満額で置き続けるかぎり報酬は名指しでトーキックを要求する。
+#
+# 初回 run (2026-08-21_03-49-24) の実測:
+#   * kick_rate は 250 iteration で 0.85 を超えている = 発見は 250 で済んでいる。
+#   * それでも 0-1500 の間、strong の払いは kick_inside_contact の 43〜69 倍あった。
+#     当たり所の型が決まるのはまさにこの時期なので、インサイドの側の勾配は
+#     桁違いに小さい圧としてしか働けなかった。
+# 発見が済み次第 strong を退場させ、型の決定権を kick_inside_contact と
+# kick_velocity_scaled へ渡す。500 は上りが終わる点 (満額に達した直後から落とす)、
+# 1200 は拡大ゲートが動き出す 500 から 700 iteration の移行期間を取った点。
+#
+# σ_velocity のアニール (500 → 3000) と overshoot 罰のフェードイン (1500 → 3000) は
+# **触らない**。あちらは「速度を指令帯へ絞り込む」側の仕掛けで、当たり所とは別件。
+# 終値が 0 であることも変えない (少しでも残すと「速いほど得」が残る)。
+# --------------------------------------------------------------------------- #
+_STRONG_FADE_START_ITER = 500
+_STRONG_FADE_END_ITER = 1200
+_INSIDE_STRONG_KNOTS = [
+    (0, 0.0),
+    (_STRONG_FADE_START_ITER, _STRONG_W),
+    (_STRONG_FADE_END_ITER, 0.0),
+]
 
 # --------------------------------------------------------------------------- #
 # 全方位への拡大ゲートの窓 [iteration]
@@ -258,6 +312,16 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
     # 変わらないので、実績のあるレシピをそのまま土台にする。
     _apply_middle_kick_recipe(cfg)
 
+    # -- 1b. kick_velocity_strong のフェードアウトを前倒し ------------------ #
+    #
+    # レシピ関数は触らず、レシピが入れた curriculum 項 (piecewise_reward_weight) の
+    # knots だけをこのタスク用の折れ線へ差し替える (:data:`_INSIDE_STRONG_KNOTS`)。
+    # 上り (0 → 500) は同じで、下りが 1500 → 3000 から 500 → 1200 に早まる。
+    # 理由は :data:`_INSIDE_STRONG_KNOTS` のコメント (発見は 250 iteration で済んで
+    # いるのに、当たり所の型が決まる 0-1500 の間 strong が kick_inside_contact の
+    # 43〜69 倍の額でトーキックを要求し続けていた)。
+    cfg.curriculum.kick_velocity_strong_weight.params["knots"] = _INSIDE_STRONG_KNOTS
+
     # -- 2. kick_plant_foot を外す ----------------------------------------- #
     #
     # walk_lob 系 5 run の実測で plant_lon は −0.36〜−0.43 に居座り、一度も目標
@@ -285,6 +349,13 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
         -_KICK_HEADING_HALFWIDTH_RANGE[0],
         _KICK_HEADING_HALFWIDTH_RANGE[0],
     )
+
+    # 当たり所の幾何を TensorBoard に出す (Metrics/kick_direction/foot_kick_dot と
+    # .../ball_side)。kick_inside_contact の f_perp / f_side の中身そのものなので、
+    # 「報酬が伸びない」ときに向きの問題なのか内外の問題なのかを切り分けられる。
+    # 既定 False = 他タスクの TB タグ集合を変えないため、ここだけ True にする
+    # (:class:`~..walk_kick.mdp.commands.KickDirectionCommandCfg` の同名フラグ)。
+    cfg.commands.kick_direction.log_contact_geometry = True
 
     # -- 4. ball_avoidance を weight 0 で置く ------------------------------- #
     #
@@ -496,6 +567,12 @@ class K1WalkInsideKickEnvCfg(K1WalkKickEnvCfg):
       ``inside_foot_orient`` を小さい weight で有効化することを検討する。
     * ``Metrics/kick_direction/plant_lon`` / ``plant_lat``: 報酬からは外してある
       ので、インサイドが立ち上がったときに軸足がどこへ移ったかの **観察用**。
+    * ``Metrics/kick_direction/foot_kick_dot`` / ``ball_side``: 当たり所そのもの。
+      前者が 1 付近なら足がキック方向を向いたまま = トーキック、0 付近なら足が真横 =
+      側面で当てている。後者は蹴り足のローカル y [m] で、正がインサイド側 (足箱の
+      半幅 0.035 付近まで来ていれば面の中央で当たっている)。
+      ``kick_inside_contact`` が伸びないときに、向き (f_perp) と内外 (f_side) の
+      どちらが足りていないのかはこの 2 つで分かる。
     * ``Metrics/kick_direction/kick_foot_right_frac``: このタスクは右足専用なので、
       1.0 から離れていくようなら ``kick_inside_contact`` の右足ゲートが払われて
       いないことになる (キック報酬全体は左足でも入るため、左足へ逃げる余地はある)。

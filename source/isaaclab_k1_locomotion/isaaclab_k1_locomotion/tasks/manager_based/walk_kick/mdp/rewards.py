@@ -993,6 +993,7 @@ def kick_inside_contact(
     sigma_direction: float = 0.35,
     d_sat: float = 0.34,
     side_margin: float = 0.0,
+    side_sat: float = 0.035,
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
@@ -1008,11 +1009,13 @@ def kick_inside_contact(
       ``foot_kick_dot_frozen`` は足のローカル +x (つま先方向) の水平成分と kick_dir の
       内積なので、1 に近い = つま先が前 = トーキック、0 に近い = 足が真横 = 側面で
       当てている。
-    * ``f_side = (ball_side_frozen > side_margin)``
-      : ボールが蹴り足の **ローカル +y 側 = 内側** にあった接触だけを通す 0/1。
-      右足のインサイド面が +y であることは K1_22dof.xml の foot body から確認済み
-      (:mod:`.kick_state` の該当コメント参照)。|foot_kick_dot| だけではインサイドと
-      アウトサイドが区別できないので、この符号が要る。
+    * ``f_side = clamp((ball_side_frozen − side_margin) / side_sat, 0, 1)``
+      : ボールが蹴り足の **ローカル +y 側 = 内側** へ、どれだけ深く入ったところで
+      当たったか。右足のインサイド面が +y であることは K1_22dof.xml の foot body から
+      確認済み (:mod:`.kick_state` の該当コメント参照)。|foot_kick_dot| だけでは
+      インサイドとアウトサイドが区別できないので、この符号が要る。
+      ``side_sat = 0.035`` は足箱の半幅 [m] で、ボール中心が足のローカル +y へ
+      半幅ぶん入ったら満点。**0/1 の階段にしないこと** (下の失敗記録)。
     * ``right = (kick_foot_frozen == 1)``
       : 右足で蹴った latch だけ。kick_state の規約で 1 = 右。**このタスクは右足専用**
       (既存 run が 9/9 右足なので、左右両対応にして探索空間を倍にする理由がない)。
@@ -1021,8 +1024,8 @@ def kick_inside_contact(
       とまったく同じ理由で、``foot_kick_dot_frozen`` の初期値 0 は f_perp = 1 =
       **満点側** に写ってしまう。未計測が満点になる向きの失敗モードは残さない。
 
-    なぜ f_perp を線形クランプにするか (Gaussian にしないこと)
-    --------------------------------------------------------
+    なぜ f_perp も f_side も線形クランプなのか (Gaussian・階段にしないこと)
+    ----------------------------------------------------------------------
     ``d_sat = 0.34`` は cos70°。足がキック方向から 70° 以上横を向いた当たりで満点、
     そこから連続に落ちて、真正面 (|dot| = 1 = 完全なトーキック) でようやく 0 になる。
     **全域で勾配が残る**のが肝。
@@ -1032,6 +1035,21 @@ def kick_inside_contact(
     −0.36〜−0.43 に居座ったまま一度も目標へ寄らず、σ を広げた版でも gap が開いただけ
     だった。学習の出発点はトーキック (|dot| ≈ 1) の側なので、その位置で値も勾配も
     死んでいる形にしてはいけない。
+
+    f_side も **まったく同じ理由**で線形。0/1 の階段は「境界の手前では動かしても
+    報酬が 1 mm も変わらない」形なので、Gaussian の裾と同じく勾配が死ぬ。線形なら
+    ボールが足の外側寄り (ball_side が小さい) で当たっている段階から
+    「もう少し内側で当てる」方向に値が増え続ける。
+
+    失敗記録: f_side を階段にしていた初回 run (2026-08-21_03-49-24)
+    --------------------------------------------------------------
+    初回の実装は ``f_side = (ball_side_frozen > side_margin)`` の 0/1 だった。
+    キック自体は健全 (kick_rate 0.99、拡大ゲートも歩行も崩れず) だったのに、
+    ``kick_inside_contact`` を ``kick_direction`` と右足率で割り戻した
+    「内側で当たった割合」は iter 320 の 0.073 から iter 997 の 0.036 へ **半減** し、
+    トーキックの方へ戻っていった。当たり所を内側へ寄せる方向の勾配がそもそも
+    存在しなかったのだから当然で、f_perp には plant_lon の教訓を適用したのに
+    f_side に同じ教訓を適用し損ねたのが原因。
 
     設計上の約束 (``kick_plant_foot`` / ``kick_contact_height`` と同じ)
     ------------------------------------------------------------------
@@ -1050,11 +1068,20 @@ def kick_inside_contact(
           この項とは別に gate 用の係数関数を足すこと。エスカレーションであって、
           最初から掛けてはいけない (上の「加算で並べる」と同じ理由)。
 
+    NOTE: この項を使っているタスクは **walk_inside_kick だけ** (grep 済み。
+          ``_KICK_STATE_REWARD_TERMS`` に名前があるのはパラメータ配布先の名簿で、
+          項そのものを足しているのは walk_inside_kick の cfg のみ)。したがって
+          f_side の形を変えても他タスクの学習は 1 ステップも変わらない。
+
     Args:
         d_sat: f_perp が満点になる |foot_kick_dot| の上限。既定 0.34 = cos70°。
-        side_margin: 内側判定のしきい値 [m]。0.0 (既定) で「足のローカル原点より
-            +y 側」。足の半幅は 0.035 なので、当たり面をもっと内側に限りたければ
-            正の値を入れる。
+        side_margin: f_side の坂が始まる ball_side の値 [m]。0.0 (既定) で
+            「足のローカル原点より +y 側に入った時点から加点が始まる」。
+            当たり面をもっと内側に限りたければ正の値を入れる。
+        side_sat: f_side が満点になるまでの幅 [m]。既定 0.035 = 足箱の半幅で、
+            ボール中心が足のローカル +y へ半幅ぶん入ったら 1.0。
+            狭くするほど階段に近づく = 勾配が痩せるので、下げるときは
+            上の失敗記録を読んでから。
     """
     r_dir, state = _r_direction(
         env,
@@ -1071,7 +1098,8 @@ def kick_inside_contact(
 
     span = max(1.0 - d_sat, 1e-6)
     f_perp = torch.clamp((1.0 - state["foot_kick_dot_frozen"].abs()) / span, min=0.0, max=1.0)
-    f_side = (state["ball_side_frozen"] > side_margin).float()
+    side_span = max(side_sat, 1e-6)
+    f_side = torch.clamp((state["ball_side_frozen"] - side_margin) / side_span, min=0.0, max=1.0)
     right = (state["kick_foot_frozen"] == 1.0).float()
     measured = (state["touch_count"] > 0.0).float()
 

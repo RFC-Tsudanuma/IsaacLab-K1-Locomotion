@@ -70,6 +70,18 @@ class KickDirectionCommand(UniformVelocityCommand):
       この実測値を見て決める (飽和しきっているなら上げる)。
       これも「キックが成立した env」だけで平均している。
 
+    ``cfg.log_contact_geometry`` が True のときだけ、当たり所の幾何が 2 つ増える
+    (既定 False。既存タスクの TB タグ集合を変えないため):
+
+    * ``foot_kick_dot``: latch を起こした接触の瞬間に凍結した、蹴り足のつま先方向
+      (足のローカル +x の水平成分) と指令蹴り方向の内積。1 に近い = つま先が前 =
+      トーキック、0 に近い = 足が真横 = 側面で当てている、−1 に近い = かかと側。
+    * ``ball_side``: 同じ瞬間の、蹴り足のローカル座標で見たボール中心の y [m]。
+      **正 = 右足の内側 (インサイド) の面の側**。足箱の半幅は 0.035 なので、
+      0.035 付近まで来ていれば面の中央で当たっている。
+      :func:`~.rewards.kick_inside_contact` の f_side がそのまま見える値で、
+      「インサイドで当てられているか」はこの 2 つを並べて読む。
+
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
     """
@@ -114,6 +126,11 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_low_frac"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_rate_low"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["kick_vel_ratio_low"] = torch.zeros(self.num_envs, device=self.device)
+        # 当たり所の幾何 (walk_inside_kick 用)。**キー自体を作らない** ことで、
+        # 既定 False の他タスクでは TensorBoard のタグ集合が一切変わらない。
+        if self.cfg.log_contact_geometry:
+            self.metrics["foot_kick_dot"] = torch.zeros(self.num_envs, device=self.device)
+            self.metrics["ball_side"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -154,6 +171,12 @@ class KickDirectionCommand(UniformVelocityCommand):
         self.metrics["kick_low_frac"] = is_low
         self.metrics["kick_rate_low"] = kick_done * is_low
         self.metrics["kick_vel_ratio_low"] = ratio * kick_done * is_low
+
+        # 当たり所の幾何。plant_lon / plant_lat と同じ流儀で、latch した env だけを
+        # 見る (未キックを 0 として混ぜると誤読する) ため kick_done を掛ける。
+        if self.cfg.log_contact_geometry:
+            self.metrics["foot_kick_dot"] = state["foot_kick_dot_frozen"] * kick_done
+            self.metrics["ball_side"] = state["ball_side_frozen"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
@@ -221,6 +244,17 @@ class KickDirectionCommandCfg(UniformVelocityCommandCfg):
     既定 0.8 は kick_state の既定 v_thresh と同じ。**この値未満の指令は、既定の
     latch 閾値のままだと「指令どおり蹴っても latch が発火しない」領域**なので、
     そこだけを切り出して見られるようにしてある (メトリクスのみ。挙動には影響しない)。
+    """
+
+    log_contact_geometry: bool = False
+    """当たり所の幾何 (``foot_kick_dot`` / ``ball_side``) をメトリクスに出すか。
+
+    **既定 False = 既存タスクの TensorBoard のタグ集合を変えないため。** False の
+    ときは ``metrics`` 辞書にキー自体を作らないので、出力されるタグが 1 つも増えない
+    (過去の run と同じ並びで比較できる)。
+
+    True にするのは当たり所そのものが目的のタスク (walk_inside_kick) だけ。
+    メトリクスのみで、挙動には一切影響しない。
     """
 
 
