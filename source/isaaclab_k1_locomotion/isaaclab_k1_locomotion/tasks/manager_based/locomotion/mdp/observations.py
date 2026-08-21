@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 from isaaclab.assets import Articulation
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
-from .events import get_phase_freq
+from .events import get_gait_phase, get_phase_freq
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -27,15 +27,27 @@ def phase_obs(
     phase_freq: float = 1.5,
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.1,
+    adaptive: bool = False,
+    l_fwd: float = 0.31,
+    l_lat: float = 0.11,
+    f_min: float = 1.2,
+    f_max: float = 5.0,
+    dr_base: float = 1.6,
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
     コマンド速度が ``cmd_threshold`` 未満のときは位相をゼロで埋め、
     停止すべき状況であることをポリシーに明示する。
+
+    ``adaptive=True`` にすると位相の周波数を **速度指令とその向き** から決める
+    (:func:`~.events.adaptive_phase_freq`)。横歩きは歩幅が前進の 60% しか出ないので、
+    固定周波数では前進と横を両立できないため。既定 False で従来どおり。
+    ☠ ``adaptive=True`` のときは ``reset_gait_phase`` を EventTerm に登録すること。
     """
-    t = env.episode_length_buf * env.step_dt
-    pf = get_phase_freq(env, phase_freq)
-    phase_left = 2.0 * math.pi * pf * t
+    phase_left = get_gait_phase(
+        env, phase_freq, adaptive=adaptive, command_name=command_name,
+        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
+    )
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

@@ -880,6 +880,7 @@ def swing_ground_exposure(
     env: "ManagerBasedRLEnv",
     command_name: str = "base_velocity",
     h_target: float = 0.010,
+    edge_frac: float = 0.3,
     cmd_threshold: float = 0.05,
     move_threshold: float = 0.002,
     force_threshold: float = 1.0,
@@ -930,9 +931,13 @@ def swing_ground_exposure(
     Args:
         h_target: この高さ未満を「露出」とみなす [m]。閾値ではなく線形ランプの上端で、
             クリアランス c に対する重みは ``clamp((h_target - c) / h_target, 0, 1)``。
-            低いところほど強く罰するので、h_target の値そのものへの感度は低い。
+            ``edge_frac`` で決まる上端の幅だけで 0 に落ちる急峻なランプなので、
+            実質「h_target 未満か否か」= 指標 f(h) の指示関数とほぼ同じ。
             既定 0.010 は 07-28 の足裏 p50 (13.3mm) のすぐ下 = 頂点を上げずに軌道を
             作り直すだけで届く水準。会場の人工芝が長い場合は 0.015 へ上げる。
+        edge_frac: ランプが 0 に落ちる幅を h_target に対する割合で指定する。
+            0.3 なら「7mm 以下は満額 1.0、7→10mm で 0」。**1.0 にすると 2026-08-17 に
+            失敗した線形ランプに戻るので上げないこと**。
         move_threshold: 遊脚の水平移動がこれ未満のステップは比が不安定なので 0 を返す [m]。
 
     Returns:
@@ -973,7 +978,20 @@ def swing_ground_exposure(
     ref = torch.where(torch.isinf(ref), env.scene.env_origins[:, 2], ref)
 
     clearance = z_sole - ref.unsqueeze(1)                               # (N, 2)
-    ramp = torch.clamp((h_target - clearance) / max(h_target, 1e-6), 0.0, 1.0)
+    # ☠ 2026-08-17: ここを **h_target で割る線形ランプ** にしていたのが失敗だった。
+    #    線形だと 0mm → 5mm に上げるだけでペナルティが半分になり、10mm を越えるより
+    #    はるかに安い。実測 (iter 1000 → 4000、cmd 1.0) はその通りに動いた:
+    #        f(2mm)  0.123 → 0.048  (報酬が見ている低い側だけ 2.6 倍改善)
+    #        f(10mm) 0.416 → 0.515  (**測りたかった指標は悪化**)
+    #    = 「低いところを避けろ」と書いたつもりが「一番低いところだけ少し上げろ」に
+    #    なっていた。地面すれすれ数 mm を舐めるように滑る歩容へ収束する。
+    #    → **上端 edge_frac だけで 0 に落ちる急峻なランプ**にして、指標 f(h) の
+    #    指示関数にほぼ一致させる。これで「5mm に逃げる」に利得が無くなり、
+    #    h_target を越える以外にペナルティを下げる手段が無くなる。
+    #    (RL の報酬は微分可能である必要が無いので階段関数でも良いが、途中経過に
+    #     まったく credit が出ないと学習が難しいので上端 30% だけ勾配を残す)
+    edge = max(h_target * edge_frac, 1e-6)
+    ramp = torch.clamp((h_target - clearance) / edge, 0.0, 1.0)
 
     ds = bufs["foot_ds"] * airborne.float()                             # (N, 2)
     denom = ds.sum(dim=1)
@@ -985,3 +1003,150 @@ def swing_ground_exposure(
     cmd = env.command_manager.get_command(command_name)
     cmd_norm = torch.norm(cmd[:, :3], dim=1)
     return torch.where(cmd_norm < cmd_threshold, torch.zeros_like(exposure), exposure)
+
+
+# ---------------------------------------------------------------------------
+# 振動対策 (2026-08-21)
+# ---------------------------------------------------------------------------
+#
+# ★ 実機で 07-28 が振動する件の対策。**停止指令時** に diag_walk_jitter.py で測ると:
+#
+#       ||Δaction||  mean 0.0332      ← 1階差分 (動きの大きさ)
+#       2階差分       mean 0.0404      ← 高周波成分
+#       比            1.217
+#
+#   正弦波なら 2階差分/1階差分 = 2·sin(πf/fs) なので、fs=50Hz で逆算すると **f ≈ 10.4 Hz**。
+#   きれいな 1.6Hz の歩容なら比は 0.20 なので、6 倍の高周波成分が乗っている。
+#   停止指令なのに ``ベース水平速度 max = 0.684 m/s`` も出ており、待機中に暴れている。
+#
+# ☠ ``action_smoothness_l2`` の weight を 100 倍 (-0.12 → -12.0) にすると振動は消えたが、
+#   **横速度が 1/3 になった** (2026-08-20 実機デプロイ)。あの項は 1階差分と2階差分の
+#   **和**、つまり **振幅** を罰するので、高周波と一緒に歩行そのものを潰す。
+#   → 狙うべきは振幅ではなく **周波数**。以下の 2 つはその 2 通りの実装。
+
+_JITTER_HIST_ATTR = "_gk_jitter_hist"        # (2, N, A) [a_{t-1}, a_{t-2}]
+_JITTER_STEP_ATTR = "_gk_jitter_step"
+_JITTER_VAL_ATTR = "_gk_jitter_val"          # (d1, d2) のキャッシュ
+
+
+def _action_diffs(env: "ManagerBasedRLEnv") -> tuple[torch.Tensor, torch.Tensor]:
+    """``(||a-a₋₁||, ||a-2a₋₁+a₋₂||)`` を返す (どちらも (N,))。
+
+    ☠ 履歴の更新は **1 ステップにつき 1 回だけ**。locomotion の ``action_smoothness_l2``
+      が使う ``env._prev_prev_action`` とは **別のバッファ**にしてある。あちらは呼ばれる
+      たびに書き換える実装なので、同じステップで両方を使うと a₋₂ が壊れる。
+
+    ☠ 指標は ``scripts/rsl_rl/diag_walk_jitter.py`` と同じ **L2 ノルム**で揃えてある
+      (あちらは二乗和ではなくノルムを出力する)。報酬と評価指標の形を一致させること。
+    """
+    a = env.action_manager.action
+    cur = int(getattr(env, "common_step_counter", 0))
+    if getattr(env, _JITTER_STEP_ATTR, -1) == cur:
+        return getattr(env, _JITTER_VAL_ATTR)
+
+    hist: torch.Tensor | None = getattr(env, _JITTER_HIST_ATTR, None)
+    if hist is None or hist.shape[1:] != a.shape:
+        hist = a.detach().unsqueeze(0).repeat(2, 1, 1)
+        setattr(env, _JITTER_HIST_ATTR, hist)
+
+    d1 = torch.norm(a - hist[0], dim=1)
+    d2 = torch.norm(a - 2.0 * hist[0] + hist[1], dim=1)
+    hist[1] = hist[0]
+    hist[0] = a.detach()
+    setattr(env, _JITTER_STEP_ATTR, cur)
+    setattr(env, _JITTER_VAL_ATTR, (d1, d2))
+    return d1, d2
+
+
+def _stopped_boost(
+    env: "ManagerBasedRLEnv",
+    scale: float,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """**停止指令中** だけペナルティ倍率を ``scale`` にするゲート (N,)。
+
+    ☠☠ locomotion の :func:`~...locomotion.mdp.rewards._stand_still_boost` は
+      「停止指令 **かつ** base が実際に静止 (|lin_vel|<0.2 かつ |ang_vel_z|<0.2)」を
+      要求する。ところが **抑えたい対象そのもの (待機中の震え) がこの条件を満たさない**。
+      GK Stage2 側の実測では待機中の |ang_vel_z| が平均 0.955 rad/s あり、
+      ``ang_vel < 0.2`` の成立率はわずか **7.9%** だった。
+      → **震えているという理由で、震えを抑える罰が無効化される**自己矛盾。
+      weight や scale をいくら上げても効かなかったのはこれが理由。
+      本関数は **実速度の条件を外し**、指令ノルムだけで判定する。
+
+    ``lin_vel_max`` だけは残す。push イベントで突き飛ばされた直後まで倍率を掛けると
+    復帰動作を罰してしまうため。閾値 0.5 は震え (実測 0.02 m/s 級) を確実に含み、
+    押された直後は外れる値。
+    """
+    cmd = env.command_manager.get_command(command_name)[:, :3]
+    is_stopped = torch.norm(cmd, dim=1) < float(cmd_threshold)
+    robot: Articulation = env.scene["robot"]
+    lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+    boost = is_stopped & (lin < float(lin_vel_max))
+    return torch.where(boost, torch.full_like(lin, float(scale)), torch.ones_like(lin))
+
+
+def lateral_action_smoothness_l2(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    stand_still_scale: float = 8.0,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """locomotion の ``action_smoothness_l2`` の横移動版 (待機ゲートを差し替え)。
+
+    ペナルティの式は locomotion 版と完全に同じ。違いはゲートだけで、
+    :func:`_stopped_boost` を使う (理由は同関数の docstring)。
+    ★ **weight は 07-28 のまま (-0.12) にすること**。移動中にも効く weight を上げるのは
+      振幅を罰する道で、速度を 1/3 にした失敗の再現になる。調整は stand_still_scale で。
+    """
+    from ...locomotion.mdp.rewards import action_smoothness_l2
+
+    base = action_smoothness_l2(env, stand_still_scale=1.0)
+    return base * _stopped_boost(env, stand_still_scale, command_name, cmd_threshold, lin_vel_max)
+
+
+def lateral_action_rate_l2(
+    env: "ManagerBasedRLEnv",
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    stand_still_scale: float = 8.0,
+    lin_vel_max: float = 0.5,
+) -> torch.Tensor:
+    """locomotion の ``action_rate_l2`` の横移動版 (待機ゲートを差し替え)。"""
+    from ...locomotion.mdp.rewards import action_rate_l2
+
+    base = action_rate_l2(env, stand_still_scale=1.0)
+    return base * _stopped_boost(env, stand_still_scale, command_name, cmd_threshold, lin_vel_max)
+
+
+def action_jitter_ratio(
+    env: "ManagerBasedRLEnv",
+    move_threshold: float = 0.005,
+    eps: float = 1e-3,
+) -> torch.Tensor:
+    """**動きあたりのガタつき** = ``||a-2a₋₁+a₋₂|| / (||a-a₋₁|| + eps)`` (N,)。
+
+    ☆ 分子・分母が同じ次元なので **振幅が約分され、周波数だけが残る**。
+      正弦波なら値は ``2·sin(πf/fs)`` に等しく、fs=50Hz では:
+
+          1.6Hz (歩行の基本波) → 0.20
+          10Hz  (実機の振動)   → 1.17
+          25Hz  (Nyquist)      → 2.00
+
+      **大きく速く動くことにはコストがかからず、ガタつきだけにコストがかかる。**
+      ``action_smoothness_l2`` の weight を上げる道は振幅を罰するので歩行そのものを
+      潰した (速度 1/3)。本項にはその代償が原理的に無い。
+
+    ☠ 動きが小さいと 0/0 で暴れるので、``||Δa|| < move_threshold`` のステップは 0 を返す。
+      **待機中はこのゲートで落ちる**ので、停止時の振動は本項ではなく
+      :func:`lateral_action_smoothness_l2` の停止時ゲートが担当する (両方要る)。
+
+    ☠ 指標は ``diag_walk_jitter.py`` と同じ L2 ノルム比。**報酬と評価指標の形が一致**
+      しているので、学習後にそのまま同じ数字で合否が判定できる。
+    """
+    d1, d2 = _action_diffs(env)
+    ratio = d2 / (d1 + float(eps))
+    return torch.where(d1 > float(move_threshold), ratio, torch.zeros_like(ratio))

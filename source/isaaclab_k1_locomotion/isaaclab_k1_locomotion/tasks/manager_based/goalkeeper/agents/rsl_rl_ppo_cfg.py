@@ -271,9 +271,17 @@ class K1GKLateralPPORunnerCfg(K1GKDirectPPORunnerCfg):
 
     ネットワーク形状・PPO ハイパーパラメータは Stage1 と完全に同一
     (07-28 の ckpt から ``--resume`` して重みを引き継ぐため、変えてはいけない)。
-    対称性設定も継承する = **data augmentation 有効 / mirror 係数 2.0**。
-    07-28 は aug 無効 / 係数 0.5 の世代で、左右非対称な歩容が残っており、
-    横移動時の系統的な yaw ドリフト (約 10°/s) の要因の一つと見ている。
+
+    ★★ 2026-08-20: **from scratch で学習する方針に変更**したのに伴い、対称性設定は
+       親 (``K1GKDirectPPORunnerCfg``) の現行値 = **data augmentation 有効 /
+       mirror 係数 2.0** をそのまま継承する。
+
+       一時的に 07-28 の値 (aug 無効 / 係数 0.5) へ戻していたが、あれは 07-28 の
+       学習条件を再現するための措置だった。もう再現が目的ではないうえ、
+       aug 有効・係数 2.0 は「右への横移動だけ足が上がらず転びやすい」左右非対称への
+       対策 (2026-08-09) で、**「全方向で頑健に歩ける」という今の目標と向きが同じ**。
+       critic 観測の ``zmp_position`` も親の ``zmp_xy_base`` (base yaw frame) のままに
+       してあるので、``symmetry.py`` が前提とする [52:54] の y 反転とも整合する。
     """
 
     max_iterations = 15000

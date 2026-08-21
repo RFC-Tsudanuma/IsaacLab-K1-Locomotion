@@ -43,10 +43,13 @@ parser.add_argument(
 )
 parser.add_argument(
     "--cmd_list", type=str,
-    default="0,0.5;0,0.9;0,1.2;0,1.5;1.0,0;1.0,0.9;1.0,1.5",
+    default="0,0.5;0,0.9;0,1.2;0,1.5;1.0,0;1.0,0.9;1.0,1.5;-0.6,0;-1.0,0;-0.7,0.7",
     help=(
         "Semicolon-separated 'vx,vy' command pairs to sweep. "
-        "Defaults cover pure lateral (up to vy=1.5) / pure forward / diagonal combinations."
+        "Defaults cover pure lateral (up to vy=1.5) / pure forward / diagonal / backward. "
+        "★ 2026-08-20: 後退 (-0.6,0 / -1.0,0 / -0.7,0.7) を追加。それまで既定に負の vx が "
+        "1 つも無く、実機で『後退指令だと人が支えないと転倒する』ことにデプロイするまで "
+        "気づけなかった。測っていない量は直らない。"
     ),
 )
 parser.add_argument("--hold_s", type=float, default=20.0, help="Measurement duration per command pair [s].")
@@ -74,6 +77,22 @@ parser.add_argument("--onset_max_s", type=float, default=2.0, help="Trace length
 parser.add_argument(
     "--onset_frac", type=float, default=0.9,
     help="Fraction of the steady speed used as the rise-time threshold (0.9 = t90).",
+)
+parser.add_argument(
+    "--rev_reps", type=int, default=3,
+    help=(
+        "Number of full-speed reversal (+v -> -v) step responses per command (0 disables). "
+        "★ 2026-08-21 追加。ゴールキーパーで実際に効くのは『静止 → 全開』ではなく "
+        "**左右への振り直し** (+1.3 → -1.3 = 速度差 2.6 m/s)。それまで反転を測る指標が "
+        "1 つも無く、実機で振られたときの挙動をデプロイするまで見られなかった。"
+    ),
+)
+parser.add_argument(
+    "--rev_pre_s", type=float, default=2.0,
+    help="Hold the +v command this long (to reach steady state) before flipping [s].",
+)
+parser.add_argument(
+    "--rev_max_s", type=float, default=3.0, help="Trace length after the reversal [s]."
 )
 parser.add_argument(
     "--cmd_clip", type=float, nargs=2, default=[1.0, 1.5], metavar=("VX", "VY"),
@@ -228,6 +247,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                         bad |= dones.to(device=device, dtype=torch.bool).flatten()
                 onset_traces.append((trace.cpu(), (~bad).cpu()))
 
+        # --- 反転 (+v -> -v) の計測 ---
+        # ★ 2026-08-21 追加。GK で効くのは静止からの立ち上がりより **左右の振り直し**。
+        #   +v で定常まで持っていってから指令を反転させ、逆向きの定常速度の
+        #   onset_frac に達するまでの時間と、その間の転倒率を測る。
+        #   速度差は 2v (指令 1.3 なら 2.6 m/s) で、立ち上がりの倍の要求になる。
+        # ☠ 転倒率は「反転させたから転んだ」に限らない (計測窓には反転後の走行も
+        #   含まれる) が、同条件で run 間比較する分には有効。
+        rev_traces = []
+        rev_falls = 0
+        rev_trials = 0
+        if args_cli.rev_reps > 0:
+            pre_steps = max(1, int(args_cli.rev_pre_s / dt))
+            trace_steps = max(1, int(args_cli.rev_max_s / dt))
+            ones = torch.ones(n, device=device)
+            for _rep in range(int(args_cli.rev_reps)):
+                teleport_to_start()
+                # +v で定常まで持っていく
+                for _ in range(pre_steps):
+                    with torch.inference_mode():
+                        set_command(eff_vx, eff_vy, ones)
+                        action = policy(obs)
+                        obs, _, _, _ = inner_env.step(action)
+                        set_command(eff_vx, eff_vy, ones)
+                # ここで指令を反転
+                trace = torch.zeros(trace_steps, n, device=device)
+                bad = torch.zeros(n, dtype=torch.bool, device=device)
+                for k in range(trace_steps):
+                    with torch.inference_mode():
+                        set_command(-eff_vx, -eff_vy, ones)
+                        action = policy(obs)
+                        obs, _, dones, _ = inner_env.step(action)
+                        set_command(-eff_vx, -eff_vy, ones)
+                    v_w = robot.data.root_lin_vel_w[:, :2]
+                    h = robot.data.heading_w
+                    v_fwd = v_w[:, 0] * torch.cos(h) + v_w[:, 1] * torch.sin(h)
+                    v_lat = -v_w[:, 0] * torch.sin(h) + v_w[:, 1] * torch.cos(h)
+                    # 射影の軸は **反転前の指令方向**。したがって反転が成功すると負に振れる。
+                    trace[k] = v_fwd * axis_x + v_lat * axis_y
+                    if dones is not None:
+                        bad |= dones.to(device=device, dtype=torch.bool).flatten()
+                rev_traces.append((trace.cpu(), (~bad).cpu()))
+                rev_falls += int(bad.sum().item())
+                rev_trials += n
+
         teleport_to_start()
         anchor = (robot.data.root_pos_w[:, :2] - raw_env.scene.env_origins[:, :2]).clone()
         direction = torch.ones(n, device=device)
@@ -325,6 +388,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             "sent": (eff_vx, eff_vy),
             "axis": (axis_x, axis_y),
             "onset": onset_traces,
+            "rev": rev_traces,
+            "rev_falls": rev_falls,
+            "rev_trials": rev_trials,
             "fwd": float((fwd_sum / denom).item()),
             "lat": float((lat_sum / denom).item()),
             "head_drift": float((head_drift_sum / denom).item()) * 180.0 / math.pi,
@@ -393,6 +459,48 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         print(f"  試行数 = 指令あたり {args_cli.onset_reps} 回 × {args_cli.num_envs} env。"
               "到達率は転倒した env を除いた到達割合 (低いと計測窓 --onset_max_s が短い)。")
         print("  ★ 最重要指標。07-28 は約 0.6s。目標は 0.4s 台。")
+
+    if any(r.get("rev") for r in results):
+        frac = float(args_cli.onset_frac)
+
+        def _rev_time(res: dict, level: float) -> tuple[float, float]:
+            """反転後、逆向きの定常速度の ``level`` 倍に達するまでの平均時間 [s] と到達率。"""
+            steady = res["fwd"] * res["axis"][0] + res["lat"] * res["axis"][1]
+            if steady <= 1e-6:
+                return float("nan"), 0.0
+            hits, total, times = 0, 0, 0.0
+            for trace, valid in res["rev"]:
+                # 射影軸は反転前の向きなので、反転成功 = 十分に負へ振れること
+                reached = trace <= -level * steady          # (steps, env)
+                ok = reached.any(dim=0) & valid
+                idx = reached.float().argmax(dim=0)
+                total += int(valid.sum().item())
+                hits += int(ok.sum().item())
+                if bool(ok.any()):
+                    times += float(((idx[ok] + 1).float() * dt).sum().item())
+            if hits == 0:
+                return float("nan"), 0.0
+            return times / hits, hits / max(total, 1)
+
+        print("\n--- 反転応答 (+v で定常 → 指令を反転) ---")
+        print(f"{'cmd(vx,vy)':>13} {'定常':>8} {'t_rev50':>9} {f't_rev{int(frac*100)}':>9} "
+              f"{'到達率':>8} {'転倒率':>8}")
+        for r in results:
+            if not r.get("rev"):
+                continue
+            steady = r["fwd"] * r["axis"][0] + r["lat"] * r["axis"][1]
+            t50, _ = _rev_time(r, 0.5)
+            t_hi, rate = _rev_time(r, frac)
+            fall = r["rev_falls"] / max(r["rev_trials"], 1)
+            print(f"{r['cmd'][0]:6.2f},{r['cmd'][1]:5.2f} {steady:7.3f}m/s {t50:8.3f}s {t_hi:8.3f}s "
+                  f"{rate * 100:7.1f}% {fall * 100:7.1f}%")
+        print(f"  +v で {args_cli.rev_pre_s}s 走ってから指令を反転し、**逆向き**の定常速度の"
+              f" 50% / {int(frac * 100)}% に達するまでの時間を測る。")
+        print("  速度差は 2v (指令 1.3 なら 2.6 m/s) で、立ち上がり (静止→全開) の倍の要求。")
+        print(f"  試行数 = 指令あたり {args_cli.rev_reps} 回 × {args_cli.num_envs} env。")
+        print("  ★ ゴールキーパーで実際に効くのはこちら。左右に振られたときの挙動を測る。")
+        print("  ☠ 転倒率は反転そのものが原因とは限らない (窓には反転後の走行も含む)。"
+              "同条件での run 間比較にのみ使うこと。")
 
     print("\n--- 足の持ち上げ高さ (1 歩ごとのピーク) ---")
     print(f"{'cmd(vx,vy)':>13} {'左平均':>9} {'右平均':>9}")

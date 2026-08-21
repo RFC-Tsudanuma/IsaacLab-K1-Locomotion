@@ -51,13 +51,77 @@ class DiscreteVelocityCommand(UniformVelocityCommand):
     def _resample_command(self, env_ids: Sequence[int]):
         n = len(env_ids)
         r = torch.empty(n, device=self.device)
+        prev = self.vel_command_b[env_ids].clone()
         self.vel_command_b[env_ids, 0] = self._sample_axis(n, self.cfg.ranges.lin_vel_x, self.cfg.lin_vel_x_resolution)
         self.vel_command_b[env_ids, 1] = self._sample_axis(n, self.cfg.ranges.lin_vel_y, self.cfg.lin_vel_y_resolution)
         self.vel_command_b[env_ids, 2] = self._sample_axis(n, self.cfg.ranges.ang_vel_z, self.cfg.ang_vel_z_resolution)
+        self._apply_pure_axis(env_ids, n)
+        self._apply_reversal(env_ids, n, prev)
         if self.cfg.heading_command:
             self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
             self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
         self.is_standing_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_standing_envs
+
+    def _apply_pure_axis(self, env_ids: Sequence[int], n: int) -> None:
+        """``pure_axis_prob`` の確率で **1 軸だけ残して他をゼロ**にする。
+
+        ★ 2026-08-20 追加。既定 0.0 なので、指定しない限り従来の挙動と完全に同じ。
+
+        なぜ要るか (実測):
+            3 軸を独立に一様サンプルすると、「ほぼ純粋な後退」(vx ≤ -0.5 かつ |vy| ≤ 0.05)
+            は resolution 0.05 のとき **全指令の約 1.5%** しか出ない (純粋前進も同じ)。
+            ところが **実機はコントローラで純粋方向の指令を出す**。学習分布と
+            デプロイ分布が食い違っており、実機で「後退だけ人が支えないと転倒する」
+            症状が出た (2026-08-20 のデプロイ)。
+
+            なお vx の符号は完全に対称にサンプルされているので、「後退の分布が
+            足りない」わけではない。薄いのは **符号ではなく「純粋方向」** である。
+
+        ☠ standing env (指令ゼロ) とは別物。あちらは全軸ゼロ、こちらは 1 軸だけ生かす。
+        """
+        p = float(getattr(self.cfg, "pure_axis_prob", 0.0) or 0.0)
+        if p <= 0.0:
+            return
+        pure = torch.rand(n, device=self.device) < p
+        if not bool(pure.any()):
+            return
+        # 残す軸を 0/1/2 から一様に選ぶ (vx / vy / wz)
+        keep = torch.randint(0, 3, (n,), device=self.device)
+        axis_idx = torch.arange(3, device=self.device).unsqueeze(0)          # (1, 3)
+        mask = (axis_idx == keep.unsqueeze(1)) | ~pure.unsqueeze(1)          # (n, 3)
+        self.vel_command_b[env_ids] = self.vel_command_b[env_ids] * mask.float()
+
+    def _apply_reversal(self, env_ids: Sequence[int], n: int, prev: torch.Tensor) -> None:
+        """``reversal_prob`` の確率で新しい指令を **直前の指令の符号反転** に差し替える。
+
+        ★ 2026-08-21 追加。既定 0.0 なので、指定しない限り従来の挙動と完全に同じ。
+
+        なぜ要るか:
+            ゴールキーパーで実際に効くのは「静止 → 全開」より **左右への振り直し**
+            (+1.3 → -1.3、速度差 2.6 m/s) の方。ところが 3 軸を独立にサンプルすると、
+            この最悪ケースは偶然にしか出ない (符号が反転し、かつ大きさも残る組み合わせ)。
+            実機の GK は上位方策やコントローラから左右に振られ続けるので、
+            **デプロイ分布に合わせて最悪ケースの密度を上げる**。
+
+        ☆ 追加の報酬は要らない。反転で転べば ``termination_penalty`` (-200) と
+          以降の報酬喪失で十分強く罰される。**まず分布だけ変えて、足りなければ
+          姿勢の項を足す** 順序にすること (報酬を先に足すと何が効いたか分からなくなる)。
+
+        Args:
+            prev: 直前の指令 (n, 3)。再サンプル前に控えたもの。
+            reversal_min_speed: 直前の指令がこれ未満の env は対象外 [m/s]。
+                ほぼ停止していた env を「反転」させても最悪ケースにならないため。
+        """
+        p = float(getattr(self.cfg, "reversal_prob", 0.0) or 0.0)
+        if p <= 0.0:
+            return
+        min_speed = float(getattr(self.cfg, "reversal_min_speed", 0.3))
+        prev_speed = torch.norm(prev[:, :2], dim=1)
+        do = (torch.rand(n, device=self.device) < p) & (prev_speed > min_speed)
+        if not bool(do.any()):
+            return
+        ids = torch.as_tensor(env_ids, device=self.device)[do]
+        self.vel_command_b[ids] = -prev[do]
 
 
 @configclass
@@ -69,6 +133,16 @@ class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
     lin_vel_x_resolution: float | None = None
     lin_vel_y_resolution: float | None = None
     ang_vel_z_resolution: float | None = None
+
+    # 1 軸だけ残して他をゼロにする確率 (:meth:`DiscreteVelocityCommand._apply_pure_axis`)。
+    # 既定 0.0 = 無効なので、既存タスクの挙動は変わらない。
+    pure_axis_prob: float = 0.0
+
+    # 直前の指令の符号反転に差し替える確率 (:meth:`DiscreteVelocityCommand._apply_reversal`)。
+    # 既定 0.0 = 無効。
+    reversal_prob: float = 0.0
+    # 反転の対象にする直前指令の最低速度 [m/s]。これ未満はほぼ停止なので対象外。
+    reversal_min_speed: float = 0.3
 
 
 class KickDirectionCommand(CommandTerm):

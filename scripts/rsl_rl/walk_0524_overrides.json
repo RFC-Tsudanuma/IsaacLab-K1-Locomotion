@@ -1,0 +1,10 @@
+{
+  "_comment": "0524_walk.pt (実機で振動していない基準歩行、iter 19999) を現行の Isaac-Velocity-Flat-K1-Play-v0 で再生・計測するための上書き。★ ckpt は正常で、当時と今で構成が変わっているだけ。(1) ネットワーク形状: 学習当時 actor [256,128,128] / critic [256,256,128]、現行の既定は両方 [512,256,128]。K1FlatPPORunnerCfg にコメントアウトで残っている値と一致する。(2) critic 観測: 当時 52 次元、現行 54 次元。差分は 2026-08-09 に K1CriticCfg へ追加された zmp_position (2次元) なので、それを None にして 52 に戻す。actor 観測 49 次元は当時から不変なので、歩容の計測 (actor しか使わない) には影響しない。",
+  "env": {
+    "observations.critic.zmp_position": null
+  },
+  "agent": {
+    "policy.actor_hidden_dims": [256, 128, 128],
+    "policy.critic_hidden_dims": [256, 256, 128]
+  }
+}

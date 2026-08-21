@@ -21,7 +21,7 @@ from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
 from .observations import ball_vel as get_ball_vel
-from .events import get_phase_freq
+from .events import get_gait_phase, get_phase_freq
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -78,6 +78,12 @@ def feet_phase(
     phase_freq: float = 1.5,
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
+    adaptive: bool = False,
+    l_fwd: float = 0.31,
+    l_lat: float = 0.11,
+    f_min: float = 1.2,
+    f_max: float = 5.0,
+    dr_base: float = 1.6,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -110,12 +116,12 @@ def feet_phase(
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
-    # Current time within the episode for each environment  [N]
-    t = env.episode_length_buf * env.step_dt
-
-    pf = get_phase_freq(env, phase_freq)
     # Phase angle in [0, 2*pi) for the LEFT foot
-    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)   # [N]
+    # adaptive=True なら速度指令から周波数を決める (:func:`~.events.adaptive_phase_freq`)
+    phase_left = get_gait_phase(
+        env, phase_freq, adaptive=adaptive, command_name=command_name,
+        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
+    ) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 
@@ -351,6 +357,12 @@ def foot_clearance_ji(
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
     sigma: float = 0.03,
+    adaptive: bool = False,
+    l_fwd: float = 0.31,
+    l_lat: float = 0.11,
+    f_min: float = 1.2,
+    f_max: float = 5.0,
+    dr_base: float = 1.6,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -366,8 +378,16 @@ def foot_clearance_ji(
     left_foot_height_err = torch.exp(-torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2]) / (sigma **2))
 
     # feet_phase と同一の desired-stance 判定
-    t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
+    # ☠ 2026-08-21 まで、本関数だけ `get_phase_freq` を経由せず引数の phase_freq を
+    #   **直接**使っていた。位相 DR (randomize_phase_freq、±0.05Hz) が掛かった env では
+    #   feet_phase / phase_obs と位相がズレ、エピソード後半では逆位相になりうる。
+    #   その状態で「遊脚の高さ」を要求すると **接地している足に高さを要求する**ことに
+    #   なり、それを満たす唯一の手段が跳躍。「foot_clearance の weight を上げるたび
+    #   跳躍に退行した」履歴の一因と見て、他項と同じ get_gait_phase に統一した。
+    phase_left = get_gait_phase(
+        env, phase_freq, adaptive=adaptive, command_name=command_name,
+        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
+    ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
@@ -391,6 +411,12 @@ def foot_clearance_ji_pen(
     stance_ratio: float = 0.55,
     cmd_threshold: float = 0.1,
     sigma: float = 0.03,
+    adaptive: bool = False,
+    l_fwd: float = 0.31,
+    l_lat: float = 0.11,
+    f_min: float = 1.2,
+    f_max: float = 5.0,
+    dr_base: float = 1.6,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -408,9 +434,10 @@ def foot_clearance_ji_pen(
     left_foot_height_err = left_foot_vel * torch.square(target_clearance - asset.data.body_pos_w[:, left_foot_idx, 2])
 
     # feet_phase と同一の desired-stance 判定
-    t = env.episode_length_buf * env.step_dt
-    pf = get_phase_freq(env, phase_freq)
-    phase_left = (2.0 * math.pi * pf * t) % (2.0 * math.pi)
+    phase_left = get_gait_phase(
+        env, phase_freq, adaptive=adaptive, command_name=command_name,
+        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
+    ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
     desired_stance_left = phase_left < stance_threshold
