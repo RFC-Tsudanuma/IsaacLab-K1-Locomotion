@@ -47,6 +47,7 @@ def reset_gk_buffers(env: "ManagerBasedEnv", env_ids: torch.Tensor):
     bufs["situation_age"][env_ids] = 0
     bufs["unreachable"][env_ids] = False
     bufs["y_cross_true"][env_ids] = float("nan")
+    bufs["is_shot"][env_ids] = False
 
     # ★ 2026-08-15: 歩行位相のアキュムレータと指令ローパスの状態をクリアする。
     #   どちらも前エピソードの値を持ち越すと、開始直後に「途中の位相」や
@@ -362,6 +363,9 @@ def reset_ball_shot(
     bufs["y_cross_true"][env_ids] = torch.where(
         _valid, _y_cross, torch.full_like(_y_cross, float("nan"))
     )
+    # ★ 2026-08-21: この球は「守るべきシュート」。_diversify_situations が
+    #   状況を差し替えた場合はそこで False に戻される。
+    bufs["is_shot"][env_ids] = True
 
     # --- 「この球はこのキーパー位置から物理的に取れるか」を発射時に判定する ---
     #
@@ -457,6 +461,19 @@ def _diversify_situations(env, env_ids, ball, radius: float) -> None:
 
     vel = ball.data.root_vel_w[env_ids].clone()
     speed_xy = torch.norm(vel[:, :2], dim=1, keepdim=True).clamp(min=1e-3)
+
+    # ★ 2026-08-21: 差し替えた球は **もうシュートではない**。発射時に立てた
+    #   ブックキーピングを取り消す。これを忘れると:
+    #     * y_cross_true : キャンセルされたシュートの到達点が残り、Pure 版の密報酬が
+    #       **存在しない到達点** へ走らせる (ボールは別の場所に居るのに)。
+    #     * is_shot      : 静止球・遠ざかる球に触るだけで save_touch_bonus (+100) が
+    #       満額になり、save_success でエピソードが「成功」終了する。
+    #       = 「あらゆるボールへ走る」ことが最適解になる。
+    _not_shot = is_static | is_lateral | is_wide | is_none
+    if bool(_not_shot.any()):
+        _ids = env_ids[_not_shot]
+        bufs["is_shot"][_ids] = False
+        bufs["y_cross_true"][_ids] = float("nan")
 
     # 静止: 速度をゼロに
     vel[is_static] = 0.0

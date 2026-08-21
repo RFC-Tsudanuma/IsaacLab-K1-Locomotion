@@ -63,3 +63,29 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:K1GKHierDHStage2PPORunnerCfg",
     },
 )
+
+##
+# 最終分布での直接学習 (適応カリキュラムなし)
+#   昇格イベントが崩壊の引き金だったため、段階的に登るのをやめて最終分布で直接学習する。
+#   難易度は env_cfg の ball_speed_max / aim_y_range で直接指定する。
+##
+
+gym.register(
+    id="Isaac-GoalkeeperHierDH-Final-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:K1GKHierDHFinalEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:K1GKHierDHFinalPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-GoalkeeperHierDH-Final-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.env_cfg:K1GKHierDHFinalEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{__name__}.agent_cfg:K1GKHierDHFinalPPORunnerCfg",
+    },
+)

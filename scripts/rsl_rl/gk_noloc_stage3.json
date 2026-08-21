@@ -1,0 +1,9 @@
+{
+  "_comment": "【自己位置依存の低減 STEP3】STEP2 に加えて self_state の y を確率 0.5 で隠す (x と yaw は残す)。y の情報は STEP1 で target_y スロットへ移っているので落とせるが、ゴールポスト際 (±1.3m) が見えなくなるため out_of_bounds 終了率を必ず確認すること。x は守備面 guard_x の維持に必要で、前後誤差は横振動の原因ではないため残す。yaw は正対の維持に必須なので常に残る。",
+  "env": {
+    "goalkeeper.lateral_error_obs": true,
+    "goalkeeper.vel_dropout_p": 0.5,
+    "goalkeeper.self_dropout_p": 0.5,
+    "goalkeeper.self_dropout_only_y": true
+  }
+}

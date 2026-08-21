@@ -104,3 +104,30 @@ class K1FlatPPORunnerCfg(K1RoughPPORunnerCfg):
             raise ValueError(
                 "When using recurrent policy, please use RslRlPpoActorCriticRecurrentCfg for policy configuration."
             )
+
+
+@configclass
+class K1RecoveryPPORunnerCfg(K1FlatPPORunnerCfg):
+    """Recovery-from-near-fall policy (see recovery_env_cfg.py).
+
+    Same network/observation contract as the walk policy so the two can be swapped at runtime;
+    only the run bookkeeping differs. Episodes are 4 s instead of 20 s, so fewer iterations are
+    needed for the same number of episode-completions.
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 6000
+        self.experiment_name = "k1_recovery"
+        self.run_name = "recovery"
+        # Match the DEPLOYED walk policy's architecture ([256, 128, 128], see 0524_walk.pt) so the
+        # recovery policy can be warm-started from it (--warmstart_actor). The observation layout is
+        # identical by design, so with matching widths the walk weights transfer directly and training
+        # starts from "can stand and step" instead of from scratch.
+        self.policy.actor_hidden_dims = [256, 128, 128]
+        self.policy.critic_hidden_dims = [256, 128, 128]
+        # Fine-tuning noise, not from-scratch noise. The inherited init_noise_std (0.72) puts ~+-0.36
+        # rad of random offset on every joint (action scale 0.5): the diagnostic run showed even a
+        # warm-started walk policy toppling in 0.8 s from a NOMINAL standing reset with no pushes, so
+        # every episode died of exploration noise before the task could begin.
+        self.policy.init_noise_std = 0.25

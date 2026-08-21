@@ -110,3 +110,42 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg_dribble:K1DribblePPORunnerCfg",
     },
 )
+gym.register(
+    id="Isaac-Recovery-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.recovery_env_cfg:K1RecoveryEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1RecoveryPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Recovery-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.recovery_env_cfg:K1RecoveryEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1RecoveryPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Recovery-K1-DiagNoPush-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.recovery_env_cfg:K1RecoveryEnvCfgDiagNoPush",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1RecoveryPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Recovery-K1-Rough-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.recovery_env_cfg:K1RecoveryRoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1RecoveryPPORunnerCfg",
+    },
+)

@@ -87,9 +87,37 @@ def ball_lateral_progress(
     #
     #   nan (非シュート状況・枠外へ外れる球) のときは従来どおりボールの現在位置に
     #   フォールバックする。守るべき到達点が存在しないため。
+    #   ★ 2026-08-21: nan (= 非シュート状況) のときのフォールバックに
+    #     **関連性のゲート**を入れる。
+    #
+    #     従来は無条件で「今のボールの y」へ寄る報酬だったので、
+    #       * ゴールから遠ざかる球
+    #       * ゴールラインより後ろ・脇にある球
+    #       * 遠すぎる球
+    #     まで追いかけることを教えていた。実機で「あらゆるボールに反応する」
+    #     症状の学習側の原因のひとつ。観測側 (compute_target_y) には同じゲートを
+    #     入れたが、**報酬が追うことを教え続けたら意味がない**ので両方に入れる。
+    #
+    #     ゲートが立ったときの基準は 0 (ゴール中央) にする。報酬をゼロにすると
+    #     「中央へ戻る」勾配まで消えて、弾いた位置に居座る解に落ちるため。
+    #     観測側の tracking.gated_target: center と意味を揃えてある。
+    ball_goal = ball_pos_goal(env)
+    ball_vel_w = env.scene["soccer_ball"].data.root_com_vel_w[:, :3]
+    p_gk = env.cfg.goalkeeper
+    #     ④ ポスト超え: |ball_y| > track_y_max なら追わない。ここは真値なので
+    #       観測側のようなヒステリシスは不要 (境界で往復するのは知覚ノイズが
+    #       原因であり、報酬は真値で採点するため)。
+    relevant = (
+        (ball_vel_w[:, 0] <= float(getattr(p_gk, "track_receding_vx_max", 0.3)))
+        & (ball_goal[:, 0] >= float(getattr(p_gk, "track_min_x", 0.2)))
+        & (ball_goal[:, 0] <= float(getattr(p_gk, "track_max_x", 4.0)))
+        & (ball_goal[:, 1].abs() <= float(getattr(p_gk, "track_y_max", max_y)))
+    )
+
     y_cross = gk_buffers(env)["y_cross_true"]
-    ball_y = ball_pos_goal(env)[:, 1].clamp(-max_y, max_y)
-    target_y_true = torch.where(torch.isnan(y_cross), ball_y, y_cross.clamp(-max_y, max_y))
+    ball_y = ball_goal[:, 1].clamp(-max_y, max_y)
+    fallback = torch.where(relevant, ball_y, torch.zeros_like(ball_y))
+    target_y_true = torch.where(torch.isnan(y_cross), fallback, y_cross.clamp(-max_y, max_y))
     potential = -(robot_y - target_y_true).abs()
 
     prev = getattr(env, _PREV_ATTR, None)
@@ -116,7 +144,9 @@ def ball_lateral_progress(
     #
     #   スケールを差分側と揃える: r_stop は [0,1] なので max_step_m 倍して、
     #   同じ weight で桁が合うようにする。
-    err = (robot_y - ball_y).abs()
+    # 停止項の基準も潜在関数と揃える。ゲートが立った球では「ボールの近くに
+    # 居ること」を要求しない (追わないと決めた球なので)。
+    err = (robot_y - target_y_true).abs()
     speed = torch.norm(env.scene["robot"].data.root_lin_vel_w[:, :2], dim=1)
     r_stop = (1.0 - speed / stop_speed).clamp(0.0, 1.0) * max_step_m
     delta = torch.where(err <= deadband, r_stop, delta)

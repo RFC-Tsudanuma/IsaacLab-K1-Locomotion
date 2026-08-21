@@ -75,7 +75,22 @@ def update_save_state(env: "ManagerBasedRLEnv") -> torch.Tensor:
 
     contact = _feet_ball_contact_force(env) > float(p.touch_force_threshold)
     deflected = (dist < float(p.touch_proximity)) & (vel[:, 0] > 0.1)
-    newly = active & (~bufs["touched"]) & (contact | deflected)
+    # ★ 2026-08-21: **守るべきシュートに限る**。
+    #
+    #   これが無いと `newly` は「アクティブな球に触った」だけで立つので、
+    #   状況の多様化 (_diversify_situations) で入れた
+    #     静止球 / 横に転がる球 / ゴールから遠ざかる球
+    #   に走って行って触るだけで save_touch_bonus (+100) が満額になり、さらに
+    #   no_threat が即成立して save_cd が回り save_success で「成功」終了する。
+    #   密報酬が ±1 スケールなのに対して +100 なので、**あらゆるボールを追うことが
+    #   最適解**になる。実機で観測された「持って離れていくボールにも反応する」
+    #   「ゴールと反対方向へ行く球にも反応する」の学習側の原因。
+    #
+    #   is_shot は reset_ball_shot が立て、_diversify_situations が差し替えた球で
+    #   False に戻す。cfg で False にすると従来どおり全ての球を採点する (A/B 用)。
+    require_shot = bool(getattr(p, "save_requires_shot", True))
+    eligible = active & bufs["is_shot"] if require_shot else active
+    newly = eligible & (~bufs["touched"]) & (contact | deflected)
     bufs["touched"][newly] = True
     setattr(env, _NEWLY_TOUCHED_ATTR, newly)
 

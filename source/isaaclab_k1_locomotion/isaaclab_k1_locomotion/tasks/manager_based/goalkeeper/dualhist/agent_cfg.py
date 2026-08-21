@@ -107,12 +107,43 @@ class K1GKHierDHPPORunnerCfg(K1GKHierPPORunnerCfg):
         #     目安は σ ≲ 0.06 (= deadband / 1.6)。
         self.algorithm.entropy_coef = 0.008
 
-        # 親は 59 次元固定の反転関数を入れるので、履歴ブロック対応版へ差し替える。
-        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+        # ★ 2026-08-16: **対称性を完全に無効化した。** mirror loss と data augmentation の両方。
+        #
+        #   崩壊 3 回すべてに共通する唯一の異常が ``Loss/symmetry`` の爆発だった:
+        #       通常 0.02 → 崩壊時 1.7 / 28.4  (最大 1400 倍)
+        #   しかも 3 回目は **難易度を 3.0 で完全に固定した状態**で起きている。
+        #   「昇格イベントが引き金」という当初の仮説は、これで否定された。
+        #
+        #   時系列も一貫している。symmetry が先に上がり、その 30〜40 iter 後に転倒が増え、
+        #   さらに後から reward が落ちる:
+        #       symmetry 0.017 → 0.051 → 0.187 → 2.49 → 13.1 → 28.4
+        #       転倒     0.003 → 0.004 → 0.006 → 0.125 → 0.107 → 0.103
+        #   係数を 2.0 → 0.5 に下げても、損失値そのものが 1600 倍になったので効かなかった
+        #   (0.5 × 28.4 = 14.2。mean_reward 60 に対して支配的)。
+        #
+        #   切ってよい理由: **歩容の左右対称性は凍結下位が担保している。** 上位が出すのは
+        #   3 次元の速度指令 (vx, vy, wz) だけで、そこに強い対称性拘束を掛ける必然性は薄い。
+        #   代償は上位が左右非対称な戦略に収束しうることだが、崩壊する対称な方策より
+        #   動く非対称な方策の方が実用的。
+        #
+        #   ★ これで崩壊が止まらなければ、次の容疑者は ``termination_penalty = -500``。
+        #     難易度が上がると失点率が 0.72 まで上がり、1 エピソードあたり ±500 の
+        #     分散がリターンに乗る。実際 ``Loss/value_function`` は健全時 1.4 に対し
+        #     崩壊直前で 6.6〜10.9 まで上がっていた。
+        self.algorithm.symmetry_cfg = None
+        _unused_symmetry_cfg = RslRlSymmetryCfg(
             use_data_augmentation=True,
             use_mirror_loss=True,
             data_augmentation_func=compute_symmetric_states_dualhist,
-            mirror_loss_coeff=2.0,
+            # ★ 2026-08-16: 2.0 → 0.5 (階層版 v2 以前の値に戻す)。
+            #   崩壊時のログで ``Loss/symmetry`` が 0.04 → 1.7 (40倍) に爆発し、
+            #   損失に占める割合が 5% → 53% になっていた (surrogate 0.008 の 400 倍)。
+            #   係数 2.0 が掛かるので、方策がタスクを解くのをやめて左右対称になることだけを
+            #   最適化する状態になる。しかも ``Loss/learning_rate`` は 1e-5 (下限) に
+            #   張り付いており、適応スケジュールが抑えきれていなかった。
+            #   2.0 は 2026-08-09 に直接制御版 (下位も学習) で上げた値で、出力が
+            #   3 次元の速度指令しかない階層版の上位には強すぎる。
+            mirror_loss_coeff=0.5,
         )
 
 
@@ -136,3 +167,11 @@ class K1GKHierDHStage2PPORunnerCfg(K1GKHierDHPPORunnerCfg):
 
     max_iterations = 60000
     experiment_name = "k1_gk_hier_dh_stage2"
+
+
+@configclass
+class K1GKHierDHFinalPPORunnerCfg(K1GKHierDHPPORunnerCfg):
+    """最終分布での直接学習 (適応カリキュラムなし)。Stage2 の ckpt から --resume。"""
+
+    max_iterations = 60000
+    experiment_name = "k1_gk_hier_dh_final"

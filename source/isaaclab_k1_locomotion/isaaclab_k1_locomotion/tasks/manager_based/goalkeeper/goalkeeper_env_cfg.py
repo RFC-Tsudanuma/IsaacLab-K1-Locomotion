@@ -97,7 +97,7 @@ from .mdp.rewards import (
     track_target_y,
 )
 # ★ 共有定数 (configs/gk_prediction.yaml)。sim と実機デプロイの唯一の正。
-from .mdp.shared_params import drive as _shd, pred as _shp
+from .mdp.shared_params import drive as _shd, pred as _shp, tracking as _sht
 
 from .mdp.terminations import goal_conceded, robot_out_of_bounds, save_success
 
@@ -148,6 +148,31 @@ class GoalkeeperParamsCfg:
     # closing < approach_speed_min のとき target_y を 0 (中央待機) にするか。
     #   False なら従来の y_track (ボール方向へ寄る)。
     idle_center_wait: bool = _shp("idle_center_wait")
+
+    # --- 横追従 (y_track) のゲート (2026-08-21) ---
+    #
+    # ★ 実機で「あらゆるボールに反応する」症状の原因。y_track は
+    #     y_track = ball_y * (guard_x / max(ball_x, guard_x))
+    #   でボールの速度も距離も見ていないため、ゴールから遠ざかる球にも、人が
+    #   持って運んでいる球にも等しく反応する。さらに clamp(min=guard_x) により
+    #   **ゴールラインより後ろ (x < 0) の球が角度係数 1.0 = 最大ゲインで追われる**
+    #   (x=-1.0, y=1.0 の球で目標 y = 1.0m)。ゴール脇を人が通っただけで全力で走る。
+    #
+    # ★ ゲートが立ったときの target_y は 0 か self_y に寄るだけで、**学習分布に
+    #   無い値は作らない** (静止ボール状況 20% / post_save_hold で既出)。
+    #   したがって現行 ONNX のままデプロイ側を先に直しても方策は破綻しない。
+    #
+    # 値は configs/gk_prediction.yaml が唯一の正 (実機 C++ と共有)。
+    track_receding_vx_max: float = _sht("receding_vx_max")  # vx がこれ超で遠ざかる判定 [m/s]
+    track_min_x: float = _sht("min_x")                      # これ未満は背後・脇として無視 [m]
+    track_max_x: float = _sht("max_x")                      # これ超は遠すぎとして無視 [m]
+    # |ball_y| がこれ超 = ゴールポストの外へ出た球は追わない [m]。
+    #   従来は y_track を ±goal_half_width でクランプしていただけで、ポストの
+    #   真横まで歩いて張り付いていた。クランプではなく追従そのものを止める。
+    #   y_max / y_exit はシュミットトリガ (境界での往復 = 自励振動の防止)。
+    track_y_max: float = _sht("y_max")
+    track_y_exit: float = _sht("y_exit")
+    track_gated_target: str = _sht("gated_target")          # "hold" | "center"
     # ★ 2026-08-15: task_drive_vector の 1 次ローパスの時定数 [s]。0 で無効。
     #   この指令は自己位置 (MCL) から作られ、しかも drive_t_fast=0.15 のせいで
     #   0.195m 以上のずれで常に全力になる。MCL の跳び (±0.5m) は必ず「全力で横へ」
@@ -258,6 +283,32 @@ class GoalkeeperParamsCfg:
     vel_dropout_p: float = 0.0      # ball_vel を隠す確率
     target_dropout_p: float = 0.0   # target_y を隠す確率
 
+    # --- 自己位置 (MCL) 依存を減らす (2026-08-21) ---
+    #
+    # actor は自己位置を 3 経路で見ている:
+    #   ① self_state (x, y, sin yaw, cos yaw)      … 直接
+    #   ② target_y                                 … ゴール座標系への変換経由
+    #   ③ ball_vel                                 … CVKF がフィールド座標で微分する漏れ
+    #
+    # ② が最も安く消せる。_gk_perceived_goal_state は
+    #     pos = rpos + R(heading) · rel
+    # なので target_y = rpos_y + [R·rel]_y + vel_y·t、self_state.y = rpos_y。
+    # **差を取ると rpos_y が厳密に打ち消える** (同じ推定値を両方に使っているため)。
+    # MCL のバイアス ±0.20m も跳び ±0.5m も近似ではなく代数的に消え、残るのは
+    # heading 誤差による回転ぶんだけ (yaw はラインが見えるぶん位置より安定)。
+    #
+    # ★ 次元は変わらない。target_y スロットの中身が差に変わるだけなので、
+    #   ONNX の入出力もそのまま、既存 ckpt から継続学習できる。
+    #   実機 C++ は obs[54] = clamp(target_y - self_y, ±max_y) の 1 行。
+    lateral_error_obs: bool = False
+    # self_state の x, y を隠す確率 (yaw は常に残す)。
+    #   y の情報は lateral_error_obs へ移るので落とせるが、ゴールポスト際
+    #   (±goal_half_width) が見えなくなり out_of_bounds が増えうる。段階的に上げる。
+    #   x は守備面 guard_x の維持に必要で、前後誤差は横振動の原因ではないため
+    #   self_dropout_xy_only_y=True なら x は残す。
+    self_dropout_p: float = 0.0
+    self_dropout_only_y: bool = True
+
     # --- 状況の多様化 (2026-08-18) ---
     #
     # ★ [静止, 横移動, 枠外, ボールなし] の比率。残りがシュート。
@@ -271,13 +322,37 @@ class GoalkeeperParamsCfg:
     #     増える (60% なら約 1.7 倍)。セーブ率の立ち上がりは遅くなるが、
     #     到達できる上限は変わらない。
     #   ★ 全部 0 にすれば従来どおり 100% シュートに戻る。
-    situation_probs: tuple = (0.15, 0.10, 0.10, 0.05)
+    # ★ 2026-08-19: (0.15, 0.10, 0.10, 0.05) = シュート 60% から
+    #   **(0.08, 0.05, 0.05, 0.02) = シュート 80%** に下げた。
+    #
+    #   60% で回したところ、**両系譜とも難易度が後退した**:
+    #       直接版   ball_speed_hi 5.16 -> 4.30 -> 3.58
+    #       基準版   ball_speed_hi 3.58 -> 2.49 (以降 2800 iter 動かず)
+    #   歩容と転倒は良好 (転倒 1.5%) なので歩けなくなったのではなく、
+    #   **1 iteration あたりのセーブ経験が減って成功率が上がらなくなった**。
+    #   適応カリキュラムは成功率が adaptive_fail_threshold (0.55) を割ると難易度を
+    #   下げるので、多様化直後の一時的な低下で下げが入り、戻せなくなっていた。
+    #
+    #   多様性の目的 (実機で問題が出た「ボールは見えているが脅威でない」状況を
+    #   学習分布に入れる) は 20% でも達成できる。経験密度とのバランスを取る。
+    situation_probs: tuple = (0.08, 0.05, 0.05, 0.02)
     # ★ 非シュート球を撃ち直すまでの秒数。0 で無効 (撃ち直さない)。
     #   シュート以外は失点しないのでエピソードが終わらず、1 個の球で 20 秒が
     #   過ぎてシュートの経験密度が 1/3 以下に落ちた (実測: time_out 74%)。
     #   ゴール方向へ動いている球 (= 本物のシュート) は対象外なので、
     #   シュートの挙動は変わらない。
     situation_hold_s: float = 4.0
+
+    # ★ 2026-08-21: セーブ判定を **守るべきシュートに限る**か。
+    #
+    #   False (従来) だと update_save_state のタッチ判定が「アクティブな球に触った」
+    #   だけで立つため、状況の多様化で入れた静止球・横に転がる球・ゴールから
+    #   遠ざかる球に走って触るだけで save_touch_bonus (+100) が満額になり、
+    #   save_success で「成功」終了までする。密報酬が ±1 スケールなのに対して
+    #   +100 なので、**あらゆるボールを追うことが最適解**になっていた。
+    #   実機の「持って離れていくボールにも反応する」の学習側の原因。
+    #   A/B したいとき以外は True のままにすること。
+    save_requires_shot: bool = True
 
     idle_hold_enter_m: float = 0.25    # このずれ未満で待機保持に入る [m]
     idle_hold_exit_m: float = 0.30     # このずれ以上で待機保持を抜ける [m]

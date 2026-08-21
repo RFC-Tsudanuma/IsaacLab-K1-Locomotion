@@ -1,0 +1,7 @@
+{
+  "_comment": "【自己位置依存の低減 STEP2】STEP1 に加えて、ball_vel を確率 0.5 で隠す。ball_vel は実機では CVKF がフィールド座標 (= 自己位置 + 相対) を微分して作るため MCL の跳びが偽速度に化ける (loc_vel_leak_coef 0.82: 跳び 0.5m -> 偽速度 0.41m/s が tau 0.79s で減衰)。ball_history 30 次元は gk_ball_pos_rel_perceived = カメラ相対で MCL を一切通らないので、そこから速度を読む方策へ移行させる。★ ballhist 版でのみ有効 (履歴が無いと代替情報が無い)。",
+  "env": {
+    "goalkeeper.lateral_error_obs": true,
+    "goalkeeper.vel_dropout_p": 0.5
+  }
+}

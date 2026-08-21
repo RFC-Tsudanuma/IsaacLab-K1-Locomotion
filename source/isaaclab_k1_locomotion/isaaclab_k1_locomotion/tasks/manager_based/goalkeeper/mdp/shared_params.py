@@ -23,6 +23,11 @@ _FALLBACK = {
         "horizon_fast": 0.15, "horizon_idle": 1.0,
         "deadband_y": 0.0, "vy_scale": 1.3, "vx_scale": 1.0,
     },
+    # 横追従 (y_track) のゲート。詳細は YAML 側のコメント参照。
+    "tracking": {
+        "receding_vx_max": 0.3, "min_x": 0.2, "max_x": 4.0, "y_max": 1.3, "y_exit": 1.5,
+        "gated_target": "center",
+    },
 }
 
 _CACHE: dict | None = None
@@ -76,6 +81,7 @@ def gk_shared() -> dict:
     print(f"[gk_shared] 読込元: {src}")
     print(f"[gk_shared]   prediction: {merged['prediction']}")
     print(f"[gk_shared]   drive     : {merged['drive']}")
+    print(f"[gk_shared]   tracking  : {merged['tracking']}")
     return merged
 
 
@@ -85,3 +91,7 @@ def pred(key: str):
 
 def drive(key: str):
     return gk_shared()["drive"][key]
+
+
+def tracking(key: str):
+    return gk_shared()["tracking"][key]

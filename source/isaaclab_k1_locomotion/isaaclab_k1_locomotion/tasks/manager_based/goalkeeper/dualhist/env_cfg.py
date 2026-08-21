@@ -26,6 +26,7 @@
     今回は素直に Stage1 からやり直す (Stage1 は 5000 iter で頭打ちになる想定)。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.utils import configclass
@@ -37,6 +38,7 @@ from ..goalkeeper_hier_env_cfg import (
     K1GKHierStage2EnvCfg,
     _make_play_clean,
 )
+from .curriculums import fixed_difficulty_log
 from .observations import gk_io_history, reset_gk_history
 
 # --- 履歴の長さ (agents 側の hist_short_frames / hist_long_frames と必ず一致させること) ---
@@ -163,6 +165,76 @@ class K1GKHierDHStage2EnvCfg(K1GKHierStage2EnvCfg):
 
 
 @configclass
+class K1GKHierDHFinalEnvCfg(K1GKHierDHStage2EnvCfg):
+    """最終分布で直接学習する版。**適応カリキュラムを使わない。**
+
+    なぜ止めるのか (2026-08-16 の実測):
+
+    1. **崩壊が 2 回とも昇格の直後に起きた。** 速度 2.488 と 2.509 で、刻みを 1.2 → 1.1 に、
+       ``hard_ball_speed_mult`` を 1.6 → 1.3 に下げ、健全と検証した ckpt から始めても再現した。
+       内訳を見ると ``Loss/symmetry`` が 0.04 → 1.7 (40倍) に爆発し、損失全体の 53% を
+       占める状態になっていた (surrogate の 400 倍)。昇格イベントそのものが引き金なので、
+       **無くせば消える**。
+
+    2. **段階的に登る必要がない。** スポーン距離が時間で決まる設計 (``d = v × spawn_time_*``)
+       なので、速い球ほど遠くから来て **到達時間の分布は速度によらず一定**。到達不能球の
+       割合も 27〜29% で変わらない。変わるのはスポーン距離、つまり知覚ノイズだけ:
+
+           速度上限   到達不能   到達時間中央   スポーン距離p90   σ(d)
+             2.07      27.4%       0.69s          2.08m        0.41m
+             6.00      27.0%       0.75s          5.77m        0.86m
+
+    3. **固定重みなら高速球でも転ばない。** model_32000 を速度別に走らせた実測:
+
+           速度上限 2.074  セーブ 67.5%  転倒 0.2%
+           速度上限 3.0    セーブ 55.7%  転倒 0.0%
+           速度上限 4.0    セーブ 45.8%  転倒 0.2%
+
+       つまり 3 m/s は **能力としては既に満たしている**。登れないのは学習の問題。
+
+    難易度は ``ball_speed_max`` (= 速度上限、下限は ``ball_speed_min`` = 0.5 固定) と
+    ``aim_y_range`` で直接指定する。速度は U(0.5, ball_speed_max) の一様分布なので、
+    易しい球が分布の半分を占め、学習信号は途切れない。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # 適応カリキュラムを外し、成功率の記録だけを残す (学習の進み具合を見る主指標)
+        self.curriculum.difficulty = None
+        self.curriculum.hard_ball = None
+        self.curriculum.fixed = CurrTerm(func=fixed_difficulty_log)
+
+        # 難易度を直接指定する。カリキュラムが _gk_speed_hi / _gk_aim_y を作らないので、
+        # reset_ball_shot はこの 2 つを直接読む。
+        # ★ 2026-08-16 (ユーザー判断): **2 段階でやる。まず 3.0、固まったら 6.0。**
+        #
+        #   要件は「最低 3 m/s、最大 6 m/s」。3.0 を先にやる理由:
+        #     1. 締め切りリスク。時間切れでも必須要件を満たした方策が残る。6.0 から
+        #        始めて途中で切れると 3 も 6 も中途半端になる。
+        #     2. 分布の飛びが小さい。現在の方策は 2.07 で学習済み。2.07 → 3.0 は小さいが
+        #        2.07 → 6.0 は大きい。崩壊が 2 回とも 2.5 付近で起きているので、
+        #        大きく飛ばすのは博打になる。
+        #     3. 拡張が無料。観測の次元は変わらないので、この値を 6.0 に書き換えて
+        #        resume するだけで済む。3.0 で学習した ckpt をそのまま使える。
+        #
+        #   3.0 → 6.0 へ進む判定基準:
+        #     * base_contact が 0.01 未満を維持している (崩壊していない)
+        #     * Curriculum/fixed/success_ema の上昇が 2000 iter 以上止まった (頭打ち)
+        #     * eval_gk_hier_envelope.py で転倒 1% 未満を確認
+        #
+        #   期待値の目安 (model_32000 を速度別に固定して測った実測値):
+        #       速度上限 3.0 → 全球 55.7%   4.0 → 45.8%   6.0 → 40% 前後 (外挿)
+        #   転倒は 4.0 でも 0.2% なので、速度を上げても物理的に崩れる心配は無い。
+        self.goalkeeper.ball_speed_max = 3.0
+        self.goalkeeper.aim_y_range = 1.1       # 適応カリキュラムの最終段と同じ
+
+        # 到達不能球は適応で増やさず、最終値 (0.1) を最初から固定で混ぜる
+        self.goalkeeper.hard_ball_auto = False
+        self.goalkeeper.hard_ball_prob = 0.1
+
+
+@configclass
 class K1GKHierDHStage1EnvCfg_PLAY(K1GKHierDHStage1EnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -171,6 +243,13 @@ class K1GKHierDHStage1EnvCfg_PLAY(K1GKHierDHStage1EnvCfg):
 
 @configclass
 class K1GKHierDHStage2EnvCfg_PLAY(K1GKHierDHStage2EnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _make_play_clean(self)
+
+
+@configclass
+class K1GKHierDHFinalEnvCfg_PLAY(K1GKHierDHFinalEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
         _make_play_clean(self)

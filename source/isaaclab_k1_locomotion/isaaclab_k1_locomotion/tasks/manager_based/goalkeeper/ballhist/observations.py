@@ -244,7 +244,24 @@ def ballhist_is_engaged(
     if getattr(env, _ENGAGED_STEP_ATTR, -1) == int(env.common_step_counter):
         return prev
 
-    tol = torch.where(prev, lateral_exit_m, lateral_enter_m)
+    # ★ 2026-08-20 修正: ヒステリシスの向きが **逆だった**。
+    #
+    #   旧: tol = prev ? exit(0.30) : enter(0.25)
+    #       = 「入るのは 0.25、留まるには 0.30 必要」。これはヒステリシスではなく
+    #         その逆で、0.25〜0.30 の帯に留まると毎ティック トグルする。
+    #
+    #   is_idle_hold では同じ書き方が正しい (あちらは「保持を続ける条件を緩くする」
+    #   ので exit > enter でよい)。判定の向きが逆なのにパターンをコピーしたのが原因。
+    #
+    #   実機で測定 (343 秒): 出動の解除 378 回 (66回/分)、うち 94% が帯の中、
+    #   347 回が **1 ティックだけ**、出動継続の中央値 0.02 秒。1 歩に 0.625 秒
+    #   必要なので、方策は 20ms の位相パルスを渡されるだけで一歩も踏めていなかった。
+    #   「ボールを追わない」「ワンテンポ遅い」「宙で足が止まる」は全部これ。
+    #
+    #   正しい Schmitt トリガ: 高い方 (exit_m) で入り、低い方 (enter_m) を割るまで維持。
+    tol_hi = torch.maximum(torch.as_tensor(lateral_enter_m), torch.as_tensor(lateral_exit_m))
+    tol_lo = torch.minimum(torch.as_tensor(lateral_enter_m), torch.as_tensor(lateral_exit_m))
+    tol = torch.where(prev, tol_lo.to(lateral.device), tol_hi.to(lateral.device))
     out = detected & (approaching | (lateral > tol))
 
     setattr(env, _ENGAGED_ATTR, out)

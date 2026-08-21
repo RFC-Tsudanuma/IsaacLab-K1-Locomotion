@@ -449,8 +449,9 @@ class K1GKDirectEnvCfg(K1GKDirectStage1EnvCfg):
         # 「上げているつもりで擦っている」解に満額を払ってしまう。
         #
         # foot_clearance_sole は足裏 4 隅の最小高さを支持脚基準で測り、位相と整合を
-        # 取る (詳細は同関数の docstring と goalkeeper_lateral_env_cfg.py の
-        # TARGET_SOLE_CLEARANCE の解説)。横移動特化タスクで先に導入した実装をそのまま使う。
+        # 取る (詳細は同関数の docstring)。横移動特化タスクで先に導入した実装をそのまま使う。
+        # ※ 導入時の経緯は docs/archive/lateral_phase1_2026-08-17/ にある巻き戻し前の
+        #   goalkeeper_lateral_env_cfg.py (TARGET_SOLE_CLEARANCE の解説) に残してある。
         #
         # 目標 0.03m は人工芝のパイル (20〜30mm) を上回り、かつ 07-28 の脚上げ量
         # (3.2〜3.9cm) より低い。**脚を高く上げなくても足首を水平にすれば届く**ので、

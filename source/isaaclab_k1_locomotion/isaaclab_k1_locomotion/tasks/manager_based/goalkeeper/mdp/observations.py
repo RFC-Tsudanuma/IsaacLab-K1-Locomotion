@@ -73,6 +73,13 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         #   Pure 版の密報酬 (ball_lateral_progress) が採点に使う。
         #   nan = 有効な到達点が無い (非シュート状況・枠外へ外れる球)。
         env._gk_y_cross_true = torch.full((n,), float("nan"), device=env.device)
+        # ★ 2026-08-21: 今飛んでいる球が **守るべきシュートか**。
+        #   reset_ball_shot が True にし、_diversify_situations が静止/横移動/枠外/
+        #   ボールなしに差し替えた球で False に戻す。
+        #   セーブ判定 (update_save_state) がこれで足切りする。これが無いと
+        #   **静止球や遠ざかる球に触っただけで save_touch_bonus (+100) が満額**に
+        #   なり、「あらゆるボールへ走る」ことが最適解になる (実機で観測された症状)。
+        env._gk_is_shot = torch.zeros(n, dtype=torch.bool, device=env.device)
     return {
         "target_y": env._gk_target_y,
         "ball_active": env._gk_ball_active,
@@ -85,6 +92,7 @@ def gk_buffers(env: "ManagerBasedRLEnv") -> dict[str, torch.Tensor]:
         "save_quality": env._gk_save_quality,
         "unreachable": env._gk_unreachable,
         "y_cross_true": env._gk_y_cross_true,
+        "is_shot": env._gk_is_shot,
         "hard_ball": env._gk_hard_ball,
         "situation_age": env._gk_situation_age,
     }
@@ -457,6 +465,55 @@ def is_idle_hold(env: "ManagerBasedRLEnv", use_perceived: bool = True) -> torch.
     return out
 
 
+_TRACK_Y_ATTR = "_gk_track_y_in"        # (N,) bool: 追従レンジ内か
+_TRACK_Y_STEP_ATTR = "_gk_track_y_step"  # 同一ステップ内の多重更新を防ぐ
+
+
+def _track_y_in_range(env: "ManagerBasedRLEnv", ball_y: torch.Tensor) -> torch.Tensor:
+    """ボールの y が横追従して良いレンジ内か (N,) bool。**ヒステリシス付き**。
+
+    ゴールポストの外へ出た球には立ち位置を合わせない。従来は ``y_track`` を
+    ±max_y でクランプしていただけだったので、**ポストの真横まで歩いて張り付く**
+    動きになっていた。クランプではなく追従そのものを止める。
+
+    ☠ 単純なしきい値だと境界 (|y| ≈ 1.3) で「追う/追わない」が毎ステップ入れ替わり、
+      目標が 1.3 と 0 の間を往復して自励振動になる。知覚ノイズ σ = 0.124d + 0.149
+      は 3m 先で 0.52m あるので、境界付近では確実に起きる。
+      入るときは ``track_y_max``、出るときは ``track_y_exit`` (> max) を使う
+      シュミットトリガにする。
+
+    ☠ 向きに注意 (過去に ballhist_is_engaged で逆にした実績あり):
+        追従中     -> 広いほう (track_y_exit)  まで許して追い続ける
+        非追従中   -> 狭いほう (track_y_max)   まで戻らないと再開しない
+
+    ``compute_target_y`` は 1 ステップに複数回 (policy / critic / 報酬 /
+    is_idle_hold / task_drive_vector) 呼ばれるので、ラッチの更新は
+    ``common_step_counter`` で 1 回に制限する。
+    """
+    p = env.cfg.goalkeeper
+    y_max = float(getattr(p, "track_y_max", float(getattr(p, "goal_half_width", 1.3))))
+    y_exit = float(getattr(p, "track_y_exit", y_max + 0.2))
+
+    prev = getattr(env, _TRACK_Y_ATTR, None)
+    if prev is None or prev.shape[0] != env.num_envs:
+        prev = ball_y.abs() <= y_max
+        setattr(env, _TRACK_Y_ATTR, prev)
+
+    step = int(env.common_step_counter)
+    if getattr(env, _TRACK_Y_STEP_ATTR, -1) == step:
+        return prev
+    setattr(env, _TRACK_Y_STEP_ATTR, step)
+
+    tol = torch.where(
+        prev,
+        torch.full_like(ball_y, max(y_max, y_exit)),   # 追従中は広いほう
+        torch.full_like(ball_y, min(y_max, y_exit)),   # 非追従中は狭いほう
+    )
+    out = ball_y.abs() <= tol
+    setattr(env, _TRACK_Y_ATTR, out)
+    return out
+
+
 def compute_target_y(
     env: "ManagerBasedRLEnv",
     max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
@@ -534,6 +591,52 @@ def compute_target_y(
     #   configs/gk_prediction.yaml の idle_center_wait: false で従来挙動に戻せる。
     if bool(getattr(env.cfg.goalkeeper, "idle_center_wait", False)):
         y_track = torch.zeros_like(y_track)
+
+    # ★ 2026-08-21: 横追従に **関連性のゲート** を入れる。
+    #
+    #   実機で「あらゆるボールに反応する」症状が出た。原因は y_track が
+    #   ボールの速度も距離も見ていないこと。特に上の
+    #       x_ball = pos_track[:, 0].clamp(min=guard_x)
+    #   は「x が小さい = 近い = 正面に立て」という意味なので、**ゴールラインより
+    #   後ろ (x < 0) のボールが角度係数 1.0 = 最大ゲインで追われる**:
+    #       x=3.0, y=1.0 -> 目標 0.20m   (係数 0.20)
+    #       x=1.5, y=1.0 -> 目標 0.40m   (係数 0.40)
+    #       x=-1.0, y=1.0 -> 目標 1.00m  (係数 1.00)  ← ゴール脇を人が通っただけ
+    #
+    #   「横に動いたら追う」という要件は残したまま、次の 3 つだけ落とす:
+    #     ① 遠ざかる    vx > track_receding_vx_max
+    #     ② 背後・脇    ball_x < track_min_x
+    #     ③ 遠すぎる    ball_x > track_max_x
+    #     ④ ポスト超え  |ball_y| > track_y_max   (:func:`_track_y_in_range`)
+    #
+    #   ④ が無いと、横へ転がってゴールポストの外へ出た球にも立ち位置を合わせ続ける。
+    #   従来は y_track を ±max_y でクランプしていただけなので、**ポストの真横まで
+    #   歩いて張り付く**動きになっていた (「ポストを超える球を追いかけないで欲しい」)。
+    #   クランプではなく追従そのものを止める。
+    #
+    #   ★ ゲートが立ったときの目標は 0 (中央) か self_y (その場保持) で、
+    #     **学習分布に無い値は作らない**。静止ボール状況 (20%) と post_save_hold で
+    #     既出の状態なので、現行 ONNX のままデプロイ側だけ先に直しても安全。
+    #
+    #   x のクランプ前の生値で判定する (クランプ後は背後と正面が区別できない)。
+    p_gk = env.cfg.goalkeeper
+    x_raw = pos_track[:, 0]
+    vx_track = vel[:, 0]
+    relevant = (
+        (vx_track <= float(getattr(p_gk, "track_receding_vx_max", 0.3)))
+        & (x_raw >= float(getattr(p_gk, "track_min_x", 0.2)))
+        & (x_raw <= float(getattr(p_gk, "track_max_x", 4.0)))
+        & _track_y_in_range(env, pos_track[:, 1])
+    )
+    if str(getattr(p_gk, "track_gated_target", "hold")) == "hold":
+        # その場保持: 自機の y を目標にすると task_drive_vector の dy が 0 になる。
+        y_gated = (
+            robot_pose_est(env)[0][:, 1] if use_perceived else robot_pos_goal(env)[:, 1]
+        ).clamp(-max_y, max_y)
+    else:
+        y_gated = torch.zeros_like(y_track)
+    y_track = torch.where(relevant, y_track, y_gated)
+
     target = torch.where(approaching, y_pred, y_track)
     out = torch.where(bufs["ball_active"], target, bufs["target_y"])
 
@@ -906,13 +1009,46 @@ def gk_target_y(
     env: "ManagerBasedRLEnv",
     max_y: float = 1.3,  # = GOAL_HALF_WIDTH (ゴール幅 2.6m)
     use_perceived: bool = False,
+    lateral: bool | None = None,
 ) -> torch.Tensor:
-    """目標 y 座標 (ゴール座標系) の観測 (N, 1)。:func:`compute_target_y` 参照。
+    """目標 y の観測 (N, 1)。:func:`compute_target_y` 参照。
 
     policy には ``use_perceived=True`` (知覚DR後のボール状態から予測)、
     critic には既定の真値版を使う。
+
+    Args:
+        lateral: True なら **絶対座標ではなく自機からの相対誤差** を返す。
+            None なら ``cfg.goalkeeper.lateral_error_obs`` に従う。
+
+    ★ 2026-08-21: 相対誤差モードを追加した (自己位置依存を減らす)。
+
+      ``_gk_perceived_goal_state`` は自己位置推定でボールをゴール座標系へ戻す::
+
+          pos = rpos + R(heading) · rel
+
+      したがって観測はこうなっている::
+
+          target_y     = rpos_y + [R(θ)·rel]_y + vel_y·t
+          self_state.y = rpos_y
+
+      **差を取ると rpos_y が厳密に打ち消える**。同じ推定値を両方に使っているので、
+      MCL のバイアス (±0.20m) も跳び (±0.5m) も近似ではなく代数的に消える。
+      残るのは heading 誤差による R(θ) の回転ぶんだけで、yaw はフィールドライン
+      が見えるぶん位置より桁違いに安定している。
+
+      ★ 次元は変わらない。既存 ckpt から継続学習でき、ONNX の入出力もそのまま。
+        実機 C++ は ``obs[54] = clamp(target_y - self_y, ±max_y)`` の 1 行。
     """
-    return compute_target_y(env, max_y=max_y, use_perceived=use_perceived).unsqueeze(1)
+    tgt = compute_target_y(env, max_y=max_y, use_perceived=use_perceived)
+    if lateral is None:
+        lateral = bool(getattr(env.cfg.goalkeeper, "lateral_error_obs", False))
+    if lateral:
+        if use_perceived:
+            self_y = robot_pose_est(env)[0][:, 1]
+        else:
+            self_y = robot_pos_goal(env)[:, 1]
+        tgt = (tgt - self_y).clamp(-2.0 * max_y, 2.0 * max_y)
+    return tgt.unsqueeze(1)
 
 
 def zmp_xy_base(
@@ -1423,6 +1559,33 @@ def task_drive_phase_obs(
     return torch.where(walking.unsqueeze(1), phase, torch.zeros_like(phase))
 
 
+_SELF_MASK_ATTR = "_gk_self_mask"
+_SELF_MASK_EP_ATTR = "_gk_self_mask_ep"
+
+
+def _gk_episode_mask(env: "ManagerBasedRLEnv", p: float, attr: str, ep_attr: str) -> torch.Tensor:
+    """確率 ``p`` で False (=隠す) になる env ごとのマスク。エピソード境界で引き直す。
+
+    ★ **env ごと・エピソード固定** にする。毎ステップ切り替えると「見えたり見えなかったり」
+      が高周波ノイズになり、方策が時間平均で回避してしまう (隠した意味が無くなる)。
+      ballhist 版の ``_episode_mask`` と同じ規約。
+    """
+    ep = env.episode_length_buf
+    mask = getattr(env, attr, None)
+    prev_ep = getattr(env, ep_attr, None)
+    if mask is None or mask.shape[0] != env.num_envs:
+        mask = torch.rand(env.num_envs, device=env.device) >= p
+        setattr(env, attr, mask)
+    elif prev_ep is not None:
+        fresh = ep < prev_ep
+        if bool(fresh.any()):
+            new = torch.rand(env.num_envs, device=env.device) >= p
+            mask = torch.where(fresh, new, mask)
+            setattr(env, attr, mask)
+    setattr(env, ep_attr, ep.clone())
+    return mask
+
+
 def gk_self_state(
     env: "ManagerBasedRLEnv",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
@@ -1440,4 +1603,173 @@ def gk_self_state(
         xy, heading = robot_pose_est(env)
     else:
         xy, heading = robot_pos_goal(env, asset_cfg)[:, :2], robot.data.heading_w
-    return torch.stack([xy[:, 0], xy[:, 1], torch.sin(heading), torch.cos(heading)], dim=1)
+    x, y = xy[:, 0], xy[:, 1]
+
+    # ★ 2026-08-21: policy 側だけ x, y を確率的に隠せるようにする (自己位置依存の低減)。
+    #
+    #   y の情報は lateral_error_obs で target_y スロットへ移るので落とせる。ただし
+    #   ゴールポスト際 (±goal_half_width) が見えなくなり out_of_bounds が増えうるので
+    #   段階的に上げること。x は守備面 guard_x の維持に必要で、しかも **前後の誤差は
+    #   横振動の原因ではない**ため、既定 (self_dropout_only_y=True) では残す。
+    #   yaw は正対の維持に必須なので常に残す。
+    #
+    #   critic は特権情報を見る側なので絶対に隠さない。
+    if use_perceived:
+        p = float(getattr(env.cfg.goalkeeper, "self_dropout_p", 0.0))
+        if p > 0.0:
+            if p >= 1.0:
+                keep = torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            else:
+                keep = _gk_episode_mask(env, p, _SELF_MASK_ATTR, _SELF_MASK_EP_ATTR)
+            zero = torch.zeros_like(y)
+            y = torch.where(keep, y, zero)
+            if not bool(getattr(env.cfg.goalkeeper, "self_dropout_only_y", True)):
+                x = torch.where(keep, x, zero)
+    return torch.stack([x, y, torch.sin(heading), torch.cos(heading)], dim=1)
+
+
+# ---------------------------------------------------------------------------
+# 観測の遅延 DR (sim2real: ループ入力側の位相遅れ)
+# ---------------------------------------------------------------------------
+#
+# ★ 2026-08-20 追加。実機で振動する / シムで振動しない、の構造的な原因を埋める。
+#
+# ループ一周の位相遅れを実機と揃えるには **入力側と出力側の両方**が要る:
+#
+#   出力側 (方策 → 関節トルク) : DelayedPDActuatorCfg(min_delay=2, max_delay=7)
+#                                = 10〜35ms @ sim 200Hz。**既に入っている**
+#   入力側 (状態 → 観測)       : **これまでゼロ**。真値が遅延なしで来ていた
+#
+# 実機は InEKF 200Hz (5ms) + 差分の半サンプル (2.5ms) + LPF 5Hz の群遅延 (31.8ms)
+# + executor の遅延 = **40〜60ms = 制御 2〜3 tick** 遅れている。
+# 片側だけ模擬するとループ全体の位相遅れが実機の半分以下のままで、
+# 「今の状態を見て今すぐ強く直す」高ゲインな制御則が学習される。それを遅延のある
+# 実機に持って行くと必ず行き過ぎて振動する (シャワーの温度調節と同じ)。
+#
+# ☠ DR は遅延を **消さない**。「遅れた情報しか来ない世界で安定する制御則」を
+#   学ばせるためのもの。遅延の除去は推論側の仕事。
+#
+# ☠ **actor (policy) 観測にだけ掛けること**。critic は特権情報を見る側なので
+#   真値のままにする (遅らせると価値推定が無意味に難しくなるだけ)。
+#
+# 遅延段数は **env ごとに 1 つ**で、全観測に共通で掛かる (実機のセンサ→方策の
+# 経路は 1 本なので、観測ごとに別々の遅延を引くのは物理的に不自然)。
+
+_OBS_DELAY_ATTR = "_gk_obs_delay_steps"       # (N,) env ごとの遅延段数 [制御 tick]
+_OBS_HIST_ATTR = "_gk_obs_delay_hist"         # dict[key] -> (D, N, C) リングバッファ
+_OBS_HIST_STEP_ATTR = "_gk_obs_delay_step"    # dict[key] -> 最後に push した step
+
+
+def _obs_delay_steps(env: "ManagerBasedRLEnv", min_delay: int, max_delay: int) -> torch.Tensor:
+    """env ごとの遅延段数 (N,)。初回呼び出し時に 1 度だけサンプルして固定する。
+
+    リセットでは引き直さない (startup DR と同じ扱い)。実機の遅延は個体・配線・
+    負荷で決まる量で、エピソードごとに変わるものではないため。
+    """
+    d = getattr(env, _OBS_DELAY_ATTR, None)
+    if d is None or d.shape[0] != env.num_envs:
+        lo, hi = int(min_delay), int(max_delay)
+        if hi < lo:
+            lo, hi = hi, lo
+        d = torch.randint(lo, hi + 1, (env.num_envs,), device=env.device)
+        setattr(env, _OBS_DELAY_ATTR, d)
+    return d
+
+
+def _delayed(
+    env: "ManagerBasedRLEnv",
+    key: str,
+    value: torch.Tensor,
+    min_delay: int,
+    max_delay: int,
+) -> torch.Tensor:
+    """``value`` (N, C) を env ごとの遅延段数だけ遅らせて返す。
+
+    ☠ リングバッファへの push は **1 step につき 1 回だけ**。同じ観測項が
+      policy / critic の両グループから呼ばれても二重に進まないよう、
+      ``common_step_counter`` で番人を置いている。
+
+    ☠ エピソード開始直後 (経過 < バッファ長) は **遅延を掛けない**。
+      前エピソードの値 (リセット前 = テレポート前の姿勢) が漏れてくるのを防ぐため。
+      実機には存在しない不連続なので、模擬する価値がない。
+    """
+    depth = int(max_delay) + 1
+    if depth <= 1:
+        return value
+
+    hist = getattr(env, _OBS_HIST_ATTR, None)
+    if hist is None:
+        hist = {}
+        setattr(env, _OBS_HIST_ATTR, hist)
+    steps = getattr(env, _OBS_HIST_STEP_ATTR, None)
+    if steps is None:
+        steps = {}
+        setattr(env, _OBS_HIST_STEP_ATTR, steps)
+
+    buf = hist.get(key)
+    if buf is None or buf.shape[0] != depth or buf.shape[1:] != value.shape:
+        buf = value.detach().unsqueeze(0).repeat(depth, *([1] * value.dim()))
+        hist[key] = buf
+        steps[key] = -1
+
+    cur = int(env.common_step_counter)
+    pos = cur % depth
+    if steps.get(key) != cur:
+        buf[pos] = value.detach()
+        steps[key] = cur
+
+    d = _obs_delay_steps(env, min_delay, max_delay)
+    idx = (pos - d) % depth
+    out = buf[idx, torch.arange(value.shape[0], device=value.device)]
+
+    # エピソード序盤は遅延なし (前エピソードの値の漏れ込みを防ぐ)
+    young = env.episode_length_buf < depth
+    return torch.where(young.unsqueeze(-1), value, out)
+
+
+def base_ang_vel_delayed(
+    env: "ManagerBasedRLEnv",
+    min_delay: int = 1,
+    max_delay: int = 3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遅延つき :func:`isaaclab.envs.mdp.observations.base_ang_vel`。"""
+    from isaaclab.envs.mdp.observations import base_ang_vel
+
+    return _delayed(env, "base_ang_vel", base_ang_vel(env, asset_cfg), min_delay, max_delay)
+
+
+def projected_gravity_delayed(
+    env: "ManagerBasedRLEnv",
+    min_delay: int = 1,
+    max_delay: int = 3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遅延つき :func:`isaaclab.envs.mdp.observations.projected_gravity`。"""
+    from isaaclab.envs.mdp.observations import projected_gravity
+
+    return _delayed(env, "projected_gravity", projected_gravity(env, asset_cfg), min_delay, max_delay)
+
+
+def joint_pos_rel_delayed(
+    env: "ManagerBasedRLEnv",
+    min_delay: int = 1,
+    max_delay: int = 3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遅延つき :func:`isaaclab.envs.mdp.observations.joint_pos_rel`。"""
+    from isaaclab.envs.mdp.observations import joint_pos_rel
+
+    return _delayed(env, "joint_pos", joint_pos_rel(env, asset_cfg), min_delay, max_delay)
+
+
+def joint_vel_rel_delayed(
+    env: "ManagerBasedRLEnv",
+    min_delay: int = 1,
+    max_delay: int = 3,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """遅延つき :func:`isaaclab.envs.mdp.observations.joint_vel_rel`。"""
+    from isaaclab.envs.mdp.observations import joint_vel_rel
+
+    return _delayed(env, "joint_vel", joint_vel_rel(env, asset_cfg), min_delay, max_delay)

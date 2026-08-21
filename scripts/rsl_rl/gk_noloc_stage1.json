@@ -1,0 +1,6 @@
+{
+  "_comment": "【自己位置依存の低減 STEP1】target_y スロットを絶対座標から自機相対の誤差へ切り替える。_gk_perceived_goal_state が pos = rpos + R(heading)*rel でボールをゴール座標系へ戻しているため、target_y = rpos_y + [R*rel]_y + vel_y*t、self_state.y = rpos_y となり、差を取ると rpos_y が代数的に打ち消える。MCL のバイアス (±0.20m) も跳び (±0.5m) も消え、残るのは heading 誤差の回転ぶんだけ。★ 次元は変わらないので既存 ckpt から継続学習でき、ONNX の入出力もそのまま。実機 C++ は obs[54] = clamp(target_y - self_y, ±1.3) の 1 行。",
+  "env": {
+    "goalkeeper.lateral_error_obs": true
+  }
+}
