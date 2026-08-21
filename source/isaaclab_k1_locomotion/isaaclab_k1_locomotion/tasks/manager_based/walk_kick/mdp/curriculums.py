@@ -1,5 +1,6 @@
 # mdp/curriculums.py
 from __future__ import annotations
+import math
 import os
 import torch
 from typing import TYPE_CHECKING
@@ -438,4 +439,171 @@ def kick_rate_gated_speed_range(
         "speed_max": speed_max,
         "alpha": alpha,
         "kick_rate_ema": ema,
+    }
+
+
+def kick_rate_gated_expansion(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    start_step: int,
+    end_step: int,
+    steps_per_iteration: int = 0,
+    advance_above: float = 0.80,
+    retreat_below: float = 0.50,
+    ema_alpha: float = 0.01,
+    retreat_scale: float = 2.0,
+    ball_event_name: str = "reset_ball",
+    half_angle_range: tuple[float, float] = (1.047, math.pi),
+    dist_range_start: tuple[float, float] = (0.5, 0.8),
+    dist_range_end: tuple[float, float] = (0.5, 1.5),
+    heading_halfwidth_range: tuple[float, float] = (math.pi / 4, math.pi),
+    approach_term_name: str = "approach_penalty",
+    approach_end_weight: float = -3.0,
+    approach_fade_iterations: int = 500,
+    avoidance_term_name: str = "ball_avoidance",
+    avoidance_end_weight: float = -3.0,
+) -> dict[str, float]:
+    """キック成立率で開閉するゲートで、**限定レンジ → 全方位** を一本の α で進める。
+
+    :func:`kick_rate_gated_speed_range` とゲートの作りは同じ (EMA、``advance_above`` /
+    ``retreat_below`` のヒステリシス、戻りは ``retreat_scale`` 倍速)。違うのは α が
+    動かす先だけで、こちらは次の 5 つを **同時に** 線形補間する:
+
+    1. ``events.<ball_event_name>.params["half_angle"]``  … ボール出現の方位範囲
+    2. ``events.<ball_event_name>.params["dist_range"]``  … ボール出現の距離
+    3. ``commands.<command_name>.ranges.heading``         … 蹴り方向の範囲 (±半幅)
+    4. ``rewards.<approach_term_name>.weight``            … 接近圧 (下の式)
+    5. ``rewards.<avoidance_term_name>.weight``           … 回り込み圧 (``end × α``)
+
+    approach_penalty と ball_avoidance のクロスフェード
+    --------------------------------------------------
+    2 つは向きが逆の項で、限定レンジでは接近圧 (approach_penalty) が要り、全方位では
+    「構えができるまで寄るな」の抑止 (ball_avoidance) が要る
+    (:func:`..rewards.ball_avoidance` の docstring)。段を分けずに 1 本の run で
+    やりたいので、α で入れ替える::
+
+        w_a  = approach_end_weight × clamp(now / approach_fade_iterations, 0, 1)
+        approach_penalty.weight  = w_a × (1 − α)
+        ball_avoidance.weight    = avoidance_end_weight × α
+
+    ``w_a`` の側 (壁時計の 0 → 500 iteration フェードイン) は基底 walk_kick が
+    ``linear_reward_weight`` で入れているものと同じ立ち上がりを、**この関数の中で
+    再現している**。基底のカリキュラム項をそのまま残すと同じ weight を 2 つの
+    curriculum 項が書き合い、どちらが最後に走るかで値が決まってしまうため。
+    このゲートを使うタスクでは基底の ``approach_penalty_weight`` を ``None`` にして、
+    書き手をこの関数 1 つに絞ること。
+
+    積 (``w_a × (1 − α)``) にしてあるのは、フェードインの途中でゲートが開き始めても
+    「立ち上がりきっていない接近圧をさらに薄める」という素直な向きに合成されるため。
+    ``min`` だと α が進むほど ``w_a`` の立ち上がりの形が階段状に切り取られる。
+
+    なぜ壁時計で広げないか
+    ----------------------
+    ボールの出現範囲と蹴り方向の範囲は **キックの難しさそのもの** を決める軸なので、
+    ポリシーの実力より先に広げると回り込みが間に合わずキックが成立しなくなる。
+    キック報酬が消えると ``kick_finished`` の「残りの歩行報酬を捨てるコスト」だけが
+    残って収支が逆転し、「蹴らずに time_out まで歩く」へ落ちる
+    (:func:`linear_command_speed_range` の失敗記録と同じ機構)。壁時計はそこから
+    自己回復しない。ゲート付きなら崩れた時点で止まり、崩れ続ければ蹴れていた範囲まで
+    戻る。
+
+    実装の重複について
+    ------------------
+    ゲートの計算そのものは :func:`kick_rate_gated_speed_range` とほぼ同じコードだが、
+    **共通化のためにあちらへ手を入れることは意図的に避けている**。あちらは
+    walk_long_pass 系の収束済みの run が依存している関数で、リファクタで挙動が
+    1 ビットでも変われば既存 run の再現性が失われる。ロジックの重複はその対価として
+    受け入れる。ゲート状態も別の属性 (``_kick_expansion_gate_state``) に持ち、
+    あちらの ``_kick_speed_gate_state`` とは共有しない。
+
+    Returns:
+        TensorBoard に ``Curriculum/<term_name>/`` 以下で出る値。``alpha`` が止まって
+        いるのに ``kick_rate_ema`` が低いままなら、その範囲が今のポリシーの実質的な上限。
+    """
+    if end_step <= start_step:
+        raise ValueError(f"end_step ({end_step}) は start_step ({start_step}) より大きくすること。")
+
+    if steps_per_iteration > 0:
+        now = env.common_step_counter / steps_per_iteration
+    else:
+        now = float(env.common_step_counter)
+
+    state = getattr(env, "_kick_expansion_gate_state", None)
+    if state is None:
+        state = {}
+        env._kick_expansion_gate_state = state
+    if command_name not in state:
+        state[command_name] = {"alpha": 0.0, "kick_rate_ema": 1.0, "last_now": now}
+    gate = state[command_name]
+
+    # -- 直近に終わったエピソード群のキック成立率を EMA に入れる
+    #
+    # ManagerBasedRLEnv._reset_idx は curriculum → command reset の順に呼ぶので、
+    # ここで env_ids を見ると Metrics/<command>/kick_rate として記録されるのと同じ値を
+    # ゼロ化前に読める (kick_rate_gated_speed_range と同じ読み方)。
+    command_term = env.command_manager.get_term(command_name)
+    metric = command_term.metrics.get("kick_rate", None)
+    if metric is not None and env_ids is not None and len(env_ids) > 0:
+        kick_rate = float(metric[env_ids].mean())
+        gate["kick_rate_ema"] += ema_alpha * (kick_rate - gate["kick_rate_ema"])
+
+    # -- ゲートの開閉に応じて α を進める / 戻す
+    elapsed = max(0.0, now - gate["last_now"])
+    gate["last_now"] = now
+    ema = gate["kick_rate_ema"]
+    if now >= start_step:
+        delta = elapsed / (end_step - start_step)
+        if ema >= advance_above:
+            gate["alpha"] += delta
+        elif ema < retreat_below:
+            gate["alpha"] -= delta * retreat_scale
+        # advance_above > ema >= retreat_below は据え置き (ヒステリシス)。
+        gate["alpha"] = min(max(gate["alpha"], 0.0), 1.0)
+
+    if _GATE_DEBUG:
+        gate["calls"] = gate.get("calls", 0) + 1
+        if gate["calls"] <= 5 or gate["calls"] % 25 == 0:
+            print(
+                f"[expansion] calls={gate['calls']} now={now:.3f} elapsed={elapsed:.5f}"
+                f" alpha={gate['alpha']:.6f} ema={ema:.4f} id(env)={id(env)}"
+            )
+
+    alpha = gate["alpha"]
+
+    def _lerp(a: float, b: float) -> float:
+        return a + (b - a) * alpha
+
+    # -- 1+2. ボール出現の方位と距離 (EventManager は params を毎回読み直す)
+    half_angle = _lerp(half_angle_range[0], half_angle_range[1])
+    dist_min = _lerp(dist_range_start[0], dist_range_end[0])
+    dist_max = _lerp(dist_range_start[1], dist_range_end[1])
+    ball_event = env.event_manager.get_term_cfg(ball_event_name)
+    ball_event.params["half_angle"] = half_angle
+    ball_event.params["dist_range"] = (dist_min, dist_max)
+
+    # -- 3. 蹴り方向の範囲 (KickDirectionCommand は resample のたびに cfg を読み直す)
+    heading_half = _lerp(heading_halfwidth_range[0], heading_halfwidth_range[1])
+    command_term.cfg.ranges.heading = (-heading_half, heading_half)
+
+    # -- 4+5. approach_penalty / ball_avoidance のクロスフェード
+    fade = 1.0 if approach_fade_iterations <= 0 else min(now / approach_fade_iterations, 1.0)
+    approach_weight = approach_end_weight * fade * (1.0 - alpha)
+    avoidance_weight = avoidance_end_weight * alpha
+
+    approach_term = env.reward_manager.get_term_cfg(approach_term_name)
+    if abs(approach_term.weight - approach_weight) > 1e-8:
+        approach_term.weight = approach_weight
+    avoidance_term = env.reward_manager.get_term_cfg(avoidance_term_name)
+    if abs(avoidance_term.weight - avoidance_weight) > 1e-8:
+        avoidance_term.weight = avoidance_weight
+
+    return {
+        "alpha": alpha,
+        "kick_rate_ema": ema,
+        "half_angle": half_angle,
+        "dist_max": dist_max,
+        "heading_half": heading_half,
+        "approach_weight": approach_weight,
+        "avoidance_weight": avoidance_weight,
     }

@@ -274,6 +274,7 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
             orbit_beta=self.cfg.orbit_beta,
             overshoot_margin=self.cfg.overshoot_margin,
             lateral_band=self.cfg.lateral_band,
+            style_halfwidth=self.cfg.style_halfwidth,
         )
 
         robot_pos_w = robot.data.root_pos_w[:, :2]
@@ -376,5 +377,18 @@ class BallFollowVelocityCommandCfg(DiscreteVelocityCommandCfg):
     None (既定) で従来どおり横ずれ 0 の一点。:func:`..kick_state.kick_state` の
     同名引数を参照。``r_max`` と同じく全ての kick_state 利用項へ同じ値を配ること
     (G と P_kick はその step で最初に呼ばれた項の値で確定するため)。
+    """
+
+    style_halfwidth: float | None = None
+    """p_style (胴体の向きの正対度) を **帯** で採点する半幅 [rad]。
+
+    None (既定) で従来どおり ``clamp(forward·kick_dir, 0, 1)``。値を入れると
+    角度差がこの半幅以内なら 1、超えた分だけ緩やかに減衰する。
+    :func:`..kick_state.kick_state` の同名引数を参照。``r_max`` と同じく
+    **全ての kick_state 利用項へ同じ値を配ること**。
+
+    このコマンド自身は p_style を読まないが、``follow_ball=True`` のとき
+    :func:`..kick_state.kick_state` を呼ぶ側になりうるので、他の項と食い違わない
+    よう同じ値を保持する。
     """
 

@@ -89,6 +89,16 @@ _KICK_STATE_REWARD_TERMS = (
     "kick_plant_foot",
     "kick_foot_lift",
     "kick_contact_height",
+    # インサイドキック (walk_inside_kick) の項。他タスクの cfg には存在しないので
+    # getattr の None ガードで飛ばされる = 完全に no-op。
+    "kick_inside_contact",
+    "inside_foot_orient",
+    # 脚同士の接近ペナルティの「キック中だけ緩める」版。locomotion 版
+    # (feet_close_penalty / knee_close_penalty) とは **項名を分けてある**。
+    # あちらは kick_state を呼ばないので、同じ名前でこのリストに入れると
+    # 既存タスクで orbit のパラメータが渡されて TypeError になる。
+    "feet_close_penalty_kick_aware",
+    "knee_close_penalty_kick_aware",
     "walk_speed",
     "approach_penalty",
     "ball_avoidance",

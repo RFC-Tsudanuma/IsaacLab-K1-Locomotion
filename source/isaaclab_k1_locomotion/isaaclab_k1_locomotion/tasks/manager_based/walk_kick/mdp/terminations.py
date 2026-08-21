@@ -27,6 +27,7 @@ def kick_finished(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """キック成立 (kick_done) から delay_steps 後にエピソードを終了する。shape: (N,) bool
 
@@ -44,9 +45,10 @@ def kick_finished(
     その step の状態全体に効く。
 
     ``r_max`` / ``orbit_beta`` (回り込み型の G) と ``overshoot_margin``、
-    ``lateral_band`` (終端の構えの横のあそび) も同じく :func:`kick_state` にそのまま
-    渡すが、こちらは **報酬項側にも同じ値を配ること**。既定
-    (``r_max=None`` / ``overshoot_margin=0.0`` / ``lateral_band=None``) では
+    ``lateral_band`` (終端の構えの横のあそび)、``style_halfwidth`` (p_style を帯で
+    採点する) も同じく :func:`kick_state` にそのまま渡すが、こちらは
+    **報酬項側にも同じ値を配ること**。既定 (``r_max=None`` /
+    ``overshoot_margin=0.0`` / ``lateral_band=None`` / ``style_halfwidth=None``) では
     従来の挙動と完全に一致する。
     """
     state = kick_state(
@@ -61,6 +63,7 @@ def kick_finished(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     if not hasattr(env, "_kick_done_counter"):

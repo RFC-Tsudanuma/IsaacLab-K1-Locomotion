@@ -28,6 +28,8 @@ import math
 import torch
 from typing import TYPE_CHECKING
 
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -76,6 +78,26 @@ _INIT_SIDE_COMMIT_DIST = 0.1
 # --------------------------------------------------------------------------- #
 _SOLE_OFFSET = 0.038
 
+# --------------------------------------------------------------------------- #
+# p_style を「帯」にしたときの、帯の外側の減衰幅 [rad]
+#
+# ``style_halfwidth`` を入れると p_style は「胴体の向きとキック方向の角度差が
+# ±style_halfwidth 以内なら 1、そこを超えた超過分 excess に対して
+# exp(−(excess/_STYLE_DECAY)²) で落ちる」形になる (既定 None では従来の
+# clamp(forward·kick_dir, 0, 1) のまま = 完全に no-op)。
+#
+# 0.35 rad ≈ 20° は τ_direction のシェイピング幅
+# (``..walk_kick_env_cfg._SIGMA_DIRECTION``) と同じ値を意図的に使っている。
+# 「向きをこれだけ外したら報酬がどれだけ減るか」の尺度を、ボールの飛翔方向
+# (τ_direction) と胴体の向き (p_style) で揃えておくと、どちらを直すのが得かの
+# 比が読める。
+#
+# 帯の外を **崖 (0) にしない** のが肝。崖にすると帯の外にいる方策には勾配が
+# 一切なく、帯の中へ偶然入るまで何も学習できない。緩やかに落とせば
+# 「今より少しでも正対する」が必ず得になる。
+# --------------------------------------------------------------------------- #
+_STYLE_DECAY = 0.35
+
 
 def kick_state(
     env: ManagerBasedRLEnv,
@@ -91,6 +113,7 @@ def kick_state(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> dict:
     """キック関連の共有状態を返す。同一ステップ内では一度しか更新しない。
 
@@ -167,6 +190,34 @@ def kick_state(
                   その step の最初の呼び出しで確定するので、項ごとに違う値を渡すと
                   結果が評価順に依存する。
 
+        style_halfwidth: p_style (胴体の向きが蹴り方向にどれだけ正対しているか) を
+            **一点ではなく帯**で採点する [rad]。None (既定) では従来どおり
+            ``clamp(forward·kick_dir, 0, 1)`` = 完全に正対したときだけ 1 で、
+            そこから離れるほど cos で落ちる。値を入れると
+
+                角度差 δ = acos(clamp(forward·kick_dir, -1, 1))
+                excess  = clamp(δ − style_halfwidth, 0)
+                p_style = exp(−(excess / :data:`_STYLE_DECAY`)²)
+
+            となり、**δ ≤ style_halfwidth の間はどこにいても 1** になる。
+
+            **なぜ帯が要るか** (インサイドキック): 足の内側の面でボールを当てるには、
+            蹴り足を体の外へ振り出す都合で胴体が蹴り方向から 30-45° ずれた向きで
+            構えるのが自然な形になる。従来の p_style はその姿勢を
+            cos40° = 0.77 (= キック報酬が 2 割減) と採点するので、**報酬側が
+            「胴体を蹴り方向へ正対させろ」= つま先で蹴る構えを名指しで要求していた**。
+            帯にすると、その範囲内では正対の度合いが報酬に効かなくなり、当たり所
+            (:func:`..rewards.kick_inside_contact`) だけが構えを決めるようになる。
+
+            p_style は latch 時の凍結値 (``p_style_frozen``、項1-3 の r_direction に
+            掛かる) としても、pre-latch の ``p_style`` (``approach_penalty`` /
+            ``ball_avoidance`` の pose_match) としても使われる。計算箇所は 1 か所
+            なので、ここを変えれば両方に同時に効く。
+
+            NOTE: ``lateral_band`` などと同じく **kick_state を呼ぶ全ての項に同じ値を
+                  配ること**。その step の最初の呼び出しで p_style が確定するため、
+                  項ごとに違う値を渡すと結果が評価順に依存する。
+
     NOTE: ``v_thresh_target_frac`` / ``v_thresh_floor`` も ``track_ball`` と
           まったく同じ扱い。トリガー判定を行うのは kick_state 自身だけで、報酬項は
           結果 (``kick_done`` と凍結値) を読むだけなので、報酬項の signature を
@@ -233,6 +284,24 @@ def kick_state(
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
             "sole_height_last_touch": torch.zeros(env.num_envs, device=device),
             "sole_height_at_kick": torch.zeros(env.num_envs, device=device),
+            # ------------------------------------------------------------ #
+            # インサイドキック用の 2 つ。どちらも sole_height の二段パターン
+            # (接触ステップで測る → 値 latch で凍結) を踏襲する。
+            #
+            # foot_kick_dot: 蹴り足リンクの前方向 (足のローカル +x = つま先方向を
+            #   ワールドへ回し、水平成分を正規化したもの) と kick_dir の内積。
+            #   |dot| ≈ 1 → つま先/かかとがキック方向を向いている = トーキック。
+            #   |dot| ≈ 0 → 足が真横を向いている = 足の側面 (インサイド/アウトサイド)
+            #   でボールに当たっている。
+            # ball_side: 接触時のボール中心を蹴り足のローカル座標へ直した y 成分 [m]。
+            #   足のローカル +y は左なので、**右足では正 = ボールが足の内側**。
+            #   インサイド (+y 側) とアウトサイド (−y 側) は |dot| では区別できない
+            #   ので、当たった面をこの符号で分ける。
+            # ------------------------------------------------------------ #
+            "foot_kick_dot_last_touch": torch.zeros(env.num_envs, device=device),
+            "foot_kick_dot_frozen": torch.zeros(env.num_envs, device=device),
+            "ball_side_last_touch": torch.zeros(env.num_envs, device=device),
+            "ball_side_frozen": torch.zeros(env.num_envs, device=device),
             # 軸足 (蹴っていない方の足) のボール相対位置。値 latch で凍結する。
             # plant_lon: キック方向成分 (+ = ボールより前)。plant_lat: 横方向の **絶対値**。
             "plant_lon_frozen": torch.zeros(env.num_envs, device=device),
@@ -285,6 +354,10 @@ def kick_state(
         state["touch_refractory"][just_reset] = 0
         state["sole_height_last_touch"][just_reset] = 0.0
         state["sole_height_at_kick"][just_reset] = 0.0
+        state["foot_kick_dot_last_touch"][just_reset] = 0.0
+        state["foot_kick_dot_frozen"][just_reset] = 0.0
+        state["ball_side_last_touch"][just_reset] = 0.0
+        state["ball_side_frozen"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
         state["foot_vz_frozen"][just_reset] = 0.0
@@ -351,8 +424,21 @@ def kick_state(
 
     # ------------------------------------------------------------------ #
     # p_style: 胴体の向きが蹴り方向にどれだけ正対しているか (1 = 正対)
+    #
+    # style_halfwidth=None (既定) は従来どおりの cos そのまま。値が入っているときだけ
+    # 「帯の中は一律 1、外は超過分に対してガウスで減衰」に切り替わる
+    # (:data:`_STYLE_DECAY` と kick_state の docstring 参照)。
+    # ここ 1 か所で決まる値が、凍結値 p_style_frozen と pre-latch の p_style の
+    # **両方** になるので、帯の効果は項1-3 にも approach_penalty / ball_avoidance にも
+    # 同時に効く。
     # ------------------------------------------------------------------ #
-    p_style = torch.clamp((forward * kick_dir).sum(dim=-1), min=0.0, max=1.0)
+    if style_halfwidth is None:
+        p_style = torch.clamp((forward * kick_dir).sum(dim=-1), min=0.0, max=1.0)
+    else:
+        cos_style = torch.clamp((forward * kick_dir).sum(dim=-1), min=-1.0, max=1.0)
+        style_angle = torch.acos(cos_style)
+        style_excess = torch.clamp(style_angle - style_halfwidth, min=0.0)
+        p_style = torch.exp(-((style_excess / _STYLE_DECAY) ** 2))
 
     # ------------------------------------------------------------------ #
     # 値 latch: L = (v_ball > v_thresh) の立ち上がりで
@@ -399,6 +485,55 @@ def kick_state(
 
     state["sole_height_last_touch"] = torch.where(
         touched, sole_z, state["sole_height_last_touch"]
+    )
+
+    # ------------------------------------------------------------------ #
+    # 接触瞬間の「当たり所の幾何」2 つ。sole_height と同じ二段構え
+    # (接触ステップで測って last_touch に置き、値 latch で frozen へ写す)。
+    #
+    # 足リンクのローカル軸は K1_22dof.xml の foot body で確認済み:
+    #   +x = つま先方向 (コライダー箱 pos=(0.026,0,-0.02) size=(0.09,0.035,0.018)、
+    #        メッシュの x 範囲 −0.066〜+0.119 と、どちらも前方へ張り出している)
+    #   +y = 左 (MJCF はモデル全体が z-up / x-front / y-left で、足リンクまでの
+    #        親子チェーンに回転が入っていない)
+    #   +z = 上 (足裏は z = −_SOLE_OFFSET)
+    # よって **右足のインサイド面は +y 側**。
+    #
+    # foot_kick_dot: 足のローカル +x をワールドへ回し、水平成分を正規化して
+    #   kick_dir との内積を取る。足が上下に傾いていても「上から見てどっちを向いて
+    #   いるか」だけを見たいので、z 成分は落としてから正規化する。
+    #   1 に近い = つま先がキック方向 (トーキック)、−1 に近い = かかとから当てている、
+    #   0 に近い = 足の側面で当てている (インサイド / アウトサイド)。
+    # ball_side: ボール中心を蹴り足のローカル座標へ直した y 成分。足の内外どちら側で
+    #   当てたかは |foot_kick_dot| では区別が付かないので、この符号で分ける。
+    #
+    # NOTE: どちらも「未計測 = 0」で、0 は foot_kick_dot にとっては満点側
+    #       (|dot|=0 = 真横向き) に写る。:func:`..rewards.kick_inside_contact` が
+    #       ``touch_count > 0`` でゲートしているのはこのため
+    #       (``kick_contact_height`` とまったく同じ理由)。ball_side 側は 0 が
+    #       「内側ではない」に写るので二重に塞がれている。
+    # ------------------------------------------------------------------ #
+    env_idx = torch.arange(env.num_envs, device=device)
+    foot_quat = robot.data.body_quat_w[:, foot_ids, :]  # (N, 2, 4)
+    kick_foot_quat = foot_quat[env_idx, kicking_foot, :]  # (N, 4)
+    kick_foot_pos = foot_pos[env_idx, kicking_foot, :]  # (N, 3)
+
+    local_x = torch.zeros_like(kick_foot_pos)
+    local_x[:, 0] = 1.0
+    foot_forward_w = quat_apply(kick_foot_quat, local_x)[:, :2]
+    foot_forward_w = foot_forward_w / (foot_forward_w.norm(dim=-1, keepdim=True) + 1e-6)
+    foot_kick_dot = (foot_forward_w * kick_dir).sum(dim=-1)
+
+    ball_in_foot = quat_apply_inverse(
+        kick_foot_quat, ball.data.root_pos_w[:, :3] - kick_foot_pos
+    )
+    ball_side = ball_in_foot[:, 1]
+
+    state["foot_kick_dot_last_touch"] = torch.where(
+        touched, foot_kick_dot, state["foot_kick_dot_last_touch"]
+    )
+    state["ball_side_last_touch"] = torch.where(
+        touched, ball_side, state["ball_side_last_touch"]
     )
 
     # ------------------------------------------------------------------ #
@@ -496,6 +631,16 @@ def kick_state(
         # ステップなら sole_height_last_touch は既に今回の値に更新されている。
         state["sole_height_at_kick"] = torch.where(
             trigger, state["sole_height_last_touch"], state["sole_height_at_kick"]
+        )
+        # 当たり所の幾何も同じ扱い。「最初の接触」ではなく **latch を起こした接触**
+        # (= キック本体) の値を採る。多重接触があるとき、最初の接触は蹴る前の偶発的な
+        # かすりであることが多く、それを採るとインサイドで蹴っていても
+        # 「つま先が当たった」と誤判定されてしまう。
+        state["foot_kick_dot_frozen"] = torch.where(
+            trigger, state["foot_kick_dot_last_touch"], state["foot_kick_dot_frozen"]
+        )
+        state["ball_side_frozen"] = torch.where(
+            trigger, state["ball_side_last_touch"], state["ball_side_frozen"]
         )
         # 軸足の配置も latch と同時に凍結する。sole_height_at_kick と違って
         # 「最後の接触時」ではなく **latch したステップの現在値** を採る。軸足は接触の

@@ -20,7 +20,13 @@ from __future__ import annotations
 import torch
 from typing import TYPE_CHECKING
 
-from .kick_state import kick_state
+from isaaclab.utils.math import quat_apply
+
+from ...locomotion.mdp.rewards import (
+    feet_close_penalty as _loco_feet_close_penalty,
+    knee_close_penalty as _loco_knee_close_penalty,
+)
+from .kick_state import _foot_body_ids, kick_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -36,6 +42,7 @@ def _r_direction(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """r_direction = (f(τ_direction) − 0.5) * 2 * p_style （いずれも凍結値）。
 
@@ -59,6 +66,7 @@ def _r_direction(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     tau = state["tau_direction_frozen"]
@@ -82,6 +90,7 @@ def kick_direction(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項1. Kick Direction。凍結した飛翔方向誤差 × 凍結 p_style。shape: (N,)
 
@@ -107,6 +116,7 @@ def kick_direction(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     if v_gate_frac <= 0.0:
@@ -129,6 +139,7 @@ def kick_velocity_scaled(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項2. Kick Velocity Scaled = r_direction * f(v_ball)。shape: (N,)
 
@@ -151,6 +162,7 @@ def kick_velocity_scaled(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
@@ -169,6 +181,7 @@ def kick_velocity_strong(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項3. Kick Velocity Strong = r_direction * v_ball（生の速度）。shape: (N,)"""
     r_dir, state = _r_direction(
@@ -181,6 +194,7 @@ def kick_velocity_strong(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
     return r_dir * state["v_ball_frozen"]
 
@@ -196,6 +210,7 @@ def kick_velocity_overshoot(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項10. Kick Velocity Overshoot = clamp(v_ball − (v_target + margin), 0, sat)。
 
@@ -239,6 +254,7 @@ def kick_velocity_overshoot(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     excess = state["v_ball_frozen"] - (state["v_target"] + margin)
@@ -259,6 +275,7 @@ def kick_elevation(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項7. Loop Shot (ループシュート) = r_direction * f(φ)。shape: (N,)
 
@@ -296,6 +313,7 @@ def kick_elevation(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     phi = state["phi_frozen"]
@@ -318,6 +336,7 @@ def kick_loft(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項7'. Loft = r_direction * clamp(vz / vz_sat, 0, 1)。shape: (N,)
 
@@ -344,6 +363,7 @@ def kick_loft(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     vz = state["v_ball_3d_frozen"] * torch.sin(state["phi_frozen"])
@@ -365,6 +385,7 @@ def kick_plant_foot(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項9. Plant Foot (軸足配置) = r_direction * f(lon) * f(lat)。shape: (N,)
 
@@ -413,6 +434,7 @@ def kick_plant_foot(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     f_lon = torch.exp(-((state["plant_lon_frozen"] - lon_target) ** 2) / (2.0 * sigma_lon**2))
@@ -431,6 +453,7 @@ def kick_foot_lift(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項11. Foot Lift (すくい上げ) = r_direction * clamp(foot_vz / vz_foot_sat, 0, 1)。shape: (N,)
 
@@ -481,6 +504,7 @@ def kick_foot_lift(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     f_lift = torch.clamp(state["foot_vz_frozen"] / vz_foot_sat, min=0.0, max=1.0)
@@ -499,6 +523,7 @@ def kick_contact_height(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項12. Contact Height (低い当たり) = r_direction * f_low。shape: (N,)
 
@@ -591,6 +616,7 @@ def kick_contact_height(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     span = max(ball_radius - h_sat, 1e-6)
@@ -610,6 +636,7 @@ def walk_speed(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項4. Walk Speed = (f(τ_walk) − 0.5) * 2 * p_walk。shape: (N,)
 
@@ -627,6 +654,7 @@ def walk_speed(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     f_walk = torch.sigmoid(state["tau_walk"] / sigma_walk)
@@ -645,6 +673,7 @@ def approach_penalty(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項5. Approach Penalty = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -663,6 +692,7 @@ def approach_penalty(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     # 遠いほど 1 に近づく
@@ -686,6 +716,7 @@ def ball_avoidance(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項5'. Ball Avoidance = f(d_soleToBall) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -715,6 +746,7 @@ def ball_avoidance(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     # 近いほど 1 に近づく (approach_penalty と逆)
@@ -738,6 +770,7 @@ def ball_avoidance_exec(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項5''. Ball Avoidance (execution 解釈) = f(d_mean) * p_kickPose。負の重みで使う。shape: (N,)
 
@@ -794,6 +827,7 @@ def ball_avoidance_exec(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
 
     # 遠いほど 1。d_contact 以下 (= 接触している) で厳密に 0。
@@ -816,6 +850,7 @@ def extra_ball_touch(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項8. 2 回目以降のボール接触。発火したステップだけ 1。負の重みで使う。shape: (N,)
 
@@ -837,6 +872,7 @@ def extra_ball_touch(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
     return state["extra_touch_event"]
 
@@ -850,6 +886,7 @@ def kick_latch_bonus(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項9. Latch 後の定額ボーナス。post-latch の間ずっと 1。正の重みで使う。shape: (N,)
 
@@ -894,6 +931,7 @@ def kick_latch_bonus(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
     return state["kick_done"].float()
 
@@ -907,6 +945,7 @@ def kick_pose_overshoot(
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
 ) -> torch.Tensor:
     """項6. Kick Pose Overshoot。キック線 R を跨いだ瞬間だけ 1。負の重みで使う。shape: (N,)
 
@@ -925,5 +964,294 @@ def kick_pose_overshoot(
         orbit_beta=orbit_beta,
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
     )
     return state["overshoot_event"]
+
+
+# --------------------------------------------------------------------------- #
+# インサイドキック (足の内側の面で当てる) 用の項
+#
+# 既存のキック報酬は「どこへ・どれだけ速く飛んだか」しか見ないので、当たり所は
+# 自由だった。実測では 9/9 の run がトーキック (つま先で突く形) に収束している。
+# つま先はボールとの接触面積が小さく、実機では当たり所のわずかなずれが方向誤差に
+# 直結するので、面の広いインサイドで当てさせたい。
+#
+# 誘導の入口は 2 つあり、この 2 つで組になっている:
+#   1. 逆風を外す  … p_style の帯 (:mod:`.kick_state` の ``style_halfwidth``)。
+#      「胴体を蹴り方向へ正対させろ」= トーキックの構えの要求を、帯の中では消す。
+#   2. 順風を入れる … :func:`kick_inside_contact`。接触の幾何 (足の向き・当たった面)
+#      を直接採点する。
+# --------------------------------------------------------------------------- #
+
+
+def kick_inside_contact(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    d_sat: float = 0.34,
+    side_margin: float = 0.0,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項13. Inside Contact (右足インサイドで当てたか) = r_direction * f_perp * f_side。shape: (N,)
+
+    値 latch を起こした接触 (= キック本体) の幾何を凍結値で採点する。
+
+    * ``f_perp = clamp((1 − |foot_kick_dot_frozen|) / (1 − d_sat), 0, 1)``
+      : 蹴り足がキック方向に対してどれだけ **横を向いているか**。
+      ``foot_kick_dot_frozen`` は足のローカル +x (つま先方向) の水平成分と kick_dir の
+      内積なので、1 に近い = つま先が前 = トーキック、0 に近い = 足が真横 = 側面で
+      当てている。
+    * ``f_side = (ball_side_frozen > side_margin)``
+      : ボールが蹴り足の **ローカル +y 側 = 内側** にあった接触だけを通す 0/1。
+      右足のインサイド面が +y であることは K1_22dof.xml の foot body から確認済み
+      (:mod:`.kick_state` の該当コメント参照)。|foot_kick_dot| だけではインサイドと
+      アウトサイドが区別できないので、この符号が要る。
+    * ``right = (kick_foot_frozen == 1)``
+      : 右足で蹴った latch だけ。kick_state の規約で 1 = 右。**このタスクは右足専用**
+      (既存 run が 9/9 右足なので、左右両対応にして探索空間を倍にする理由がない)。
+    * ``measured = (touch_count > 0)``
+      : 一度も接触が記録されないまま latch した場合のガード。``kick_contact_height``
+      とまったく同じ理由で、``foot_kick_dot_frozen`` の初期値 0 は f_perp = 1 =
+      **満点側** に写ってしまう。未計測が満点になる向きの失敗モードは残さない。
+
+    なぜ f_perp を線形クランプにするか (Gaussian にしないこと)
+    --------------------------------------------------------
+    ``d_sat = 0.34`` は cos70°。足がキック方向から 70° 以上横を向いた当たりで満点、
+    そこから連続に落ちて、真正面 (|dot| = 1 = 完全なトーキック) でようやく 0 になる。
+    **全域で勾配が残る**のが肝。
+
+    Gaussian にすると、σ の外にいる方策には勾配がまったく無くなる。walk_lob 系 5 run の
+    ``kick_plant_foot`` (f_lon が Gaussian) で実際にこれが起きていて、plant_lon は
+    −0.36〜−0.43 に居座ったまま一度も目標へ寄らず、σ を広げた版でも gap が開いただけ
+    だった。学習の出発点はトーキック (|dot| ≈ 1) の側なので、その位置で値も勾配も
+    死んでいる形にしてはいけない。
+
+    設計上の約束 (``kick_plant_foot`` / ``kick_contact_height`` と同じ)
+    ------------------------------------------------------------------
+    * **r_direction への乗算**であること。加算にすると「方向を無視して足を横に向ける」
+      だけで報酬が取れてしまう。乗算なら kick_done ゲート・方向精度 (τ_direction)・
+      胴体の向き (p_style) を全て通過した蹴りにしか払われない。``sigma_direction`` は
+      同じタスクの他のキック報酬と **必ず同じ値** にすること。
+    * **他のキック報酬とは加算で並べる** (乗算にしない)。学習初期はインサイドがまず
+      出ないので、他項に掛けるとそちらの勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。トーキックは「罰される」のではなく「報われない」に留める。
+      負の dense 払いにすると ``_r_direction`` の NOTE と同じ「外したら早く転んで
+      損切り」の抜け道が復活する。
+
+    TODO: 発見が立ち上がった後に「インサイドで当たっていない蹴りは他のキック報酬も
+          減らす」形 (f_perp を r_direction 側のゲートに昇格させる) へ進めたくなったら、
+          この項とは別に gate 用の係数関数を足すこと。エスカレーションであって、
+          最初から掛けてはいけない (上の「加算で並べる」と同じ理由)。
+
+    Args:
+        d_sat: f_perp が満点になる |foot_kick_dot| の上限。既定 0.34 = cos70°。
+        side_margin: 内側判定のしきい値 [m]。0.0 (既定) で「足のローカル原点より
+            +y 側」。足の半幅は 0.035 なので、当たり面をもっと内側に限りたければ
+            正の値を入れる。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+
+    span = max(1.0 - d_sat, 1e-6)
+    f_perp = torch.clamp((1.0 - state["foot_kick_dot_frozen"].abs()) / span, min=0.0, max=1.0)
+    f_side = (state["ball_side_frozen"] > side_margin).float()
+    right = (state["kick_foot_frozen"] == 1.0).float()
+    measured = (state["touch_count"] > 0.0).float()
+
+    return r_dir * f_perp * f_side * right * measured
+
+
+def inside_foot_orient(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_dist: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項14. Inside Foot Orientation (latch 前の足の向き) 。shape: (N,)
+
+    ``exp(−(d / sigma_dist)²) × (1 − |右足前方向 · kick_dir|)`` を latch 前だけ払う。
+    d は右足リンクとボール中心の距離 [m]。
+
+    :func:`kick_inside_contact` は「当たった瞬間」しか見ないので、そもそもインサイドで
+    当たる接触が一度も起きなければ勾配が 1 度も立たない。この項はその発見期の呼び水で、
+    **接触していなくても、ボールの近くで足が横を向いていれば払う**。
+
+    .. warning::
+       **農作 (reward farming) のリスクがある。** 蹴らずにボールの脇で足を横に向けた
+       まま滞在すると、この項だけが毎ステップ入り続ける。kick_done ゲートは掛けてある
+       ので latch 後は消えるが、**latch させないこと自体が得**という方向の圧力になる。
+       このリポジトリの他のキック項が全て「latch を通った蹴りにしか払わない」形に
+       してあるのは同じ穴を避けるためで、この項だけがその原則を破っている。
+
+       したがって既定では **weight 0 で寝かせておく**。``kick_inside_contact`` が
+       数千 iteration 立ち上がらず、``Metrics/kick_direction/kick_rate`` は健全なのに
+       インサイドの当たりがまったく出ない、という状況を確認してから、人間が小さい
+       weight で有効化すること。有効にしたら ``kick_rate`` と ``time_out`` の割合を
+       必ず並べて見る (滞在解に落ちると kick_rate が下がり time_out が増える)。
+
+    NOTE: 右足だけを見る (:func:`kick_inside_contact` と揃えて右足専用)。
+    NOTE: 凍結値ではなく現在値を使うので、kick_state の状態には触らずに
+          ロボット・ボール・コマンドから直接測る。kick_state は kick_done ゲートと
+          パラメータの一貫性 (同じ step の状態を共有すること) のためだけに呼ぶ。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+
+    robot = env.scene["robot"]
+    ball = env.scene["soccer_ball"]
+    # _foot_body_ids は [left, right] の順 (kick_state の規約)。
+    right_id = _foot_body_ids(env, robot)[1]
+
+    right_pos = robot.data.body_pos_w[:, right_id, :]
+    d = (right_pos - ball.data.root_pos_w[:, :3]).norm(dim=-1)
+
+    local_x = torch.zeros_like(right_pos)
+    local_x[:, 0] = 1.0
+    foot_forward = quat_apply(robot.data.body_quat_w[:, right_id, :], local_x)[:, :2]
+    foot_forward = foot_forward / (foot_forward.norm(dim=-1, keepdim=True) + 1e-6)
+
+    cmd = env.command_manager.get_command("kick_direction")
+    kick_dir = torch.stack([cmd[:, 1], cmd[:, 0]], dim=-1)
+
+    f_near = torch.exp(-((d / sigma_dist) ** 2))
+    f_perp = 1.0 - (foot_forward * kick_dir).sum(dim=-1).abs()
+
+    return f_near * f_perp * (~state["kick_done"]).float()
+
+
+# --------------------------------------------------------------------------- #
+# 脚同士の接近ペナルティの「キック中だけ緩める」版
+#
+# locomotion 側の feet_close_penalty (足首・二値・しきい値 0.14) と
+# knee_close_penalty (膝・連続・しきい値 0.13) は、``enabled_self_collisions=False``
+# で sim では脚がすり抜けてしまうぶんを報酬で補う項。無いと交差する歩容を獲得して
+# MuJoCo / 実機で実際に脚がぶつかる。
+#
+# ところがインサイドキックは「軸足をキック線のすぐ脇まで寄せて、蹴り足を体の内側から
+# 外へ振る」動きなので、接触の前後で左右の脚が普段の歩行より確実に近づく。しきい値を
+# 歩行のまま置くと、**インサイドの構えそのものが罰される**。
+#
+# そこで「ボールが近い env だけ」しきい値を緩める。
+#   * 緩めるだけで **無効化はしない**。膝コライダーの直径は 0.09、足箱の幅は 0.07
+#     (半幅 0.035) なので、0.10 はまだ物理的な接触の手前。実機で脚がぶつかる解は
+#     引き続き罰される。
+#   * ボールが飛んでいけば d_sole_to_ball が開いて自動的に元のしきい値へ戻るので、
+#     カリキュラムも時計も要らない。「蹴る瞬間だけ緩い」が距離だけで実現する。
+# --------------------------------------------------------------------------- #
+
+
+def feet_close_penalty_kick_aware(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    feet_distance_threshold: float = 0.14,
+    relaxed_threshold: float = 0.10,
+    relax_dist: float = 0.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """``locomotion.mdp.rewards.feet_close_penalty`` の「ボールが近い間だけ緩める」版。
+
+    ボールまでの距離 (``kick_state`` の ``d_sole_to_ball``) が ``relax_dist`` 未満の
+    env だけしきい値を ``relaxed_threshold`` に切り替え、それ以外は locomotion 版と
+    **完全に同じ値** を返す。負の重みで使う (locomotion 側と同じ −20)。
+
+    Args:
+        feet_distance_threshold: 通常時のしきい値 [m]。locomotion 側の既定と揃える。
+        relaxed_threshold: ボールが近いときのしきい値 [m]。足箱の幅が 0.07 なので
+            0.10 は左右の足がまだ 3cm 空いている状態。
+        relax_dist: しきい値を緩める距離 [m]。0.5 はキックの構えに入る手前。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+    near = state["d_sole_to_ball"] < relax_dist
+
+    # locomotion 版をそのまま 2 回呼んで env ごとに選ぶ。しきい値を per-env の
+    # テンソルにする形だと locomotion 側の実装を写し取ることになり、あちらを直した
+    # ときに片方だけ古くなる。
+    normal = _loco_feet_close_penalty(env, feet_distance_threshold=feet_distance_threshold)
+    relaxed = _loco_feet_close_penalty(env, feet_distance_threshold=relaxed_threshold)
+    return torch.where(near, relaxed, normal)
+
+
+def knee_close_penalty_kick_aware(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    min_distance: float = 0.13,
+    relaxed_min_distance: float = 0.10,
+    relax_dist: float = 0.5,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """``locomotion.mdp.rewards.knee_close_penalty`` の「ボールが近い間だけ緩める」版。
+
+    切り替えの条件も理由も :func:`feet_close_penalty_kick_aware` と同じ。
+    膝コライダーは半径 0.045 の円柱なので幾何的な接触は約 0.09、
+    ``relaxed_min_distance = 0.10`` はその手前で、緩めても交差は罰され続ける。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+    near = state["d_sole_to_ball"] < relax_dist
+
+    normal = _loco_knee_close_penalty(env, min_distance=min_distance)
+    relaxed = _loco_knee_close_penalty(env, min_distance=relaxed_min_distance)
+    return torch.where(near, relaxed, normal)
