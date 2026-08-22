@@ -189,12 +189,41 @@ _RAND_SPIN_RANGE = (0.0, 5.0)
 _BALL_ANGULAR_DAMPING = 0.5
 
 
-def apply_ball_param_dr(cfg) -> None:
+def apply_ball_param_dr(
+    cfg,
+    *,
+    static_friction_range: tuple[float, float] | None = None,
+    dynamic_friction_range: tuple[float, float] | None = None,
+    restitution_range: tuple[float, float] | None = None,
+    mass_scale_range: tuple[float, float] | None = None,
+) -> None:
     """ボールまわりの 4 点セットを適用する (足の反発 / 物性 / 初期回転 / 転がり減速)。
 
     ボールが居ない段 (walk phase) から呼んでも安全なように、``soccer_ball`` と
     ``reset_ball`` の有無を見てから触る。
+
+    ボール物性の 4 つの範囲だけ、キーワード引数で差し替えられる
+    ----------------------------------------------------------
+    既定は ``None`` = このモジュールの定数 (:data:`_BALL_STATIC_FRICTION_RANGE` ほか)。
+    **既定のまま呼べば従来と 1 ビットも変わらない**ので、既存の呼び出し元
+    (walk_weak_kick_orbit / walk_inside_kick / walk_long_pass_orbit 側の同名関数) は
+    そのままでよい。
+
+    引数を足した理由は :class:`~..walk_inside_kick.walk_inside_kick_env_cfg.K1WalkInsideKickDualRoughEnvCfg`
+    (stage 3)。あちらは平坦 stage で入った narrow な orbit DR を、凹凸地形と一緒に
+    walk_loop_shoot の広い帯へ **広げ直す**。新しい ``apply_*`` を書き足すと
+    「初期回転・転がり減速・足の反発」の 3 点が二重管理になるので、範囲だけを
+    差し替えられるようにしてある。
+
+    **2 回呼んでも安全** (差分ではなく上書き)。``ball_physics_material`` /
+    ``ball_mass`` は EventTerm を作り直して代入、``reset_ball`` の spin 2 キーと
+    ``soccer_ball.spawn.rigid_props`` も同じ値の再代入なので、累積するものは無い。
     """
+    static_friction_range = static_friction_range or _BALL_STATIC_FRICTION_RANGE
+    dynamic_friction_range = dynamic_friction_range or _BALL_DYNAMIC_FRICTION_RANGE
+    restitution_range = restitution_range or _BALL_RESTITUTION_RANGE
+    mass_scale_range = mass_scale_range or _BALL_MASS_SCALE_RANGE
+
     # -- (1) 足の反発係数 ------------------------------------------------ #
     cfg.events.physics_material.params["restitution_range"] = _FOOT_RESTITUTION_RANGE
 
@@ -210,9 +239,9 @@ def apply_ball_param_dr(cfg) -> None:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("soccer_ball"),
-            "static_friction_range": _BALL_STATIC_FRICTION_RANGE,
-            "dynamic_friction_range": _BALL_DYNAMIC_FRICTION_RANGE,
-            "restitution_range": _BALL_RESTITUTION_RANGE,
+            "static_friction_range": static_friction_range,
+            "dynamic_friction_range": dynamic_friction_range,
+            "restitution_range": restitution_range,
             "num_buckets": _BALL_MATERIAL_BUCKETS,
         },
     )
@@ -221,7 +250,7 @@ def apply_ball_param_dr(cfg) -> None:
         mode="startup",
         params={
             "asset_cfg": SceneEntityCfg("soccer_ball"),
-            "mass_distribution_params": _BALL_MASS_SCALE_RANGE,
+            "mass_distribution_params": mass_scale_range,
             "operation": "scale",
         },
     )

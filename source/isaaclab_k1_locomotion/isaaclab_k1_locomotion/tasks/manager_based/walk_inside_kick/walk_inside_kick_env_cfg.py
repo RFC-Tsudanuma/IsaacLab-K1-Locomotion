@@ -146,6 +146,78 @@ checkpoint を引き継いでいる。このタスクは **1 段で回す**。
 ``--resume`` は使わないこと (common_step_counter が同期され、キック報酬の
 フェードインが「もう終わった」と判定されてランプしない)。``--reset_noise_std`` も
 使わないこと (歩行 checkpoint のスイングを壊す)。
+
+stage 2 / stage 3 (dual history / rough + DR)
+---------------------------------------------
+上の「なぜ段を分けないのか」は **型を発見するまで** の話。インサイドの型は
+run 2026-08-22_11-56-42 (3600 iteration) で収束した::
+
+    Curriculum/kick_expansion/alpha      1.0   (全方位に到達済み)
+    Metrics/kick_direction/kick_rate     0.998
+    Metrics/kick_direction/plant_lon     -0.107   (初版 -0.23 から目標 -0.03 側へ)
+    Metrics/kick_direction/foot_kick_dot -0.030   (足が真横 = 側面で当てている)
+    Metrics/kick_direction/kick_vel_ratio 0.887
+
+ここから先は「同じ型のまま実機へ寄せる」フェーズで、こちらは **fine-tune の段** に
+分ける。1 run でまとめて掛けると、崩れたときに履歴のせいなのか地形のせいなのか
+DR のせいなのか切り分けられないため。
+
+* **stage 2** = :class:`K1WalkInsideKickDualEnvCfg` (平坦、観測履歴のみ)
+
+  actor の入力を 100 フレームの履歴にする (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。
+  **変えるのはそれだけ。** 報酬・コマンド・地形・ボール DR は stage 1 と同一なので、
+  ここで指標が動いたら原因は履歴以外にあり得ない。
+
+* **stage 3** = :class:`K1WalkInsideKickDualRoughEnvCfg` (凹凸 + ボール物性 DR 拡大)
+
+  stage 2 の上に :func:`~..walk_kick.walk_kick_env_cfg._apply_rough_terrain` (±1-4 cm の
+  ランダム凹凸) と、ボール物性 DR の帯を walk_loop_shoot 相当まで広げたものを載せる。
+
+カリキュラムは段に入る前に終値へ固定する (:func:`_pin_curricula_at_end`)
+--------------------------------------------------------------------------
+stage 2/3 は ``--load_pretrained`` で **収束済み** checkpoint から始める。あちらは
+``common_step_counter`` を 0 に戻すので、カリキュラムを生かしたままだと全ランプが
+巻き戻る (キック報酬は 0 から、拡大ゲートは限定レンジから、σ_velocity は 1.0 から、
+``lon_span`` は 0.45 から、strong は満額から)。その帰結が
+:func:`~..walk_kick_dual.walk_kick_dual_env_cfg._freeze_fade_in_curricula` の docstring に
+書かれている「最初の 500 iteration は蹴らない方が得」で、蹴らなくなった後に weight が
+戻ってきても払われる先が無い。詳細と、なぜ ``_freeze_fade_in_curricula`` ではなく
+**項ごと None にする** のかは :func:`_pin_curricula_at_end` の docstring。
+
+checkpoint の橋渡し
+-------------------
+stage 1 の checkpoint は **1 フレーム観測** (素の ``ActorCritic``) なので、履歴 actor
+(``ActorCriticHistoryCNN``) には形が合わず、そのままでは actor が 1 本も引き継がれない。
+``--warm_start_from_single_frame`` を付けると旧 actor を履歴 actor の
+「最新フレームの列」へ移植するので、学習開始時点の出力が stage 1 のポリシーと一致する
+(:func:`~..locomotion.networks.remap_single_frame_actor`)。critic は 1 フレームのまま
+(このタスクは 61 次元) なので無加工でそのまま載る。
+通しスクリプト :file:`scripts/rsl_rl/train_walk_inside_kick_dual.sh` は checkpoint に
+``actor.0.weight`` があるかを見てこのフラグを自動で付ける。
+stage 2 → stage 3 は履歴 → 履歴なのでフラグは不要 (付かない)。
+
+TensorBoard で最初に見るもの (stage 2/3 共通)
+---------------------------------------------
+出発点が収束済みなので、**伸びしろより「壊れていないこと」を先に見る**。
+上に挙げた run 2026-08-22_11-56-42 の値が基準:
+
+* ``Metrics/kick_direction/plant_lon`` ≈ −0.11。0.05 以上マイナス側へ戻る
+  (= −0.16 より後ろ) なら軸足の踏み込みを失っている。実機の転倒事故の直接原因なので、
+  ここが戻ったら他がどれだけ良くても採用しない。
+* ``Metrics/kick_direction/foot_kick_dot`` ≈ 0。1 に向かって上がっていたら
+  インサイドを捨ててトーキックへ戻っている。
+* ``Metrics/kick_direction/kick_vel_ratio`` ≈ 0.88。
+* ``Metrics/kick_direction/kick_rate`` ≈ 1.0。stage 3 は地形と DR が乗るので
+  最初の数百 iteration は落ちてよいが、戻ってこなければ地形が厳しすぎる。
+
+いずれも 1 iteration 目からほぼ基準値のはずで、**そうなっていなければ
+checkpoint が繋がっていない** (起動ログの "Skipped N tensors" を見ること)。
+
+禁止フラグ (stage 1 と同じ)
+---------------------------
+* ``--resume`` — experiment_name が段ごとに違うので前段を検出できないうえ、
+  ``common_step_counter`` を同期してしまう。段の引き継ぎは常に ``--load_pretrained``。
+* ``--reset_noise_std`` — 収束済みの std (0.06-0.1 級) を戻すと当たり所の精度が壊れる。
 """
 
 import math
@@ -155,15 +227,23 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
+from ..locomotion.mdp.curriculums import (
+    lin_vel_command_curriculum,
+    modify_command_resampling_time_range,
+    modify_push_robot,
+)
+from ..locomotion.rough_env_cfg import _apply_play_viewer
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
     _apply_noisy_ball_obs,
+    _apply_rough_terrain,
     _disable_ball_obs_jitter,
     _KICK_STATE_PARAMS,
     _KICK_W_SCALE,
     _SIGMA_DIRECTION,
     K1WalkKickEnvCfg,
 )
+from ..walk_kick_dual.walk_kick_dual_env_cfg import enable_obs_history
 from ..walk_middle_kick.walk_middle_kick_env_cfg import _apply_middle_kick_recipe
 from ..walk_weak_kick.walk_weak_kick_env_cfg import _STRONG_W
 from ..walk_weak_kick_orbit.orbit_mods import (
@@ -811,3 +891,443 @@ class K1WalkInsideKickEnvCfg_PLAY(K1WalkInsideKickEnvCfg):
         # 関数側に移したジッタは別途切る。遅延とサンプル&ホールドは観測パイプラインの
         # 構造 (= PLAY で見たいもの) なので残す。
         _disable_ball_obs_jitter(self)
+
+
+# =========================================================================== #
+# stage 2 / stage 3 — 収束済み checkpoint からの fine-tune 段
+#
+# 段の位置づけ・引き継ぎ方・TensorBoard で見るものはモジュール docstring の
+# 「stage 2 / stage 3 (dual history / rough + DR)」節にまとめてある。
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# stage 3 で広げるボール物性 DR の帯
+#
+# 基底のレシピ (:func:`_apply_inside_kick_recipe` → :func:`~..walk_weak_kick_orbit.orbit_mods.apply_ball_param_dr`)
+# は既に orbit の narrow な帯を入れている:
+#     静摩擦 (0.3, 0.7) / 動摩擦 (0.2, 0.5) / 反発 (0.2, 0.7) / 質量 ×(0.9, 1.15)
+# stage 3 は **これを walk_loop_shoot と同じ広い帯へ広げるだけ** で、DR の項目
+# (足の反発 / ボール物性 / 初期回転 / 転がり減速) は 1 つも増やさない。
+#
+# 値の出どころは :mod:`..walk_loop_shoot.walk_loop_shoot_env_cfg` の同名定数で、
+# 「IsaacLab (摩擦 1.0/0.8, restitution 0.6) と MuJoCo (摩擦 0.4, 反発ほぼ 0) の
+# 両方を内包する」という取り方。同じ蹴り方が両方の接触モデルで通るように寄せる。
+# 実機がどちら寄りかは不明なので、片方に合わせるのではなく両方をカバーする。
+#
+# 質量スケールだけは orbit と同じ (0.9, 1.15) = 5 号球の公称 410-450 g のばらつき。
+# 広げる理由が無い (実球の質量は物理的にこの範囲を出ない)。明示的に渡しているのは、
+# 4 つの範囲がここに並んでいた方が「何を広げて何を据え置いたか」が読めるため。
+#
+# NOTE: 平坦の stage 2 では **広げない**。stage 2 の趣旨は「観測履歴だけを変えて
+#       効果を切り分ける」ことなので、DR を混ぜると変更点が 2 つになる。
+# --------------------------------------------------------------------------- #
+_ROUGH_BALL_STATIC_FRICTION_RANGE = (0.3, 1.0)
+_ROUGH_BALL_DYNAMIC_FRICTION_RANGE = (0.2, 0.8)
+_ROUGH_BALL_RESTITUTION_RANGE = (0.0, 0.7)
+_ROUGH_BALL_MASS_SCALE_RANGE = (0.9, 1.15)
+
+# --------------------------------------------------------------------------- #
+# :func:`_pin_curricula_at_end` が **固定せずそのまま残す** カリキュラム項。
+#
+# 3 つとも locomotion 側 (:class:`~..locomotion.flat_env_cfg.K1FlatCurriculumCfg`) が
+# 全 K1 タスクへ配っている **環境 DR のスケジュール** で、報酬のランプではない:
+#
+#   * modify_command_resampling_time_range … base_velocity の再サンプリング間隔
+#   * lin_vel_command_curriculum           … 線速度コマンド範囲の段階拡大
+#   * modify_push_robot                    … 外乱プッシュの強さ / 間隔
+#
+# 残す理由が 3 つある:
+#
+# 1. **巻き戻る向きが「易しい方」**。フェードイン系が巻き戻ると「蹴らない方が得」に
+#    なるのが問題なのに対し、こちらが巻き戻ると外乱が弱く・コマンド帯が狭くなる
+#    だけで、収支が逆転する経路が無い。
+# 2. **窓が短い**。num_steps は raw step で 6000-14000 = 250-583 iteration
+#    (steps_per_iteration = 24)。fine-tune の既定 3000 iteration のごく序盤で
+#    終値に着く。
+# 3. ``lin_vel_command_curriculum`` はそもそも壁時計のランプではなく **追従誤差で
+#    段が進むゲート**。「終値を書き込む」という操作が意味を持たない。
+#
+# また、このリポジトリの全 PLAY cfg が既にこの 3 項を生かしたまま回している
+# (CurriculumManager は PLAY でも step 0 から走る) ので、ここだけ挙動を変えると
+# 他タスクの PLAY と比較できなくなる。
+#
+# **func の identity で判定する** (名前ではなく)。名前で書くと、将来 cfg 側で項名を
+# 変えたときに黙って NotImplementedError 側へ落ちる。
+# --------------------------------------------------------------------------- #
+_UNPINNED_CURRICULUM_FUNCS = (
+    modify_command_resampling_time_range,
+    lin_vel_command_curriculum,
+    modify_push_robot,
+)
+
+
+def _pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1.0) -> list[str]:
+    """全カリキュラム項の **終値を対象へ直接書き込み、項そのものを None にする**。
+
+    なぜ必要か
+    ----------
+    stage 2/3 は ``--load_pretrained`` で **収束済み**の checkpoint から始める
+    (基準 run 2026-08-22_11-56-42、3600 iteration、カリキュラムは全て 3000 で終点に
+    到達済み)。``--load_pretrained`` は ``--resume`` と違って ``common_step_counter`` を
+    引き継がず 0 から数え直すので、カリキュラムを生かしたままだと **全部のランプが
+    巻き戻る**:
+
+    * キック報酬 4 項 (direction / scaled / inside_contact / plant_lon) が weight 0 から
+      フェードインし直す。この間 ``kick_finished`` は「残りの歩行報酬を捨てるコスト」
+      だけを課すので、**最初の 500 iteration は蹴らない方が得**が明示的に成立する
+      (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg._freeze_fade_in_curricula` の
+      docstring にある実測。500 iteration 後に weight が戻っても、そのときには
+      蹴らなくなっているので払われる先が無い)。
+    * 拡大ゲートの α が 0 に戻り、ボールが ±60°・0.5-0.8 m の限定レンジに縮む。
+      収束済みポリシーには易しすぎるうえ、``ball_avoidance`` が 0 に落ちて
+      ``approach_penalty`` が復活するので、回り込みの構えを壊す方向に更新される。
+    * ``sigma_velocity`` が 0.5 → 1.0 に戻り、速度の採点が緩む
+      (「指令どおりに蹴る」の圧が消える)。
+    * ``kick_plant_lon`` の ``lon_span`` が 0.25 → 0.45 に戻り、勾配が 24 → 13.3 に鈍る。
+      軸足の踏み込み (plant_lon −0.11) は実機の転倒事故への直接の対策なので、
+      ここが緩むのがいちばん困る。
+    * ``kick_velocity_strong`` が満額 (=「速く蹴るほど得」) で復活する。この項は
+      **トーキックを名指しで要求する**項で、退場させたのがこのタスクの肝
+      (:data:`_INSIDE_STRONG_KNOTS`)。
+
+    なぜ ``_freeze_fade_in_curricula`` を使い回さないのか
+    ----------------------------------------------------
+    あちらは (1) ``func`` が ``linear_reward_weight`` の項しか見ず、(2) ``end_step`` が
+    ``before_iter`` 以下のものだけを対象にし、(3) 項は残したまま
+    ``start_weight = end_weight`` に潰す、という作り。このタスクで足りないのは
+    (1) と (2) の方:
+
+    * ``piecewise_reward_weight`` (strong の折れ線) と ``linear_reward_param``
+      (σ_velocity / lon_span) と ``kick_rate_gated_expansion`` (拡大ゲート) は
+      対象外なので、そのまま巻き戻る。
+    * ``kick_velocity_overshoot_weight`` の窓は 1500 → 3000 なので、
+      ``before_iter = 500`` では拾えない。基準 run では完走しているので凍結が正しい。
+
+    (3) の「項を残す」は、まだ動く窓が後ろに残っている段では利点 (今いくつなのかが
+    ``Curriculum/...`` に出続ける) だが、**全部の窓が既に閉じているこの段では
+    ただのノイズ**。項ごと ``None`` にすると:
+
+    * 「カリキュラムはもう 1 本も無い」を関数の最後に検査できる (下の assert)。
+      定数化しただけだと、新しい項が足されたときに黙って巻き戻る側へ回る。
+    * PLAY cfg が自動的に正しくなる。CurriculumManager は PLAY でも
+      ``common_step_counter`` 0 から走るので、項が生きていると PLAY で見る値が
+      学習終盤と食い違う (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.hold_sigma_direction`
+      の「2. アニールが入っている段の PLAY」と同じ機序)。継承だけで直る。
+
+    Args:
+        cfg: ``__post_init__`` を通した後の env cfg。
+        expansion_alpha: 拡大ゲートを固定する α [0, 1]。既定 1.0 = 全方位。
+            基準 run 2026-08-22_11-56-42 の ``Curriculum/kick_expansion/alpha`` は
+            3643 iteration 時点で **1.0** (kick_rate_ema 0.996) なので既定でよい。
+            別の checkpoint から始めるときは、その run の同じタグを見て合わせること
+            (実力より広い範囲を固定すると、ゲートが本来やる「崩れたら戻る」が
+            効かない状態で難易度だけ据え置かれる)。
+
+    Returns:
+        固定した curriculum 項の名前 (呼び出し側の検証・表示用)。
+
+    Raises:
+        NotImplementedError: 終値の意味が分からない ``func`` の項が残っていたとき。
+            **黙って巻き戻らせないため、握り潰さずに落とす。** 新しいカリキュラムを
+            足したら、この関数にも固定の仕方を書くこと。
+    """
+    pinned: list[str] = []
+
+    for name in sorted(dir(cfg.curriculum)):
+        if name.startswith("_"):
+            continue
+        term = getattr(cfg.curriculum, name, None)
+        # configclass のメソッド (to_dict / replace など) も dir() に出るので、
+        # CurrTerm であることを型で確かめてから触る。
+        if not isinstance(term, CurrTerm):
+            continue
+
+        func = term.func
+        params = term.params
+
+        if func in _UNPINNED_CURRICULUM_FUNCS:
+            # 報酬のランプではない環境 DR のスケジュール。理由は
+            # :data:`_UNPINNED_CURRICULUM_FUNCS` のコメント。
+            continue
+
+        if func is mdp.linear_reward_weight:
+            _reward_term(cfg, params["term_name"], name).weight = params["end_weight"]
+
+        elif func is mdp.piecewise_reward_weight:
+            # 折れ線は最後の knot の weight で頭打ちになる (piecewise_reward_weight の
+            # 実装: step >= knots[-1][0] なら knots[-1][1])。このタスクの strong は
+            # :data:`_INSIDE_STRONG_KNOTS` の最終 knot が (1200, 0.0) なので 0.0。
+            _reward_term(cfg, params["term_name"], name).weight = params["knots"][-1][1]
+
+        elif func is mdp.linear_reward_param:
+            # σ_velocity (1.0 → 0.5) と kick_plant_lon の lon_span (0.45 → 0.25)。
+            _reward_term(cfg, params["term_name"], name).params[params["param_name"]] = params["end_value"]
+
+        elif func is mdp.window_reward_weight:
+            # 「start_step < step <= end_step の間だけ weight、外は 0」。窓の外 =
+            # end_step より後が終状態なので 0。**現在このタスクには 1 つも無い**が、
+            # weak/middle 側に足されたときに黙って巻き戻らないよう先に書いてある
+            # (窓が生きていると fine-tune の序盤だけ罰/報酬が復活する)。
+            _reward_term(cfg, params["term_name"], name).weight = 0.0
+
+        elif func is mdp.kick_rate_gated_expansion:
+            _pin_expansion_gate(cfg, params, expansion_alpha)
+
+        else:
+            raise NotImplementedError(
+                f"curriculum.{name} (func={getattr(func, '__name__', func)}) の終値の固定方法が "
+                "_pin_curricula_at_end に書かれていません。"
+                "stage 2/3 は収束済み checkpoint からの fine-tune なので、"
+                "巻き戻るランプが 1 本でも残っていると型が壊れます。"
+                "固定の仕方をこの関数に足すか、巻き戻ってよい理由を "
+                "_UNPINNED_CURRICULUM_FUNCS に書いて除外してください。"
+            )
+
+        setattr(cfg.curriculum, name, None)
+        pinned.append(name)
+
+    # -- 検算: ランプが 1 本も残っていないこと ----------------------------- #
+    #
+    # 「新しいカリキュラム項を足したのにこの関数を直し忘れる」を起動時に落とすための
+    # 検査。上のループが NotImplementedError で守っているので通常は到達しないが、
+    # 除外リストの誤用 (報酬ランプを間違って入れる) はここでしか捕まらない。
+    remaining = [
+        n
+        for n in sorted(dir(cfg.curriculum))
+        if not n.startswith("_")
+        and isinstance(getattr(cfg.curriculum, n, None), CurrTerm)
+        and getattr(cfg.curriculum, n).func not in _UNPINNED_CURRICULUM_FUNCS
+    ]
+    if remaining:
+        raise AssertionError(f"固定されなかった curriculum 項が残っています: {remaining}")
+
+    return pinned
+
+
+def _reward_term(cfg: "K1WalkKickEnvCfg", term_name: str, curr_name: str):
+    """カリキュラムの ``term_name`` が指す報酬項を取り出す (無ければ落とす)。
+
+    ``None`` の報酬項に weight を書いても ``AttributeError`` になるだけで
+    「なぜ壊れたか」が読めないので、curriculum 項の名前を添えて先に落とす。
+    """
+    term = getattr(cfg.rewards, term_name, None)
+    if term is None:
+        raise AssertionError(
+            f"curriculum.{curr_name} が指す報酬項 rewards.{term_name} がありません "
+            "(報酬項だけ None にして curriculum 項を消し忘れている可能性)。"
+        )
+    return term
+
+
+def _pin_expansion_gate(cfg: "K1WalkKickEnvCfg", params: dict, alpha: float) -> None:
+    """:func:`~..walk_kick.mdp.curriculums.kick_rate_gated_expansion` が α で動かす
+    5 つの対象に、α を固定した値を直接書き込む。
+
+    **値は全て term 自身の params から読む** (このモジュールの定数を再参照しない)。
+    ゲートの設定を :func:`_apply_inside_kick_recipe` で変えたときに、固定側だけ
+    古い値のまま残る事故を構造的に防ぐため。
+
+    α = 1 のとき ``approach_penalty`` の weight は **0** になる (``end_weight`` では
+    ない)。あちらは ``approach_end_weight × fade × (1 − α)`` というクロスフェードで、
+    全方位に届いた時点で「ボールに寄れ」の圧は ``ball_avoidance`` (寄るな) に
+    完全に置き換わるため。``end_weight`` を書き込むと、収束済みポリシーに対して
+    **互いに打ち消し合う 2 つの罰を同時に掛ける**ことになる。
+    """
+    def lerp(a: float, b: float) -> float:
+        return a + (b - a) * alpha
+
+    half_angle_range = params["half_angle_range"]
+    dist_start, dist_end = params["dist_range_start"], params["dist_range_end"]
+    heading_range = params["heading_halfwidth_range"]
+
+    ball_event = getattr(cfg.events, params["ball_event_name"])
+    ball_event.params["half_angle"] = lerp(*half_angle_range)
+    ball_event.params["dist_range"] = (lerp(dist_start[0], dist_end[0]), lerp(dist_start[1], dist_end[1]))
+
+    heading_half = lerp(*heading_range)
+    getattr(cfg.commands, params["command_name"]).ranges.heading = (-heading_half, heading_half)
+
+    # approach (寄れ) → avoidance (寄るな) のクロスフェード。fade は
+    # min(now / approach_fade_iterations, 1) で、固定する時点では既に 1。
+    # α = 1 では積が -0.0 になる。値は 0.0 と等価だがログ表示が紛らわしいので +0.0 で均す。
+    getattr(cfg.rewards, params["approach_term_name"]).weight = params["approach_end_weight"] * (1.0 - alpha) + 0.0
+    getattr(cfg.rewards, params["avoidance_term_name"]).weight = params["avoidance_end_weight"] * alpha
+
+
+@configclass
+class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
+    """stage 2 (平坦): actor に 100 フレームの観測履歴を与える。
+
+    :class:`K1WalkInsideKickEnvCfg` との差は **2 つだけ**:
+
+    1. カリキュラムを全て終値に固定する (:func:`_pin_curricula_at_end`)。
+    2. policy 観測グループを 100 フレームの履歴にする
+       (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。
+
+    ``__post_init__`` の順序に意味がある::
+
+        super()                 … インサイドのレシピ + ボール観測ノイズ (継承のまま)
+        _pin_curricula_at_end() … 報酬・イベント・コマンドが全部揃った後に固定する
+        enable_obs_history()    … **最後**。観測グループの構成が固まってから履歴化する
+
+    ``enable_obs_history`` を最後に置くのは walk_lob_rough の Stage 3
+    (:class:`~..walk_lob_rough.walk_lob_rough_env_cfg.K1WalkLobHistEnvCfg`) と同じ流儀。
+    ``history_length`` は ObservationGroup 全体に掛かるフラグなので、後から観測項を
+    足しても壊れはしないが、「グループの形を変える操作は最後」を守っておけば
+    順序依存を考えなくて済む。
+
+    dual 系から **持ち込まないもの** (全て意図的)
+    ---------------------------------------------
+    :mod:`..walk_kick_dual` は履歴のほかに 4 つの変更を畳み込んでいるが、この段は
+    **観測履歴だけを変えて効果を帰属させる**のが目的なので 1 つも入れない:
+
+    * ``K1WalkKickBothFeetObservationsCfg`` (観測スロット 3 を左足裏 → ボール 3D 位置、
+      critic 58 次元) — 入れると stage 1 の checkpoint が **意味の上で** 繋がらなくなる
+      (55 次元なので ``--load_pretrained`` は形の上では通ってしまうぶん、たちが悪い)。
+      基底の policy 55 次元 / critic 61 次元をそのまま使う。
+    * ``_apply_phase_offset`` (歩行位相の初期オフセット {0, π}) — 両足で蹴れるように
+      するための変更。**このタスクは右足専用** (``kick_inside_contact`` が右足ゲート付き)
+      なので、蹴り足を割る意味が無い。
+    * ``disable_landing_shaping`` / ``rebalance_gait_vs_kick`` — 報酬の変更。stage 1 が
+      その報酬集合で収束しているので、ここで動かすと「履歴の効果」が読めなくなる。
+      必要になったら **別の段** として足すこと。
+    * ``enable_obs_delay`` — ボール観測にはこのタスク独自の認識パイプライン
+      (:func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs`: エピソードごとの
+      ランダム遅延 2-6 step + 30 Hz サンプル&ホールド + フレーム同期ジッタ) が
+      既に載っており、``enable_obs_delay`` はパイプライン付きの位置スロットを
+      **二重掛け防止のため飛ばす** 作りなので、掛けても実質 IMU / エンコーダにしか
+      効かない。内界センサの遅延 DR は「履歴の効果を見る」この段の目的と別件なので、
+      入れるなら stage 3 以降に単独で足す。
+    * mirror loss (``PPOSparseMirror`` / ``_use_mirror_loss``) — 右足専用タスクなので
+      鏡像対称性が成り立たない。RunnerCfg 側の話なので
+      :mod:`.agents.rsl_rl_ppo_cfg` の ``_use_history_cnn_policy`` を参照。
+
+    引き継ぎ::
+
+        ./scripts/rsl_rl/train_walk_inside_kick_dual.sh          # STAGE=23 が既定
+
+    stage 1 の checkpoint は 1 フレーム観測なので ``--warm_start_from_single_frame``
+    が要る (スクリプトが自動で付ける)。詳細はモジュール docstring。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. カリキュラムを終値へ固定する ------------------------------ #
+        #
+        # --load_pretrained は common_step_counter を 0 に戻すので、生かしたままだと
+        # キック報酬のフェードイン・拡大ゲート・σ_velocity・lon_span・strong の
+        # 全部が巻き戻る。理由の詳細は :func:`_pin_curricula_at_end`。
+        _pin_curricula_at_end(self)
+
+        # -- 2. 観測履歴 (この段で変えるのはここだけ) --------------------- #
+        #
+        # 必ず最後。policy グループの構成が固まってから (N, H, 55) に変える。
+        enable_obs_history(self)
+
+
+@configclass
+class K1WalkInsideKickDualEnvCfg_PLAY(K1WalkInsideKickDualEnvCfg):
+    """stage 2 の PLAY。:class:`K1WalkInsideKickEnvCfg_PLAY` と同じ調整。
+
+    カリキュラムは親で全て ``None`` にしてあるので、PLAY でも
+    ``common_step_counter`` 0 から巻き戻る心配は無い (項が 1 つも無い)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        # enable_corruption = False は ObsTerm の noise しか切らないので、
+        # 関数側に移したジッタは別途切る。遅延とサンプル&ホールドは観測パイプラインの
+        # 構造 (= PLAY で見たいもの) なので残す。
+        _disable_ball_obs_jitter(self)
+
+
+@configclass
+class K1WalkInsideKickDualRoughEnvCfg(K1WalkInsideKickDualEnvCfg):
+    """stage 3 (凹凸 + ボール物性 DR の拡大): 実機の床とボールのばらつきへ寄せる最終段。
+
+    stage 2 との差は 2 つだけ:
+
+    1. 地形を ±1-4 cm のランダム凹凸へ
+       (:func:`~..walk_kick.walk_kick_env_cfg._apply_rough_terrain`、
+       :data:`~..walk_kick.walk_kick_env_cfg.WALK_KICK_ROUGH_TERRAIN_CFG`)。
+       ボールは ``spawn_clearance`` = 5 cm 浮かせて落とす (凹凸の振幅より上)。
+    2. ボール物性 DR の帯を walk_loop_shoot 相当まで広げる
+       (:data:`_ROUGH_BALL_STATIC_FRICTION_RANGE` ほか)。
+
+    ``__post_init__`` の順序について
+    --------------------------------
+    ``super()`` が既に :func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`
+    を掛け終わっているが、**問題ない**。:func:`_apply_rough_terrain` が触るのは
+    ``scene.terrain`` の 3 属性と ``events.reset_ball.params["spawn_clearance"]`` だけで、
+    観測グループにも報酬にもコマンドにも一切触らないため (あちらの docstring と実装を
+    確認済み)。同じ理由で :func:`~..walk_weak_kick_orbit.orbit_mods.apply_ball_param_dr`
+    の再呼び出しも観測に影響しない。
+
+    ``apply_ball_param_dr`` を 2 回呼ぶことについて
+    ----------------------------------------------
+    ``super()`` の中 (:func:`_apply_inside_kick_recipe` の第 9 節) で 1 回、ここで
+    もう 1 回。あちらは **差分ではなく上書き** なので冪等:
+    ``events.ball_physics_material`` / ``events.ball_mass`` は EventTerm を作り直して
+    代入、``reset_ball`` の spin 2 キーと ``soccer_ball.spawn.rigid_props`` も同じ値の
+    再代入で、累積するものは 1 つも無い。したがって 2 回目の呼び出しは
+    「範囲だけ差し替わった 1 回目」と等価になる。
+
+    .. warning::
+       **凹凸地形 + ボールの組み合わせはこのリポジトリで学習実績が無い**
+       (``k1_walk_kick_rough`` / ``k1_walk_lob_rough`` 系の log が存在しない。
+       :class:`~..walk_lob_rough.walk_lob_rough_env_cfg.K1WalkLobRoughKickEnvCfg` の
+       同じ警告を参照)。必ず平坦の stage 2 を先に通し、その checkpoint から入ること。
+       立ち上がりで ``kick_rate`` が落ちるのは想定内だが、数百 iteration で戻って
+       こないなら地形が厳しすぎる (地形の振幅を下げるより先に、まず stage 2 の
+       checkpoint が本当に繋がっているかを "Skipped N tensors" で確認すること)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. 地形だけ凹凸へ -------------------------------------------- #
+        _apply_rough_terrain(self)
+
+        # -- 2. ボール物性 DR の帯を広げる -------------------------------- #
+        #
+        # 項目は増やさず範囲だけ差し替える (:data:`_ROUGH_BALL_STATIC_FRICTION_RANGE`)。
+        # 初期回転・転がり減速・足の反発は基底のレシピと同じ値が再代入される。
+        apply_ball_param_dr(
+            self,
+            static_friction_range=_ROUGH_BALL_STATIC_FRICTION_RANGE,
+            dynamic_friction_range=_ROUGH_BALL_DYNAMIC_FRICTION_RANGE,
+            restitution_range=_ROUGH_BALL_RESTITUTION_RANGE,
+            mass_scale_range=_ROUGH_BALL_MASS_SCALE_RANGE,
+        )
+
+
+@configclass
+class K1WalkInsideKickDualRoughEnvCfg_PLAY(K1WalkInsideKickDualRoughEnvCfg):
+    """stage 3 の PLAY。stage 2 の PLAY + generator 地形用のカメラ設定。
+
+    :func:`~..locomotion.rough_env_cfg._apply_play_viewer` を足すのは
+    :class:`~..walk_kick.walk_kick_env_cfg.K1WalkKickRoughEnvCfg_PLAY` と同じ理由。
+    terrain generator は env origin を地形グリッドに割り当てるので、既定の
+    world 固定カメラ (原点を見つめたまま動かない) だと ``play.py --video`` に
+    **地形しか映らない**。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 20
+        self.scene.env_spacing = 4
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+        _disable_ball_obs_jitter(self)
+        _apply_play_viewer(self)
