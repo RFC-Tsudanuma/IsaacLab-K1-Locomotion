@@ -99,6 +99,36 @@ _SOLE_OFFSET = 0.038
 _STYLE_DECAY = 0.35
 
 
+def _foot_forward_xy(quat: torch.Tensor) -> torch.Tensor:
+    """足リンクの姿勢クォータニオンから「上から見たつま先方向」の単位ベクトルを返す。
+
+    足リンクのローカル +x = つま先方向 (K1_22dof.xml の foot body で確認済み:
+    コライダー箱 pos=(0.026, 0, -0.02) size=(0.09, 0.035, 0.018) とメッシュの
+    x 範囲 −0.066〜+0.119 がどちらも前方へ張り出している)。これをワールドへ回し、
+    **z 成分を落としてから正規化する**。
+
+    z を落とすのは「足が上下に傾いていても、上から見てどっちを向いているか」だけを
+    見たいため。足を持ち上げて爪先が下がっている姿勢でも、水平面での向きは変わらない
+    ものとして扱う。正規化の分母に 1e-6 を足してあるのは、足が真上/真下を向いて
+    水平成分が消えたときの 0 除算よけ (その姿勢では向きが定義できないので値に意味は
+    無いが、NaN を下流へ流さない)。
+
+    NOTE: 同じ式を 3 か所 (kick_state の foot_kick_dot / 同 plant_yaw_dot /
+          :func:`..rewards.inside_foot_orient`) で使うのでここに集約してある。
+          ローカル +x が前という規約が変わったら直す場所はここ 1 つ。
+
+    Args:
+        quat: 足リンクのワールド姿勢 ``(N, 4)`` (w, x, y, z)。
+
+    Returns:
+        ``(N, 2)`` の水平単位ベクトル。
+    """
+    local_x = torch.zeros(quat.shape[0], 3, device=quat.device, dtype=quat.dtype)
+    local_x[:, 0] = 1.0
+    forward = quat_apply(quat, local_x)[:, :2]
+    return forward / (forward.norm(dim=-1, keepdim=True) + 1e-6)
+
+
 def kick_state(
     env: ManagerBasedRLEnv,
     r_stance: float,
@@ -306,6 +336,13 @@ def kick_state(
             # plant_lon: キック方向成分 (+ = ボールより前)。plant_lat: 横方向の **絶対値**。
             "plant_lon_frozen": torch.zeros(env.num_envs, device=device),
             "plant_lat_frozen": torch.zeros(env.num_envs, device=device),
+            # 軸足の **向き**: つま先方向 (上から見た水平成分) と kick_dir の内積。
+            # 1 = 軸足のつま先が蹴り方向を向いている、0 = 真横、−1 = 真後ろ。
+            # plant_lon/lat と同じく latch したステップの現在値で凍結する。
+            # 位置 (どこに置くか) だけでなく向きを分けて持つのは、インサイドでは
+            # 「軸足がボール横にあるが、つま先はあらぬ方を向いている」という構えが
+            # 実際に起きるため (:func:`..rewards.kick_plant_yaw`)。
+            "plant_yaw_dot_frozen": torch.zeros(env.num_envs, device=device),
             # 蹴り足のワールド鉛直速度 [m/s]。値 latch で凍結する。+ = すくい上げ。
             "foot_vz_frozen": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
@@ -360,6 +397,7 @@ def kick_state(
         state["ball_side_frozen"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
+        state["plant_yaw_dot_frozen"][just_reset] = 0.0
         state["foot_vz_frozen"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
@@ -518,11 +556,7 @@ def kick_state(
     kick_foot_quat = foot_quat[env_idx, kicking_foot, :]  # (N, 4)
     kick_foot_pos = foot_pos[env_idx, kicking_foot, :]  # (N, 3)
 
-    local_x = torch.zeros_like(kick_foot_pos)
-    local_x[:, 0] = 1.0
-    foot_forward_w = quat_apply(kick_foot_quat, local_x)[:, :2]
-    foot_forward_w = foot_forward_w / (foot_forward_w.norm(dim=-1, keepdim=True) + 1e-6)
-    foot_kick_dot = (foot_forward_w * kick_dir).sum(dim=-1)
+    foot_kick_dot = (_foot_forward_xy(kick_foot_quat) * kick_dir).sum(dim=-1)
 
     ball_in_foot = quat_apply_inverse(
         kick_foot_quat, ball.data.root_pos_w[:, :3] - kick_foot_pos
@@ -553,6 +587,16 @@ def kick_state(
     d_sup = p_sup - ball_pos
     plant_lon = (d_sup * kick_dir).sum(dim=-1)
     plant_lat = torch.abs((d_sup * right_vec).sum(dim=-1))
+
+    # 軸足の向き: つま先方向 (上から見た水平成分) と kick_dir の内積。
+    # foot_quat は上の当たり所ブロックで両足ぶん (N, 2, 4) を既に取ってあるので、
+    # シミュレーションへの追加の読み出しは無い (軸足のスライスを取るだけ)。
+    #
+    # NOTE: **絶対値にしない** (plant_lat と違う)。plant_lat を絶対値で持つのは
+    #       左右どちらの足で蹴るかを縛らないためだが、こちらは前後の裏返し
+    #       (つま先が蹴り方向 / かかとが蹴り方向) が鏡像解ではなく別物だから。
+    #       かかとを蹴り方向へ向けて立つのは誘導したい構えではない。
+    plant_yaw_dot = (_foot_forward_xy(foot_quat[env_idx, support_foot, :]) * kick_dir).sum(dim=-1)
 
     # ------------------------------------------------------------------ #
     # 蹴り足のワールド鉛直速度 v_z [m/s]。値 latch で凍結する (foot_vz_frozen)。
@@ -647,6 +691,12 @@ def kick_state(
         # 瞬間に接地しているので、キック本体のステップの値がそのまま構えを表す。
         state["plant_lon_frozen"] = torch.where(trigger, plant_lon, state["plant_lon_frozen"])
         state["plant_lat_frozen"] = torch.where(trigger, plant_lat, state["plant_lat_frozen"])
+        # 軸足の向きも位置と同じ一段構え (last_touch を経由せず、latch したステップの
+        # 現在値をそのまま凍結する)。理由は plant_lon と同じで、軸足は接触の瞬間に
+        # 接地しているのでそのステップの値がそのまま構えを表す。
+        state["plant_yaw_dot_frozen"] = torch.where(
+            trigger, plant_yaw_dot, state["plant_yaw_dot_frozen"]
+        )
         # 蹴り足の鉛直速度も plant_* と同じく **latch したステップの現在値** を採る。
         # latch = ボールが動き出した瞬間なので、そのステップの足速度がすくい上げの
         # 有無をそのまま表す。

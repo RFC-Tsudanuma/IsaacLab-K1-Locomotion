@@ -70,7 +70,7 @@ class KickDirectionCommand(UniformVelocityCommand):
       この実測値を見て決める (飽和しきっているなら上げる)。
       これも「キックが成立した env」だけで平均している。
 
-    ``cfg.log_contact_geometry`` が True のときだけ、当たり所の幾何が 2 つ増える
+    ``cfg.log_contact_geometry`` が True のときだけ、当たり所の幾何が 3 つ増える
     (既定 False。既存タスクの TB タグ集合を変えないため):
 
     * ``foot_kick_dot``: latch を起こした接触の瞬間に凍結した、蹴り足のつま先方向
@@ -81,6 +81,16 @@ class KickDirectionCommand(UniformVelocityCommand):
       0.035 付近まで来ていれば面の中央で当たっている。
       :func:`~.rewards.kick_inside_contact` の f_side がそのまま見える値で、
       「インサイドで当てられているか」はこの 2 つを並べて読む。
+    * ``plant_yaw_dot``: 同じ瞬間の **軸足** (蹴っていない方の足) のつま先方向
+      (上から見た水平成分) と指令蹴り方向の内積。1 = 軸足のつま先が蹴り方向、
+      0 = 真横、−1 = かかとが蹴り方向。角度に直すなら ``acos``
+      (0.87 = 30°、0.71 = 45°、0.50 = 60°)。
+      ``plant_lon`` / ``plant_lat`` が軸足を **どこに置いたか** なのに対し、これは
+      **どちらを向けたか**。:func:`~.rewards.kick_plant_yaw` が直接引っ張る値なので、
+      その項が効いているかの判定はここを見る。胴体の向き (p_style) は帯で
+      30-45° のずれを許しているので、**胴体と軸足がどれだけ別々の向きを向けている
+      かを見る指標** でもある (両者を分ける自由度は Hip_Yaw)。
+      これも「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
 
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
@@ -131,6 +141,10 @@ class KickDirectionCommand(UniformVelocityCommand):
         if self.cfg.log_contact_geometry:
             self.metrics["foot_kick_dot"] = torch.zeros(self.num_envs, device=self.device)
             self.metrics["ball_side"] = torch.zeros(self.num_envs, device=self.device)
+            # 軸足の **向き** (つま先方向 · kick_dir)。位置の plant_lon / plant_lat とは
+            # 別物なので分けて出す。同じフラグに相乗りさせているのは、これも
+            # walk_inside_kick 専用の指標で、他タスクの TB タグ集合を変えないため。
+            self.metrics["plant_yaw_dot"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -177,6 +191,7 @@ class KickDirectionCommand(UniformVelocityCommand):
         if self.cfg.log_contact_geometry:
             self.metrics["foot_kick_dot"] = state["foot_kick_dot_frozen"] * kick_done
             self.metrics["ball_side"] = state["ball_side_frozen"] * kick_done
+            self.metrics["plant_yaw_dot"] = state["plant_yaw_dot_frozen"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)

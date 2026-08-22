@@ -196,6 +196,61 @@ def linear_reward_param(
     return {param_name: new_value}
 
 
+def piecewise_reward_param(
+    env: ManagerBasedRLEnv,
+    _env_ids: torch.Tensor,
+    term_name: str,
+    param_name: str,
+    knots: list[tuple[float, float]],
+    steps_per_iteration: int = 0,
+) -> dict[str, float]:
+    """折れ線で報酬項の **params の 1 つ** を動かすカリキュラム。
+
+    :func:`piecewise_reward_weight` の params 版であり、:func:`linear_reward_param` の
+    多段版。``knots`` の意味・補間・端の飽和・``steps_per_iteration`` の扱いは
+    :func:`piecewise_reward_weight` とまったく同じ (``[(step, value), ...]`` を step の
+    昇順、区間内は線形補間、最初の knot より前は最初の値、最後の knot より後は
+    最後の値で固定)。
+
+    **なぜ linear_reward_param を 2 本並べてはいけないか**
+    -----------------------------------------------------
+    「1500 → 3000 で 0.45 → 0.25、そのあと 3000 → 4000 でさらに 0.15 へ」のような
+    多段のアニールを、:func:`linear_reward_param` 2 本で書きたくなる。**これは壊れる。**
+    あちらは ``step <= start_step`` のとき ``start_value`` を **書き込む** ので、
+    2 本目 (start_step = 3000) は 3000 までずっと 0.25 を書き続け、1 本目は 3000 以降
+    ずっと 0.25 を書き続ける。同じ param に 2 つの書き手がいる状態になり、
+    最終的な値は **CurriculumManager がどちらの項を後に走らせたか** で決まる
+    (項の順序は cfg の属性順という実装依存の要素)。1 本の折れ線にすれば書き手が
+    1 つになり、この曖昧さが構造的に消える。
+
+    NOTE: :func:`linear_reward_param` と同じく ``RewardManager.get_term_cfg`` が返す
+          cfg の ``params`` を書き換える。報酬関数は毎ステップ params を読み直すので
+          次のステップから反映される。
+    NOTE: 返り値は ``Curriculum/<term_name>/<param_name>`` として TensorBoard に出る。
+    """
+    if steps_per_iteration > 0:
+        step = env.common_step_counter // steps_per_iteration
+    else:
+        step = env.common_step_counter
+
+    if step <= knots[0][0]:
+        new_value = knots[0][1]
+    elif step >= knots[-1][0]:
+        new_value = knots[-1][1]
+    else:
+        new_value = knots[-1][1]
+        for (s0, v0), (s1, v1) in zip(knots[:-1], knots[1:]):
+            if s0 <= step <= s1:
+                alpha = 0.0 if s1 == s0 else (step - s0) / (s1 - s0)
+                new_value = v0 + (v1 - v0) * alpha
+                break
+
+    term = env.reward_manager.get_term_cfg(term_name)
+    term.params[param_name] = new_value
+
+    return {param_name: new_value}
+
+
 def linear_command_speed_range(
     env: ManagerBasedRLEnv,
     _env_ids: torch.Tensor,

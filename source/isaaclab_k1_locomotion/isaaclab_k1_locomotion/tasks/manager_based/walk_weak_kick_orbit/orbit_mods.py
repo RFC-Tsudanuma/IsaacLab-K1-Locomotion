@@ -97,6 +97,17 @@ _KICK_STATE_REWARD_TERMS = (
     # kick_plant_foot とは別項で、あちらは触らない。他タスクの cfg には属性が
     # 存在しないので、上と同じく getattr の None ガードで飛ばされる = 完全に no-op。
     "kick_plant_lon",
+    # 軸足の **向き** (kick_plant_yaw) と、足を上げすぎない天井 (kick_foot_ceiling)。
+    # どちらも walk_inside_kick が実機フィードバック 2 回目で足した項で、上と同じく
+    # 他タスクの cfg には属性が無いので None ガードで飛ばされる = 完全に no-op。
+    #
+    # NOTE: walk_long_pass_orbit/orbit_mods.py は **自前の同名リストを持っている** が、
+    #       あちらには手を入れない。この 2 項を足すのは walk_inside_kick の cfg だけで、
+    #       long_pass 系の cfg には報酬項そのものが存在しないため (名簿に足しても
+    #       None ガードで飛ぶだけの死んだ行が増える)。inside 系は必ずこちらの
+    #       walk_weak_kick_orbit 版を import している。
+    "kick_plant_yaw",
+    "kick_foot_ceiling",
     # 脚同士の接近ペナルティの「キック中だけ緩める」版。locomotion 版
     # (feet_close_penalty / knee_close_penalty) とは **項名を分けてある**。
     # あちらは kick_state を呼ばないので、同じ名前でこのリストに入れると

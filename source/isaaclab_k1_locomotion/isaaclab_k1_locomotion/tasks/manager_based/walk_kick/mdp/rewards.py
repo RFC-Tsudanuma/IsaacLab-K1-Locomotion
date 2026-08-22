@@ -17,16 +17,15 @@ B-Human "A Modular Ball Kicking Behavior with Reinforcement Learning" の
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
-
-from isaaclab.utils.math import quat_apply
 
 from ...locomotion.mdp.rewards import (
     feet_close_penalty as _loco_feet_close_penalty,
     knee_close_penalty as _loco_knee_close_penalty,
 )
-from .kick_state import _foot_body_ids, kick_state
+from .kick_state import _foot_body_ids, _foot_forward_xy, kick_state
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -1165,10 +1164,7 @@ def inside_foot_orient(
     right_pos = robot.data.body_pos_w[:, right_id, :]
     d = (right_pos - ball.data.root_pos_w[:, :3]).norm(dim=-1)
 
-    local_x = torch.zeros_like(right_pos)
-    local_x[:, 0] = 1.0
-    foot_forward = quat_apply(robot.data.body_quat_w[:, right_id, :], local_x)[:, :2]
-    foot_forward = foot_forward / (foot_forward.norm(dim=-1, keepdim=True) + 1e-6)
+    foot_forward = _foot_forward_xy(robot.data.body_quat_w[:, right_id, :])
 
     cmd = env.command_manager.get_command("kick_direction")
     kick_dir = torch.stack([cmd[:, 1], cmd[:, 0]], dim=-1)
@@ -1321,6 +1317,209 @@ def kick_plant_lon(
     gap = (state["plant_lon_frozen"] - lon_target).abs()
     f_lon = torch.clamp(1.0 - gap / span, min=0.0, max=1.0)
     return r_dir * f_lon
+
+
+def kick_plant_yaw(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    yaw_span: float = math.pi / 2,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項16. Plant Yaw (軸足の **向き** を線形で誘導) = r_direction * f_yaw。shape: (N,)
+
+    latch 時に凍結した軸足 (蹴っていない方の足) の **つま先方向** を採点する。
+    ``plant_yaw_dot_frozen`` は「軸足のつま先方向 (上から見た水平成分) · kick_dir」で、
+    1 = つま先が蹴り方向、0 = 真横、−1 = かかとが蹴り方向。
+
+    :func:`kick_plant_lon` が軸足の **位置** (前後) を誘導するのに対し、この項は
+    同じ軸足の **向き** を誘導する。位置と向きは独立に外れるので項も分ける。
+
+    なぜ軸足の向きを誘導したいのか (実機フィードバック 2 回目)
+    ----------------------------------------------------------
+    軸足のつま先が蹴り方向を向いていると、骨盤ごと蹴り方向へ正対する側へ寄るので、
+    振り足の面 (インサイド面) がキック線に正対しやすくなる。軸足が蹴り方向から
+    大きくずれた向きで立つと、振り足はその骨盤の向きに引きずられて斜めに入るので、
+    **当たりが薄くなる / 空振りする**。実機で実際に出ている失敗がこれである。
+
+    胴体 (p_style) の側は帯 (``style_halfwidth`` = 40°) にしてあり、インサイドの
+    自然な構え = 蹴り方向から 30-45° ずれた向きを **積極的に許している**
+    (:mod:`~...walk_inside_kick.walk_inside_kick_env_cfg` の「逆風を外す」節)。
+    この項はそれと矛盾しない: **胴体はずれてよいが軸足は蹴り方向を向かせる**、
+    という役割分担である。骨盤と足首の間に Hip_Yaw があるので両立できる。
+    しかも walk_inside_kick は ``joint_deviation_hip`` の対象から ``.*_Hip_Yaw`` を
+    外してある (Hip_Yaw を初期値 0 へ引き戻す圧が無い) ので、軸足のヨーは
+    ポリシーが自由に使える自由度になっている。
+
+    なぜ cos ではなく **角度** に対して線形なのか
+    --------------------------------------------
+    ``theta = acos(clamp(plant_yaw_dot_frozen, -1, 1))`` [rad] を取ってから
+
+        ``f_yaw = clamp(1 − theta / yaw_span, 0, 1)``
+
+    と、**角度に対する線形テント** (頂点 theta = 0、``yaw_span`` で 0) にする。
+    ``plant_yaw_dot`` (= cos theta) にそのまま線形クランプを掛けると、角度で見たとき
+    非線形になる。特に **0° 付近が真っ平ら** になるのが困る (cos の微分は 0 で 0)。
+    たとえば 0° → 20° のずれで cos は 1.00 → 0.94 しか動かないので、「あと 20° 直す」
+    という改善に対して報酬がほとんど動かない。同じ 20° でも 70° → 90° では
+    cos が 0.34 → 0.00 と大きく動く。**直したい領域 (目標の近く) ほど勾配が細る**
+    という、報酬の形として最悪の向きの歪みになる。角度で線形にすれば、どこにいても
+    「1° 直せば同じだけ得」になる。
+
+    既定 ``yaw_span = π/2`` (90°) の意味は「真横 (90°) で 0 点、そこから
+    つま先が蹴り方向へ向くほど直線的に増える」。90° より外 (かかと側) は 0 で
+    飽和する。90° を境にするのは、そこから先が「軸足を後ろ向きに置く」= 誘導したい
+    構えの反対側だからで、そこに勾配を残しても向かせたい先が無い。
+
+    なぜ未計測ガードが要らないのか
+    ------------------------------
+    :func:`kick_plant_lon` とまったく同じ理由。pre-latch は ``p_style_frozen`` が 0 で
+    ``r_direction`` が 0 になる (:func:`_r_direction` の kick_done ゲートも掛かる) ので
+    1 円も払われず、latch 後は ``plant_yaw_dot_frozen`` が必ずその蹴りの実測値になる
+    (:mod:`.kick_state` が trigger と同じステップの現在値を凍結する)。初期値 0 が
+    残ったまま払われる状態が存在しないので、「未計測が満点側に写る」失敗モードが無い。
+    なお初期値 0 は theta = 90° = f_yaw 0 なので、仮に残っても無得点側である。
+
+    設計上の約束 (:func:`kick_plant_lon` と同じ)
+    --------------------------------------------
+    * **r_direction への乗算**であること。加算にすると「方向を無視して軸足の向きだけ
+      揃える」で報酬が取れてしまう。乗算なら kick_done ゲート・方向精度
+      (τ_direction)・胴体の向き (帯つき p_style) を全て通過した蹴りにしか払われない。
+      ``sigma_direction`` は同じタスクの他のキック項と **必ず同じ値** にすること。
+    * **他のキック報酬とは加算で並べる** (乗算にしない)。学習初期は軸足の向きがまず
+      合わないので、他項に掛けるとそちらの勾配がゼロ付近で死ぬ。
+    * **非負** (罰にしない)。ずれた軸足は「罰される」のではなく「報われない」に
+      留める。負の dense 払いにすると :func:`_r_direction` の NOTE と同じ
+      「外したら早く転んで損切り」の抜け道が復活する。
+    * **線形テント。Gaussian にしないこと。** σ の外で勾配が完全に死ぬ失敗は
+      :func:`kick_plant_foot` で実証済み (:func:`kick_plant_lon` の docstring)。
+
+    NOTE: この項を使っているタスクは **walk_inside_kick だけ**。
+          ``_KICK_STATE_REWARD_TERMS`` に名前があるのはパラメータ配布先の名簿で、
+          項そのものを足しているのは walk_inside_kick の cfg のみ (他タスクの cfg には
+          属性が無いので None ガードで飛ばされる)。
+
+    Args:
+        yaw_span: テントの半幅 [rad]。軸足のつま先が蹴り方向からこの角度だけ
+            ずれると 0 点。既定 π/2 = 90° (真横)。**狭くするほど、いま居る場所が
+            0 に潰れて勾配が死ぬ**ので、絞るときは
+            ``Metrics/kick_direction/plant_yaw_dot`` の実測を見てから。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+
+    span = max(yaw_span, 1e-6)
+    # clamp は acos の定義域外 (数値誤差で |dot| がわずかに 1 を超える) 対策。
+    theta = torch.acos(torch.clamp(state["plant_yaw_dot_frozen"], min=-1.0, max=1.0))
+    f_yaw = torch.clamp(1.0 - theta / span, min=0.0, max=1.0)
+    return r_dir * f_yaw
+
+
+def kick_foot_ceiling(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    h_cap: float = 0.09,
+    h_span: float = 0.08,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項17. Foot Ceiling (足を上げすぎない **上限だけ**) = r_direction * f_cap。shape: (N,)
+
+    latch 時に凍結した蹴り足の足裏高さ (``sole_height_at_kick`` [m]) に、
+    **天井だけ** を課す:
+
+        ``f_cap = clamp(1 − (h − h_cap) / h_span, 0, 1)``
+
+    * ``h ≤ h_cap`` → **f_cap = 1 で満点**。それより低くしても 1 円も増えない。
+    * ``h_cap < h < h_cap + h_span`` → 線形に減る。
+    * ``h ≥ h_cap + h_span`` → 0。
+
+    :func:`kick_contact_height` との違い (こちらは「上限だけ」)
+    ----------------------------------------------------------
+    足裏高さを見る項は既に :func:`kick_contact_height` があるが、あちらは
+    ``f_low = clamp((R − h) / (R − h_sat), 0, 1)`` = **低いほど得** という形で、
+    h_sat (0.03) まで下げ続ける圧を掛ける。**この形は walk_lob で反証されている
+    (2026-08-18)**: ``sole_height_at_kick`` は狙いどおり 0.062 → 0.050 に下がったが、
+    同じ run で apex が 0.340 → 0.234 に落ちた。低く当てるには立ち位置を詰めるしか
+    なく、それがスイング長 = ボール速度を削るためである。
+
+    この項はその失敗を繰り返さないために **下向きの圧を一切持たない**。
+    ``h_cap`` 以下はすべて満点なので、「もっと低く」の勾配がそもそも存在しない。
+    採りたいのは「上げすぎない」だけで、どこまで低くするかはポリシーの自由に任せる。
+    したがって :func:`kick_contact_height` の代わりではなく、**別の目的の項**である
+    (両方を同時に入れる理由は無い。入れれば h_cap 以下で f_low の下向きの圧だけが
+    残り、結局あちらの反証済みの形になる)。
+
+    ``h_cap = 0.09`` の根拠 (足箱の中心がボール中心以下に来る高さ)
+    --------------------------------------------------------------
+    足コライダーは足リンク原点から見て z = −0.038 (足裏) 〜 −0.002 (上面) の厚み
+    0.036 の箱 (:data:`~.kick_state._SOLE_OFFSET` のコメント)。足裏高さ h のとき
+    足箱の中心は h + 0.018 にある。ボール中心は静止時 0.11 (半径) なので、
+    **足箱の中心がボール中心以下** = h + 0.018 ≤ 0.11 ⇔ h ≤ 0.092。
+    0.09 はそのすぐ内側の丸めた値。これより上で当てると足の重心がボール中心より
+    高いところを通ることになり、ボールを上から押さえる / 空振りして足がボールの
+    上を越える形になる。
+
+    ``h_span = 0.08`` は 0 点になる高さを h = 0.17 に置く幅。ボール直径 0.22 の
+    おおよそ 3/4 で、「足がボールの上半分にしか当たっていない」領域を 0 に落とす。
+    span を狭くするほど天井の壁が急になるが、急にすると天井の外に居るあいだ勾配が
+    死ぬ (:func:`kick_plant_foot` の死因) ので、いま居る高さからの傾きが残る幅を取る。
+
+    設計上の約束
+    ------------
+    * **r_direction への乗算**・**他のキック報酬とは加算**・**非負** — 理由は
+      :func:`kick_plant_lon` の同名の節と同じ。特に「上げすぎたら罰」にしない
+      (負の dense 払いは :func:`_r_direction` の NOTE の損切り exploit を復活させる)。
+    * ``touch_count > 0`` のゲートが **要る**。この項は凍結値の初期値 0.0 が
+      f_cap(0) = 1 = 満点側に写るので、接触が一度も記録されないまま latch した場合に
+      払ってしまう。:func:`kick_contact_height` とまったく同じ理由で、同じゲートを掛ける
+      (:func:`kick_plant_lon` / :func:`kick_plant_yaw` が要らないのは、あちらの
+      凍結値が latch と同じステップの現在値で必ず埋まるため)。
+
+    Args:
+        h_cap: これ以下なら満点になる足裏高さ [m]。既定 0.09 = 足箱の中心が
+            ボール中心 (0.11) 以下に来る高さ。
+        h_span: 天井を越えてから 0 点になるまでの幅 [m]。既定 0.08 (h = 0.17 で 0)。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+
+    span = max(h_span, 1e-6)
+    f_cap = torch.clamp(1.0 - (state["sole_height_at_kick"] - h_cap) / span, min=0.0, max=1.0)
+    measured = (state["touch_count"] > 0.0).float()
+    return r_dir * f_cap * measured
 
 
 # --------------------------------------------------------------------------- #

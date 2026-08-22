@@ -124,6 +124,53 @@ foot_kick_dot を 0.9 → 0.0 まで動かし切った実績と同じ流儀。
 lat (横) は掛けない — plant_lat 0.30 は別の課題であり、掛けると「横が外れている
 あいだ lon の勾配も死ぬ」という kick_plant_foot の失敗を作り直すことになる。
 
+実機フィードバック 2 回目 (2026-08-23)
+--------------------------------------
+1 回目 (「振りが手前すぎてボールを巻き込んで転ぶ」→ ``kick_plant_lon`` の新設) の
+あと、実機で残っていた症状は **当たりが薄い / 空振りする** と **軸足がまだ手前**
+の 2 つ。3 つの変更で対処する。すべて :func:`_apply_inside_kick_recipe` に入れるので、
+``K1WalkInsideKickDualEnvCfg`` (stage 2) / ``K1WalkInsideKickDualRoughEnvCfg``
+(stage 3) にも継承で自動的に載る (**history 版と通常版の両方に入れる**)。
+
+1. **軸足の向き** (``kick_plant_yaw``、weight 3.0、第 6c 節)
+
+   軸足のつま先を蹴り方向へ向かせる。軸足が斜めのまま立つと骨盤もそちらを向き、
+   振り足のインサイド面がキック線に正対しないので当たりが薄くなる。角度に対する
+   線形テント (半幅 90°)。胴体は p_style の帯で 30-45° ずれてよく、**ずれるのは
+   胴体で軸足は向かせる** という役割分担 (分ける自由度は Hip_Yaw で、このタスクは
+   ``joint_deviation_hip`` から外してある)。
+
+2. **軸足の目標を 0 cm へ + span の第 3 段** (第 6b 節)
+
+   ``lon_target`` −0.03 → 0.0 (足首がボール真横 = 足箱の中心は 2.6 cm 前) と、
+   ``lon_span`` の折れ線に 3000 → 4000 で 0.25 → 0.15 の第 3 段を足す。
+   **目標を動かしてもテントの勾配 (W/span) は変わらないので、目標だけでは政策は
+   ほぼ動かない。** 踏み込ませる実際のレバーは span で、2 つはセットで入れる。
+
+3. **足を上げすぎない上限** (``kick_foot_ceiling``、weight 3.0、第 6d 節)
+
+   足裏高さ 0.09 (足箱の中心がボール中心以下に来る高さ) 以下は一律満点、そこから
+   0.08 かけて 0 へ。**天井だけで下向きの圧を持たない**のが肝で、「低いほど得」の
+   ``kick_contact_height`` は walk_lob で反証済み (スイング長 = ボール速度を削る)。
+
+TensorBoard で見るもの (この 3 つを入れた run)
+---------------------------------------------
+* ``Metrics/kick_direction/plant_yaw_dot`` — **新設。まず初期値を記録すること。**
+  現行ポリシーが軸足を何度向けているかの記録がまだ無い (1 = 蹴り方向、0 = 真横、
+  0.87 = 30°、0.71 = 45°)。1 iteration 目の値が「素の値」で、``kick_plant_yaw`` が
+  そこからどれだけ動かせたかの基準になる。素の値が既に 0.9 級なら、この項は
+  効きようが無いので weight ではなく ``yaw_span`` を絞る側で考え直す。
+* ``Metrics/kick_direction/sole_height_at_kick`` — ``kick_foot_ceiling`` の対象。
+  0.09 以下なら満点なので、**下がり続ける必要は無い**。0.09 を割ったあとも下がり
+  続けているなら、それはこの項ではなく別の圧 (スイングの都合) で下がっている。
+* ``Metrics/kick_direction/plant_lon`` — −0.107 から 0 側へ動くか。第 3 段の窓
+  (3000 → 4000) は他のカリキュラムが全部終わったあとなので、そこでの変化は
+  span 以外に原因が無い。
+* ``Metrics/kick_direction/kick_vel_ratio`` — **威力とのトレード**の監視。0.887 が
+  基準。形の項を 3 つ (plant_lon 6.0 / plant_yaw 3.0 / foot_ceiling 3.0) 積んだので、
+  「形のためにキックそのものを削る」が起きていないかはここでしか見えない。
+  ratio が落ちているなら、いちばん新しく足した項から weight を下げる。
+
 なぜ段を分けないのか
 --------------------
 weak / middle 系は「限定レンジ → 全方位 → 観測ノイズ」を stage で分け、段ごとに
@@ -178,7 +225,7 @@ DR のせいなのか切り分けられないため。
 stage 2/3 は ``--load_pretrained`` で **収束済み** checkpoint から始める。あちらは
 ``common_step_counter`` を 0 に戻すので、カリキュラムを生かしたままだと全ランプが
 巻き戻る (キック報酬は 0 から、拡大ゲートは限定レンジから、σ_velocity は 1.0 から、
-``lon_span`` は 0.45 から、strong は満額から)。その帰結が
+``lon_span`` は 0.15 から 0.45 へ、strong は満額から)。その帰結が
 :func:`~..walk_kick_dual.walk_kick_dual_env_cfg._freeze_fade_in_curricula` の docstring に
 書かれている「最初の 500 iteration は蹴らない方が得」で、蹴らなくなった後に weight が
 戻ってきても払われる先が無い。詳細と、なぜ ``_freeze_fade_in_curricula`` ではなく
@@ -341,11 +388,22 @@ _INSIDE_CONTACT_WEIGHT = 6.0
 # --------------------------------------------------------------------------- #
 # kick_plant_lon (軸足の前後位置) のパラメータと重み
 #
-# _PLANT_LON_TARGET = -0.03:
+# _PLANT_LON_TARGET = 0.0:
 #   軸足の目標前後位置 [m] (ボール基準、+ が前)。body_pos_w が返すのは足リンク原点
-#   (= 足首) で、足箱の中心はそこから前方 +0.026 にあるので、**足箱の中心をボールの
-#   真横に置くには足首を −0.026**。middle の kick_plant_foot の lon_target と
-#   まったく同じ導出・同じ値。
+#   (= 足首) で、足箱の中心はそこから前方 +0.026 にある。つまり **足首をボールの真横
+#   (0.0) に置くと、足箱の中心は 2.6 cm だけボールより前** に来る。
+#
+#   初版は −0.03 (足箱の中心をボール真横に合わせる導出。middle の kick_plant_foot の
+#   lon_target と同じ値) だったが、実機フィードバック 2 回目でも「手前すぎ」の症状が
+#   続いたので、目標そのものを −0.03 より前へ動かす。足箱の中心が少し前に出る位置は
+#   「軸足がボールと並ぶかわずかに追い越す」構えで、巻き込みの向きから最も遠い。
+#
+#   **重要: 目標を動かしても、それだけでは政策はほとんど動かない。** 線形テントの
+#   勾配は W/span であって目標位置に依らないので、目標を 0.03 前へずらしても
+#   「現在位置での傾き」は 1 ミリも変わらない (変わるのは f の切片だけ)。
+#   踏み込ませる実際のレバーは **span を絞ること** で、下の第 3 段
+#   (:data:`_PLANT_LON_SPAN_END2`) とセットで初めて意味を持つ。目標だけを動かした
+#   変更は「効かなかった」ではなく「そもそも効く仕掛けではない」ので、単独では入れない。
 #
 # _PLANT_LON_SPAN = 0.45:
 #   線形テントの半幅 [m]。目標からこの距離離れると 0 点。
@@ -384,7 +442,7 @@ _INSIDE_CONTACT_WEIGHT = 6.0
 #   項1-3 と同じく post-latch に dense で払われるので、猶予窓 (2.0 秒) ぶんの
 #   割り戻し (_KICK_W_SCALE) を掛けること。
 #
-# _PLANT_LON_SPAN_END = 0.25 / 窓 1500 → 3000 (kick_plant_lon_span カリキュラム):
+# _PLANT_LON_SPAN_END = 0.25 / 窓 1500 → 3000 (kick_plant_lon_span の第 2 段):
 #   第 2 のエスカレーション。テントの勾配は W/span なので、weight を上限で止めた
 #   あとの増強は span を絞る側で行う (6.0/0.45 = 13.3 → 6.0/0.25 = 24。
 #   初版 2.0/0.45 = 4.4 の 5.4 倍)。
@@ -396,13 +454,120 @@ _INSIDE_CONTACT_WEIGHT = 6.0
 #   から一歩も動かなかったとしても f = 1 − 0.20/0.25 = 0.2 が残る。0.20 まで
 #   絞るとちょうどその位置で f = 0 になり、「動かない場所で報酬が真っ平ら」を
 #   自分で作ってしまう。
+#
+# _PLANT_LON_SPAN_END2 = 0.15 / 窓 3000 → 4000 (第 3 段。実機フィードバック 2 回目):
+#   第 2 段の想定 (「動かなくても f = 0.2 が残る」) は保守的すぎた。実際には
+#   run 2026-08-22_11-56-42 で plant_lon は −0.23 → **−0.107** まで動いており、
+#   目標 0.0 との gap は 0.11 しかない。span 0.25 ではその位置の f が
+#   1 − 0.11/0.25 = 0.56 もあり、「もう十分もらえている」状態になっている。
+#   0.15 まで絞ると同じ位置で f = 1 − 0.11/0.15 = 0.27 で、**まだ潰れていないのに
+#   伸びしろが大きい** ところへ移る。勾配は 6.0/0.25 = 24 → 6.0/0.15 = 40。
+#   0.11 より狭くしないのは、そこで現在位置が f = 0 に潰れるため (kick_plant_foot の
+#   死因そのもの)。0.15 は現在位置 −0.107 の外側に 0.04 の余裕を残す最小限の値。
+#
+#   窓 3000 → 4000 は **他の全カリキュラムが終わったあとの仕上げ窓**。
+#   σ_velocity アニール・拡大ゲート・overshoot 罰・span 第 2 段はすべて 3000 で
+#   終点に着くので、この窓の中で動いているランプはこれだけになる。plant_lon が
+#   動いたか / 何かを壊したかを他の変化と混ぜずに読める。
+#
+#   NOTE: 3 段は **1 本の折れ線** (piecewise_reward_param) で書くこと。
+#         linear_reward_param を 2 本並べると、1 本目が 3000 以降ずっと 0.25 を、
+#         2 本目が 3000 まで 0.25 を書き続ける「同じ param に書き手が 2 人」状態に
+#         なり、最終値が CurriculumManager の実行順で決まってしまう
+#         (:func:`~..walk_kick.mdp.curriculums.piecewise_reward_param` の docstring)。
 # --------------------------------------------------------------------------- #
-_PLANT_LON_TARGET = -0.03
+_PLANT_LON_TARGET = 0.0
 _PLANT_LON_SPAN = 0.45
 _PLANT_LON_SPAN_END = 0.25
 _PLANT_LON_SPAN_START_ITER = 1500
 _PLANT_LON_SPAN_END_ITER = 3000
+_PLANT_LON_SPAN_END2 = 0.15
+_PLANT_LON_SPAN2_START_ITER = 3000
+_PLANT_LON_SPAN2_END_ITER = 4000
 _PLANT_LON_WEIGHT = 6.0
+
+# lon_span の折れ線。書き手を 1 つに保つため 3 段を 1 本にまとめる (上の NOTE)。
+# 先頭の (0, _PLANT_LON_SPAN) は「1500 まで 0.45 で据え置き」を明示するための平坦部で、
+# これが無いと 0 → 1500 の間に勝手に補間が始まってしまう。
+_PLANT_LON_SPAN_KNOTS = [
+    (0, _PLANT_LON_SPAN),
+    (_PLANT_LON_SPAN_START_ITER, _PLANT_LON_SPAN),
+    (_PLANT_LON_SPAN_END_ITER, _PLANT_LON_SPAN_END),
+    (_PLANT_LON_SPAN2_END_ITER, _PLANT_LON_SPAN_END2),
+]
+
+# 第 2 段の終点 (3000) と第 3 段の始点 (3000) は折れ線では **同じ 1 つの knot** に
+# 潰れる。したがって _PLANT_LON_SPAN2_START_ITER は上の knots に現れず、ずれても
+# 折れ線は黙って「3000 → 4000 で 0.25 → 0.15」のまま通ってしまう (定数だけが嘘に
+# なる)。第 3 段を後ろへずらしたくなったときに 2 つの定数が食い違ったまま放置される
+# のを防ぐため、ここで一致を強制する。
+assert _PLANT_LON_SPAN_END_ITER == _PLANT_LON_SPAN2_START_ITER, (
+    "lon_span の第 2 段の終点と第 3 段の始点は同じ iteration である必要があります "
+    f"({_PLANT_LON_SPAN_END_ITER} != {_PLANT_LON_SPAN2_START_ITER})"
+)
+
+# --------------------------------------------------------------------------- #
+# kick_plant_yaw (軸足の向き) のパラメータと重み — 実機フィードバック 2 回目
+#
+# _PLANT_YAW_SPAN = math.pi / 2 (90°):
+#   線形テントの半幅 [rad]。軸足のつま先が蹴り方向から 90° (真横) ずれると 0 点で、
+#   そこから蹴り方向へ向くほど **角度に対して線形に** 増える。
+#   cos ではなく角度に対して線形にする理由 (0° 付近で cos が真っ平らになるため) は
+#   :func:`~..walk_kick.mdp.rewards.kick_plant_yaw` の docstring。
+#   90° より外 = かかとを蹴り方向へ向ける側は誘導したい構えの反対なので 0 で飽和させる。
+#
+#   NOTE: 絞るのは **現行ポリシーの plant_yaw_dot の実測を見てから**。この項は
+#         初導入なので、いまポリシーが何度を向いているかの記録がまだ無い
+#         (だからこそ同時に Metrics/kick_direction/plant_yaw_dot を出す)。
+#         span を実測より狭くすると、その位置で f = 0 = 勾配ゼロになり
+#         kick_plant_foot の死因を作り直す。
+#
+# _PLANT_YAW_WEIGHT = 3.0:
+#   **形の項は objective (direction 6.0) の半分** から入れる、という序列に従う。
+#   キック報酬の上限を direction 同格の 6.0 に置く理由は _PLANT_LON_WEIGHT の
+#   コメント (形が目的を出し抜けるようになる境目) にあり、この項もその上限の下で
+#   運用する。3.0 はその半分 = 「効くかどうかがまず分かる大きさで、かつ direction /
+#   scaled のどちらか一方に対しても単独では勝てない」量。
+#   kick_plant_lon が 2.0 → 4.0 → 6.0 と上げていったのと同じ道筋を辿る想定で、
+#   効果が出て副作用 (vel_ratio の低下) が無ければ上げる。
+#
+#   項1-3 と同じく post-latch に dense で払われるので、猶予窓 (2.0 秒) ぶんの
+#   割り戻し (_KICK_W_SCALE) を掛けること。
+# --------------------------------------------------------------------------- #
+_PLANT_YAW_WEIGHT = 3.0
+_PLANT_YAW_SPAN = math.pi / 2
+
+# --------------------------------------------------------------------------- #
+# kick_foot_ceiling (足を上げすぎない上限) のパラメータと重み — 実機フィードバック 2 回目
+#
+# _FOOT_CEILING_H_CAP = 0.09:
+#   これ以下なら満点になる足裏高さ [m]。足コライダーは足リンク原点から
+#   z = −0.038 (足裏) 〜 −0.002 (上面) の厚み 0.036 の箱なので、足裏高さ h のとき
+#   足箱の中心は h + 0.018。**足箱の中心がボール中心 0.11 以下に来る** のは
+#   h ≤ 0.092 で、0.09 はそのすぐ内側。これより上で当てると足の重心がボール中心より
+#   高いところを通るので、上から押さえる / 空振りして足がボールの上を越える形になる。
+#
+# _FOOT_CEILING_H_SPAN = 0.08:
+#   天井を越えてから 0 点になるまでの幅 [m] (h = 0.17 で 0)。ボール直径 0.22 の
+#   おおよそ 3/4 で、「ボールの上半分にしか当たっていない」領域を 0 に落とす。
+#   狭くするほど天井の壁は急になるが、急にすると天井の外に居るあいだ勾配が死ぬ。
+#
+# _FOOT_CEILING_WEIGHT = 3.0:
+#   _PLANT_YAW_WEIGHT と同じ「形の項は objective の半分から」。上限 6.0 の
+#   ルールも同じ (_PLANT_LON_WEIGHT のコメント)。
+#
+#   **kick_contact_height (低いほど得) は入れないこと。** あちらは walk_lob で
+#   反証されている (sole_height は下がったが apex が 0.340 → 0.234。低く当てるには
+#   立ち位置を詰めるしかなく、それがスイング長 = ボール速度を削る)。この項は
+#   h_cap 以下を一律満点にして **下向きの圧を持たない** ので、その失敗を踏まない。
+#   両方入れると h_cap 以下で f_low の下向きの圧だけが残り、結局あちらと同じ形になる。
+#
+#   項1-3 と同じく post-latch に dense で払われるので、猶予窓 (2.0 秒) ぶんの
+#   割り戻し (_KICK_W_SCALE) を掛けること。
+# --------------------------------------------------------------------------- #
+_FOOT_CEILING_WEIGHT = 3.0
+_FOOT_CEILING_H_CAP = 0.09
+_FOOT_CEILING_H_SPAN = 0.08
 
 # --------------------------------------------------------------------------- #
 # kick_velocity_strong の折れ線 (このタスク用に「下り」を前倒しした版)
@@ -683,19 +848,21 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
         },
     )
 
-    # 第 2 のエスカレーション: 後期に span を絞り、目標付近の傾きを立てる
-    # (勾配 = W/span)。窓 1500 → 3000 と終値 0.25 の根拠は
-    # :data:`_PLANT_LON_SPAN_END` のコメント。strong 退場 (1200) より前に絞ると
-    # トーキック期の居場所が 0 に潰れるので、始点は必ずその後に置くこと。
+    # 第 2・第 3 のエスカレーション: 後期に span を絞り、目標付近の傾きを立てる
+    # (勾配 = W/span)。0.45 → 0.25 (1500 → 3000) → 0.15 (3000 → 4000) の
+    # **3 段を 1 本の折れ線で** 書く。各段の根拠は :data:`_PLANT_LON_SPAN_END` と
+    # :data:`_PLANT_LON_SPAN_END2` のコメント。strong 退場 (1200) より前に絞ると
+    # トーキック期の居場所が 0 に潰れるので、絞り始めは必ずその後に置くこと。
+    #
+    # linear_reward_param を 2 本並べないこと。同じ param に書き手が 2 人になり、
+    # 3000 以降の値が CurriculumManager の実行順で決まってしまう
+    # (:func:`~..walk_kick.mdp.curriculums.piecewise_reward_param` の docstring)。
     cfg.curriculum.kick_plant_lon_span = CurrTerm(
-        func=mdp.linear_reward_param,
+        func=mdp.piecewise_reward_param,
         params={
             "term_name": "kick_plant_lon",
             "param_name": "lon_span",
-            "start_value": _PLANT_LON_SPAN,
-            "end_value": _PLANT_LON_SPAN_END,
-            "start_step": _PLANT_LON_SPAN_START_ITER,
-            "end_step": _PLANT_LON_SPAN_END_ITER,
+            "knots": _PLANT_LON_SPAN_KNOTS,
             "steps_per_iteration": _SPI,
         },
     )
@@ -713,6 +880,81 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
         func=mdp.inside_foot_orient,
         weight=0.0,
         params={**_KICK_STATE_PARAMS},
+    )
+
+    # -- 6c. 軸足の向きを誘導する項 ---------------------------------------- #
+    #
+    # 実機フィードバック 2 回目 (2026-08-23) の 1 つ目。軸足 (蹴っていない方の足) の
+    # **つま先を蹴り方向へ向かせる**。軸足がキック線に正対して立つと骨盤もそちら側へ
+    # 寄るので、振り足のインサイド面がキック線に正対しやすくなる。軸足が斜めのままだと
+    # 振り足はその骨盤の向きに引きずられて斜めに入り、**当たりが薄い / 空振り**になる。
+    # 実機で残っている失敗がこれ。
+    #
+    # 6b (kick_plant_lon) との関係: あちらは軸足を **どこに置くか** (前後位置)、
+    # こちらは **どちらへ向けるか** (ヨー)。位置が合っていても向きは独立に外れるので
+    # 項を分ける。lon に掛け算しないのは kick_plant_foot の失敗 (片方が外れている
+    # あいだ両方の勾配が死ぬ) を作り直さないため — 常に加算で並べる。
+    #
+    # 胴体の帯 (style_halfwidth = 40°) と矛盾しない。**胴体は 30-45° ずれてよいが
+    # 軸足は蹴り方向を向かせる**、という役割分担で、両者を分ける自由度が Hip_Yaw。
+    # このタスクは joint_deviation_hip の対象から Hip_Yaw を外してある (第 7 節) ので、
+    # 軸足のヨーはポリシーが自由に使える。
+    #
+    # フェードインの窓は他のキック報酬と同じ 0 → 500。
+    cfg.rewards.kick_plant_yaw = RewTerm(
+        func=mdp.kick_plant_yaw,
+        weight=0.0,
+        params={
+            **_KICK_STATE_PARAMS,
+            "sigma_direction": _SIGMA_DIRECTION,
+            "yaw_span": _PLANT_YAW_SPAN,
+        },
+    )
+    cfg.curriculum.kick_plant_yaw_weight = CurrTerm(
+        func=mdp.linear_reward_weight,
+        params={
+            "term_name": "kick_plant_yaw",
+            "start_weight": 0.0,
+            "end_weight": _PLANT_YAW_WEIGHT * _KICK_W_SCALE,
+            "start_step": 0,
+            "end_step": 500,
+            "steps_per_iteration": _SPI,
+        },
+    )
+
+    # -- 6d. 足を上げすぎない上限 ------------------------------------------- #
+    #
+    # 実機フィードバック 2 回目 (2026-08-23) の 3 つ目。蹴り足の足裏高さに
+    # **天井だけ** を課す (h ≤ 0.09 は一律満点、そこから 0.08 かけて 0 へ)。
+    # 高い位置で当てると足の重心がボール中心より上を通るので、上から押さえる形か、
+    # 空振りして足がボールの上を越える形になる。
+    #
+    # **kick_contact_height (低いほど得) とは別物で、あちらは入れない。** walk_lob
+    # 2026-08-18 で反証済み: 足裏を下へ押す圧はスイングを短くして apex とボール速度を
+    # 削った (0.340 → 0.234)。この項は h_cap 以下で完全に平ら = 下向きの圧が
+    # ゼロなので、その失敗を踏まない。採りたいのは「上げすぎない」だけ。
+    #
+    # フェードインの窓は他のキック報酬と同じ 0 → 500。
+    cfg.rewards.kick_foot_ceiling = RewTerm(
+        func=mdp.kick_foot_ceiling,
+        weight=0.0,
+        params={
+            **_KICK_STATE_PARAMS,
+            "sigma_direction": _SIGMA_DIRECTION,
+            "h_cap": _FOOT_CEILING_H_CAP,
+            "h_span": _FOOT_CEILING_H_SPAN,
+        },
+    )
+    cfg.curriculum.kick_foot_ceiling_weight = CurrTerm(
+        func=mdp.linear_reward_weight,
+        params={
+            "term_name": "kick_foot_ceiling",
+            "start_weight": 0.0,
+            "end_weight": _FOOT_CEILING_WEIGHT * _KICK_W_SCALE,
+            "start_step": 0,
+            "end_step": 500,
+            "steps_per_iteration": _SPI,
+        },
     )
 
     # -- 7. joint_deviation_hip から Hip_Yaw を外す ------------------------- #
@@ -839,9 +1081,11 @@ class K1WalkInsideKickEnvCfg(K1WalkKickEnvCfg):
     * ``Metrics/kick_direction/plant_lon``: 軸足の前後位置 [m] (+ = ボールより前)。
       ``kick_plant_lon`` が直接引っ張っている値なので、**この項が効いているかの
       唯一の判定材料**。初版の収束値が −0.23 なので、そこから −0.10 側へ動くかを見る。
-      1500 iteration 以降は span が 0.45 → 0.25 へ絞られる
-      (``Curriculum/kick_plant_lon/lon_span``)。絞りの途中で plant_lon が悪化する
-      ようなら、絞りすぎ = 居場所の勾配が細っているサイン。
+      1500 iteration 以降は span が 0.45 → 0.25 (3000) → 0.15 (4000) と 3 段で
+      絞られる (``Curriculum/kick_plant_lon/lon_span``)。絞りの途中で plant_lon が
+      悪化するようなら、絞りすぎ = 居場所の勾配が細っているサイン。
+      **第 3 段 (3000 → 4000) は他の全カリキュラムが終わったあとの仕上げ窓**なので、
+      ここで動く指標の変化は span 以外に原因が無い。
       動かないまま ``Episode_Reward/kick_plant_lon`` だけが増えているなら、
       f_lon ではなく r_direction (キックの数と質) の方が伸びているだけ。
       なお ``--resume`` での後掛けでは動かない前例が 2 つあるので、動かなければ
@@ -983,7 +1227,7 @@ def _pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1
       ``approach_penalty`` が復活するので、回り込みの構えを壊す方向に更新される。
     * ``sigma_velocity`` が 0.5 → 1.0 に戻り、速度の採点が緩む
       (「指令どおりに蹴る」の圧が消える)。
-    * ``kick_plant_lon`` の ``lon_span`` が 0.25 → 0.45 に戻り、勾配が 24 → 13.3 に鈍る。
+    * ``kick_plant_lon`` の ``lon_span`` が 0.15 → 0.45 に戻り、勾配が 40 → 13.3 に鈍る。
       軸足の踏み込み (plant_lon −0.11) は実機の転倒事故への直接の対策なので、
       ここが緩むのがいちばん困る。
     * ``kick_velocity_strong`` が満額 (=「速く蹴るほど得」) で復活する。この項は
@@ -998,8 +1242,8 @@ def _pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1
     (1) と (2) の方:
 
     * ``piecewise_reward_weight`` (strong の折れ線) と ``linear_reward_param``
-      (σ_velocity / lon_span) と ``kick_rate_gated_expansion`` (拡大ゲート) は
-      対象外なので、そのまま巻き戻る。
+      (σ_velocity) と ``piecewise_reward_param`` (lon_span の 3 段) と
+      ``kick_rate_gated_expansion`` (拡大ゲート) は対象外なので、そのまま巻き戻る。
     * ``kick_velocity_overshoot_weight`` の窓は 1500 → 3000 なので、
       ``before_iter = 500`` では拾えない。基準 run では完走しているので凍結が正しい。
 
@@ -1060,8 +1304,15 @@ def _pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1
             _reward_term(cfg, params["term_name"], name).weight = params["knots"][-1][1]
 
         elif func is mdp.linear_reward_param:
-            # σ_velocity (1.0 → 0.5) と kick_plant_lon の lon_span (0.45 → 0.25)。
+            # σ_velocity (1.0 → 0.5)。
             _reward_term(cfg, params["term_name"], name).params[params["param_name"]] = params["end_value"]
+
+        elif func is mdp.piecewise_reward_param:
+            # 折れ線の params 版。piecewise_reward_weight と同じく最後の knot で
+            # 頭打ちになる (実装: step >= knots[-1][0] なら knots[-1][1])。
+            # このタスクでは kick_plant_lon の lon_span
+            # (:data:`_PLANT_LON_SPAN_KNOTS`) の最終 knot = (4000, 0.15)。
+            _reward_term(cfg, params["term_name"], name).params[params["param_name"]] = params["knots"][-1][1]
 
         elif func is mdp.window_reward_weight:
             # 「start_step < step <= end_step の間だけ weight、外は 0」。窓の外 =
