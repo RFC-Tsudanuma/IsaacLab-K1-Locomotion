@@ -231,6 +231,7 @@ def kick_state(
             "touch_count": torch.zeros(env.num_envs, device=device),
             "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
+            "pre_latch_touch_event": torch.zeros(env.num_envs, device=device),
             "sole_height_last_touch": torch.zeros(env.num_envs, device=device),
             "sole_height_at_kick": torch.zeros(env.num_envs, device=device),
             # 軸足 (蹴っていない方の足) のボール相対位置。値 latch で凍結する。
@@ -283,6 +284,7 @@ def kick_state(
         state["prev_v_ball"][just_reset] = 0.0
         state["touch_count"][just_reset] = 0.0
         state["touch_refractory"][just_reset] = 0
+        state["pre_latch_touch_event"][just_reset] = 0.0
         state["sole_height_last_touch"][just_reset] = 0.0
         state["sole_height_at_kick"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
@@ -438,6 +440,9 @@ def kick_state(
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
     state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
+    # latch 前に始まった接触。正しいキックの接触stepも含め、姿勢の良否は報酬側で
+    # 判定する。既にlatchした後のボールとの再接触だけは対象外。
+    state["pre_latch_touch_event"] = (touched & (~state["kick_done"])).float()
 
     state["touch_refractory"] = torch.where(
         touched,

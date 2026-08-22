@@ -4,8 +4,8 @@
 # **継続学習**。学習済みの walk_long_pass ポリシーを出発点に、policy 観測の本体状態
 # 5 項 (projected_gravity / base_ang_vel / joint_pos / joint_vel / prev_joint_request)
 # に 0.1 秒 = 5 ステップの履歴を付ける。arXiv:2401.16889 の short history 相当。
-# ネットワーク構造・報酬定義・行動空間は変えない。観測変更への適応中にキックを
-# 維持するため、球速帯を成立率で進退させ、多重接触罰を最終帯到達後に立ち上げる。
+# ネットワーク構造・行動空間は変えない。観測変更への適応中にキックを
+# 維持するため、球速帯を成立率で進退させ、非キック接触罰を最終帯到達後に立ち上げる。
 # ミラー可能にするため、policy / critic の左足裏 3D スロットはボール位置へ変える。
 # PPO には係数 0.5 の mirror loss を追加し、data augmentation は使わない。
 #
@@ -25,7 +25,7 @@
 # --resume ではなく --load_pretrained を使う理由: experiment_name が
 # k1_walk_long_pass_history と別なので --resume では親 run を検出できない。env cfg 側では
 # 500 iteration までの報酬 weight ランプだけを終値に固定し、球速帯は (2.0, 3.0) から
-# kick-rate gate で (3.2, 5.0) へ進める。多重接触罰は最終帯到達後に立ち上げる。
+# kick-rate gate で (3.2, 5.0) へ進める。非キック接触罰は最終帯到達後に立ち上げる。
 #
 # --reset_noise_std は **付けない**。walk_long_pass / walk_mid_kick の失敗記録参照。
 # 行動空間は変わっていないので、探索は元の std のままで足りている。
@@ -42,9 +42,11 @@
 #   Metrics/kick_direction/kick_rate       … 観測変更と mirror loss 導入の過渡を監視
 #   Metrics/kick_direction/kick_vel_ratio  … 履歴で改善するか
 #   Metrics/kick_direction/kick_dir_error_deg … 同上
+#   Metrics/kick_direction/ball_touch_count … 回り込み中の偶発接触が減るか
+#   Episode_Reward/non_kick_ball_touch      … 悪い構えでの接触罰が減るか
 #   Curriculum/kick_speed_range/alpha      … 球速帯の進捗。停止/後退も正常動作
 #   Curriculum/kick_speed_range/kick_rate_ema … gate が見る成立率
-#   Curriculum/extra_ball_touch_weight/weight … 最終帯到達までは 0
+#   Curriculum/non_kick_ball_touch_weight/weight … 最終帯到達までは 0
 #   Train/mean_episode_length              … 転倒が減れば伸びる
 
 set -euo pipefail

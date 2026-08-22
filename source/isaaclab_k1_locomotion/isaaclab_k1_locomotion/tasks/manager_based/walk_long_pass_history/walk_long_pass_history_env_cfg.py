@@ -6,7 +6,7 @@
 """K1 ロングパス + 短期 I/O 履歴 (short history) 環境。
 
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
-**短期履歴 + 左右対称学習用** バリアント。報酬定義と行動空間は継承し、policy 観測の
+**短期履歴 + 左右対称学習用** バリアント。行動空間を継承し、policy 観測の
 本体状態 5 項に 0.1 秒ぶんの履歴を付ける。さらに、左足裏だけを見る 3 次元スロットを
 ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、固定global目標と遅延・DR済み
 自己位置からactor用のlocal方向を計算し、キックlatch時に凍結する。観測フィールド名と
@@ -15,7 +15,7 @@
 観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
 親から変更する。親の早期報酬 weight ランプは終値に固定する一方、目標球速は
 ``(2.0, 3.0)`` から始め、キック成立率が十分な間だけ ``(3.2, 5.0)`` へ進める。
-多重接触罰は最終速度帯へ到達した後に立ち上げる。
+非キック接触罰は最終速度帯へ到達した後に立ち上げる。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -108,7 +108,7 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 ``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
 500 iteration までに終わる報酬 weight のランプだけは終値に固定する。球速帯は
 キック成立率 EMA が 0.80 以上なら進み、0.50 未満なら 2 倍速で戻る。最終帯へ到達した
-後だけ ``extra_ball_touch`` を 500 iteration かけて 0 → -50 へ立ち上げる。
+後だけ ``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
 ``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
 
 見るべきもの
@@ -124,6 +124,7 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
@@ -208,7 +209,7 @@ def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
     """``before_iter`` までに終わる報酬 weight のランプだけを終値に固定する。
 
     継続学習の開始時にキック報酬を 0 へ戻すと、適応期間中に「蹴らない方が得」という
-    収支を作ってしまう。一方、球速帯と後段の多重接触罰は今回の復旧順序に必要なので、
+    収支を作ってしまう。一方、球速帯と後段の非キック接触罰は今回の復旧順序に必要なので、
     ``mdp.linear_reward_weight`` かつ早期に終わる項だけを対象にする。
 
     Returns:
@@ -291,13 +292,25 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
         #
         # 観測の意味変更へ適応する間は、親の最終速度帯を最初から要求しない。
         # 親の早期報酬 weight は終値に保ち、成立率を見ながら球速帯を進退させる。
-        # 多重接触罰は最終帯に届いてから立ち上げ、接触自体を避ける逃げ道を作らない。
-        self.curriculum.extra_ball_touch_weight = CurrTerm(
+        # 回り込み中の偶発接触そのものを罰し、P_kick で目標方向を向いた接触は
+        # ほぼ罰しない。親の extra_ball_touch は最初の偶発接触を無料にして、その後の
+        # 本命キック側へ罰を載せ得るため、この history 復旧段では置き換える。
+        non_kick_touch_params = dict(self.rewards.extra_ball_touch.params)
+        non_kick_touch_params["sigma_pose"] = self.rewards.ball_avoidance.params["sigma_pose"]
+        self.rewards.extra_ball_touch = None
+        self.curriculum.extra_ball_touch_weight = None
+        self.rewards.non_kick_ball_touch = RewTerm(
+            func=mdp.non_kick_ball_touch,
+            weight=0.0,
+            params=non_kick_touch_params,
+        )
+        self.curriculum.non_kick_ball_touch_weight = CurrTerm(
             func=mdp.linear_reward_weight_after_speed_gate,
             params={
-                "term_name": "extra_ball_touch",
+                "term_name": "non_kick_ball_touch",
                 "start_weight": 0.0,
-                "end_weight": -50.0,
+                # RewardManager は dt=0.02 を掛けるので、最大で1接触あたり-0.5。
+                "end_weight": -25.0,
                 "command_name": "kick_direction",
                 "ramp_iterations": 500,
                 "steps_per_iteration": _STEPS_PER_ITERATION,
