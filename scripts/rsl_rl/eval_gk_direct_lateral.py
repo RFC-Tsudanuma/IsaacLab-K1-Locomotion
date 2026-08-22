@@ -161,6 +161,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     policy = runner.get_inference_policy(device=inner_env.unwrapped.device)
 
     raw_env = inner_env.unwrapped
+
+    def _real_falls() -> torch.Tensor:
+        """time_out を除いた「本当の終了」だけを bool (N,) で返す。
+
+        ☠☠ 2026-08-22 修正。それまで ``step`` の返す ``dones`` をそのまま数えており、
+          **エピソード満了 (time_out、20s) が「転倒」に混ざっていた**。反転の計測窓は
+          3s あるので、転倒と無関係に一定割合で done が立つ。この汚染で
+          「後退からの反転で転倒率 16〜26%」という誤った結論を出しかけた
+          (同条件を eval_gk_fall_forensics.py で測ると **121 env-分で転倒 0 件**)。
+          TerminationManager.terminated は time_out 項を除いた終了だけを返す。
+        """
+        tm = getattr(raw_env, "termination_manager", None)
+        if tm is None or not hasattr(tm, "terminated"):
+            return torch.zeros(n, dtype=torch.bool, device=device)
+        return tm.terminated.to(device=device, dtype=torch.bool).flatten()
+
     robot = raw_env.scene["robot"]
     cmd_term = raw_env.command_manager.get_term("base_velocity")
     left_foot_idx = robot.find_bodies("left_foot_link")[0][0]
@@ -243,8 +259,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                     v_fwd = v_w[:, 0] * torch.cos(h) + v_w[:, 1] * torch.sin(h)
                     v_lat = -v_w[:, 0] * torch.sin(h) + v_w[:, 1] * torch.cos(h)
                     trace[k] = v_fwd * axis_x + v_lat * axis_y
-                    if dones is not None:
-                        bad |= dones.to(device=device, dtype=torch.bool).flatten()
+                    bad |= _real_falls()
                 onset_traces.append((trace.cpu(), (~bad).cpu()))
 
         # --- 反転 (+v -> -v) の計測 ---
@@ -285,8 +300,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                     v_lat = -v_w[:, 0] * torch.sin(h) + v_w[:, 1] * torch.cos(h)
                     # 射影の軸は **反転前の指令方向**。したがって反転が成功すると負に振れる。
                     trace[k] = v_fwd * axis_x + v_lat * axis_y
-                    if dones is not None:
-                        bad |= dones.to(device=device, dtype=torch.bool).flatten()
+                    bad |= _real_falls()
                 rev_traces.append((trace.cpu(), (~bad).cpu()))
                 rev_falls += int(bad.sum().item())
                 rev_trials += n

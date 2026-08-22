@@ -120,6 +120,7 @@ def adaptive_phase_freq(
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
+    use_actual_speed: bool = False,
 ) -> torch.Tensor:
     """速度指令とその向きから、歩行位相の周波数 [Hz] を env ごとに決める (N,)。
 
@@ -146,7 +147,23 @@ def adaptive_phase_freq(
     """
     cmd = env.command_manager.get_command(command_name)[:, :2]
     v = torch.norm(cmd, dim=1)
-    safe = v.clamp(min=1e-6)
+    if use_actual_speed:
+        # ★ 2026-08-22: 周波数の **大きさ** を実速度から決める (向きは指令のまま)。
+        #
+        #   既定 (指令ベース) だと、指令 1.5 に対し実速度 0.94 でも位相は 4.0Hz を要求し、
+        #   方策は **届かない要求と戦い続ける**。5 本目 (f_max 5.0) はこれで位相比が
+        #   0.60 まで崩れ、位相報酬 (feet_phase / foot_clearance) がまとめて無効化された。
+        #
+        #   実速度から決めれば **位相比は常に 1 に保たれる**。位相は歩容を整える役に徹し、
+        #   速度は track_lin_vel_* と lateral_speed_bonus が押す、と役割が分離する。
+        #   → 位相と速度の綱引きが構造的に消えるので、速度を伸ばす余地が広がる見込み。
+        #
+        #   ☠ 向きまで実速度にしないのは、低速時に向きが暴れて位相が乱れるため。
+        #   ☠ 「遅い → 位相も遅い → さらに遅い」の悪循環が理屈上ありうるが、速度を
+        #     押しているのは位相ではなく追従報酬なので起きないはず。**要検証**。
+        robot = env.scene["robot"]
+        v = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+    safe = torch.norm(cmd, dim=1).clamp(min=1e-6)
     cx = cmd[:, 0] / safe
     cy = cmd[:, 1] / safe
     inv_l = torch.sqrt((cx / float(l_fwd)) ** 2 + (cy / float(l_lat)) ** 2)

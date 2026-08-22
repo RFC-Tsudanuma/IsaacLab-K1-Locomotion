@@ -33,6 +33,7 @@ def phase_obs(
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
+    use_actual_speed: bool = False,
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
@@ -47,6 +48,7 @@ def phase_obs(
     phase_left = get_gait_phase(
         env, phase_freq, adaptive=adaptive, command_name=command_name,
         l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
+        use_actual_speed=use_actual_speed,
     )
     phase_right = phase_left + math.pi
 

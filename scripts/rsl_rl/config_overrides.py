@@ -39,22 +39,43 @@ def apply_overrides(data: dict, *, env_cfg: Any, agent_cfg: Any) -> None:
 
 
 def _set_dotted(root: Any, path: str, value: Any, *, scope: str) -> None:
+    """ドットパスで cfg の 1 要素を上書きする。
+
+    ★ 2026-08-22: **辞書に対応した**。RewTerm / ObsTerm / EventTerm の ``params`` は
+      configclass ではなく **素の dict** なので ``hasattr``/``setattr`` では辿れず、
+      ``rewards.<term>.params.<key>`` の形が使えなかった (例:
+      ``rewards.base_height_penalty.params.min_height`` が
+      "leaf attribute 'min_height' missing on dict" で落ちた)。
+    """
+
+    def _has(o: Any, k: str) -> bool:
+        return k in o if isinstance(o, dict) else hasattr(o, k)
+
+    def _get(o: Any, k: str) -> Any:
+        return o[k] if isinstance(o, dict) else getattr(o, k)
+
+    def _set(o: Any, k: str, v: Any) -> None:
+        if isinstance(o, dict):
+            o[k] = v
+        else:
+            setattr(o, k, v)
+
     parts = path.split(".")
     obj = root
     for p in parts[:-1]:
-        if not hasattr(obj, p):
+        if not _has(obj, p):
             raise AttributeError(
                 f"[override] {scope}.{path}: intermediate attribute '{p}' missing on {type(obj).__name__}"
             )
-        obj = getattr(obj, p)
+        obj = _get(obj, p)
     last = parts[-1]
-    if not hasattr(obj, last):
+    if not _has(obj, last):
         raise AttributeError(
             f"[override] {scope}.{path}: leaf attribute '{last}' missing on {type(obj).__name__}"
         )
-    current = getattr(obj, last)
+    current = _get(obj, last)
     coerced = _coerce(current, value)
-    setattr(obj, last, coerced)
+    _set(obj, last, coerced)
     print(f"[override] {scope}.{path}: {current!r} -> {coerced!r}")
 
 

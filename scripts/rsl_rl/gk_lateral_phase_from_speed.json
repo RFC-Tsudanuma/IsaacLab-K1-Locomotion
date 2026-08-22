@@ -1,0 +1,9 @@
+{
+  "_comment": "歩行位相の周波数を **指令ではなく実速度** から決める上書き。★ 2026-08-22 検証用。既定 (指令ベース) だと、指令 1.5 に対し実速度 0.94 でも位相は 4.0Hz を要求し、方策は届かない要求と戦い続ける (5 本目はこれで位相比 0.60 まで崩れ、位相報酬がまとめて無効化された)。実速度から決めれば位相比は常に 1 に保たれ、位相は歩容を整える役に徹し、速度は track_lin_vel_* と lateral_speed_bonus が押す、と役割が分離する。☠ 向きは指令のまま (低速時に実速度の向きが暴れて位相が乱れるため)。☠ 『遅い→位相も遅い→さらに遅い』の悪循環が理屈上ありうる。速度を押しているのは位相ではなく追従報酬なので起きないはずだが要検証。☠ 4 箇所すべてに配ること。1 つでも漏れるとその項だけ別の位相を見る。判定は横速度 (現状 0.941) と停止時 2階差分 (現状 0.0114) の両方。",
+  "env": {
+    "observations.policy.gait_phase.params.use_actual_speed": true,
+    "observations.critic.gait_phase.params.use_actual_speed": true,
+    "rewards.feet_phase.params.use_actual_speed": true,
+    "rewards.foot_clearance.params.use_actual_speed": true
+  }
+}
