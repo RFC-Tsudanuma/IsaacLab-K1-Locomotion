@@ -343,6 +343,10 @@ def kick_state(
             # 「軸足がボール横にあるが、つま先はあらぬ方を向いている」という構えが
             # 実際に起きるため (:func:`..rewards.kick_plant_yaw`)。
             "plant_yaw_dot_frozen": torch.zeros(env.num_envs, device=device),
+            # 軸足の接地の強さ。latch したステップの法線接触力を体重の半分で
+            # 正規化して [0, 1] にクランプしたもの (:func:`_plant_contact_normalized`)。
+            # 1 = 片足立ちぶんの荷重がちゃんと乗っている、0 = 軸足も浮いている。
+            "plant_contact_frozen": torch.zeros(env.num_envs, device=device),
             # 蹴り足のワールド鉛直速度 [m/s]。値 latch で凍結する。+ = すくい上げ。
             "foot_vz_frozen": torch.zeros(env.num_envs, device=device),
             "G": torch.zeros(env.num_envs, 2, device=device),
@@ -398,6 +402,7 @@ def kick_state(
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
         state["plant_yaw_dot_frozen"][just_reset] = 0.0
+        state["plant_contact_frozen"][just_reset] = 0.0
         state["foot_vz_frozen"][just_reset] = 0.0
 
     # ------------------------------------------------------------------ #
@@ -598,6 +603,10 @@ def kick_state(
     #       かかとを蹴り方向へ向けて立つのは誘導したい構えではない。
     plant_yaw_dot = (_foot_forward_xy(foot_quat[env_idx, support_foot, :]) * kick_dir).sum(dim=-1)
 
+    # 軸足の接地の強さ (0-1)。計算は :func:`_plant_contact_normalized` を参照。
+    # contact_forces センサが無い構成では 0 が返るだけで、既存の値は何も変わらない。
+    plant_contact = _plant_contact_normalized(env, robot, support_foot, device)
+
     # ------------------------------------------------------------------ #
     # 蹴り足のワールド鉛直速度 v_z [m/s]。値 latch で凍結する (foot_vz_frozen)。
     #
@@ -696,6 +705,11 @@ def kick_state(
         # 接地しているのでそのステップの値がそのまま構えを表す。
         state["plant_yaw_dot_frozen"] = torch.where(
             trigger, plant_yaw_dot, state["plant_yaw_dot_frozen"]
+        )
+        # 軸足の接地の強さも plant_* と同じ一段構え (latch したステップの現在値)。
+        # 蹴っている最中に軸足まで浮いている = 跳びながら蹴っている、を捕まえる。
+        state["plant_contact_frozen"] = torch.where(
+            trigger, plant_contact, state["plant_contact_frozen"]
         )
         # 蹴り足の鉛直速度も plant_* と同じく **latch したステップの現在値** を採る。
         # latch = ボールが動き出した瞬間なので、そのステップの足速度がすくい上げの
@@ -824,6 +838,85 @@ def kick_state(
 
 
 _FOOT_IDS_ATTR = "_kick_foot_body_ids"
+
+# 軸足の接地力を読むための、contact_forces センサ側の足 body index。
+# ロボット (Articulation) の body 順とセンサの body 順は **別物** なので、
+# _foot_body_ids とは別に解決してキャッシュする。
+# 値は [left, right] の順 (kicking_foot / support_foot と同じ並び)、
+# センサが無い / 足が見つからない構成では None。
+_PLANT_CONTACT_IDS_ATTR = "_kick_plant_contact_body_ids"
+_PLANT_CONTACT_MASS_ATTR = "_kick_plant_contact_mass_scale"
+_PLANT_CONTACT_SENSOR = "contact_forces"
+_GRAVITY = 9.81
+
+
+def _plant_contact_ids(env: ManagerBasedRLEnv):
+    """contact_forces センサの左右足 body index を一度だけ解決してキャッシュする。
+
+    見つからなければ ``None`` をキャッシュして以後は諦める (毎ステップ例外を
+    投げると全タスクが道連れになるため)。諦めた場合 :func:`_plant_contact_normalized`
+    は常に 0 を返すので、この値を使う報酬項が payout されなくなるだけで、
+    既存タスクの数値は 1 つも変わらない。
+    """
+    ids = getattr(env, _PLANT_CONTACT_IDS_ATTR, "unset")
+    if ids != "unset":
+        return ids
+
+    sensor = env.scene.sensors.get(_PLANT_CONTACT_SENSOR)
+    resolved = None
+    if sensor is not None:
+        for name_fn in (
+            lambda n: sensor.find_bodies(n)[0][0],
+            lambda n: list(sensor.body_names).index(n),
+        ):
+            try:
+                resolved = [name_fn("left_foot_link"), name_fn("right_foot_link")]
+                break
+            except Exception:  # noqa: BLE001 - API 差異を吸収するのが目的
+                resolved = None
+    if resolved is None:
+        print(
+            "[WARN] kick_state: contact_forces センサから足の body index を解決できません。"
+            " plant_contact_frozen は常に 0 になります"
+            " (kick_plant_grounded を使うタスクだけが影響を受けます)。"
+        )
+    setattr(env, _PLANT_CONTACT_IDS_ATTR, resolved)
+    return resolved
+
+
+def _plant_contact_normalized(env: ManagerBasedRLEnv, robot, support_foot, device) -> "torch.Tensor":
+    """軸足の法線接触力を体重の半分で正規化して [0, 1] にクランプしたもの。shape: (N,)
+
+    ``clamp(F_z,plant / (0.5 · m · g), 0, 1)``。
+
+    * **法線 (ワールド z) 成分** を採る。ノルムだと蹴りの最中に出る摩擦 (水平成分) が
+      混ざって「踏ん張っている」と「横に滑っている」の区別が付かない。地面は
+      平面かごく軽い凹凸 (±1-4 cm) なので、法線はほぼ鉛直と見なしてよい。
+    * 分母の **0.5 · m · g** は「片足立ちぶんの荷重」。両足で立っていれば各足が
+      おおよそこの値、片足支持ならその倍が乗るので、飽和して 1 になる。蹴っている
+      最中は軸足の片足支持が正常なので、**満点が出るのが正しい状態**。
+    * 質量は ``robot.data.default_mass`` の全 body 合計。質量 DR を掛けている
+      タスクでも既定質量で割ることになるが、この項は「荷重が乗っているか」の
+      0-1 指標なので分母の数 % のずれは意味を持たない (飽和側にいる)。
+
+    センサが解決できない構成ではゼロを返す (:func:`_plant_contact_ids`)。
+    """
+    ids = _plant_contact_ids(env)
+    if ids is None:
+        return torch.zeros(env.num_envs, device=device)
+
+    scale = getattr(env, _PLANT_CONTACT_MASS_ATTR, None)
+    if scale is None:
+        mass = robot.data.default_mass.sum(dim=1).to(device)  # (N,)
+        scale = torch.clamp(0.5 * mass * _GRAVITY, min=1e-6)
+        setattr(env, _PLANT_CONTACT_MASS_ATTR, scale)
+
+    sensor = env.scene.sensors[_PLANT_CONTACT_SENSOR]
+    # net_forces_w_history: (N, history, num_bodies, 3)。index 0 = 最新。
+    fz = sensor.data.net_forces_w_history[:, 0, ids, 2]  # (N, 2)
+    fz_plant = fz[torch.arange(env.num_envs, device=device), support_foot]
+    return torch.clamp(fz_plant / scale, min=0.0, max=1.0)
+
 
 
 def _foot_body_ids(env: ManagerBasedRLEnv, robot) -> list[int]:

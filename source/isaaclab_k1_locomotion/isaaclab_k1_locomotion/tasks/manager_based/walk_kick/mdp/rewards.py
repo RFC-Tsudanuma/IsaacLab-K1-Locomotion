@@ -1319,6 +1319,68 @@ def kick_plant_lon(
     return r_dir * f_lon
 
 
+def kick_plant_grounded(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+    style_halfwidth: float | None = None,
+) -> torch.Tensor:
+    """項17. Plant Grounded (蹴る瞬間に軸足が接地しているか) = r_direction * plant_contact。shape: (N,)
+
+    latch したステップの **軸足 (蹴っていない方の足) の法線接触力** を、片足立ちぶんの
+    荷重 (0.5 · m · g) で正規化して 0-1 にしたもの
+    (:func:`~.kick_state._plant_contact_normalized`)。1 = 軸足にちゃんと体重が
+    乗っている、0 = 軸足も浮いている = **跳びながら蹴っている**。
+
+    狙いは実機で観測された「蹴る瞬間に跳ぶ / 蹴った直後に跳ねる」の抑制である。
+    跳んで蹴ると、地面反力を使えないぶん蹴り足の運動量だけでボールを打つことになり、
+    威力が出ないうえ着地が乱れる。罰で潰すのではなく **接地している蹴りに上乗せで
+    払う** ことで、「跳ねない蹴り」を正解側に置く。
+
+    設計上の約束は :func:`kick_plant_lon` / :func:`kick_plant_yaw` と同じ:
+
+    * **r_direction への乗算**。加算だと「蹴らずに両足で立っている」で報酬が取れる。
+      乗算なら kick_done ゲート・方向精度・胴体の向きを通過した蹴りにしか払われない。
+      ``sigma_direction`` は同じタスクの他のキック項と **必ず同じ値** にすること。
+    * **他のキック報酬とは加算で並べる** (乗算にしない)。
+    * **非負** (罰にしない)。跳んだ蹴りは「罰される」のではなく「報われない」に留める。
+      負の dense 払いにすると :func:`_r_direction` の NOTE と同じ「外したら早く転んで
+      損切り」の抜け道が復活する。
+    * **線形** (Gaussian にしない)。0-1 に正規化済みの量をそのまま掛けるので、
+      跳んでいる側 (0 付近) でも勾配が一定で残る (:func:`kick_plant_lon` の
+      「線形テントにする理由」と同じ)。
+
+    未計測ガードが要らない理由も :func:`kick_plant_lon` と同じ。pre-latch は
+    ``p_style_frozen`` が 0 で ``r_direction`` が 0 になるので 1 円も払われず、
+    latch 後は ``plant_contact_frozen`` が必ずその蹴りの実測値になっている。
+
+    NOTE: ``contact_forces`` センサから足の body index を解決できない構成では
+          ``plant_contact_frozen`` が常に 0 になり、この項は常に 0 を返す
+          (:func:`~.kick_state._plant_contact_ids` が起動時に一度だけ警告を出す)。
+          「効いていない」と「値が 0」を取り違えないよう、Metrics の
+          ``plant_contact`` (log_contact_geometry=True で出る) を必ず並べて見ること。
+    """
+    r_dir, state = _r_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+        style_halfwidth=style_halfwidth,
+    )
+    return r_dir * state["plant_contact_frozen"]
+
+
 def kick_plant_yaw(
     env: ManagerBasedRLEnv,
     r_stance: float,

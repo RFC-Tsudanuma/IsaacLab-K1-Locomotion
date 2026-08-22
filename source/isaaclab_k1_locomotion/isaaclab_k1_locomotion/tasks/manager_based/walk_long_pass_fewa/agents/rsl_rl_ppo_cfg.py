@@ -168,3 +168,13 @@ class K1WalkLongPassFewaBand6CalmPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_long_pass_fewa_band6calm"
+
+
+@configclass
+class K1WalkLongPassFewaGroundedPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """Ablation D: 軸足の接地を測る報酬項を足した Stage 4。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_grounded"

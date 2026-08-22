@@ -487,6 +487,14 @@ _KICK_STATE_REWARD_TERMS = (
     "ball_avoidance",
     "kick_pose_overshoot",
     "extra_ball_touch",
+    # ablation D (Grounded) だけが実際に足す項。名簿に載せておくのは
+    # _apply_v_thresh の配布先にするためで、他の変種では属性が無いので
+    # getattr の None ガードで飛ばされる (kick_velocity_strong と同じ扱い)。
+    #
+    # NOTE: 名簿に載っていても **_apply_v_thresh を呼ぶ時点で属性が無ければ配れない**。
+    #       ablation D は基底の __post_init__ (= -- 5 の配布) が終わった後に項を
+    #       足すので、足した直後にもう一度 _apply_v_thresh を呼んでいる。
+    "kick_plant_grounded",
 )
 
 

@@ -191,3 +191,23 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaBand6CalmPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Grounded-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaGroundedEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaGroundedPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Grounded-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaGroundedEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaGroundedPPORunnerCfg",
+    },
+)

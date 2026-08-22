@@ -38,12 +38,25 @@ Calm                    lin_vel_z_l2 -0.8 → -2.0                    跳ねは�
                                                                     滞空への報酬を切れば収まる。
 Band6Calm               Band6 + Calm                                強く蹴りつつ跳ねない、が両立するか。
                                                                     片方ずつと突き合わせて交互作用を見る。
+Grounded                報酬項 kick_plant_grounded を追加            跳ねるのは「跳んで蹴っても報酬が
+                        (weight 3.0 × _KICK_W_SCALE)                 変わらない」から。接地している蹴りに
+                                                                    だけ上乗せで払えば跳ばなくなる。
+                                                                    Calm と違って **罰ではない** ので、
+                                                                    蹴り自体を減らす方向へは効かない。
 ======================  ==========================================  =====================================
 """
 
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
 
-from .walk_long_pass_fewa_env_cfg import K1WalkLongPassFewaEnvCfg, K1WalkLongPassFewaEnvCfg_PLAY
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import _KICK_STATE_PARAMS, _KICK_W_SCALE, _SIGMA_DIRECTION
+from .walk_long_pass_fewa_env_cfg import (
+    _LONG_PASS_V_THRESH,
+    K1WalkLongPassFewaEnvCfg,
+    K1WalkLongPassFewaEnvCfg_PLAY,
+    _apply_v_thresh,
+)
 
 # --------------------------------------------------------------------------- #
 # Ablation A: 帯の終点を 6.0 m/s まで伸ばす
@@ -231,3 +244,87 @@ class K1WalkLongPassFewaBand6CalmEnvCfg_PLAY(K1WalkLongPassFewaBand6EnvCfg_PLAY)
     def __post_init__(self) -> None:
         super().__post_init__()
         apply_calm(self)
+
+
+# --------------------------------------------------------------------------- #
+# Ablation D: 蹴る瞬間に軸足が接地していることを報酬にする (跳ね対策・実装あり)
+#
+# B (Calm) が「跳ねを罰する」なら、こちらは **接地している蹴りに上乗せで払う**。
+# 罰と報酬では抜け道が違うので、どちらが効くかを並べて見たい:
+#
+#   * 罰 (Calm) は「跳ねないが蹴らない」でも満点になる。キック報酬との綱引きに
+#     なるので、蹴り自体が減る方向へ倒れる危険がある。
+#   * 上乗せ (Grounded) は r_direction への乗算なので、**蹴らなければ 1 円も出ない**。
+#     「跳ねずに蹴る」だけが得になる。そのかわり跳ねること自体は罰されないので、
+#     跳ぶ癖が強く残っていると勾配が育つまで時間がかかる。
+#
+# 測っている量 (:func:`~..walk_kick.mdp.kick_state._plant_contact_normalized`):
+#   latch したステップの軸足の **法線接触力** を、片足立ちぶんの荷重 (0.5·m·g) で
+#   正規化して [0, 1] にクランプしたもの。1 = 体重が軸足に乗っている、
+#   0 = 軸足も浮いている = 跳びながら蹴っている。
+#
+# weight は 3.0 × _KICK_W_SCALE。_KICK_W_SCALE (= 0.6 / 2.0) は「仕様書の weight は
+# キック窓 0.6 秒前提の配分なので、実際の窓 2.0 秒との比で割り戻す」係数で、
+# walk_kick 系のキック報酬は全部これを掛けてある。素の 3.0 は項1 (kick_direction, 6.0)
+# の半分で、方向が合った蹴り 1 回の収益を 1.5 倍程度に押し上げる水準。
+#
+# **フェードインは付けない。** Stage 4 は既に蹴れるポリシーからの fine-tune なので、
+# 立ち上げ期間はそのまま「蹴らない方が得」の期間になる (基底の
+# _freeze_fade_in_curricula の docstring)。カリキュラム項を作らず終値を直接入れる
+# ことで、1 iteration 目から満額になる (基底が既存のランプを潰しているのと同じ状態)。
+#
+# NOTE: この項は kick_state を呼ぶので v_thresh の配布対象。基底の __post_init__ が
+#       配り終えた **後** に足すことになるので、足した直後にもう一度
+#       _apply_v_thresh を呼ぶ (基底の -- 4 で extra_ball_touch を足してから -- 5 で
+#       配っているのと同じ順序を、継承の外側で作り直している)。
+# NOTE: log_contact_geometry を True にして Metrics/kick_direction/plant_contact を
+#       出す。**学習には一切影響しない** (メトリクスが 4 つ増えるだけ) が、
+#       この項が効いているかはこの値が上がるかどうかでしか判定できない。
+# --------------------------------------------------------------------------- #
+_GROUNDED_WEIGHT = 3.0 * _KICK_W_SCALE
+
+
+def apply_grounded(cfg) -> None:
+    """軸足の接地を測る報酬項を足し、v_thresh を配り直す。
+
+    PLAY からも呼べる (報酬項の増減は観測にも行動にも影響しないので、
+    checkpoint の引き継ぎにも PLAY の見え方にも影響しない)。
+    """
+    cfg.rewards.kick_plant_grounded = RewTerm(
+        func=mdp.kick_plant_grounded,
+        weight=_GROUNDED_WEIGHT,
+        # sigma_direction は同じタスクの他のキック項と必ず同じ値にすること
+        # (r_direction を共有しているので、違う値を渡すと項ごとに別の方向精度で
+        #  採点することになる)。
+        params={**_KICK_STATE_PARAMS, "sigma_direction": _SIGMA_DIRECTION},
+    )
+    # 項を足した後に配り直す (基底の -- 5 は既に走り終わっている)。
+    _apply_v_thresh(cfg, _LONG_PASS_V_THRESH)
+
+    # Metrics/kick_direction/plant_contact を出す (学習には影響しない)。
+    cfg.commands.kick_direction.log_contact_geometry = True
+
+
+@configclass
+class K1WalkLongPassFewaGroundedEnvCfg(K1WalkLongPassFewaEnvCfg):
+    """Stage 4 (軸足接地)。基底との差は報酬項が 1 つ増えることだけ。
+
+    仮説: 実機で見えた「蹴りながら跳ぶ」は、跳んで蹴っても報酬が変わらないから
+    起きている。接地している蹴りにだけ上乗せで払えば、跳ばない蹴りへ寄る。
+
+    見るところ: ``Metrics/kick_direction/plant_contact`` (kick_rate で割り戻す) が
+    上がるか。上がらないまま ``Episode_Reward/kick_plant_grounded`` も 0 のままなら、
+    contact_forces センサの body index が解決できていない可能性がある
+    (起動ログの ``[WARN] kick_state:`` を確認すること)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)
+
+
+@configclass
+class K1WalkLongPassFewaGroundedEnvCfg_PLAY(K1WalkLongPassFewaEnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)

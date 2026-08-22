@@ -92,6 +92,13 @@ class KickDirectionCommand(UniformVelocityCommand):
       かを見る指標** でもある (両者を分ける自由度は Hip_Yaw)。
       これも「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
 
+    * ``plant_contact``: 同じ瞬間の **軸足の接地の強さ** (0-1)。軸足の法線接触力を
+      片足立ちぶんの荷重 (0.5 · m · g) で正規化してクランプしたもので、
+      1 = 体重が軸足にちゃんと乗っている、0 = 軸足も浮いている =
+      **跳びながら蹴っている**。実機で見えた「蹴る瞬間に跳ぶ」の直接の指標で、
+      :func:`~.rewards.kick_plant_grounded` が引っ張る値そのもの。
+      これも「キックが成立した env」だけで平均している (``kick_rate`` で割り戻すこと)。
+
     ``kick_rate`` 以外は未キックの env を 0 として平均するため、キック成立分だけの値が
     欲しいときは ``kick_rate`` で割り戻すこと。
     """
@@ -145,6 +152,9 @@ class KickDirectionCommand(UniformVelocityCommand):
             # 別物なので分けて出す。同じフラグに相乗りさせているのは、これも
             # walk_inside_kick 専用の指標で、他タスクの TB タグ集合を変えないため。
             self.metrics["plant_yaw_dot"] = torch.zeros(self.num_envs, device=self.device)
+            # 軸足の接地の強さ (0-1)。跳ねの直接の指標なので、これも同じフラグに
+            # 相乗りさせている (他タスクの TB タグ集合を変えないため)。
+            self.metrics["plant_contact"] = torch.zeros(self.num_envs, device=self.device)
 
     def _update_metrics(self):
         # kick_state は termination / reward 側が同じステップで計算済みのものを読むだけ
@@ -192,6 +202,7 @@ class KickDirectionCommand(UniformVelocityCommand):
             self.metrics["foot_kick_dot"] = state["foot_kick_dot_frozen"] * kick_done
             self.metrics["ball_side"] = state["ball_side_frozen"] * kick_done
             self.metrics["plant_yaw_dot"] = state["plant_yaw_dot_frozen"] * kick_done
+            self.metrics["plant_contact"] = state["plant_contact_frozen"] * kick_done
 
     def _resample_command(self, env_ids: torch.Tensor):
         n = len(env_ids)
