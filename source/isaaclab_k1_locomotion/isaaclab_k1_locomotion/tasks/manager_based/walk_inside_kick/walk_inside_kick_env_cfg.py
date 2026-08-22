@@ -238,17 +238,25 @@ _INSIDE_PARAMS = {
 # --------------------------------------------------------------------------- #
 # kick_inside_contact の重み
 #
-# direction (6.0) / scaled (4.0) / strong (3.0) と同じ土俵で、scaled と同格の 4.0。
+# direction (6.0) / scaled (4.0) / strong (3.0) と同じ土俵で、direction と同格の 6.0。
 # middle の kick_plant_foot が 2.0 に抑えられていたのは、あれが「目的そのものでは
-# なく蹴り方の指定」だったため。こちらは **当たり所がこのタスクの目的そのもの** なので、
-# その上限を外して同格に置く。
+# なく蹴り方の指定」だったため。こちらは **当たり所がこのタスクの目的そのもの** なので
+# 最上位に置く。
+#
+# 初版は scaled と同格の 4.0。weight 4.0 の run (2026-08-22_11-22-36) で iter 500 の
+# foot_kick_dot が 0.91 = strong の全盛期にトーキックの型が固まりつつあった。
+# 設計上は strong の退場 (500 → 1200) 後に f_perp が引き戻す想定だが、型の決定期に
+# インサイド側の勾配が細いままなのはリスクなので、キック報酬の最上位 (direction) と
+# 同格へ上げる。direction を超えないのは、これも r_direction への乗算項であり、
+# 「形の項が目的の項を出し抜かない」という序列 (_PLANT_LON_WEIGHT のコメント参照)
+# に従うため。
 #
 # 項1-3 と同じく post-latch に dense で払われるので、猶予窓 (2.0 秒) ぶんの割り戻し
 # (_KICK_W_SCALE) を掛けること。フェードインの窓は基底のキック報酬と同じ 0 → 500 で、
 # 発見期には既に満額で乗っている状態にする (型が決まってから足すと、既に決まった
 # トーキックの位置で f_perp が小さく、勾配が細いところから始めることになる)。
 # --------------------------------------------------------------------------- #
-_INSIDE_CONTACT_WEIGHT = 4.0
+_INSIDE_CONTACT_WEIGHT = 6.0
 
 # --------------------------------------------------------------------------- #
 # kick_plant_lon (軸足の前後位置) のパラメータと重み
@@ -268,26 +276,53 @@ _INSIDE_CONTACT_WEIGHT = 4.0
 #   と、ポリシーが実際に居る場所で勾配が生きている。σ = 0.10 の Gaussian だった
 #   kick_plant_foot は同じ −0.42 で f ≈ 5e-4 = 真っ平らだったので動かなかった。
 #
-# _PLANT_LON_WEIGHT = 4.0:
-#   kick_inside_contact (4.0) と同格。初版は middle の kick_plant_foot に倣って
-#   2.0 (「軸足は型の指定であって目的そのものではない」ため一段下) に抑えていたが、
-#   実機で「蹴る位置が手前すぎてカス当たりで威力が落ちる / 空振りした足にボールを
-#   巻き込んで転ぶ」事故が続いた。plant_lon −0.23 のままでは振り足がボールの手前側を
-#   通る幾何そのものが残るので、「型の指定だから一段下げる」という序列の理屈より
-#   転倒事故の重さを優先し、当たり所と同格まで上げて軸足を目標へ動かす圧を確保する。
+# _PLANT_LON_WEIGHT = 6.0:
+#   direction (6.0) と同格 = キック報酬の最上位タイ。方針は「壊れない範囲で最強」。
 #
-#   同格まで (それ以上にしない) の理由: この項も r_direction への乗算なので、
-#   これを超えて積むと「方向・威力・当たり所を多少捨ててでも軸足を置く」側へ
-#   天秤が傾き得る。効いているかの判定は Metrics/kick_direction/plant_lon
-#   (−0.23 から −0.10 側へ動くか)、副作用の監視は vel_ratio (威力を削っていないか)
-#   と kick_inside_contact (当たり所と取り合いになっていないか)。
+#   履歴: 2.0 (初版。middle の kick_plant_foot に倣い「型の指定だから一段下」) →
+#   4.0 (実機の「手前すぎてカス当たり / 空振りした足にボールを巻き込んで転ぶ」
+#   事故対策で scaled と同格へ) → 6.0 (weight 4.0 の run 2026-08-22_11-22-36 の
+#   決着を待たず、転倒事故の再発コストを優先して壊れない上限まで上げる判断)。
+#   plant_lon −0.23 のままでは振り足がボールの手前側を通る幾何そのものが残る。
+#
+#   「壊れない」の上限を direction 同格 (6.0) に引く理由:
+#   * この項は r_direction への乗算・非負なので、方向ゲート (kick_done /
+#     τ_direction / p_style) を通らない蹴りには 1 円も払われない。農作の抜け道は
+#     構造側で塞がっている。残る壊れ方は「威力・精度を多少削ってでも軸足を置く」
+#     というトレードだけで、威力 (v_ball) は r_direction に入っていないぶん
+#     scaled が唯一の対抗馬になる。
+#   * direction 同格までなら、どの objective 項 (direction / scaled) も plant に
+#     1:1 以上で対抗でき、「軸足のためにキックそのものを崩す」が総額で勝てない。
+#     これを超えて積むと形 (軸足) が目的 (方向・威力) を出し抜けるようになるので、
+#     6.0 が上限。さらに強くしたくなったら weight ではなく span を絞る (下の
+#     _PLANT_LON_SPAN_END)。
+#
+#   効いているかの判定は Metrics/kick_direction/plant_lon (−0.23 から −0.10 側へ
+#   動くか)、副作用の監視は vel_ratio (威力を削っていないか) と
+#   kick_inside_contact (当たり所と取り合いになっていないか)。
 #
 #   項1-3 と同じく post-latch に dense で払われるので、猶予窓 (2.0 秒) ぶんの
 #   割り戻し (_KICK_W_SCALE) を掛けること。
+#
+# _PLANT_LON_SPAN_END = 0.25 / 窓 1500 → 3000 (kick_plant_lon_span カリキュラム):
+#   第 2 のエスカレーション。テントの勾配は W/span なので、weight を上限で止めた
+#   あとの増強は span を絞る側で行う (6.0/0.45 = 13.3 → 6.0/0.25 = 24。
+#   初版 2.0/0.45 = 4.4 の 5.4 倍)。
+#   始点 1500 = strong の退場 (1200) + 型の整定余裕 300。トーキック → インサイドの
+#   移行が済む前に絞ると、移行中の居場所が 0 に潰れて kick_plant_foot の死因
+#   (ポリシーの居る場所で勾配ゼロ) を作り直すことになる。終点 3000 は σ_velocity
+#   アニール・拡大ゲートの公称終点と同じ。
+#   終値 0.25 は最悪ケースの生存で決めた: 前 checkpoint の収束値 −0.23 (gap 0.20)
+#   から一歩も動かなかったとしても f = 1 − 0.20/0.25 = 0.2 が残る。0.20 まで
+#   絞るとちょうどその位置で f = 0 になり、「動かない場所で報酬が真っ平ら」を
+#   自分で作ってしまう。
 # --------------------------------------------------------------------------- #
 _PLANT_LON_TARGET = -0.03
 _PLANT_LON_SPAN = 0.45
-_PLANT_LON_WEIGHT = 4.0
+_PLANT_LON_SPAN_END = 0.25
+_PLANT_LON_SPAN_START_ITER = 1500
+_PLANT_LON_SPAN_END_ITER = 3000
+_PLANT_LON_WEIGHT = 6.0
 
 # --------------------------------------------------------------------------- #
 # kick_velocity_strong の折れ線 (このタスク用に「下り」を前倒しした版)
@@ -568,6 +603,23 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
         },
     )
 
+    # 第 2 のエスカレーション: 後期に span を絞り、目標付近の傾きを立てる
+    # (勾配 = W/span)。窓 1500 → 3000 と終値 0.25 の根拠は
+    # :data:`_PLANT_LON_SPAN_END` のコメント。strong 退場 (1200) より前に絞ると
+    # トーキック期の居場所が 0 に潰れるので、始点は必ずその後に置くこと。
+    cfg.curriculum.kick_plant_lon_span = CurrTerm(
+        func=mdp.linear_reward_param,
+        params={
+            "term_name": "kick_plant_lon",
+            "param_name": "lon_span",
+            "start_value": _PLANT_LON_SPAN,
+            "end_value": _PLANT_LON_SPAN_END,
+            "start_step": _PLANT_LON_SPAN_START_ITER,
+            "end_step": _PLANT_LON_SPAN_END_ITER,
+            "steps_per_iteration": _SPI,
+        },
+    )
+
     # 発見期の呼び水。**weight 0 で置くだけ。カリキュラムも付けない。**
     #
     # kick_inside_contact は「当たった瞬間」しか見ないので、インサイドで当たる接触が
@@ -707,6 +759,9 @@ class K1WalkInsideKickEnvCfg(K1WalkKickEnvCfg):
     * ``Metrics/kick_direction/plant_lon``: 軸足の前後位置 [m] (+ = ボールより前)。
       ``kick_plant_lon`` が直接引っ張っている値なので、**この項が効いているかの
       唯一の判定材料**。初版の収束値が −0.23 なので、そこから −0.10 側へ動くかを見る。
+      1500 iteration 以降は span が 0.45 → 0.25 へ絞られる
+      (``Curriculum/kick_plant_lon/lon_span``)。絞りの途中で plant_lon が悪化する
+      ようなら、絞りすぎ = 居場所の勾配が細っているサイン。
       動かないまま ``Episode_Reward/kick_plant_lon`` だけが増えているなら、
       f_lon ではなく r_direction (キックの数と質) の方が伸びているだけ。
       なお ``--resume`` での後掛けでは動かない前例が 2 つあるので、動かなければ
