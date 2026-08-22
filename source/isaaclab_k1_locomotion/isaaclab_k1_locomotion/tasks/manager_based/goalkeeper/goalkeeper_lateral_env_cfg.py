@@ -205,6 +205,11 @@ _ADAPTIVE_PHASE_PARAMS = {
     "f_min": PHASE_F_MIN,
     "f_max": PHASE_F_MAX,
     "dr_base": PHASE_DR_BASE,
+    # ★ 周波数の大きさを「指令」でなく「実速度」から決めるか (既定 False = 指令)。
+    #   ☠ **キーとして明示しておくこと。** `--override_json` は存在しないキーを作らない
+    #     (typo 検出のため) ので、ここに無いと
+    #     `gk_lateral_phase_from_speed.json` が "leaf attribute missing on dict" で落ちる。
+    "use_actual_speed": False,
 }
 
 # 直前の指令を符号反転させる確率 (2026-08-21 追加)。
