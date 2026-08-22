@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Export an RSL-RL checkpoint and rename the resulting policy.onnx to
-# policy_<HHMMSS>.onnx using the trailing time of the run directory name
-# (e.g. 2026-05-04_23-01-14 -> 230114). Falls back to the full run dir name
-# if the time pattern is absent (e.g. "0504_best").
+# Export an RSL-RL checkpoint to <run>/exported/.
+#
+# 成果物の名前は export_policy.py 側が
+#   <experiment>_<checkpoint>_<エクスポート時刻>.{pt,onnx}
+#   (例 k1_walk_inside_kick_model_3600_20260822-215713.onnx)
+# として書き出す (scripts/rsl_rl/export_naming.py)。
+#
+# 以前はここで policy.onnx を policy_<HHMMSS>.onnx へ mv して run の時刻を後付けして
+# いたが、(1) run の時刻はエクスポート時刻ではない、(2) step が入らないので
+# どの checkpoint から出たか分からない、という 2 点で目的を果たしていなかった。
+# 命名はエクスポート時に確定するようになったので、この mv は廃止した。
 
 set -e
 source /home/satoshi/.bash_functions
@@ -13,6 +20,7 @@ _labpython2 export_policy.py \
     --num_envs 1 \
     "$@"
 
+# 書き出したものを表示しておく (名前に時刻が入るので、毎回別ファイルになる)。
 ckpt_path=""
 prev=""
 for arg in "$@"; do
@@ -23,25 +31,10 @@ for arg in "$@"; do
     prev="$arg"
 done
 
-if [[ -z "$ckpt_path" ]]; then
-    echo "[export_policy.sh] no --checkpoint arg; skipping rename" >&2
-    exit 0
-fi
-
-run_dir="$(dirname "$ckpt_path")"
-run_name="$(basename "$run_dir")"
-
-if [[ "$run_name" =~ _([0-9]{2})-([0-9]{2})-([0-9]{2})$ ]]; then
-    tag="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}"
-else
-    tag="$run_name"
-fi
-
-src="${run_dir}/exported/policy.onnx"
-dst="${run_dir}/exported/policy_${tag}.onnx"
-if [[ -f "$src" ]]; then
-    mv -f "$src" "$dst"
-    echo "[export_policy.sh] renamed: $src -> $dst"
-else
-    echo "[export_policy.sh] WARN: $src not found, skipping rename" >&2
+if [[ -n "$ckpt_path" ]]; then
+    run_dir="$(dirname "$ckpt_path")"
+    if [[ -d "${run_dir}/exported" ]]; then
+        echo "[export_policy.sh] exported/:"
+        ls -1t "${run_dir}/exported" | sed -e 's/^/    /'
+    fi
 fi

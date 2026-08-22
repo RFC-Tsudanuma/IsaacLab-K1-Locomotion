@@ -25,6 +25,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+import export_naming  # isort: skip
 
 parser = argparse.ArgumentParser(description="Play a hierarchical (dribble) RL agent.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during play.")
@@ -210,7 +211,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         policy_nn = runner.alg.actor_critic
 
     # 上位ポリシーを TorchScript / ONNX にエクスポート (play.py と同じ流儀)。
-    # 出力先: <checkpoint dir>/exported/policy.{pt,onnx}
+    # 出力先: <checkpoint dir>/exported/<experiment>_<checkpoint>_<時刻>.{pt,onnx}
     if hasattr(policy_nn, "actor_obs_normalizer"):
         normalizer = policy_nn.actor_obs_normalizer
     elif hasattr(policy_nn, "student_obs_normalizer"):
@@ -218,9 +219,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         normalizer = None
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-    print(f"[INFO] Exported high-level policy to: {export_model_dir}/policy.{{pt,onnx}}")
+    _stem = export_naming.exported_basename(agent_cfg.experiment_name, resume_path)
+    jit_filename, onnx_filename = f"{_stem}.pt", f"{_stem}.onnx"
+    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename=jit_filename)
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
+    print(f"[INFO] Exported high-level policy to: {export_model_dir}/{_stem}.{{pt,onnx}}")
 
     if args_cli.export_only:
         hier_env.close()

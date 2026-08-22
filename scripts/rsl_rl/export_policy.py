@@ -6,8 +6,12 @@
 """Export an RSL-RL checkpoint to JIT/ONNX without running the play loop.
 
 This mirrors the export portion of ``play.py`` (the part that builds the env so
-RSL-RL can construct the correct policy shape, loads a checkpoint, and writes
-``policy.pt``/``policy.onnx`` under ``<run>/exported/``) and skips simulation.
+RSL-RL can construct the correct policy shape, loads a checkpoint, and writes the
+TorchScript/ONNX pair under ``<run>/exported/``) and skips simulation.
+
+The artifacts are named ``<experiment>_<checkpoint>_<export time>.{pt,onnx}``
+(e.g. ``k1_walk_inside_kick_model_3600_20260822-215713.onnx``) so that the file
+name alone says which checkpoint it came from -- see ``export_naming.py``.
 
 Usage examples::
 
@@ -26,6 +30,7 @@ import sys
 from isaaclab.app import AppLauncher
 
 import cli_args  # isort: skip
+import export_naming  # isort: skip
 
 parser = argparse.ArgumentParser(description="Export RSL-RL checkpoint to JIT and ONNX.")
 parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to instantiate (1 is enough).")
@@ -135,20 +140,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         normalizer = None
 
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+    # 固定名 (policy.pt / policy.onnx) ではなく「タスク名 + checkpoint + エクスポート
+    # 時刻」を焼き込む。どの .pt から出た成果物かをファイル名だけで確定させるため
+    # (理由は export_naming モジュールの docstring)。.pt と .onnx で時刻がずれない
+    # よう、stem は 1 度だけ作って両方に使い回す。
+    _stem = export_naming.exported_basename(agent_cfg.experiment_name, resume_path)
+    jit_filename, onnx_filename = f"{_stem}.pt", f"{_stem}.onnx"
     if isinstance(policy_nn, ActorCriticHistoryCNN):
         # 観測履歴を見る actor は nn.Sequential ではないので標準 exporter が使えない
         # (actor[0].in_features を見に行く)。入力は (1, history_length, obs_dim) で、
         # 正規化器は exporter の中に焼き込まれる (play.py と同じ分岐)。
-        export_history_policy_as_jit(policy_nn, path=export_model_dir, filename="policy.pt")
-        export_history_policy_as_onnx(policy_nn, path=export_model_dir, filename="policy.onnx")
+        export_history_policy_as_jit(policy_nn, path=export_model_dir, filename=jit_filename)
+        export_history_policy_as_onnx(policy_nn, path=export_model_dir, filename=onnx_filename)
         print(
             f"[INFO] Exported history-input policy (obs shape = (1, {policy_nn.history_length},"
             f" {policy_nn.obs_dim}))"
         )
     else:
-        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
-    print(f"[INFO] Exported policy.pt and policy.onnx to: {export_model_dir}")
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename=jit_filename)
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename)
+    print(f"[INFO] Exported {jit_filename} and {onnx_filename} to: {export_model_dir}")
 
     env.close()
 

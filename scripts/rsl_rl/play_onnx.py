@@ -14,6 +14,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+import export_naming  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play with an ONNX policy in Isaac Sim.")
@@ -44,7 +45,7 @@ parser.add_argument(
     "--onnx",
     type=str,
     default=None,
-    help="ONNX モデルへのパス。未指定時は logs から自動解決して .../exported/policy.onnx を読む。",
+    help="ONNX モデルへのパス。未指定時は logs から自動解決し、.../exported/ の最新 *.onnx を読む。",
 )
 parser.add_argument(
     "--onnx_provider",
@@ -228,14 +229,21 @@ def _resolve_onnx_path(args_cli, agent_cfg) -> tuple[str, str]:
         print(f"[INFO] Loading experiment from directory: {log_root_path}")
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
         log_dir = os.path.dirname(resume_path)
-        onnx_path = os.path.join(log_dir, "exported", "policy.onnx")
+        # 成果物は固定名ではなく <experiment>_<checkpoint>_<時刻>.onnx になったので
+        # (export_naming の docstring)、名前を決め打ちせず mtime が一番新しいものを拾う。
+        export_dir = os.path.join(log_dir, "exported")
+        found = export_naming.latest_artifact(export_dir, ".onnx")
+        if found is None:
+            raise FileNotFoundError(
+                f"ONNX モデルが見つかりません: {export_dir}/*.onnx\n"
+                "学習後 play.py か export_policy.py を 1 度走らせて exported/ に"
+                " 書き出しておくか、--onnx <path> で明示指定してください。"
+            )
+        onnx_path = found
+        print(f"[INFO] 最新の ONNX を使用します: {onnx_path}")
 
     if not os.path.isfile(onnx_path):
-        raise FileNotFoundError(
-            f"ONNX モデルが見つかりません: {onnx_path}\n"
-            "学習後 play.py を 1 度だけ走らせて exported/policy.onnx を生成しておくか、"
-            "--onnx <path> で明示指定してください。"
-        )
+        raise FileNotFoundError(f"ONNX モデルが見つかりません: {onnx_path}")
     return onnx_path, log_dir
 
 

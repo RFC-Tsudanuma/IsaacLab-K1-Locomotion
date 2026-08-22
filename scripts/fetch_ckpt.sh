@@ -8,7 +8,7 @@
 #   ./scripts/fetch_ckpt.sh --step 2000 k1_walk_kick # model_2000.pt を取ってくる
 #   ./scripts/fetch_ckpt.sh --run 2026-08-19_08-22-05 --step 2000 k1_walk_kick
 #   ./scripts/fetch_ckpt.sh --full k1_walk_kick     # run ディレクトリ丸ごと
-#   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (policy*.onnx) も取ってくる
+#   ./scripts/fetch_ckpt.sh --onnx k1_walk_kick     # exported/ (*.onnx) も取ってくる
 #   ./scripts/fetch_ckpt.sh --video k1_walk_kick    # videos/ も取ってくる
 #   ./scripts/fetch_ckpt.sh --no-tfevents k1_walk_kick # TensorBoard のログは要らない
 #

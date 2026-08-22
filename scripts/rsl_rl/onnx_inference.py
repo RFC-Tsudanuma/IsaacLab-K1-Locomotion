@@ -1,4 +1,4 @@
-"""RSL-RL の export_policy_as_onnx で書き出された policy.onnx を使って推論するサンプル。
+"""RSL-RL の export_policy_as_onnx で書き出した ONNX ポリシーで推論するサンプル。
 
 - ONNX 入力: "obs" shape=(N, 79), float32 (生の観測。正規化器はモデル内部に焼き込み済み)
 - ONNX 出力: "actions" shape=(N, 22), float32 (生のアクション。スケール・オフセット未適用)
@@ -70,7 +70,7 @@ assert DEFAULT_JOINT_POS.shape == (NUM_JOINTS,)
 
 
 class K1OnnxPolicy:
-    """policy.onnx をラップして 1 ステップ分の推論を行う。"""
+    """ONNX ポリシーをラップして 1 ステップ分の推論を行う。"""
 
     def __init__(self, onnx_path: str | Path, providers: list[str] | None = None) -> None:
         if providers is None:
@@ -325,7 +325,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="K1 ONNX policy inference (with optional viser viz)")
     parser.add_argument(
         "--onnx", type=str, required=True,
-        help="logs/.../exported/policy.onnx へのパス",
+        help="logs/.../exported/<experiment>_<checkpoint>_<時刻>.onnx へのパス",
     )
     parser.add_argument("--steps", type=int, default=0,
                         help="走らせるステップ数 (0 で無限ループ。viser 利用時は 0 推奨)")
