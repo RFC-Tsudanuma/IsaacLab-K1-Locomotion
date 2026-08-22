@@ -127,3 +127,44 @@ class K1WalkLongPassFewaPPORunnerCfg(K1WalkLoopPass360PPORunnerCfg):
 
         self.experiment_name = "k1_walk_long_pass_fewa"
         _use_history_cnn_policy(self)
+
+
+# --------------------------------------------------------------------------- #
+# Stage 4 の ablation (walk_long_pass_fewa_ablation_env_cfg)
+#
+# 環境側の変更は報酬の weight とカリキュラムの終点だけで、観測・行動空間は
+# 基底と同一。PPO ハイパラもネットワークも基底から変えない (変えると
+# 「1 変種につき 1 箇所」が崩れて比較にならない)。experiment_name だけ分けて
+# logs が混ざらないようにする。
+#
+# 出発 checkpoint はどれも基底 Stage 4 と同じものを使えるので、
+# scripts/rsl_rl/train_walk_long_pass_fewa_ablation.sh が LP_CKPT を全変種へ配る。
+# --------------------------------------------------------------------------- #
+@configclass
+class K1WalkLongPassFewaBand6PPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """Ablation A: 帯の終点を (3.2, 6.0) にした Stage 4。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_band6"
+
+
+@configclass
+class K1WalkLongPassFewaCalmPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """Ablation B: 跳ねに効く 3 項の weight を変えた Stage 4。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_calm"
+
+
+@configclass
+class K1WalkLongPassFewaBand6CalmPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """Ablation C: A + B。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_band6calm"

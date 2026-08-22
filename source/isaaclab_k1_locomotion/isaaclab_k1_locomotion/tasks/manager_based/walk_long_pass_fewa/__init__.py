@@ -123,3 +123,71 @@ gym.register(
 #       通し実行 (Stage 1-4) は scripts/rsl_rl/train_walk_long_pass_fewa.sh。
 #       **共用タスク側の checkpoint からは actor を引き継げない** ので、
 #       --load_pretrained には上の Stage 1-3 (履歴入力版) の run を使うこと。
+
+# --------------------------------------------------------------------------- #
+# Stage 4 の ablation (一晩で並列に回して翌日に良かったものを実機へ載せる)
+#
+# いずれも Stage 4 (Fewa-v0) を継承して **1 箇所だけ** 変えたもの。観測・行動空間は
+# 基底と同一なので、出発 checkpoint は全変種で共有できる。
+# 通し実行は scripts/rsl_rl/train_walk_long_pass_fewa_ablation.sh。
+# --------------------------------------------------------------------------- #
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaBand6EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaBand6PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaBand6EnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaBand6PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Calm-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaCalmEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaCalmPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Calm-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaCalmEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaCalmPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6Calm-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaBand6CalmEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaBand6CalmPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6Calm-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_fewa_ablation_env_cfg:K1WalkLongPassFewaBand6CalmEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassFewaBand6CalmPPORunnerCfg",
+    },
+)
