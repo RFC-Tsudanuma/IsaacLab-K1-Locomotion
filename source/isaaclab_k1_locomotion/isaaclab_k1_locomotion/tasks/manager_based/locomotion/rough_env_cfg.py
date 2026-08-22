@@ -399,7 +399,7 @@ class K1Rewards(RewardsCfg):
 
     dof_vel_l2 = RewTerm(
         func=mdp.joint_vel_l2,
-        weight=-5.0e-4,
+        weight=-5.0e-3,
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_.*", ".*_Knee_.*", ".*_Ankle_.*"])},
     )
 

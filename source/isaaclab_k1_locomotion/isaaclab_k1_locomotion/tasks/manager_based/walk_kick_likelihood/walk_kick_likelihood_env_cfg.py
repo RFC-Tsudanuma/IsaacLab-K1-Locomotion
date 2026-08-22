@@ -20,6 +20,7 @@ environment reward and it is not recurrent across control steps.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -48,12 +49,18 @@ from ..walk_kick.walk_kick_env_cfg import (
 from . import mdp
 
 
-_MOVING_BALL_SPEED_STAGES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+_MOVING_BALL_SPEED_STAGES = (0.0, 1.0, 2.0, 4.0)
 _MOVING_BALL_SPEED_RANGE = (0.0, _MOVING_BALL_SPEED_STAGES[-1])
-_MOVING_BALL_SPAWN_DISTANCE_RANGE = (1.5, 3.0)
+_MOVING_BALL_SPAWN_DISTANCE_MIN_M = 1.5
+_MOVING_BALL_SPAWN_DISTANCE_MAX_STAGES_M = (3.0, 3.0, 5.0, 8.0)
 _MOVING_BALL_SPAWN_BEARING_RANGE = (-0.87266463, 0.87266463)
 _MOVING_BALL_CLOSEST_APPROACH_RANGE = (-0.25, 0.25)
+_MOVING_BALL_NOMINAL_TTC_RANGE_S = (1.5, 5.0)
 _BALL_FRICTION_RANGE = (0.9, 1.3)
+_BALL_MASS_KG = 0.45
+_BALL_ROLLING_DECAY_RATE_RANGE_S_INV = (0.12, 0.18)
+_BALL_GROUND_CONTACT_TOLERANCE_M = 0.01
+_KICK_TARGET_HEADING_RANGE = (-math.pi / 2.0, math.pi / 2.0)
 _KICK_DETECTION_WARMUP_STEPS = 5
 _STEPS_PER_ITERATION = 48
 _BALL_DIRECTION_PENALTY_PER_KICK = 1.5
@@ -382,6 +389,7 @@ class _K1WalkKickLikelihoodBaseEnvCfg(K1WalkKickEnvCfg):
             target_distance_range=(5.0, 12.0),
             ball_asset_name="soccer_ball",
         )
+        self.commands.kick_direction.ranges.heading = _KICK_TARGET_HEADING_RANGE
 
 
 def _freeze_kick_reward_curricula_at_final(cfg) -> None:
@@ -491,6 +499,18 @@ class K1WalkKickLikelihoodStationaryEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.events.ball_rolling_resistance = EventTerm(
+            func=mdp.ApplyBallRollingResistance,
+            mode="interval",
+            interval_range_s=(_CTRL_DT, _CTRL_DT),
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "ball_radius": _BALL_RADIUS,
+                "ball_mass": _BALL_MASS_KG,
+                "decay_rate_range_s_inv": _BALL_ROLLING_DECAY_RATE_RANGE_S_INV,
+                "contact_tolerance_m": _BALL_GROUND_CONTACT_TOLERANCE_M,
+            },
+        )
         self.rewards.ball_direction_penalty = RewTerm(
             func=walk_kick_mdp.ball_direction_penalty,
             weight=0.0,
@@ -536,14 +556,14 @@ class K1WalkKickLikelihoodStationaryEnvCfg_PLAY(K1WalkKickLikelihoodStationaryEn
 
 @configclass
 class K1WalkKickLikelihoodEnvCfg(K1WalkKickLikelihoodStationaryEnvCfg):
-    """Stage 3: full estimator DR plus a moving-ball speed curriculum.
+    """Stage 3: full estimator DR plus an incoming-ball TTC curriculum.
 
     The existing WalkKick task and its ball asset stay unchanged.  This task
-    changes the reset trajectory, enables pre-kick ball
-    tracking/physical-kick detection, widens the ball's ordinary Coulomb
-    friction, and promotes the reset speed cap from stationary to 1.0 m/s.
-    Ground material and restitution remain the target Isaac Lab task's native
-    contract; no rolling-friction model or CVKF coupling is added.
+    changes the reset trajectory, enables pre-kick ball tracking/physical-kick
+    detection, preserves the widened ordinary Coulomb-friction range, and
+    promotes paired spawn-distance/speed caps from stationary to 8 m / 4 m/s.
+    TTC controls the nominal approach timing; the inherited pseudo rolling
+    resistance remains independent of the CVKF.
     """
 
     localization_dr_force_full: bool = True
@@ -557,11 +577,18 @@ class K1WalkKickLikelihoodEnvCfg(K1WalkKickLikelihoodStationaryEnvCfg):
             "ball_cfg": SceneEntityCfg("soccer_ball"),
             "ball_radius": _BALL_RADIUS,
             "speed_range_mps": (0.0, _MOVING_BALL_SPEED_STAGES[0]),
-            "incoming_probability": 0.5,
-            "incoming_spawn_distance_range_m": _MOVING_BALL_SPAWN_DISTANCE_RANGE,
-            "outgoing_spawn_distance_range_m": _MOVING_BALL_SPAWN_DISTANCE_RANGE,
+            "incoming_probability": 1.0,
+            "incoming_spawn_distance_range_m": (
+                _MOVING_BALL_SPAWN_DISTANCE_MIN_M,
+                _MOVING_BALL_SPAWN_DISTANCE_MAX_STAGES_M[0],
+            ),
+            "outgoing_spawn_distance_range_m": (
+                _MOVING_BALL_SPAWN_DISTANCE_MIN_M,
+                _MOVING_BALL_SPAWN_DISTANCE_MAX_STAGES_M[0],
+            ),
             "closest_approach_offset_range_m": _MOVING_BALL_CLOSEST_APPROACH_RANGE,
             "spawn_bearing_range_rad": _MOVING_BALL_SPAWN_BEARING_RANGE,
+            "nominal_ttc_range_s": _MOVING_BALL_NOMINAL_TTC_RANGE_S,
         }
         self.events.ball_friction = EventTerm(
             func=mdp.RandomizeBallFriction,
@@ -575,6 +602,8 @@ class K1WalkKickLikelihoodEnvCfg(K1WalkKickLikelihoodStationaryEnvCfg):
             func=mdp.MovingBallSpeedCurriculum,
             params={
                 "stages_mps": _MOVING_BALL_SPEED_STAGES,
+                "spawn_distance_max_stages_m": _MOVING_BALL_SPAWN_DISTANCE_MAX_STAGES_M,
+                "spawn_distance_min_m": _MOVING_BALL_SPAWN_DISTANCE_MIN_M,
                 "success_threshold": 0.80,
                 "frontier_fraction": 0.75,
                 "min_episodes_per_direction": 1000,
@@ -609,3 +638,13 @@ class K1WalkKickLikelihoodEnvCfg_PLAY(K1WalkKickLikelihoodEnvCfg):
         self.events.push_robot = None
         self.curriculum.moving_ball_speed = None
         self.events.reset_ball.params["speed_range_mps"] = _MOVING_BALL_SPEED_RANGE
+        final_distance_range = (
+            _MOVING_BALL_SPAWN_DISTANCE_MIN_M,
+            _MOVING_BALL_SPAWN_DISTANCE_MAX_STAGES_M[-1],
+        )
+        self.events.reset_ball.params[
+            "incoming_spawn_distance_range_m"
+        ] = final_distance_range
+        self.events.reset_ball.params[
+            "outgoing_spawn_distance_range_m"
+        ] = final_distance_range

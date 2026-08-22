@@ -3,7 +3,7 @@
 #
 #   1. Walk only, while preserving the 132D observation/model contract.
 #   2. Kick a stationary ball toward a randomized global target.
-#   3. Continue from Stage 2 with the moving-ball speed curriculum.
+#   3. Continue from Stage 2 with the incoming-ball TTC distance/speed curriculum.
 #
 # Each transition uses --load_pretrained rather than --resume.  This transfers
 # the identical model weights without carrying the preceding environment's

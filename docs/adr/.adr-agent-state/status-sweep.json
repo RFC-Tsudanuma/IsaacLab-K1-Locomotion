@@ -1,7 +1,7 @@
 {
-  "adr_preflight_count": 1,
+  "adr_preflight_count": 4,
   "cadence": 10,
-  "last_increment_at": "2026-08-21T16:25:26.709241+00:00",
+  "last_increment_at": "2026-08-22T22:07:57.945431+00:00",
   "last_status_sweep_at": null,
   "last_status_sweep_count": 0,
   "schema_version": 1

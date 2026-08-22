@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 _VISION_FOV_YAW_RAD = 3.49065850
 _VISION_MIN_DISTANCE_M = 0.05
-_VISION_MAX_DISTANCE_M = 6.0
+_VISION_MAX_DISTANCE_M = 10.0
 
 _INITIAL_BALL_SPEED_ATTR = "_walk_kick_likelihood_initial_ball_speed"
 _BALL_INCOMING_ATTR = "_walk_kick_likelihood_ball_incoming"
@@ -82,12 +82,16 @@ def reset_moving_ball_trajectory(
     outgoing_spawn_distance_range_m: tuple[float, float] = (1.5, 3.0),
     closest_approach_offset_range_m: tuple[float, float] = (-0.25, 0.25),
     spawn_bearing_range_rad: tuple[float, float] = (-0.87266463, 0.87266463),
+    nominal_ttc_range_s: tuple[float, float] | None = None,
 ) -> None:
     """Reset balls on source-compatible incoming or outgoing trajectories.
 
     Spawn positions and velocities are sampled in the reset robot's yaw frame.
     The vertical position uses the local flat-environment origin, and the
     initial angular velocity is the no-slip spin for the sampled XY velocity.
+    When ``nominal_ttc_range_s`` is set, speed is derived from the path length
+    to closest approach divided by the sampled nominal time-to-contact, then
+    clipped to ``speed_range_mps``.
     """
     if len(env_ids) == 0:
         return
@@ -114,6 +118,15 @@ def reset_moving_ball_trajectory(
     bearing_range = _validated_range(
         spawn_bearing_range_rad,
         "spawn_bearing_range_rad",
+    )
+    ttc_range = (
+        None
+        if nominal_ttc_range_s is None
+        else _validated_range(
+            nominal_ttc_range_s,
+            "nominal_ttc_range_s",
+            positive=True,
+        )
     )
     incoming_probability = float(incoming_probability)
     if not 0.0 <= incoming_probability <= 1.0:
@@ -164,7 +177,21 @@ def reset_moving_ball_trajectory(
     )
     spawn_bearing = _sample_uniform(bearing_range, count, env.device)
     closest_approach_offset = _sample_uniform(offset_range, count, env.device)
-    base_speed = _sample_uniform(speed_range, count, env.device)
+    if ttc_range is None:
+        base_speed = _sample_uniform(speed_range, count, env.device)
+    else:
+        nominal_ttc = _sample_uniform(ttc_range, count, env.device)
+        path_length = torch.sqrt(
+            torch.clamp(
+                spawn_distance.square() - closest_approach_offset.square(),
+                min=0.0,
+            )
+        )
+        base_speed = torch.clamp(
+            path_length / nominal_ttc,
+            min=speed_range[0],
+            max=speed_range[1],
+        )
 
     # Keep the sampled difficulty attached to each episode.  CurriculumManager runs
     # before the next reset event, so it can evaluate the episode that just ended
@@ -230,6 +257,97 @@ def reset_moving_ball_trajectory(
     state[:, 10] = -world_velocity_xy[:, 1] / ball_radius
     state[:, 11] = world_velocity_xy[:, 0] / ball_radius
     ball.write_root_state_to_sim(state, env_ids=env_ids)
+
+
+class ApplyBallRollingResistance(ManagerTermBase):
+    """Apply domain-randomized pseudo rolling resistance on flat ground.
+
+    Only the world-frame horizontal angular velocity is damped.  The torque is
+    cleared while the ball is above the flat-ground contact tolerance, so this
+    term does not introduce air drag or damp vertical spin.
+    """
+
+    def __init__(self, cfg, env) -> None:
+        super().__init__(cfg, env)
+        self.asset_cfg: SceneEntityCfg = cfg.params["asset_cfg"]
+        self.asset = env.scene[self.asset_cfg.name]
+        self._ball_radius = float(cfg.params["ball_radius"])
+        self._ball_mass = float(cfg.params["ball_mass"])
+        self._contact_tolerance = float(cfg.params["contact_tolerance_m"])
+        decay_rate_range = _validated_range(
+            cfg.params["decay_rate_range_s_inv"],
+            "decay_rate_range_s_inv",
+            positive=True,
+        )
+        if self._ball_radius <= 0.0:
+            raise ValueError("ball_radius must be positive")
+        if self._ball_mass <= 0.0:
+            raise ValueError("ball_mass must be positive")
+        if self._contact_tolerance < 0.0:
+            raise ValueError("contact_tolerance_m must be non-negative")
+
+        self._decay_rate = _sample_uniform(
+            decay_rate_range,
+            env.scene.num_envs,
+            env.device,
+        )
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: torch.Tensor | None,
+        asset_cfg: SceneEntityCfg,
+        ball_radius: float,
+        ball_mass: float,
+        decay_rate_range_s_inv: tuple[float, float],
+        contact_tolerance_m: float,
+    ) -> None:
+        del (
+            asset_cfg,
+            ball_radius,
+            ball_mass,
+            decay_rate_range_s_inv,
+            contact_tolerance_m,
+        )
+        if env_ids is None:
+            env_ids = torch.arange(
+                env.scene.num_envs,
+                device=env.device,
+                dtype=torch.long,
+            )
+        else:
+            env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+        if env_ids.numel() == 0:
+            return
+
+        angular_velocity = self.asset.data.root_ang_vel_w[env_ids]
+        ground_height = env.scene.env_origins[env_ids, 2]
+        ball_height = self.asset.data.root_pos_w[env_ids, 2]
+        on_flat_ground = ball_height <= (
+            ground_height + self._ball_radius + self._contact_tolerance
+        )
+
+        # For a solid sphere, I=2/5*m*r^2.  With no slip, I+m*r^2 gives
+        # 7/5*m*r^2, making lambda the ideal linear-speed decay rate.
+        effective_inertia = 1.4 * self._ball_mass * self._ball_radius**2
+        damping = effective_inertia * self._decay_rate[env_ids]
+        torque = torch.zeros(
+            (env_ids.numel(), 1, 3),
+            device=angular_velocity.device,
+            dtype=angular_velocity.dtype,
+        )
+        torque[:, 0, :2] = (
+            -damping.unsqueeze(-1)
+            * angular_velocity[:, :2]
+            * on_flat_ground.unsqueeze(-1)
+        )
+        force = torch.zeros_like(torque)
+        self.asset.permanent_wrench_composer.set_forces_and_torques(
+            forces=force,
+            torques=torque,
+            env_ids=env_ids,
+            is_global=True,
+        )
 
 
 class RandomizeBallFriction(ManagerTermBase):

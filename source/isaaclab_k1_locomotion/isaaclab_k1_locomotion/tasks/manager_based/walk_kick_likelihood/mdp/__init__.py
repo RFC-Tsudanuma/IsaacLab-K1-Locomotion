@@ -11,5 +11,9 @@ from .belief import (
 )
 from .ball_trajectory import build_ball_trajectory
 from .curriculums import MovingBallSpeedCurriculum
-from .events import RandomizeBallFriction, reset_moving_ball_trajectory
+from .events import (
+    ApplyBallRollingResistance,
+    RandomizeBallFriction,
+    reset_moving_ball_trajectory,
+)
 from .commands import GlobalTargetKickCommand, GlobalTargetKickCommandCfg
