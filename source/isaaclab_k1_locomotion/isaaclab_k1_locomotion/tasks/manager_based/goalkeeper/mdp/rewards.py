@@ -1209,3 +1209,59 @@ def _stop_mask(
     robot: Articulation = env.scene["robot"]
     lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
     return (is_stopped & (lin < float(lin_vel_max))).float()
+
+
+_BODY_JITTER_HIST_ATTR = "_gk_body_jitter_hist"    # (2, N, 3) [w_{t-1}, w_{t-2}]
+_BODY_JITTER_STEP_ATTR = "_gk_body_jitter_step"
+_BODY_JITTER_VAL_ATTR = "_gk_body_jitter_val"
+
+
+def body_jitter(
+    env: "ManagerBasedRLEnv",
+    w_ref: float = 0.15,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """**胴体角速度の2階差分**を有界に罰する (N,)。weight < 0 で使う。
+
+    ``d2w / (d2w + w_ref)`` を返す。値域 ``[0, 1)`` で有界 (倍率は PPO を壊すので使わない。
+    :func:`standstill_jitter` の docstring 参照)。
+
+    ☆☆ なぜ指令ではなく **機体側** を見るか (2026-08-22 の実測):
+
+        指令 (action) の比を罰する :func:`action_jitter_ratio` は **移動中に効いていない**。
+        速度が 1.5 倍違う 3 本を測っても比は横並びだった:
+            15-48-46 (0.90 m/s) 0.838 / min_height (0.96) 0.835 / 08-41-39 (1.32) 0.841
+        移動中の高周波は歩容そのものの性質で決まっていて、指令の比では動かせない。
+
+        一方 **胴体角速度の2階差分は実機の振動と 9.4 倍の分離**を持つ:
+            0.0207  -12.0版 (実機で振動しない)
+            0.0820  08-41-39
+            0.1956  07-28   (実機で振動する)
+        指令ベース (7.7 倍) より分離が良く、しかも物理量なので実機との対応が直接的。
+
+    ☆ シムでロボットが実際に震えていることは確認済み。PD と armature が指令の高周波を
+      一部吸収する (吸収率 07-28 0.348 / -12.0版 1.038) が、それでも胴体は 9.4 倍震える。
+
+    Args:
+        w_ref: 圧縮の基準 [rad/s]。0.15 なら 07-28 (0.196) で 0.57、
+            目標 (0.021) で 0.12 と、**運転範囲の全域で勾配が残る**。
+            ☠ 停止時と移動中では絶対値が桁で違う (移動中は 0.57 級) ので、
+              移動中は飽和気味になる。移動中も効かせたいなら w_ref を上げるか、
+              指令ノルムで正規化した版を別に作ること。
+    """
+    robot: Articulation = env.scene[asset_cfg.name]
+    w = robot.data.root_ang_vel_w
+    cur = int(getattr(env, "common_step_counter", 0))
+    if getattr(env, _BODY_JITTER_STEP_ATTR, -1) == cur:
+        d2w = getattr(env, _BODY_JITTER_VAL_ATTR)
+    else:
+        hist: torch.Tensor | None = getattr(env, _BODY_JITTER_HIST_ATTR, None)
+        if hist is None or hist.shape[1:] != w.shape:
+            hist = w.detach().unsqueeze(0).repeat(2, 1, 1)
+            setattr(env, _BODY_JITTER_HIST_ATTR, hist)
+        d2w = torch.norm(w - 2.0 * hist[0] + hist[1], dim=1)
+        hist[1] = hist[0]
+        hist[0] = w.detach()
+        setattr(env, _BODY_JITTER_STEP_ATTR, cur)
+        setattr(env, _BODY_JITTER_VAL_ATTR, d2w)
+    return d2w / (d2w + float(w_ref))

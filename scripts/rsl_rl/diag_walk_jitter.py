@@ -138,8 +138,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     robot = raw.scene["robot"]
 
     d1, d2, spd = [], [], []
+    # ★ 2026-08-22 追加: **機体側の実挙動**も測る。
+    #   それまで `action` (方策の出力) しか見ておらず、「指令は震えているが PD と
+    #   armature が吸収して関節は滑らか」という可能性を排除できていなかった。
+    #   その場合、指令の平滑度をいくら追っても実機とはズレたものを最適化している。
+    #   吸収率 = 関節の2階差分 / 指令の2階差分 が小さければ、シムが吸収している証拠。
+    q1, q2, qv2, w2 = [], [], [], []
     obs = inner_env.get_observations()
     prev = prev2 = None
+    qprev = qprev2 = None
+    qvprev = qvprev2 = None
+    wprev = wprev2 = None
     with torch.inference_mode():
         for i in range(args_cli.steps + args_cli.warmup):
             a = policy(obs)
@@ -148,6 +157,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 if prev2 is not None:
                     d2.append(torch.norm(a - 2.0 * prev + prev2, dim=1).clone())
                 spd.append(torch.norm(robot.data.root_lin_vel_w[:, :2], dim=1).clone())
+            # --- 機体側 (実際の関節・胴体) ---
+            q = robot.data.joint_pos.clone()
+            qv = robot.data.joint_vel.clone()
+            wz = robot.data.root_ang_vel_w.clone()
+            if i >= args_cli.warmup and qprev is not None:
+                q1.append(torch.norm(q - qprev, dim=1))
+                if qprev2 is not None:
+                    q2.append(torch.norm(q - 2.0 * qprev + qprev2, dim=1))
+                    qv2.append(torch.norm(qv - 2.0 * qvprev + qvprev2, dim=1))
+                    w2.append(torch.norm(wz - 2.0 * wprev + wprev2, dim=1))
+            qprev2 = None if qprev is None else qprev.clone()
+            qprev = q
+            qvprev2 = None if qvprev is None else qvprev.clone()
+            qvprev = qv
+            wprev2 = None if wprev is None else wprev.clone()
+            wprev = wz
             prev2 = None if prev is None else prev.clone()
             prev = a.clone()
             obs, _, _, _ = inner_env.step(a)
@@ -170,6 +195,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     _f = math.asin(_s) * _fs / math.pi
     print(f"  2階/1階の比      {_ratio:.4f}   → 支配周波数 約 {_f:.1f} Hz  (fs={_fs:.0f}Hz)")
     print(f"     参考: 1.6Hz→0.20 / 3.5Hz→0.44 / 5Hz→0.62 / 10Hz→1.17 / Nyquist→2.00")
+    # --- 機体側 ---
+    if q2:
+        q1t = torch.stack(q1); q2t = torch.stack(q2)
+        qv2t = torch.stack(qv2); w2t = torch.stack(w2)
+        print("  --- 機体側 (実際に震えているか) ---")
+        print(f"  関節角 1階差分   mean={q1t.mean():.5f}  [rad]")
+        print(f"  関節角 2階差分   mean={q2t.mean():.5f}  p95={torch.quantile(q2t.float(), 0.95):.5f}  [rad]")
+        print(f"  関節速度 2階差分 mean={qv2t.mean():.4f}  [rad/s]")
+        print(f"  胴体角速度 2階差分 mean={w2t.mean():.5f}  [rad/s]")
+        # ★ 吸収率: 指令の高周波がどれだけ関節に出ているか。
+        #   1 に近い = 指令どおり関節も震えている (シムで振動が再現できている)。
+        #   0 に近い = PD/armature が吸収 = **シムでは震えていない** →
+        #              指令の平滑度を追っても実機とはズレたものを最適化している。
+        #   ☠ action は scale 0.5 の関節目標角なので、指令側を 0.5 倍して単位を揃える。
+        absorb = float(q2t.mean() / (d2.mean() * 0.5).clamp(min=1e-9))
+        print(f"  ★ 吸収率 (関節2階差分 / 指令2階差分) = {absorb:.3f}")
+        print("     1 に近い = 指令どおり機体も震えている / 0 に近い = PD が吸収 = シムでは震えていない")
     print("=" * 62 + "\n")
     inner_env.close()
 
