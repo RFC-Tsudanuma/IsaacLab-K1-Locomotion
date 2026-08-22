@@ -168,7 +168,6 @@ from isaaclab.utils import configclass
 from ..locomotion.rough_env_cfg import _apply_play_viewer
 from ..walk_inside_kick.walk_inside_kick_env_cfg import (
     _INSIDE_STRONG_KNOTS,
-    _PLANT_LON_SPAN_KNOTS,
     _PLANT_LON_TARGET,
     _PLANT_YAW_SPAN,
     _ROUGH_BALL_DYNAMIC_FRICTION_RANGE,
@@ -224,7 +223,7 @@ from ..walk_weak_kick_orbit.orbit_mods import apply_ball_param_dr
 #   この系列の documented な失敗は「負の圧力が先に効いて立ち上がらない」なので、
 #   緩む向きは安全側にある。
 # * 代償は壁時計。フェードインが 500 iteration、strong の退場が 1200 iteration、
-#   lon_span の仕上げが 4000 iteration になる。既定 ``ITER=8000`` はこれを見込んだ量。
+#   lon_span の仕上げが 5000 iteration になる。既定 ``ITER=8000`` はこれを見込んだ量。
 #
 # NOTE: 継承元のモジュール (walk_kick / walk_loop_pass / walk_loop_shoot / walk_lob) は
 #       **触っていない**。書き換えるのはこのタスクの cfg インスタンスに乗った
@@ -301,20 +300,41 @@ _FOOT_LIFT_WEIGHT = 6.0
 # 6.0 は inside と違って「objective より下」。形が高さを出し抜けない配分になっている。
 #
 # 目標値 (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_TARGET` = 0.0)
-# と span の折れ線 (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_SPAN_KNOTS`)
-# は inside から **import してそのまま使う**。数値をコピーすると、あちらを直したときに
-# こちらだけ古い値で残る。
-#
-# .. warning::
-#    ロブの実測 plant_lon は **−0.42** で、inside の出発点 (−0.23) よりずっと後ろ。
-#    線形テント半幅 0.45 なら f = 1 − 0.42/0.45 = 0.07 で、**まだ勾配は生きているが
-#    余裕は薄い**。span の第 2 段 (1500 → 3000 で 0.45 → 0.25) に入ると −0.42 の
-#    位置は f = 0 に潰れるので、それまでに手前へ動いている必要がある。
-#    ``Metrics/kick_direction/plant_lon`` が 1500 iteration までに −0.30 側へ
-#    動いていなければ、**第 2 段が始まる前に折れ線を後ろへずらすこと**
-#    (潰れた場所で勾配ゼロ = kick_plant_foot の死因を作り直すことになる)。
+# は inside から **import してそのまま使う**。span の折れ線だけはロブ専用
+# (:data:`_LOB_PLANT_LON_SPAN_KNOTS`、下)。
 # --------------------------------------------------------------------------- #
 _PLANT_LON_WEIGHT = 6.0
+
+# --------------------------------------------------------------------------- #
+# span の折れ線 (ロブ専用)。inside の ``_PLANT_LON_SPAN_KNOTS`` (0.45 → 0.25 → 0.15)
+# を **そのまま使ってはいけない**。
+#
+# ロブの実測 plant_lon は **−0.42** (走り出しの最悪値) で、inside の出発点 −0.23 より
+# ずっと後ろ。inside の初期半幅 0.45 だと f = 1 − 0.42/0.45 = 0.07 と勾配が薄く、
+# 第 2 段 (1500 → 3000 で 0.25 まで絞る) に入った時点で −0.42 の位置は f = 0 に潰れる。
+# 「ポリシーの居る場所で報酬が真っ平ら」はこの系列で kick_plant_foot を殺した
+# 死因そのものなので、出発点に合わせて広く始め、絞りも遅らせる:
+#
+#   iteration    0     1500    3000    5000
+#   span        0.60   0.60    0.35    0.25
+#   f(−0.42)    0.30   0.30    0.0*    —        * ここまで一歩も動いていなければ別の問題
+#   f(−0.30)    0.50   0.50    0.14    —
+#   f(−0.15)    0.75   0.75    0.57    0.40
+#   勾配 W/span 10     10      17      24
+#
+# 終値 0.25 は inside の第 2 段と同じ値 (inside がそこから −0.11 まで踏み込めた実績)。
+# inside の第 3 段 (0.15) までは絞らない — ロブは apex 優先で、軸足の圧を上げ切る
+# より「威力と軸足のトレード」が apex に出ないことを先に確かめる。
+# 絞りの開始 1500 は strong の退場 (1200) の後 (トーキック期の居場所を潰さない)。
+#
+# .. warning::
+#    ``Metrics/kick_direction/plant_lon`` が 3000 iteration までに −0.30 側へ
+#    動いていなければ、第 2 段で f が 0 に潰れる。そのときは折れ線を後ろへずらすのでは
+#    なく、**軸足が報酬で動かない別の原因** (歩幅と接触位相、walk_lob_rough の記録) を
+#    疑うこと。折れ線の形は 1 本の piecewise で書くこと (2 本並べると同じ param に
+#    書き手が 2 人になる。:func:`~..walk_kick.mdp.curriculums.piecewise_reward_param`)。
+# --------------------------------------------------------------------------- #
+_LOB_PLANT_LON_SPAN_KNOTS = [(0, 0.60), (1500, 0.60), (3000, 0.35), (5000, 0.25)]
 
 # --------------------------------------------------------------------------- #
 # 軸足の向き (kick_plant_yaw) の最終重み (× _KICK_W_SCALE)
@@ -428,9 +448,9 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
     # 最初から合っており、掛けると「横が外れているあいだ lon の勾配も死ぬ」という
     # kick_plant_foot の失敗を作り直すことになる。
     #
-    # 目標 (0.0) と span の初期値は inside から import する
-    # (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_SPAN_KNOTS`)。
-    # 初期 span は折れ線の先頭 knot からそのまま読むので、あちらを直せばここも追従する。
+    # 目標 (0.0) は inside から import、span の折れ線はロブ専用
+    # (:data:`_LOB_PLANT_LON_SPAN_KNOTS`: 出発点 −0.42 に合わせて広く始める)。
+    # 初期 span は折れ線の先頭 knot からそのまま読む。
     #
     # sigma_direction は **このタスクの他のキック項と必ず同じ値** (0.6)。
     # 項ごとに違うと方位を外したときの損得が食い違って何を最適化しているのか読めなくなる
@@ -442,7 +462,7 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
             **_KICK_STATE_PARAMS,
             "sigma_direction": _LOB_SIGMA_DIRECTION,
             "lon_target": _PLANT_LON_TARGET,
-            "lon_span": _PLANT_LON_SPAN_KNOTS[0][1],
+            "lon_span": _LOB_PLANT_LON_SPAN_KNOTS[0][1],
         },
     )
     cfg.curriculum.kick_plant_lon_weight = CurrTerm(
@@ -457,24 +477,19 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
         },
     )
 
-    # span の折れ線 (0.45 → 0.25 → 0.15)。テントの勾配は W/span なので、weight を
-    # 上限で止めたあとの増強は **span を絞る側**で行う、という inside の設計を
-    # そのまま引き継ぐ。3 段を **1 本の折れ線** で書くこと (linear_reward_param を
-    # 2 本並べると同じ param に書き手が 2 人になり、最終値が CurriculumManager の
-    # 実行順で決まってしまう。
+    # span の折れ線 (0.60 → 0.35 → 0.25、:data:`_LOB_PLANT_LON_SPAN_KNOTS`)。
+    # テントの勾配は W/span なので、weight を上限で止めたあとの増強は **span を絞る側**
+    # で行う、という inside の設計を引き継ぐ。ただし出発点が −0.42 と後ろなので
+    # inside の数列は使わない (定数のコメント参照)。3 段を **1 本の折れ線** で書くこと
+    # (linear_reward_param を 2 本並べると同じ param に書き手が 2 人になり、最終値が
+    # CurriculumManager の実行順で決まってしまう。
     # :func:`~..walk_kick.mdp.curriculums.piecewise_reward_param` の docstring)。
-    #
-    # .. warning::
-    #    ロブの出発点 −0.42 は inside の −0.23 よりずっと後ろで、第 2 段 (1500 → 3000
-    #    で span 0.45 → 0.25) に入ると f = 0 に潰れる。1500 iteration までに
-    #    ``plant_lon`` が −0.30 側へ動いていなければ、**折れ線を後ろへずらしてから
-    #    回し直すこと** (_PLANT_LON_WEIGHT の warning)。
     cfg.curriculum.kick_plant_lon_span = CurrTerm(
         func=mdp.piecewise_reward_param,
         params={
             "term_name": "kick_plant_lon",
             "param_name": "lon_span",
-            "knots": _PLANT_LON_SPAN_KNOTS,
+            "knots": _LOB_PLANT_LON_SPAN_KNOTS,
             "steps_per_iteration": _SPI,
         },
     )
@@ -692,7 +707,7 @@ class K1WalkLobPlantEnvCfg(K1WalkLobEnvCfg):
 
     .. note::
        ``ITER`` の既定は 8000 と長い。カリキュラムの終点が lon_span の第 3 段
-       (4000 iteration) にあることに加えて、**ロブは apex がなかなか飽和しない** —
+       (5000 iteration) にあることに加えて、**ロブは apex がなかなか飽和しない** —
        loop_shoot 系では 10000 iteration を超えても apex が上がり続けていた。
        途中で止めた値を「頭打ち」と読まないこと。
     """
@@ -754,7 +769,7 @@ class K1WalkLobPlantRoughEnvCfg(K1WalkLobPlantEnvCfg):
       「残りの歩行報酬を捨てるコスト」だけを課すので **最初の 500 iteration は
       蹴らない方が得**が明示的に成立し、蹴らなくなった後に weight が戻ってきても
       払われる先が無い。
-    * ``kick_plant_lon`` の ``lon_span`` が 0.15 → 0.45 に戻り、勾配が 40 → 13.3 に鈍る。
+    * ``kick_plant_lon`` の ``lon_span`` が 0.25 → 0.60 に戻り、勾配が 24 → 10 に鈍る。
     * **``kick_velocity_strong`` が満額で復活する。** これがいちばん危ない。
       あの項は「速いほど得」= 低い弾道のトーキックを名指しで要求する呼び水で、
       退場させたのが stage 2 の肝 (:func:`_apply_lob_plant_recipe` の第 3 節)。

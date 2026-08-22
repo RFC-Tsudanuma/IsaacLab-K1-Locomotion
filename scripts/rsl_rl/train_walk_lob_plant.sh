@@ -39,7 +39,7 @@
 #
 # ITER が長いのはロブだから
 # -------------------------
-# stage 2 の既定は 8000。カリキュラムの終点が lon_span の第 3 段 (4000 iteration) に
+# stage 2 の既定は 8000。カリキュラムの終点が lon_span の第 3 段 (5000 iteration) に
 # あることに加えて、**ロブは apex がなかなか飽和しない** — loop_shoot 系では
 # 10000 iteration を超えても apex が上がり続けていた。途中で止めた値を「頭打ち」と
 # 読まないこと。
@@ -59,10 +59,11 @@
 #                                            立ち上がらなければ呼び水 (strong) の失敗。
 #   Metrics/kick_direction/kick_apex_height  本命。旧 flat lob の頭打ち 0.425 を
 #                                            超えて 0.9 へ向かうか。
-#   Metrics/kick_direction/plant_lon         -0.42 から 0 側へ動くか。1500 iteration
-#                                            までに -0.30 側へ動いていなければ、
-#                                            span の折れ線 (第 2 段が 1500 から) を
-#                                            後ろへずらして回し直すこと。
+#   Metrics/kick_direction/plant_lon         -0.42 から 0 側へ動くか。3000 iteration
+#                                            までに -0.30 側へ動いていなければ、span の
+#                                            絞り (3000 で 0.35) で勾配が潰れる。その
+#                                            ときは折れ線ではなく軸足が動かない原因
+#                                            (歩幅と接触位相) を疑う。
 #   Metrics/kick_direction/plant_yaw_dot     **1 iteration 目の値を必ず記録する**
 #                                            (ロブ系での実測がまだ無い。1 = 蹴り方向 /
 #                                            0 = 真横。素で 0.9 級ならこの項は効かない
