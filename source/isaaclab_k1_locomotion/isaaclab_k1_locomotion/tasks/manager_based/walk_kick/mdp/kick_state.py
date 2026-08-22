@@ -298,6 +298,7 @@ def kick_state(
             "P_kick": torch.zeros(env.num_envs, 2, device=device),
             "init_side": torch.zeros(env.num_envs, device=device),  # 0 = 未確定
             "kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
+            "kick_event": torch.zeros(env.num_envs, device=device),
             "overshoot_fired": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "overshoot_event": torch.zeros(env.num_envs, device=device),
             "tau_direction_frozen": torch.zeros(env.num_envs, device=device),
@@ -626,6 +627,10 @@ def kick_state(
         # 既定/static 経路は従来の式をそのまま維持する。
         trigger = (v_ball > v_thr) & (~state["kick_done"])
 
+    # latch が成立したこのステップだけ 1。同一ステップ内の kick_state 呼び出しは
+    # cache を共有するため、全報酬項から同じ one-shot event が見える。
+    state["kick_event"] = trigger.float()
+
     if trigger.any():
         # τ_direction: ボールの飛翔方向と蹴り方向の角度誤差 [rad]
         # 水平投影で測るので、ボールが浮いていてもそのまま「狙った方位か」を意味する。
@@ -887,6 +892,7 @@ def _reset_cached_episode_rows(
 
     zero_keys = (
         "kick_done",
+        "kick_event",
         "overshoot_fired",
         "overshoot_event",
         "tau_direction_frozen",

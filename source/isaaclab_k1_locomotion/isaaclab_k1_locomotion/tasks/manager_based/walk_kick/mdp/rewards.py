@@ -117,6 +117,41 @@ def kick_direction(
     return r_dir * g
 
 
+def ball_direction_penalty(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """Latch時に一度だけ払うboundedなボール飛翔方向ペナルティ。shape: (N,)
+
+    ``1 - exp(-tau^2 / (2 sigma^2))`` は方向誤差0で0、誤差が増えるほど1へ
+    飽和する。``p_style``は掛けず、既存の正方向報酬と速度報酬も変更しない。
+    戻り値は非負で、負のRewardTerm weightを掛けてペナルティとして使う。
+
+    RewardManagerは``func * weight * dt``を加算するため、最大``lambda``の
+    one-shot penaltyにするにはweightを``-lambda / dt``に設定する。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    tau = state["tau_direction_frozen"]
+    direction_error = 1.0 - torch.exp(-(tau**2) / (2.0 * sigma_direction**2))
+    return direction_error * state["kick_event"]
+
+
 def kick_velocity_scaled(
     env: ManagerBasedRLEnv,
     r_stance: float,

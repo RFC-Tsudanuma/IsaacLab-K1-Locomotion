@@ -26,9 +26,11 @@ import torch
 
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
 from isaaclab.managers import ManagerTermBase
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import GaussianNoiseCfg as Gnoise
@@ -36,7 +38,13 @@ from isaaclab.utils.noise import GaussianNoiseCfg as Gnoise
 from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD, _PHASE_FREQ
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1, ObservationsCfg
 from ..walk_kick import mdp as walk_kick_mdp
-from ..walk_kick.walk_kick_env_cfg import K1WalkKickEnvCfg, _BALL_RADIUS
+from ..walk_kick.walk_kick_env_cfg import (
+    K1WalkKickEnvCfg,
+    _BALL_RADIUS,
+    _CTRL_DT,
+    _KICK_STATE_PARAMS,
+    _SIGMA_DIRECTION,
+)
 from . import mdp
 
 
@@ -48,11 +56,14 @@ _MOVING_BALL_CLOSEST_APPROACH_RANGE = (-0.25, 0.25)
 _BALL_FRICTION_RANGE = (0.9, 1.3)
 _KICK_DETECTION_WARMUP_STEPS = 5
 _STEPS_PER_ITERATION = 48
-# Stage 2 first acquires a stationary-ball kick under clean Localization.  Once
-# the inherited 500-iteration kick-reward ramp has finished, episode-sampled
-# Localization delay/bias bounds ramp to their full values over 1,000 more
-# iterations.  This deterministic boundary is intentionally a named tuning
-# choice: the architecture only requires clean -> randomized progression.
+_BALL_DIRECTION_PENALTY_PER_KICK = 1.5
+_BALL_DIRECTION_PENALTY_RAMP_START_ITERATION = 500
+_BALL_DIRECTION_PENALTY_RAMP_END_ITERATION = 1000
+# Stage 2 first acquires a stationary-ball kick with measured nominal sensor
+# timing and zero Localization bias.  Once the inherited 500-iteration
+# kick-reward ramp has finished, episode-sampled timing/bias bounds widen to
+# their full values over 1,000 more iterations.  This deterministic boundary is
+# intentionally a named tuning choice.
 _LOCALIZATION_DR_START_STEPS = 500 * _STEPS_PER_ITERATION
 _LOCALIZATION_DR_END_STEPS = 1500 * _STEPS_PER_ITERATION
 # Keep the ball stationary for the first 1,000 learning iterations.  The
@@ -379,6 +390,7 @@ def _freeze_kick_reward_curricula_at_final(cfg) -> None:
         "track_lin_vel_xy_exp": "track_lin_vel_weight",
         "track_ang_vel_z_exp": "track_ang_vel_weight",
         "kick_direction": "kick_direction_weight",
+        "ball_direction_penalty": "ball_direction_penalty_weight",
         "kick_velocity_scaled": "kick_velocity_scaled_weight",
         "kick_velocity_strong": "kick_velocity_strong_weight",
         "walk_speed": "walk_speed_weight",
@@ -399,6 +411,7 @@ def _align_kick_curricula_with_runner(cfg) -> None:
         "track_lin_vel_weight",
         "track_ang_vel_weight",
         "kick_direction_weight",
+        "ball_direction_penalty_weight",
         "kick_velocity_scaled_weight",
         "kick_velocity_strong_weight",
         "walk_speed_weight",
@@ -474,10 +487,26 @@ class K1WalkKickLikelihoodWalkPhaseEnvCfg_PLAY(K1WalkKickLikelihoodWalkPhaseEnvC
 
 @configclass
 class K1WalkKickLikelihoodStationaryEnvCfg(_K1WalkKickLikelihoodBaseEnvCfg):
-    """Stage 2: stationary-ball kick with clean-to-full Localization DR."""
+    """Stage 2: stationary-ball kick with nominal-to-full sensor DR."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        self.rewards.ball_direction_penalty = RewTerm(
+            func=walk_kick_mdp.ball_direction_penalty,
+            weight=0.0,
+            params={**_KICK_STATE_PARAMS, "sigma_direction": _SIGMA_DIRECTION},
+        )
+        self.curriculum.ball_direction_penalty_weight = CurrTerm(
+            func=walk_kick_mdp.linear_reward_weight,
+            params={
+                "term_name": "ball_direction_penalty",
+                "start_weight": 0.0,
+                "end_weight": -_BALL_DIRECTION_PENALTY_PER_KICK / _CTRL_DT,
+                "start_step": _BALL_DIRECTION_PENALTY_RAMP_START_ITERATION,
+                "end_step": _BALL_DIRECTION_PENALTY_RAMP_END_ITERATION,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+            },
+        )
         _align_kick_curricula_with_runner(self)
         base_velocity = self.commands.base_velocity
         self.observations.policy.gait_phase.func = estimated_gait_phase_cos_sin
@@ -520,8 +549,6 @@ class K1WalkKickLikelihoodEnvCfg(K1WalkKickLikelihoodStationaryEnvCfg):
     localization_dr_force_full: bool = True
 
     def __post_init__(self) -> None:
-        from isaaclab.managers import CurriculumTermCfg as CurrTerm
-
         super().__post_init__()
         _freeze_kick_reward_curricula_at_final(self)
 

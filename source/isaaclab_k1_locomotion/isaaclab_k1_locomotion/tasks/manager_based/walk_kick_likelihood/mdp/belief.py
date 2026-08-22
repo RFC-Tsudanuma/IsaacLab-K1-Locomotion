@@ -67,7 +67,14 @@ _MEASUREMENT_NOISE_REFERENCE_DISTANCE_M = 1.0
 _MEASUREMENT_NOISE_MAX_SCALE = 8.0
 _CAMERA_FPS_RANGE = (25.0, 30.0)
 _CAMERA_FPS_JITTER = 0.15
-_LATENCY_RANGE_S = (0.0, 0.06)
+# Measured sensor timing.  Camera -> Vision -> Localization produces one atomic
+# VisionFilter snapshot whose ball and adopted Localization sample are roughly
+# 100 ms old when delivered.  The final roughly 10 ms Localization stage is
+# already part of that end-to-end age; it is not an independent pose delay.
+_LOCALIZATION_FPS_NOMINAL = 20.0
+_LOCALIZATION_FPS_RANGE = (17.0, 23.0)
+_END_TO_END_LATENCY_NOMINAL_S = 0.10
+_END_TO_END_LATENCY_RANGE_S = (0.08, 0.15)
 _DROPOUT_BURST_PROBABILITY = 0.05
 _DROPOUT_BURST_FRAMES = (1, 3)
 _OUTLIER_PROBABILITY = 0.02
@@ -81,10 +88,9 @@ _EGO_VELOCITY_BIAS_STD_MPS = 0.03
 _EGO_VELOCITY_DRIFT_STD_MPS_PER_SQRT_S = 0.01
 _EGO_YAW_RATE_BIAS_STD_RPS = 0.05
 _EGO_YAW_RATE_DRIFT_STD_RPS_PER_SQRT_S = 0.02
-# Localization randomization follows ``feat/history-kick/mirror``.  These are
-# hard physical bounds, not Gaussian standard deviations: every episode draws
-# one continuous delay and one fixed pose bias inside the bounds.
-_LOCALIZATION_DELAY_RANGE_S = (0.20, 0.30)
+# Localization pose-error bounds remain episode-fixed.  Sensor rate and
+# end-to-end latency start at their measured nominal values and widen with the
+# same Stage-2 DR scale.
 _LOCALIZATION_POSITION_BIAS_MAX_M = 0.20
 _LOCALIZATION_YAW_BIAS_MAX_RAD = 0.105
 _EGO_POSITION_NOISE_STD_M = 0.0
@@ -96,12 +102,13 @@ _STATE_ATTRIBUTE = "_walk_kick_likelihood_belief_state"
 
 
 def _localization_randomization_scale(env: ManagerBasedRLEnv) -> float:
-    """Return the configured Stage-2 Localization DR scale in ``[0, 1]``.
+    """Return the configured Stage-2 sensor DR scale in ``[0, 1]``.
 
     The walk stage never creates this state.  The stationary stage keeps the
-    first part of training clean and then ramps the episode-sampled bounds;
-    the moving-ball stage explicitly forces the final scale because
-    ``--load_pretrained`` intentionally resets ``common_step_counter``.
+    measured nominal timing and zero localization bias first, then widens the
+    episode-sampled bounds.  The moving-ball stage explicitly forces the final
+    scale because ``--load_pretrained`` intentionally resets
+    ``common_step_counter``.
     """
     cfg = getattr(env, "cfg", None)
     observations = getattr(cfg, "observations", None)
@@ -170,6 +177,7 @@ class CVKFBeliefState:
             dtype=torch.long,
         )
         self.perception_latency_steps = torch.zeros_like(self.dropout_remaining)
+        self.perception_latency_fraction = torch.zeros_like(self.measurement_noise_std)
         self.perception_latency = torch.zeros_like(self.measurement_noise_std)
         self.perception_history_valid_steps = torch.zeros_like(self.dropout_remaining)
 
@@ -183,7 +191,10 @@ class CVKFBeliefState:
         self.ego_yaw_rate_drift = torch.zeros_like(self.measurement_noise_std)
         self.ego_position_bias = torch.zeros_like(self.ego_velocity_bias)
         self.ego_yaw_bias = torch.zeros_like(self.measurement_noise_std)
-        self.localization_delay = torch.zeros_like(self.measurement_noise_std)
+        self.localization_fps = torch.zeros_like(self.measurement_noise_std)
+        self.localization_timer = torch.zeros_like(self.measurement_noise_std)
+        self.localization_sample_position = torch.zeros_like(self.ego_velocity_bias)
+        self.localization_sample_yaw = torch.zeros_like(self.measurement_noise_std)
         self.observed_base_position = torch.zeros_like(self.ego_velocity_bias)
         self.observed_base_yaw = torch.zeros_like(self.measurement_noise_std)
         self.observed_base_lin_vel_yaw = torch.zeros(
@@ -194,7 +205,7 @@ class CVKFBeliefState:
         self.observed_base_ang_vel = torch.zeros_like(self.observed_base_lin_vel_yaw)
 
         max_localization_delay_steps = int(
-            math.ceil(_LOCALIZATION_DELAY_RANGE_S[1] / self.dt)
+            math.ceil(_END_TO_END_LATENCY_RANGE_S[1] / self.dt)
         )
         self.localization_history_length = max_localization_delay_steps + 2
         self.localization_position_history = torch.zeros(
@@ -203,14 +214,14 @@ class CVKFBeliefState:
             2,
             device=self.device,
         )
-        # Store yaw as (cos, sin), so fractional-delay interpolation remains
-        # continuous across the -pi/pi boundary.
+        # Store each held yaw sample as (cos, sin) to preserve its circular
+        # representation across the -pi/pi boundary.
         self.localization_yaw_vector_history = torch.zeros_like(
             self.localization_position_history
         )
         self.localization_history_cursor = 0
 
-        max_latency_steps = int(math.ceil(_LATENCY_RANGE_S[1] / self.dt))
+        max_latency_steps = int(math.ceil(_END_TO_END_LATENCY_RANGE_S[1] / self.dt))
         self.perception_history_length = max_latency_steps + 2
         self.ball_position_history = torch.zeros(
             self.num_envs,
@@ -220,12 +231,6 @@ class CVKFBeliefState:
         )
         self.true_base_position_history = torch.zeros_like(self.ball_position_history)
         self.true_base_yaw_history = torch.zeros(
-            self.num_envs,
-            self.perception_history_length,
-            device=self.device,
-        )
-        self.base_position_history = torch.zeros_like(self.ball_position_history)
-        self.base_yaw_history = torch.zeros(
             self.num_envs,
             self.perception_history_length,
             device=self.device,
@@ -348,9 +353,20 @@ class CVKFBeliefState:
             )
             * localization_scale
         )
-        self.localization_delay[env_ids] = (
-            self._sample_uniform(_LOCALIZATION_DELAY_RANGE_S, count)
-            * localization_scale
+        localization_fps_range = (
+            _LOCALIZATION_FPS_NOMINAL
+            + localization_scale
+            * (_LOCALIZATION_FPS_RANGE[0] - _LOCALIZATION_FPS_NOMINAL),
+            _LOCALIZATION_FPS_NOMINAL
+            + localization_scale
+            * (_LOCALIZATION_FPS_RANGE[1] - _LOCALIZATION_FPS_NOMINAL),
+        )
+        self.localization_fps[env_ids] = self._sample_uniform(
+            localization_fps_range,
+            count,
+        )
+        self.localization_timer[env_ids] = (
+            torch.rand(count, device=self.device) / self.localization_fps[env_ids]
         )
 
         self.measurement_noise_std[env_ids] = self._sample_uniform(
@@ -366,11 +382,26 @@ class CVKFBeliefState:
         self.process_acceleration_std[env_ids] = _PROCESS_ACCELERATION_STD_MPS2 * q_scale
         self.camera_fps[env_ids] = self._sample_uniform(_CAMERA_FPS_RANGE, count)
 
-        sampled_latency = self._sample_uniform(_LATENCY_RANGE_S, count)
-        latency_steps = torch.round(sampled_latency / self.dt).to(torch.long)
+        end_to_end_latency_range = (
+            _END_TO_END_LATENCY_NOMINAL_S
+            + localization_scale
+            * (_END_TO_END_LATENCY_RANGE_S[0] - _END_TO_END_LATENCY_NOMINAL_S),
+            _END_TO_END_LATENCY_NOMINAL_S
+            + localization_scale
+            * (_END_TO_END_LATENCY_RANGE_S[1] - _END_TO_END_LATENCY_NOMINAL_S),
+        )
+        sampled_end_to_end_latency = self._sample_uniform(
+            end_to_end_latency_range,
+            count,
+        )
+        latency_in_steps = sampled_end_to_end_latency / self.dt
+        latency_steps = torch.floor(latency_in_steps).to(torch.long)
         latency_steps.clamp_(max=self.perception_history_length - 2)
         self.perception_latency_steps[env_ids] = latency_steps
-        self.perception_latency[env_ids] = latency_steps.to(torch.float) * self.dt
+        self.perception_latency_fraction[env_ids] = (
+            latency_in_steps - latency_steps.to(latency_in_steps.dtype)
+        )
+        self.perception_latency[env_ids] = sampled_end_to_end_latency
         self.camera_timer[env_ids] = self.perception_latency[env_ids] + (
             torch.rand(count, device=self.device) / self.camera_fps[env_ids]
         )
@@ -386,24 +417,32 @@ class CVKFBeliefState:
         ball_xy = ball.data.root_pos_w[env_ids, :2]
         base_xy = robot.data.root_pos_w[env_ids, :2]
         base_yaw = _yaw_from_quaternion(robot.data.root_quat_w[env_ids])
-        base_yaw_vector = torch.stack((torch.cos(base_yaw), torch.sin(base_yaw)), dim=-1)
-        self.localization_position_history[env_ids] = base_xy.unsqueeze(1)
-        self.localization_yaw_vector_history[env_ids] = base_yaw_vector.unsqueeze(1)
-        self.observed_base_position[env_ids] = (
+        self.localization_sample_position[env_ids] = (
             base_xy
             + self.ego_position_bias[env_ids]
             + torch.randn(count, 2, device=self.device) * _EGO_POSITION_NOISE_STD_M
         )
-        self.observed_base_yaw[env_ids] = (
+        self.localization_sample_yaw[env_ids] = (
             base_yaw
             + self.ego_yaw_bias[env_ids]
             + torch.randn(count, device=self.device) * _EGO_YAW_NOISE_STD_RAD
         )
+        sample_yaw_vector = torch.stack(
+            (
+                torch.cos(self.localization_sample_yaw[env_ids]),
+                torch.sin(self.localization_sample_yaw[env_ids]),
+            ),
+            dim=-1,
+        )
+        self.localization_position_history[env_ids] = (
+            self.localization_sample_position[env_ids].unsqueeze(1)
+        )
+        self.localization_yaw_vector_history[env_ids] = sample_yaw_vector.unsqueeze(1)
+        self.observed_base_position[env_ids] = self.localization_sample_position[env_ids]
+        self.observed_base_yaw[env_ids] = self.localization_sample_yaw[env_ids]
         self.ball_position_history[env_ids] = ball_xy.unsqueeze(1)
         self.true_base_position_history[env_ids] = base_xy.unsqueeze(1)
         self.true_base_yaw_history[env_ids] = base_yaw.unsqueeze(1)
-        self.base_position_history[env_ids] = self.observed_base_position[env_ids].unsqueeze(1)
-        self.base_yaw_history[env_ids] = self.observed_base_yaw[env_ids].unsqueeze(1)
         self.current_estimated_ball_position_w[env_ids] = 0.0
         self.filter.invalidate(env_ids)
         self.ego_generation += 1
@@ -424,14 +463,15 @@ class CVKFBeliefState:
         robot = env.scene[self.robot_name]
         self.true_base_position_history[:, cursor] = robot.data.root_pos_w[:, :2]
         self.true_base_yaw_history[:, cursor] = _yaw_from_quaternion(robot.data.root_quat_w)
-        self.base_position_history[:, cursor] = self.observed_base_position
-        self.base_yaw_history[:, cursor] = self.observed_base_yaw
         self.perception_history_valid_steps[perception_active] += 1
 
         self.filter.predict(self.process_acceleration_std, mask=filter_active)
         self.last_measurement_age[filter_active] += self.dt
         self.camera_timer[perception_active] -= self.dt
-        history_ready = self.perception_history_valid_steps >= self.perception_latency_steps
+        required_history_steps = self.perception_latency_steps + (
+            self.perception_latency_fraction > 0.0
+        ).to(torch.long)
+        history_ready = self.perception_history_valid_steps >= required_history_steps
         due = perception_active & history_ready & (self.camera_timer <= 0.0)
         due_ids = due.nonzero(as_tuple=False).flatten()
         self.measurement_updated.zero_()
@@ -471,13 +511,32 @@ class CVKFBeliefState:
                     self.dropout_remaining[start_ids] = burst_lengths - 1
 
             latency_steps = self.perception_latency_steps[due_ids]
+            latency_fraction = self.perception_latency_fraction[due_ids]
             measurement_age = self.perception_latency[due_ids]
-            history_index = (cursor - latency_steps) % self.perception_history_length
-            captured_ball = self.ball_position_history[due_ids, history_index]
-            captured_true_base = self.true_base_position_history[due_ids, history_index]
-            captured_true_yaw = self.true_base_yaw_history[due_ids, history_index]
-            captured_base = self.base_position_history[due_ids, history_index]
-            captured_yaw = self.base_yaw_history[due_ids, history_index]
+            newer_index = (cursor - latency_steps) % self.perception_history_length
+            older_index = (cursor - latency_steps - 1) % self.perception_history_length
+            position_fraction = latency_fraction.unsqueeze(-1)
+            captured_ball = torch.lerp(
+                self.ball_position_history[due_ids, newer_index],
+                self.ball_position_history[due_ids, older_index],
+                position_fraction,
+            )
+            captured_true_base = torch.lerp(
+                self.true_base_position_history[due_ids, newer_index],
+                self.true_base_position_history[due_ids, older_index],
+                position_fraction,
+            )
+            captured_true_yaw = _interpolate_yaw(
+                self.true_base_yaw_history[due_ids, newer_index],
+                self.true_base_yaw_history[due_ids, older_index],
+                latency_fraction,
+            )
+            # _update_observed_base_pose has already selected the latest held
+            # Localization sample at this same delayed snapshot time.  Rewind it
+            # through the perception history again and the delay would be applied
+            # twice.
+            captured_base = self.observed_base_position[due_ids]
+            captured_yaw = self.observed_base_yaw[due_ids]
             # Camera/VisionFilter first measures in the true camera frame, then
             # Localization places that local measurement into map coordinates.
             # Using the estimated pose for both transforms would cancel the
@@ -610,46 +669,54 @@ class CVKFBeliefState:
             self.observed_base_yaw[:] = true_base_yaw + self.ego_yaw_bias
             return
 
+        self.localization_timer -= self.dt
+        due_ids = (self.localization_timer <= 0.0).nonzero(as_tuple=False).flatten()
+        if due_ids.numel() > 0:
+            self.localization_timer[due_ids] += 1.0 / self.localization_fps[due_ids]
+            self.localization_sample_position[due_ids] = (
+                true_base_position[due_ids]
+                + self.ego_position_bias[due_ids]
+                + torch.randn(due_ids.numel(), 2, device=self.device)
+                * _EGO_POSITION_NOISE_STD_M
+            )
+            self.localization_sample_yaw[due_ids] = (
+                true_base_yaw[due_ids]
+                + self.ego_yaw_bias[due_ids]
+                + torch.randn(due_ids.numel(), device=self.device)
+                * _EGO_YAW_NOISE_STD_RAD
+            )
+
         self.localization_history_cursor = (
             self.localization_history_cursor + 1
         ) % self.localization_history_length
         cursor = self.localization_history_cursor
-        self.localization_position_history[:, cursor] = true_base_position
+        self.localization_position_history[:, cursor] = self.localization_sample_position
         self.localization_yaw_vector_history[:, cursor] = torch.stack(
-            (torch.cos(true_base_yaw), torch.sin(true_base_yaw)),
+            (
+                torch.cos(self.localization_sample_yaw),
+                torch.sin(self.localization_sample_yaw),
+            ),
             dim=-1,
         )
 
-        delay_steps = self.localization_delay / self.dt
-        newer_offset = torch.floor(delay_steps).to(torch.long)
-        fraction = (delay_steps - newer_offset.to(delay_steps.dtype)).unsqueeze(-1)
-        older_offset = newer_offset + 1
+        # Query the latest held Localization sample at or before the shared
+        # fractional snapshot time.  Localization itself is not interpolated.
+        snapshot_offset = self.perception_latency_steps + (
+            self.perception_latency_fraction > 0.0
+        ).to(torch.long)
         row_ids = torch.arange(self.num_envs, device=self.device)
-        newer_index = (cursor - newer_offset) % self.localization_history_length
-        older_index = (cursor - older_offset) % self.localization_history_length
-        delayed_position = torch.lerp(
-            self.localization_position_history[row_ids, newer_index],
-            self.localization_position_history[row_ids, older_index],
-            fraction,
-        )
-        delayed_yaw_vector = torch.lerp(
-            self.localization_yaw_vector_history[row_ids, newer_index],
-            self.localization_yaw_vector_history[row_ids, older_index],
-            fraction,
-        )
-        delayed_yaw = torch.atan2(
+        snapshot_index = (cursor - snapshot_offset) % self.localization_history_length
+        self.observed_base_position[:] = self.localization_position_history[
+            row_ids,
+            snapshot_index,
+        ]
+        delayed_yaw_vector = self.localization_yaw_vector_history[
+            row_ids,
+            snapshot_index,
+        ]
+        self.observed_base_yaw[:] = torch.atan2(
             delayed_yaw_vector[:, 1],
             delayed_yaw_vector[:, 0],
-        )
-        self.observed_base_position[:] = (
-            delayed_position
-            + self.ego_position_bias
-            + torch.randn_like(true_base_position) * _EGO_POSITION_NOISE_STD_M
-        )
-        self.observed_base_yaw[:] = (
-            delayed_yaw
-            + self.ego_yaw_bias
-            + torch.randn_like(true_base_yaw) * _EGO_YAW_NOISE_STD_RAD
         )
 
     def _sample_observed_velocities(self, env: ManagerBasedRLEnv) -> None:
@@ -696,8 +763,9 @@ class CVKFBeliefState:
         else:
             self.current_estimated_ball_position_w = current_ball_position.clone()
 
-        # The filter lives on the delayed measurement timeline, while the ego
-        # pose is current. Thus only the ball forecast includes latency.
+        # The filter state lives on the delayed snapshot timeline and forecasts
+        # the ball forward by the shared age.  The ego pose intentionally stays
+        # as the held Localization sample adopted by that snapshot.
         ego_forecast_offsets = horizons.unsqueeze(0).expand(self.num_envs, -1)
         base_position_forecast, base_yaw_forecast = forecast_constant_body_twist(
             self.observed_base_position,
@@ -1036,6 +1104,17 @@ def _yaw_from_quaternion(quaternion: torch.Tensor) -> torch.Tensor:
     """Extract yaw from Isaac Lab's ``(w, x, y, z)`` quaternion layout."""
     w, x, y, z = quaternion.unbind(dim=-1)
     return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y.square() + z.square()))
+
+
+def _interpolate_yaw(
+    newer_yaw: torch.Tensor,
+    older_yaw: torch.Tensor,
+    fraction: torch.Tensor,
+) -> torch.Tensor:
+    """Interpolate yaw along the shortest arc across the ``-pi/pi`` boundary."""
+    delta = older_yaw - newer_yaw
+    wrapped_delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+    return newer_yaw + fraction * wrapped_delta
 
 
 def _world_to_local_rotation(yaw: torch.Tensor) -> torch.Tensor:
