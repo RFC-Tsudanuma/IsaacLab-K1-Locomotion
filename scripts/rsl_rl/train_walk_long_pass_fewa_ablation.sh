@@ -65,9 +65,10 @@ GPUS_LIST=${GPUS_LIST:-0}
 LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass_fewa_loop_360"
 
 # 既定の変種一覧。grounded は実装がある場合だけ回る (下の task_for で弾く)。
-# 既定は「帯 6.0 + 跳ね対策」の 3 本 (目的 = 強く・跳ねない、を全部が狙う構成)。
-# 単独変種 (band6 / calm / grounded) は切り分け用で、既定には入れない。
-VARIANTS=${VARIANTS:-"band6calm band6grounded band6calmgrounded"}
+# 既定は「帯 6.0」を全部に入れた 4 本。band6 単独も候補 (跳ね対策が蹴りを
+# 弱める可能性があるので、強さだけを取った版を必ず残す)。calm / grounded 単独は
+# 切り分け用で既定には入れない。
+VARIANTS=${VARIANTS:-"band6 band6calm band6grounded band6calmgrounded"}
 
 # tag -> gym タスク ID。ここに無い tag はエラーで止める (綴り間違いを黙って
 # 素通りさせない)。grounded は __init__.py に登録が無ければスキップする。
@@ -108,7 +109,7 @@ RUN_TAGS=()
 for tag in $VARIANTS; do
     if ! task=$(task_for "$tag"); then
         echo "[ERROR] 知らない変種です: $tag" >&2
-        echo "[ERROR] 使えるのは band6calm / band6grounded / band6calmgrounded (切り分け用: band6 / calm / grounded)" >&2
+        echo "[ERROR] 使えるのは band6 / band6calm / band6grounded / band6calmgrounded (切り分け用: calm / grounded)" >&2
         exit 1
     fi
     if ! is_registered "$task"; then
