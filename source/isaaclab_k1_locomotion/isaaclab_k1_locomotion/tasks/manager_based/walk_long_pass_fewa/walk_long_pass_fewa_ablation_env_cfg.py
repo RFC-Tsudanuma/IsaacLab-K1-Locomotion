@@ -328,3 +328,42 @@ class K1WalkLongPassFewaGroundedEnvCfg_PLAY(K1WalkLongPassFewaEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
         apply_grounded(self)
+
+
+# --------------------------------------------------------------------------- #
+# 帯 6.0 を前提にした組み合わせ (本命の候補群)
+#
+# 目的は「強く **かつ** 跳ねない」なので、単独変種 (calm / grounded) は目的の
+# 半分しか狙っていない。実機に載せる候補は **全部に帯 6.0 を入れた上で**、
+# 跳ね対策の機構 (罰 = Calm / 上乗せ = Grounded / 両方) だけを振る。
+# --------------------------------------------------------------------------- #
+@configclass
+class K1WalkLongPassFewaBand6GroundedEnvCfg(K1WalkLongPassFewaBand6EnvCfg):
+    """Stage 4 (帯 6.0 + 軸足接地の上乗せ)。跳ね対策を罰ではなく報酬側で持つ版。"""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)
+
+
+@configclass
+class K1WalkLongPassFewaBand6GroundedEnvCfg_PLAY(K1WalkLongPassFewaBand6EnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)
+
+
+@configclass
+class K1WalkLongPassFewaBand6CalmGroundedEnvCfg(K1WalkLongPassFewaBand6CalmEnvCfg):
+    """Stage 4 (帯 6.0 + 跳ね罰 + 軸足接地の上乗せ)。跳ね対策を両方の機構で持つ版。"""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)
+
+
+@configclass
+class K1WalkLongPassFewaBand6CalmGroundedEnvCfg_PLAY(K1WalkLongPassFewaBand6CalmEnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        apply_grounded(self)

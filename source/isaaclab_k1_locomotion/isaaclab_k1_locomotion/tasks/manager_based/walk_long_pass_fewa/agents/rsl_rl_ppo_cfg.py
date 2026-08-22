@@ -178,3 +178,23 @@ class K1WalkLongPassFewaGroundedPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
         super().__post_init__()
 
         self.experiment_name = "k1_walk_long_pass_fewa_grounded"
+
+
+@configclass
+class K1WalkLongPassFewaBand6GroundedPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """帯 6.0 + 軸足接地 (A + D)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_band6grounded"
+
+
+@configclass
+class K1WalkLongPassFewaBand6CalmGroundedPPORunnerCfg(K1WalkLongPassFewaPPORunnerCfg):
+    """帯 6.0 + 跳ね罰 + 軸足接地 (A + B + D)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_long_pass_fewa_band6calmgrounded"

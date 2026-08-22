@@ -65,7 +65,9 @@ GPUS_LIST=${GPUS_LIST:-0}
 LOOP360_LOG_ROOT="logs/rsl_rl/k1_walk_long_pass_fewa_loop_360"
 
 # 既定の変種一覧。grounded は実装がある場合だけ回る (下の task_for で弾く)。
-VARIANTS=${VARIANTS:-"band6 calm band6calm grounded"}
+# 既定は「帯 6.0 + 跳ね対策」の 3 本 (目的 = 強く・跳ねない、を全部が狙う構成)。
+# 単独変種 (band6 / calm / grounded) は切り分け用で、既定には入れない。
+VARIANTS=${VARIANTS:-"band6calm band6grounded band6calmgrounded"}
 
 # tag -> gym タスク ID。ここに無い tag はエラーで止める (綴り間違いを黙って
 # 素通りさせない)。grounded は __init__.py に登録が無ければスキップする。
@@ -75,6 +77,8 @@ task_for() {
         calm)      echo "Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Calm-v0" ;;
         band6calm) echo "Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6Calm-v0" ;;
         grounded)  echo "Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Grounded-v0" ;;
+        band6grounded)     echo "Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6Grounded-v0" ;;
+        band6calmgrounded) echo "Isaac-Velocity-Flat-K1-Walk-Long-Pass-Fewa-Band6CalmGrounded-v0" ;;
         *)         return 1 ;;
     esac
 }
@@ -104,7 +108,7 @@ RUN_TAGS=()
 for tag in $VARIANTS; do
     if ! task=$(task_for "$tag"); then
         echo "[ERROR] 知らない変種です: $tag" >&2
-        echo "[ERROR] 使えるのは band6 / calm / band6calm / grounded" >&2
+        echo "[ERROR] 使えるのは band6calm / band6grounded / band6calmgrounded (切り分け用: band6 / calm / grounded)" >&2
         exit 1
     fi
     if ! is_registered "$task"; then
