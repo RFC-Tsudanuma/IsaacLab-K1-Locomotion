@@ -17,6 +17,10 @@
 ``(2.0, 3.0)`` から始め、キック成立率が十分な間だけ ``(3.2, 5.0)`` へ進める。
 非キック接触罰は最終速度帯へ到達した後に立ち上げる。
 
+キック後の採点は、最終球方向への高精度一致ではなくインサイドフォームを主目的にする。
+接触時の足内側面法線と、接触直前の足速度を目標方向へ揃え、球速と30度仰角は方向から
+独立して評価する。最終球方向は、目標の反対半球へ飛んだ場合だけ飽和ペナルティを与える。
+
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
 
@@ -115,7 +119,9 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 ------------
 * ``Metrics/kick_direction/kick_rate`` … 観測の意味変更と mirror loss 導入時の過渡を
   監視する。旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
-* ``Metrics/kick_direction/kick_vel_ratio`` / ``kick_dir_error_deg`` … 履歴で改善するか。
+* ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
+* ``Metrics/kick_direction/kick_dir_error_deg`` … 報酬から高精度方向一致を外した後も、
+  インサイドフォームによって結果の方向精度が維持・改善するか。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
@@ -136,10 +142,13 @@ from ..walk_long_pass.walk_long_pass_env_cfg import (
 )
 from ..walk_kick import mdp
 from ..walk_kick.walk_kick_env_cfg import (
+    _KICK_W_SCALE,
+    _SIGMA_DIRECTION,
     K1WalkKickCriticCfg,
     K1WalkKickObservationsCfg,
     K1WalkKickPolicyCfg,
 )
+from . import inside_rewards
 from .observations import (
     BALL_POSITION_NOISE_MAX_M,
     LOCALIZATION_DELAY_BASE_S,
@@ -177,6 +186,13 @@ if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
 # PPO runner の num_steps_per_env。カリキュラムの step を iteration へ換算する値なので、
 # runner 側を変えた場合はここも同時に変えること。
 _STEPS_PER_ITERATION = 48
+
+# インサイドフォームへ配分する nominal weight。post-latch の実 weight は親と同じく
+# _KICK_W_SCALE を掛け、2 秒の支払い窓を変えてもキック 1 回の収益を維持する。
+_INSIDE_FACE_WEIGHT = 3.0
+_STRAIGHT_SWING_WEIGHT = 3.0
+_VELOCITY_TRACKING_WEIGHT = 5.0
+_OPPOSITE_DIRECTION_WEIGHT = -2.0
 
 # 球速帯を進退させるキック成立率のヒステリシス。成立率が中間帯にある間は停止し、
 # 崩れた場合は進行時の 2 倍速で成立していた帯まで戻す。
@@ -288,7 +304,77 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. 継続学習用の復旧カリキュラム
+        # -- 1. 最終球方向中心の報酬をインサイドフォーム中心へ置換
+        #
+        # 旧 kick_direction (nominal 6) は、接触時のインサイド面角度 (3) と
+        # 接触直前の足速度方向 (3) に分ける。球速と30度仰角からは _r_direction を外し、
+        # 最終球方向は反対半球だけを飽和ペナルティ (-2) で禁止する。
+        # 既存の方向誤差 metric は報酬から独立して残るので、結果の精度は引き続き観測できる。
+        kick_state_params = dict(self.rewards.kick_direction.params)
+        for name in ("sigma_direction", "v_gate_frac", "sigma_gate"):
+            kick_state_params.pop(name, None)
+
+        velocity_params = dict(self.rewards.kick_velocity_scaled.params)
+        velocity_params.pop("sigma_direction", None)
+        elevation_params = dict(self.rewards.kick_elevation.params)
+        elevation_params.pop("sigma_direction", None)
+
+        direction_ramp = dict(self.curriculum.kick_direction_weight.params)
+        self.rewards.kick_direction = None
+        self.curriculum.kick_direction_weight = None
+
+        self.rewards.kick_inside_face_alignment = RewTerm(
+            func=inside_rewards.kick_inside_face_alignment,
+            weight=0.0,
+            params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
+        )
+        self.curriculum.kick_inside_face_alignment_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                **direction_ramp,
+                "term_name": "kick_inside_face_alignment",
+                "end_weight": _INSIDE_FACE_WEIGHT * _KICK_W_SCALE,
+            },
+        )
+
+        self.rewards.kick_straight_swing = RewTerm(
+            func=inside_rewards.kick_straight_swing,
+            weight=0.0,
+            params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
+        )
+        self.curriculum.kick_straight_swing_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                **direction_ramp,
+                "term_name": "kick_straight_swing",
+                "end_weight": _STRAIGHT_SWING_WEIGHT * _KICK_W_SCALE,
+            },
+        )
+
+        self.rewards.kick_velocity_scaled.func = inside_rewards.kick_velocity_independent
+        self.rewards.kick_velocity_scaled.params = velocity_params
+        self.curriculum.kick_velocity_scaled_weight.params["end_weight"] = (
+            _VELOCITY_TRACKING_WEIGHT * _KICK_W_SCALE
+        )
+
+        self.rewards.kick_elevation.func = inside_rewards.kick_elevation_independent
+        self.rewards.kick_elevation.params = elevation_params
+
+        self.rewards.kick_opposite_direction = RewTerm(
+            func=inside_rewards.kick_opposite_direction,
+            weight=0.0,
+            params=kick_state_params,
+        )
+        self.curriculum.kick_opposite_direction_weight = CurrTerm(
+            func=mdp.linear_reward_weight,
+            params={
+                **direction_ramp,
+                "term_name": "kick_opposite_direction",
+                "end_weight": _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE,
+            },
+        )
+
+        # -- 2. 継続学習用の復旧カリキュラム
         #
         # 観測の意味変更へ適応する間は、親の最終速度帯を最初から要求しない。
         # 親の早期報酬 weight は終値に保ち、成立率を見ながら球速帯を進退させる。
@@ -334,7 +420,7 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             },
         )
 
-        # -- 2. policy 観測の本体状態 5 項に履歴を付ける
+        # -- 3. policy 観測の本体状態 5 項に履歴を付ける
         #
         # ObsGroup 側の history_length は **使わない**。グループに設定すると
         # ObservationManager が全項に一括で配ってしまい (observation_manager.py の
