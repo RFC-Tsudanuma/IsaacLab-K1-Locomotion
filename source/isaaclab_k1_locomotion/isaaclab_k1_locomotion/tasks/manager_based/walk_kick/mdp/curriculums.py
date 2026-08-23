@@ -324,43 +324,6 @@ def linear_reward_weight_after_speed_gate(
     return {"weight": new_weight, "iterations_since_gate": elapsed}
 
 
-def kick_error_gated_reward_weight(
-    env: ManagerBasedRLEnv,
-    _env_ids: torch.Tensor,
-    term_name: str,
-    command_name: str,
-    boosted_weight: float,
-    settled_weight: float,
-    settle_below_deg: float,
-    reboost_above_deg: float,
-) -> dict[str, float]:
-    """成功キックの方向誤差 EMA に応じて報酬 weight をヒステリシス制御する。
-
-    :func:`kick_rate_gated_speed_range` が保持する ``kick_dir_error_ema_deg`` を読み、
-    誤差が ``settle_below_deg`` 以下なら ``settled_weight``、
-    ``reboost_above_deg`` 以上なら ``boosted_weight`` にする。中間帯では現在値を維持する。
-    方向誤差をまだ観測していない開始時は ``boosted_weight`` を使う。
-    """
-    term = env.reward_manager.get_term_cfg(term_name)
-    gate = getattr(env, "_kick_speed_gate_state", {}).get(command_name, None)
-
-    if gate is None or not gate.get("kick_dir_error_seen", False):
-        new_weight = boosted_weight
-    else:
-        direction_error_ema = gate["kick_dir_error_ema_deg"]
-        if direction_error_ema <= settle_below_deg:
-            new_weight = settled_weight
-        elif direction_error_ema >= reboost_above_deg:
-            new_weight = boosted_weight
-        else:
-            new_weight = term.weight
-
-    if abs(term.weight - new_weight) > 1e-8:
-        term.weight = new_weight
-
-    return {"weight": new_weight}
-
-
 def kick_rate_gated_speed_range(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
