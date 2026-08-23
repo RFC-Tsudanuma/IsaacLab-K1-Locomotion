@@ -63,12 +63,18 @@ class K1GKLateralDHPPORunnerCfg(K1GKLateralPPORunnerCfg):
 
         # ☠ 親が入れた対称変換 (59 次元の履歴なし版) を履歴対応版に差し替える。
         #   忘れると次元チェックで落ちる (静かに壊れるより良い)。
-        #   ★ use_data_augmentation は **False** にする。あちらのブランチと同じ判断で、
-        #     履歴グループ全体 (4913 次元 × ミニバッチ) を 2 倍に複製するとメモリが厳しい。
-        #     mirror loss だけなら最新 1 フレームの反転で済む (symmetry.py 参照)。
-        #     ☠ 非 DH 版は aug=True だったので、ここは条件が変わる点に注意。
+        #   ★★ 2026-08-23: use_data_augmentation を **False → True に戻した**。
+        #     当初は「履歴グループ全体をミニバッチごと 2 倍に複製するとメモリが厳しい」
+        #     という理由で切ったが、これは **非 DH 版 (aug=True) との差を履歴+CNN 以外にも
+        #     作ってしまう手抜き**だった。実測でも A/B の DH 側だけ左右差が
+        #     **1.5 で −7.8% / 1.8 で −7.5%** と一貫して残っている (右が速い)。
+        #     mirror loss だけでは「出力の対称性」しか縛れず、critic の価値推定・
+        #     advantage・観測正規化の統計は左右非対称なまま残るため。
+        #   ☠ メモリ実測: H=50 なら 4096 env で 8.97GB / 16GB。aug で増えるのは
+        #     ミニバッチ 12288 サンプル × 2 × (4900+5400) 次元 × 4B ≒ **+1.0GB** なので収まる。
+        #     H を 100 に戻すときは再計算すること (履歴が倍なので +2GB 級になる)。
         self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
-            use_data_augmentation=False,
+            use_data_augmentation=True,
             use_mirror_loss=True,
             data_augmentation_func=compute_symmetric_states_lateral_history,
             mirror_loss_coeff=2.0,
