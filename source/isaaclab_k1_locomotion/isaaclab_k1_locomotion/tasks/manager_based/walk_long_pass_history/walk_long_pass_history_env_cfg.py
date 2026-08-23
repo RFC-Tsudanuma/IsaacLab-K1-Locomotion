@@ -14,7 +14,8 @@
 
 観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
 親から変更する。親の早期報酬 weight ランプは終値に固定する一方、目標球速は
-``(2.0, 3.0)`` から始め、キック成立率が十分な間だけ ``(3.2, 5.0)`` へ進める。
+``(2.0, 3.0)`` から始め、キック成立率が十分かつ成功キックの方向平均誤差が25°以下の
+間だけ ``(3.2, 5.0)`` へ進める。方向誤差が35°以上なら成立率にかかわらず帯を戻す。
 非キック接触罰は最終速度帯へ到達した後に立ち上げる。
 
 キック後の採点は、最終球方向への高精度一致ではなくインサイドフォームを主目的にする。
@@ -111,8 +112,9 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 
 ``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
 500 iteration までに終わる報酬 weight のランプだけは終値に固定する。球速帯は
-キック成立率 EMA が 0.80 以上なら進み、0.50 未満なら 2 倍速で戻る。最終帯へ到達した
-後だけ ``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
+キック成立率 EMA が0.80以上かつ成功キックの方向平均誤差 EMA が25°以下なら進む。
+成立率が0.50未満または方向誤差が35°以上なら2倍速で戻る。最終帯へ到達した後だけ
+``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
 ``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
 
 見るべきもの
@@ -122,6 +124,8 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
 * ``Metrics/kick_direction/kick_dir_error_deg`` … 報酬から高精度方向一致を外した後も、
   インサイドフォームによって結果の方向精度が維持・改善するか。
+* ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
+  成功キックだけの方向平均誤差 EMA。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
@@ -194,10 +198,12 @@ _STRAIGHT_SWING_WEIGHT = 3.0
 _VELOCITY_TRACKING_WEIGHT = 5.0
 _OPPOSITE_DIRECTION_WEIGHT = -2.0
 
-# 球速帯を進退させるキック成立率のヒステリシス。成立率が中間帯にある間は停止し、
-# 崩れた場合は進行時の 2 倍速で成立していた帯まで戻す。
+# 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
+# ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
 _SPEED_GATE_ADVANCE_ABOVE = 0.80
 _SPEED_GATE_RETREAT_BELOW = 0.50
+_SPEED_GATE_ADVANCE_ERROR_BELOW_DEG = 25.0
+_SPEED_GATE_RETREAT_ERROR_ABOVE_DEG = 35.0
 _SPEED_GATE_RETREAT_SCALE = 2.0
 
 # --------------------------------------------------------------------------- #
@@ -416,6 +422,8 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                 "steps_per_iteration": _STEPS_PER_ITERATION,
                 "advance_above": _SPEED_GATE_ADVANCE_ABOVE,
                 "retreat_below": _SPEED_GATE_RETREAT_BELOW,
+                "advance_error_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "retreat_error_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
                 "retreat_scale": _SPEED_GATE_RETREAT_SCALE,
             },
         )
