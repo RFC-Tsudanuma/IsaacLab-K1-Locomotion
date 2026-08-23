@@ -481,3 +481,31 @@ def delayed_ball_pos_rel_kick_foot(
     """
     value = ball_pos_rel_kick_foot(env, foot_cfg=foot_cfg, ball_cfg=ball_cfg)
     return _delayed_signal(env, "ball_pos_rel_kick_foot", group, value, max_delay_s, base_delay_s)
+
+
+def delayed_kick_dir_b(
+    env: ManagerBasedRLEnv,
+    max_delay_s: float,
+    group: str = "localization",
+    base_delay_s: float = 0.0,
+    command_name: str = "kick_direction",
+) -> torch.Tensor:
+    """自己位置推定の遅延を模した :func:`kick_dir_b`。shape: (N, 2)
+
+    ``kick_dir_b`` は world 座標の目標蹴り方向を **推定ヨー角** で body frame へ回した
+    値なので、自己位置推定が遅れるとこの 2 次元がそのまま古いヨーで回った値になる。
+
+    実機計測で自己位置推定に約 300 ms の遅延があり、旋回中 (指令上限 1.0 rad/s) には
+    最大 0.3 rad ≈ 17° ずれた蹴り方向が観測に入っていた。遅延なしの sim では方向精度が
+    明確に良いことから、実機の方向誤差の主要因と見ている。
+
+    **body frame ベクトルを遅延させることは、遅延したヨーで回すことと等価**である。
+    world 座標の目標方向はエピソード中一定なので、
+    ``R_yaw(t-Δ)⁻¹ · d_world`` は「Δ 前に計算した body frame ベクトル」そのもの。
+    近似ではなく厳密に実機の現象を再現できる。
+
+    ポリシーは base_ang_vel (IMU 由来で低遅延) と 100 フレームの履歴を持っているので、
+    角速度から遅延ぶんを補外することを学習できる余地がある。
+    """
+    value = kick_dir_b(env, command_name=command_name)
+    return _delayed_signal(env, "kick_dir_b", group, value, max_delay_s, base_delay_s)

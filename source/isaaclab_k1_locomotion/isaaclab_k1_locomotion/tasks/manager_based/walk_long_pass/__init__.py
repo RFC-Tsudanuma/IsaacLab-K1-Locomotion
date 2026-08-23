@@ -112,3 +112,23 @@ gym.register(
 #       通し実行 (Stage 1-4) は scripts/rsl_rl/train_walk_long_pass.sh。
 #       **共用タスク側の checkpoint からは actor を引き継げない** ので、
 #       --load_pretrained には上の Stage 1-3 (履歴入力版) の run を使うこと。
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Power-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_power_env_cfg:K1WalkLongPassPowerEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassPowerPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Long-Pass-Power-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_long_pass_power_env_cfg:K1WalkLongPassPowerEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLongPassPowerPPORunnerCfg",
+    },
+)

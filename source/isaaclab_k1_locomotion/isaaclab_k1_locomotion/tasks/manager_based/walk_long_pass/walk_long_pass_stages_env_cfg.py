@@ -46,9 +46,11 @@ from .walk_long_pass_env_cfg import (
     disable_landing_shaping,
     enable_obs_history,
     rebalance_gait_vs_kick,
-    replace_sole_pos_with_ball_pos,
-    use_fixed_kick_foot,
 )
+
+# NOTE: replace_sole_pos_with_ball_pos / use_fixed_kick_foot は実機評価で不採用に
+#       なったので呼んでいない (理由は walk_long_pass_env_cfg の __post_init__ の
+#       コメント参照)。戻すときは Stage 4 と **必ず揃えて** 有効にすること。
 
 
 @configclass
@@ -59,7 +61,6 @@ class K1WalkLongPassWalkPhaseEnvCfg(K1WalkKickWalkPhaseEnvCfg):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self, zero_fill=True)
 
 
 @configclass
@@ -68,7 +69,6 @@ class K1WalkLongPassWalkPhaseEnvCfg_PLAY(K1WalkKickWalkPhaseEnvCfg_PLAY):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self, zero_fill=True)
 
 
 @configclass
@@ -79,8 +79,6 @@ class K1WalkLongPassLoopPassEnvCfg(K1WalkLoopPassEnvCfg):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self)
-        use_fixed_kick_foot(self)
         rebalance_gait_vs_kick(self)
 
 
@@ -90,8 +88,6 @@ class K1WalkLongPassLoopPassEnvCfg_PLAY(K1WalkLoopPassEnvCfg_PLAY):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self)
-        use_fixed_kick_foot(self)
         rebalance_gait_vs_kick(self)
 
 
@@ -103,8 +99,6 @@ class K1WalkLongPassLoop360EnvCfg(K1WalkLoopPass360EnvCfg):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self)
-        use_fixed_kick_foot(self)
         rebalance_gait_vs_kick(self)
 
 
@@ -114,6 +108,4 @@ class K1WalkLongPassLoop360EnvCfg_PLAY(K1WalkLoopPass360EnvCfg_PLAY):
         super().__post_init__()
         enable_obs_history(self)
         disable_landing_shaping(self)
-        replace_sole_pos_with_ball_pos(self)
-        use_fixed_kick_foot(self)
         rebalance_gait_vs_kick(self)

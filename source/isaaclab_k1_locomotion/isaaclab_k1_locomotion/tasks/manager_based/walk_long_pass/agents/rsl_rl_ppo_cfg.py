@@ -112,3 +112,12 @@ class K1WalkLongPassPPORunnerCfg(K1WalkLoopPass360PPORunnerCfg):
 
         self.experiment_name = "k1_walk_long_pass"
         _use_history_cnn_policy(self)
+
+
+@configclass
+class K1WalkLongPassPowerPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
+    """飛距離重視版 Stage 4。ハイパラは同一で experiment_name だけ分ける。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_walk_long_pass_power"

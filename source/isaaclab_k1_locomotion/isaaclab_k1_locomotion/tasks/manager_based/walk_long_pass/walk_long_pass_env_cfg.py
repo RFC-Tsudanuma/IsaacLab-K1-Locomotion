@@ -445,21 +445,28 @@ _OBS_DELAY_MAX_S = 0.02
 # ボールはカメラ → 検出 → 座標変換のパイプラインを通るので、実機のレイテンシは
 # 内界センサより **明確に大きい** (一般的なヒューマノイドで 30-60 ms = 1.5-3 ステップ)。
 #
-# 実効遅延は **2 項とも 0.02-0.08 s** になるよう組んである:
+# 実機計測: カメラ画像 -> 認識までのレイテンシが約 **80 ms**。
+# 実効遅延は **2 項とも 0.06-0.10 s** (中心 80 ms) になるよう組んである:
 #
-#   prev_ball_pos : 0.02 (prev_ball_pos_b の固定 1 ステップ) + [0, 0.06] = 0.02-0.08
-#   ball_vel      : 0.02 (_BALL_OBS_BASE_DELAY_S)            + [0, 0.06] = 0.02-0.08
+#   prev_ball_pos : 0.02 (prev_ball_pos_b の固定 1 ステップ) + 0.04 (base) + [0, 0.04]
+#   ball_vel      : 0.06 (base)                                           + [0, 0.04]
 #
-# ball_vel 側に固定ぶんを足しているのは、prev_ball_pos が設計上すでに 1 ステップ
-# 遅れているため。同じカメラフレームから出る 2 つの量のレイテンシが 1 ステップ
-# ずれているのは実機ではあり得ないので揃える。vision group で乱数を共有するので、
-# ランダム成分も 2 項で同じ値になる。
+# 以前は 0.02-0.08 s (平均 50 ms) で、実測 80 ms を下回っていた。中心を実測値に合わせ、
+# ±20 ms のばらつきを残す形にする。
 #
-# 0.08 s = 4 ステップ。実機のカメラ遅延を測った結果で調整すること。
-# ball_vel だけ従来どおり [0, 0.06] に戻したいなら _BALL_OBS_BASE_DELAY_S = 0.0。
+# prev_ball_pos に足す base が 0.04 なのは、この項が設計上すでに 1 ステップ (0.02 s)
+# 遅れているため (0.02 + 0.04 = 0.06)。同じカメラフレームから出る 2 つの量の
+# レイテンシがずれているのは実機ではあり得ないので、実効値を揃える。
+# vision group で乱数を共有するので、ランダム成分も 2 項で同じ値になる。
+#
+# NOTE: 実効の最小値は _BALL_OBS_EFFECTIVE_MIN_S、幅は _BALL_OBS_DELAY_MAX_S。
+#       レイテンシを測り直したら _BALL_OBS_EFFECTIVE_MIN_S を動かすこと。
 # --------------------------------------------------------------------------- #
-_BALL_OBS_DELAY_MAX_S = 0.06
-_BALL_OBS_BASE_DELAY_S = 0.02
+_BALL_OBS_EFFECTIVE_MIN_S = 0.06
+_BALL_OBS_DELAY_MAX_S = 0.04
+# prev_ball_pos_b が元から持っている固定遅延 [s] (1 ステップ)。
+_PREV_BALL_POS_BUILTIN_DELAY_S = 0.02
+_BALL_OBS_BASE_DELAY_S = _BALL_OBS_EFFECTIVE_MIN_S
 
 # --------------------------------------------------------------------------- #
 # ボール観測のノイズ (一様、±この値)
@@ -476,6 +483,42 @@ _BALL_OBS_BASE_DELAY_S = 0.02
 # 速度 ±0.5 m/s は指令帯 (3.2-5.0) の 10-15%。ボール速度観測に頼った蹴り分けは
 # ほぼできなくなるが、そもそも実機で信用できない量なので頼らせない方が正しい。
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# 自己位置推定 (ヨー) の遅延上限 [s]
+#
+# kick_direction は world 座標の目標蹴り方向を **推定ヨー** で body frame へ回した値
+# なので、自己位置推定が遅れるとその 2 次元が丸ごと古いヨーで回った値になる。
+#
+# 実機計測では約 300 ms 遅れていた。旋回の指令上限が 1.0 rad/s なので、
+# 300 ms なら最大 0.3 rad ≈ 17° ずれた蹴り方向が観測に入る計算で、実機の方向誤差の
+# 主要因と見ている (遅延なしの sim では方向精度が明確に良い)。
+#
+# ただし 300 ms をそのまま DR に入れると 17° の不確かさを常に抱えることになり、
+# ポリシーが「どちらに転んでも大怪我しない蹴り方」に寄って方向精度の上限自体が
+# 下がる恐れがある。そこで段階的に上げて代償を測る。
+#
+# 100 ms と 200 ms を実測した結果、**間に質的な差がある** (いずれも DR なし比、
+# iteration 8007 時点):
+#
+#   遅延      方向誤差   成功率    転倒率     蹴るまで
+#   100 ms    +0.45°     +0.002    +40%      +0.44 s
+#   200 ms    +0.73°     -0.004    +77%      +0.65 s
+#
+# 100 ms は成功率を保ったまま吸収できるが、200 ms では成功率まで落ち、転倒率が
+# 1.8 倍、蹴るまでが 0.65 秒延びる。ポリシーが「遅れた指令を補うため長く回り込む」
+# 方に倒れるため。
+#
+# ただしこの 2 本は walk_speed が弱い (接近報酬が歩容維持の 1/8) 状態での測定で、
+# 「長く回り込む」に倒れやすい条件だった。walk_speed を強めた後 (_WALK_SPEED_WEIGHT)
+# は蹴るまでが 2.4 秒で固定されるので、その状態なら 150 ms も吸収できる可能性がある。
+# 100 と 200 の中間を測って、実機側でどこまで遅延を下げる必要があるかを確定させる。
+# --------------------------------------------------------------------------- #
+# 実機検証の結果、自己位置推定の遅延は **主因ではなかった** (DR を入れても、推論側で
+# 時刻補正を入れても改善が見られなかった)。残る gap は摩擦側と見て、遅延は実機の
+# 実効値に近い 0.01-0.10 s に留める (下限 0.01 = odometry 由来の最小遅延)。
+_LOCALIZATION_DELAY_MIN_S = 0.01
+_LOCALIZATION_DELAY_MAX_S = 0.09
+
 _BALL_POS_NOISE = 0.07
 _BALL_VEL_NOISE = 0.5
 
@@ -494,6 +537,8 @@ _DELAYED_OBS_TERMS = (
     ("joint_vel", "encoder", "delayed_joint_vel_rel", "body"),
     ("ball_vel", "vision", "delayed_ball_vel_b", "ball"),
     ("prev_ball_pos", "vision", "delayed_prev_ball_pos_b", "ball"),
+    # 自己位置推定 (ヨー) 由来。ボール系とは出所が違うので group を分ける。
+    ("kick_direction", "localization", "delayed_kick_dir_b", "localization"),
 )
 
 
@@ -540,13 +585,22 @@ def enable_obs_delay(
                 f"policy 観測に '{term_name}' がありません。遅延 DR の対象項名が"
                 " 継承元の観測構成と食い違っています。"
             )
-        delay = ball_max_delay_s if source == "ball" else max_delay_s
+        if source == "ball":
+            delay = ball_max_delay_s
+        elif source == "localization":
+            delay = _LOCALIZATION_DELAY_MAX_S
+        else:
+            delay = max_delay_s
         term.func = getattr(mdp, func_name)
         term.params = {**term.params, "max_delay_s": delay, "group": group}
-        # prev_ball_pos は固定 1 ステップを元から持っているので base は足さない。
-        # ball_vel だけ同じぶんを足して、同じカメラ由来の 2 項の実効遅延を揃える。
+        # 同じカメラ由来の 2 項で実効遅延を揃える。prev_ball_pos は固定 1 ステップを
+        # 元から持っているので、その分を差し引いた base を与える。
         if term_name == "ball_vel":
             term.params["base_delay_s"] = _BALL_OBS_BASE_DELAY_S
+        elif term_name == "prev_ball_pos":
+            term.params["base_delay_s"] = _BALL_OBS_BASE_DELAY_S - _PREV_BALL_POS_BUILTIN_DELAY_S
+        elif source == "localization":
+            term.params["base_delay_s"] = _LOCALIZATION_DELAY_MIN_S
         applied.append(term_name)
 
     # ボール観測のノイズを実機のカメラ由来の量に合わせて広げる
@@ -636,6 +690,108 @@ def sharpen_kick_pose_match(cfg) -> None:
         mode="startup",
         params={"exponent": _P_STYLE_EXPONENT},
     )
+
+
+
+# --------------------------------------------------------------------------- #
+# 回り込みを速くするための walk_speed 調整
+#
+# 実測 (2026-08-19_18-15-35 の iteration 8000) の払い出し:
+#
+#   feet_phase      0.200      <- 歩行の位相追従
+#   kick_direction  0.170      <- 蹴りの方向
+#   walk_speed      0.0245     <- **接近を促す唯一の項がこれ**
+#
+# 接近を促す項が歩容維持の 1/8 しか払われておらず、「急いで回り込む」動機がほぼ無い。
+# 遅延 DR を入れると蹴るまでの時間がさらに延びる (DR なし 2.66 s -> 100 ms 3.10 s) のも、
+# 元々この圧が弱いところに「慎重に寄る」方向の圧だけが加わるため。
+#
+# 2 つの効き方があるので両方いじる:
+#
+#   weight               : 払い出しの絶対量。1.5 -> _WALK_SPEED_WEIGHT
+#   sigma_walk_potential : p_walk = exp(-d_to_G / σ) の減衰幅。0.5 だと G から 1 m 離れた
+#                          時点で p_walk = 0.135 まで落ち、**遠いうちは接近しても
+#                          ほとんど払われない**。σ を広げると接近の早い段階から払われる。
+#
+#   d_to_G [m]        0.2    0.5    1.0
+#   σ=0.5 (継承元)    0.67   0.37   0.135
+#   σ=1.0             0.82   0.61   0.37
+#
+# NOTE: 「早く蹴る」ではなく「早く G へ寄る」を強めている。時間ペナルティで急がせると
+#       回り込みの途中で蹴る方向に倒れる (以前の p_style の件と同じ失敗になる)。
+# --------------------------------------------------------------------------- #
+_WALK_SPEED_WEIGHT = 4.0
+_WALK_SPEED_SIGMA_POTENTIAL = 1.0
+
+
+def boost_approach_speed(cfg) -> None:
+    """接近報酬 walk_speed を強め、回り込みを速くする。
+
+    weight は curriculum (linear_reward_weight) の end_weight 側で持っているので
+    そちらを書き換える。``_freeze_fade_in_curricula`` が後から start_weight を
+    end_weight に揃えるので、**この関数はその前に呼ぶこと**。
+    """
+    term = getattr(cfg.rewards, "walk_speed", None)
+    if term is not None:
+        term.params["sigma_walk_potential"] = _WALK_SPEED_SIGMA_POTENTIAL
+
+    curr = getattr(cfg.curriculum, "walk_speed_weight", None)
+    if curr is not None:
+        curr.params["end_weight"] = _WALK_SPEED_WEIGHT
+    elif term is not None:
+        # カリキュラムが無い構成なら weight を直接置く
+        term.weight = _WALK_SPEED_WEIGHT
+
+
+
+# --------------------------------------------------------------------------- #
+# 地面 (足裏) 摩擦の DR 範囲
+#
+# 継承元 (velocity_env_cfg) は 静 0.4-0.8 / 動 0.2-0.6。地形側のマテリアルが
+# 静 1.0 / 動 1.0 で friction_combine_mode="multiply" なので、**実効摩擦は
+# ロボット側の値そのもの**。
+#
+# 実機で残っている sim2real gap の症状:
+#
+#   1. 回り込みの途中で足を早く蹴り出し、芯を捉えられず大きく外す
+#   2. 芯は捉えるが、回り込みすぎ / 足りずに向きが目標とずれる
+#
+# 2 は摩擦ギャップの典型。旋回のヨートルクは足裏と地面の摩擦で作るので、実機の摩擦が
+# sim と違えば回転量が系統的にずれる (低ければ回り足りず、高ければ回りすぎる)。
+# 1 も軸足が滑れば胴体が想定位置に来ないので同じ結果になる。
+#
+# 実機の床 (人工芝・体育館床・埃の乗った床) は動摩擦 0.2-1.0 くらいまで振れうるので、
+# 継承元の 0.2-0.6 では滑らない側をまったく経験していない。範囲を約 2 倍に広げる。
+#
+# NOTE: 動摩擦の上限は静摩擦の上限以下にすること (物理的に μ_d ≤ μ_s、PhysX 側で
+#       クランプされて意図と違う組み合わせになる)。
+# mode は "startup" から **"reset" へ変える**。
+#
+# startup だと摩擦は env ごとに起動時 1 回決まったきりで、**1 つの env は 1 つの摩擦しか
+# 経験しない**。バッチ内に 64 バケットぶんの多様性はあっても、「足裏の滑り具合を観測から
+# 推定して回転量を調整する」圧はかからず、各 env が自分の摩擦に個別最適化するだけになる。
+#
+# 実機の症状 (回り込みすぎ / 足りない) は「その場の摩擦に合わせて旋回量を補正できていない」
+# ことなので、エピソードごとに振って**推定と適応を強制する**方が本質的な対処になる。
+# 難度は上がる (同じポリシーが滑る床と効く床の両方をこなす必要がある)。
+# --------------------------------------------------------------------------- #
+_GROUND_STATIC_FRICTION_RANGE = (0.3, 1.2)
+_GROUND_DYNAMIC_FRICTION_RANGE = (0.2, 1.0)
+_GROUND_FRICTION_MODE = "reset"
+
+
+def widen_ground_friction_dr(cfg) -> None:
+    """足裏 ⇔ 地面の摩擦 DR を広げる (:data:`_GROUND_STATIC_FRICTION_RANGE` ほか)。
+
+    ボールの摩擦には触らない (転がり減速 a ≈ 1.0 は距離換算の基準なので固定)。
+    """
+    term = getattr(cfg.events, "physics_material", None)
+    if term is None:
+        raise AttributeError("events に physics_material がありません (摩擦 DR の対象)。")
+    term.params["static_friction_range"] = _GROUND_STATIC_FRICTION_RANGE
+    term.params["dynamic_friction_range"] = _GROUND_DYNAMIC_FRICTION_RANGE
+    # エピソードごとに振り直す (理由は上の NOTE 参照)。
+    term.mode = _GROUND_FRICTION_MODE
 
 
 def use_fixed_kick_foot(cfg) -> None:
@@ -850,19 +1006,39 @@ class K1WalkLongPassEnvCfg(K1WalkLoopPass360EnvCfg):
         # 観測は 55 次元のまま変わらない。
         # enable_obs_delay の **後** に呼ぶこと (差し替えた項の遅延はこの関数が
         # 自分で設定するので、_DELAYED_OBS_TERMS には載っていない)。
-        replace_sole_pos_with_ball_pos(self)
-
-        # -- 0b''. 理想立ち位置 P_kick を蹴り足基準にずらす
+        # -- 0b0. 回り込みを速くする (walk_speed の強化)
         #
-        # 観測を蹴り足基準にしただけでは、報酬が要求する立ち位置は胴体中心のまま。
-        # 対で入れる。理由は use_fixed_kick_foot のコメント参照。
-        use_fixed_kick_foot(self)
+        # 接近を促す項が歩容維持の 1/8 しか払われていないので、weight と到達ポテンシャルの
+        # 幅を上げる。理由と数値は _WALK_SPEED_WEIGHT のコメント参照。
+        boost_approach_speed(self)
 
-        # -- 0b'''. 蹴り姿勢の一致 (正対度) を厳しくする
+        # -- 0b-. 足裏 ⇔ 地面の摩擦 DR を広げる
         #
-        # Stage 4 のみ。回り込みの途中で蹴ってしまう「蹴り急ぎ」への対処。
-        # 理由と指数の意味は _P_STYLE_EXPONENT のコメント参照。
-        sharpen_kick_pose_match(self)
+        # 実機に残る gap (回り込みすぎ/足りない、芯を外す) の主因と見ている。
+        # 理由と範囲は _GROUND_STATIC_FRICTION_RANGE のコメント参照。
+        widen_ground_friction_dr(self)
+
+        # -- 0b'. 蹴り足まわりの 3 点セットは **実機評価で不採用** になった
+        #
+        #   replace_sole_pos_with_ball_pos : 観測 3 番目を蹴り足基準のボール位置に
+        #   use_fixed_kick_foot            : P_kick を蹴り足がボール手前に来る位置へ
+        #   sharpen_kick_pose_match        : 正対度 p_style を 3 乗
+        #
+        # sim のメトリクス上は狙いどおり働いた (回り込み方向の左右差 3.64° -> 0.03°、
+        # far/near 差も解消)。しかし実機では **観測を変える前の 2026-08-15 系統
+        # (model_6600) の方が良い** と評価された。sim の区間平均でも代償が出ている:
+        #
+        #   run                        転倒率   エピソード長   速度追従
+        #   08-15 (対策なし)           1.59%    238.7         0.911
+        #   08-17 (蹴り足対応 A+B)     2.51%    240.8         0.884
+        #   08-18 (+ p_style k=3)      2.99%    245.4         0.892
+        #
+        # 対称性と引き換えに安定性・速さ・速度追従を失っており、実機ではその代償の方が
+        # 大きかった。3 つとも関数は残してあるので、戻すときは以下を有効にする。
+        #
+        # replace_sole_pos_with_ball_pos(self)
+        # use_fixed_kick_foot(self)
+        # sharpen_kick_pose_match(self)
 
         # -- 0c. 地面をランダムな軽い凹凸にする
         #
