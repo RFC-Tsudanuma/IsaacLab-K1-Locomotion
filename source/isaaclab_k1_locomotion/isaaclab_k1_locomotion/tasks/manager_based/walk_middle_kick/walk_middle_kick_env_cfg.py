@@ -401,7 +401,7 @@ class K1WalkMiddleKick360NoisyBallEnvCfg(K1WalkMiddleKick360EnvCfg):
     実機で蹴り損ねが出る原因のうち、報酬構造ではなく **観測の質** の側を潰す段。
     :class:`K1WalkMiddleKick360EnvCfg` との差は policy のボール位置観測だけで、
     :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` が
-    「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
+    「エピソードごとランダム遅延 0-6 ステップ (0-120ms) + 30Hz サンプル&ホールド +
     フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm」に差し替える (詳細はあちらの docstring)。
 
     middle のレシピ (weak の 3 点セット + 帯 (3.2, 4.5) + σ 終点 0.5 + ボール物性 DR) は
@@ -415,7 +415,7 @@ class K1WalkMiddleKick360NoisyBallEnvCfg(K1WalkMiddleKick360EnvCfg):
 
     NOTE: この帯では観測ノイズの影響が weak より大きく出る可能性がある。狙う飛距離が
           5-10 m と長いぶん、同じ蹴り角の誤差でも着弾のずれが比例して広がるため。
-          weak 版と揃えた ±5cm / 2-6 ステップから始めて、実機の遅延を計測できたら
+          weak 版と揃えた ±5cm / 0-6 ステップから始めて、実機の遅延を計測できたら
           :data:`~..walk_kick.walk_kick_env_cfg._BALL_OBS_DELAY_STEP_RANGE` を
           「計測値 + マージン」に絞ること (両系統で共有している定数なので、
           帯ごとに変えたくなったらここで params を上書きする)。

@@ -213,7 +213,7 @@ class K1WalkKick360WeakOrbitNoisyBallEnvCfg(K1WalkKick360WeakOrbitEnvCfg):
     :class:`K1WalkKick360WeakOrbitEnvCfg` との差は policy の観測 2 スロットだけ。
     観測の差し替えは報酬にもコマンドにも触らないので、回り込みの設定はそのまま残る。
 
-    * ``prev_ball_pos``: ボール知覚 (エピソードごとランダム遅延 2-6 ステップ +
+    * ``prev_ball_pos``: ボール知覚 (エピソードごとランダム遅延 0-6 ステップ +
       30Hz サンプル&ホールド + ガウスジッタ σ=6.7cm・クリップ ±20cm)。
     * ``kick_direction``: 自己位置推定の遅延 0.15-0.30 s
       (:func:`~..walk_kick.walk_kick_env_cfg.enable_localization_delay`)。

@@ -346,7 +346,7 @@ class K1WalkKick360WeakNoisyBallEnvCfg(K1WalkKick360WeakEnvCfg):
     実機で蹴り損ねが出る原因のうち、報酬構造ではなく **観測の質** の側を潰す段。
     :class:`K1WalkKick360WeakEnvCfg` との差は policy のボール位置観測だけで、
     :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` が
-    「エピソードごとランダム遅延 2-6 ステップ (40-120ms) + 30Hz サンプル&ホールド +
+    「エピソードごとランダム遅延 0-6 ステップ (0-120ms) + 30Hz サンプル&ホールド +
     フレーム同期ガウスジッタ σ=6.7cm・クリップ ±20cm」に差し替える (詳細はあちらの docstring)。
 
     weak のレシピ (latch 閾値の指令追従・strong の折れ線・σ アニール・overshoot 罰・
