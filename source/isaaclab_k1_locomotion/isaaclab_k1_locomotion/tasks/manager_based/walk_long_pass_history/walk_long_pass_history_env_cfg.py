@@ -13,15 +13,14 @@
 順序は継承元のままなので、policy / critic の次元は 223 / 61 を維持する。
 
 観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
-親から変更する。親の早期報酬 weight ランプは終値に固定する一方、目標球速は
-``(2.0, 3.0)`` から始め、キック成立率が十分かつ成功キックの方向平均誤差が25°以下の
-間だけ ``(3.2, 5.0)`` へ進める。方向誤差が35°以上なら成立率にかかわらず帯を戻す。
-非キック接触罰は最終速度帯へ到達した後に立ち上げる。
+親から変更する。Stage 1では目標方向を採点せず、足中心から見たボール方向が内側面法線
+から30°以内になる接触を先に学ぶ。キック成立率と内側接触率のEMAがともに0.80以上に
+なったら一方向にStage 2へ進み、面角度・直線スイング・逆方向罰則と、精度ゲート付きの
+球速帯カリキュラムを有効化する。
 
-キック後の採点は、最終球方向への高精度一致ではなくインサイドフォームを主目的にする。
-接触時の足内側面法線と、接触直前の足速度を目標方向へ揃え、球速と30度仰角は方向から
-独立して評価する。最終球方向は、目標の反対半球へ飛んだ場合だけ飽和ペナルティを与える。
-足内側面の角度報酬は通常値の10倍、既に成立している直線スイング報酬は3倍で固定する。
+内側接触報酬は両Stageで通常値の10倍にする。Stage 2では接触時の足内側面法線を
+目標方向へ向ける報酬を10倍、接触直前の足速度を目標方向へ揃える報酬を3倍で有効化する。
+球速と30度仰角は方向から独立して評価し、最終球方向は目標の反対半球だけを罰する。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -112,9 +111,10 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 ``./scripts/rsl_rl/train_walk_long_pass_history.sh`` だが、これも同じ近似初期化を使う。
 
 ``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
-500 iteration までに終わる報酬 weight のランプだけは終値に固定する。球速帯は
-キック成立率 EMA が0.80以上かつ成功キックの方向平均誤差 EMA が25°以下なら進む。
-成立率が0.50未満または方向誤差が35°以上なら2倍速で戻る。最終帯へ到達した後だけ
+500 iteration までに終わる報酬 weight のランプだけは終値に固定する。Stage 1では
+内側接触だけを採点し、Stage 2昇格後に500 iterationの安定期間を置いて球速帯を進める。
+球速帯はキック成立率 EMA が0.80以上かつ成功キックの方向平均誤差 EMA が25°以下なら
+進み、成立率が0.50未満または方向誤差が35°以上なら2倍速で戻る。最終帯へ到達した後だけ
 ``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
 ``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
 
@@ -127,11 +127,16 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
   インサイドフォームによって結果の方向精度が維持・改善するか。
 * ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
   成功キックだけの方向平均誤差 EMA。
+* ``Curriculum/kick_speed_range/stage`` … 1は内側接触の獲得、2は方向フォームと球速帯。
+* ``Curriculum/kick_speed_range/inside_contact_rate_ema`` … 成功キック中、足内側30°以内で
+  接触できた割合のEMA。0.80以上がStage 2への昇格条件。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
   暴れないか。暴れるなら learning_rate を下げる。
 """
+
+import math
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -196,10 +201,15 @@ _STEPS_PER_ITERATION = 48
 # _KICK_W_SCALE を掛け、2 秒の支払い窓を変えてもキック 1 回の収益を維持する。
 _INSIDE_FACE_WEIGHT = 3.0
 _STRAIGHT_SWING_WEIGHT = 3.0
+_INSIDE_CONTACT_WEIGHT = 3.0
 _VELOCITY_TRACKING_WEIGHT = 5.0
 _OPPOSITE_DIRECTION_WEIGHT = -2.0
+_INSIDE_CONTACT_MULTIPLIER = 10.0
 _INSIDE_FACE_MULTIPLIER = 10.0
 _STRAIGHT_SWING_MULTIPLIER = 3.0
+_INSIDE_CONTACT_ANGLE_DEG = 30.0
+_INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
+_INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
 
 # 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
 # ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
@@ -328,19 +338,27 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
         elevation_params = dict(self.rewards.kick_elevation.params)
         elevation_params.pop("sigma_direction", None)
 
-        direction_ramp = dict(self.curriculum.kick_direction_weight.params)
         self.rewards.kick_direction = None
         self.curriculum.kick_direction_weight = None
 
+        self.rewards.kick_inside_contact = RewTerm(
+            func=inside_rewards.kick_inside_contact,
+            weight=_INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE,
+            params={
+                **kick_state_params,
+                "sigma_contact": math.radians(_INSIDE_CONTACT_ANGLE_DEG),
+            },
+        )
+
         self.rewards.kick_inside_face_alignment = RewTerm(
             func=inside_rewards.kick_inside_face_alignment,
-            weight=_INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE,
+            weight=0.0,
             params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
         )
 
         self.rewards.kick_straight_swing = RewTerm(
             func=inside_rewards.kick_straight_swing,
-            weight=_STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE,
+            weight=0.0,
             params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
         )
 
@@ -358,14 +376,7 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             weight=0.0,
             params=kick_state_params,
         )
-        self.curriculum.kick_opposite_direction_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
-            params={
-                **direction_ramp,
-                "term_name": "kick_opposite_direction",
-                "end_weight": _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE,
-            },
-        )
+        self.curriculum.kick_opposite_direction_weight = None
 
         # -- 2. 継続学習用の復旧カリキュラム
         #
@@ -399,19 +410,36 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
         _freeze_fade_in_curricula(self, before_iter=_SPEED_RAMP_START_ITER)
 
         self.curriculum.kick_speed_range = CurrTerm(
-            func=mdp.kick_rate_gated_speed_range,
+            func=inside_rewards.inside_kick_stage_curriculum,
             params={
                 "command_name": "kick_direction",
+                "inside_contact_term_name": "kick_inside_contact",
+                "inside_face_term_name": "kick_inside_face_alignment",
+                "straight_swing_term_name": "kick_straight_swing",
+                "opposite_direction_term_name": "kick_opposite_direction",
+                "inside_contact_weight": (
+                    _INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_inside_face_weight": (
+                    _INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_straight_swing_weight": (
+                    _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_opposite_direction_weight": _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE,
+                "inside_contact_angle_deg": _INSIDE_CONTACT_ANGLE_DEG,
+                "promote_kick_rate": _INSIDE_STAGE_PROMOTE_KICK_RATE,
+                "promote_inside_contact_rate": _INSIDE_STAGE_PROMOTE_CONTACT_RATE,
                 "start_range": _LONG_PASS_SPEED_RANGE_START,
                 "end_range": _LONG_PASS_SPEED_RANGE,
-                "start_step": _SPEED_RAMP_START_ITER,
-                "end_step": _SPEED_RAMP_END_ITER,
+                "speed_start_step": _SPEED_RAMP_START_ITER,
+                "speed_end_step": _SPEED_RAMP_END_ITER,
                 "steps_per_iteration": _STEPS_PER_ITERATION,
-                "advance_above": _SPEED_GATE_ADVANCE_ABOVE,
-                "retreat_below": _SPEED_GATE_RETREAT_BELOW,
-                "advance_error_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
-                "retreat_error_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
-                "retreat_scale": _SPEED_GATE_RETREAT_SCALE,
+                "speed_advance_above": _SPEED_GATE_ADVANCE_ABOVE,
+                "speed_retreat_below": _SPEED_GATE_RETREAT_BELOW,
+                "speed_advance_error_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "speed_retreat_error_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
+                "speed_retreat_scale": _SPEED_GATE_RETREAT_SCALE,
             },
         )
 
@@ -456,3 +484,10 @@ class K1WalkLongPassHistoryEnvCfg_PLAY(K1WalkLongPassHistoryEnvCfg):
         # 親が K1WalkLongPassEnvCfg_PLAY ではないので、ここで同じ処理を行う。
         self.curriculum.kick_speed_range = None
         self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+        self.rewards.kick_inside_face_alignment.weight = (
+            _INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE
+        )
+        self.rewards.kick_straight_swing.weight = (
+            _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
+        )
+        self.rewards.kick_opposite_direction.weight = _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE

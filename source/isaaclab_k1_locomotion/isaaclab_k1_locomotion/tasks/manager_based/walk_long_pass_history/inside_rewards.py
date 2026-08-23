@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import torch
 from isaaclab.utils.math import quat_apply
 
+from ..walk_kick.mdp.curriculums import kick_rate_gated_speed_range
 from ..walk_kick.mdp.kick_state import kick_state
 
 if TYPE_CHECKING:
@@ -19,6 +21,7 @@ if TYPE_CHECKING:
 
 
 _FORM_STATE_ATTR = "_inside_kick_form_state"
+_STAGE_STATE_ATTR = "_inside_kick_stage_state"
 _FOOT_IDS_ATTR = "_inside_kick_foot_body_ids"
 _NORM_EPS = 1.0e-6
 _MOVING_EPS = 1.0e-3
@@ -106,10 +109,12 @@ def _inside_form_state(
             "prev_foot_vel": foot_vel.clone(),
             "prev_kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "last_touch_valid": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
+            "inside_contact_cos_last_touch": torch.zeros(env.num_envs, device=device),
             "inside_face_cos_last_touch": torch.zeros(env.num_envs, device=device),
             "swing_cos_last_touch": torch.zeros(env.num_envs, device=device),
             "swing_speed_last_touch": torch.zeros(env.num_envs, device=device),
             "form_valid_frozen": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
+            "inside_contact_cos_frozen": torch.zeros(env.num_envs, device=device),
             "inside_face_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_speed_frozen": torch.zeros(env.num_envs, device=device),
@@ -122,10 +127,12 @@ def _inside_form_state(
         form["prev_foot_vel"][just_reset] = foot_vel[just_reset]
         form["prev_kick_done"][just_reset] = False
         form["last_touch_valid"][just_reset] = False
+        form["inside_contact_cos_last_touch"][just_reset] = 0.0
         form["inside_face_cos_last_touch"][just_reset] = 0.0
         form["swing_cos_last_touch"][just_reset] = 0.0
         form["swing_speed_last_touch"][just_reset] = 0.0
         form["form_valid_frozen"][just_reset] = False
+        form["inside_contact_cos_frozen"][just_reset] = 0.0
         form["inside_face_cos_frozen"][just_reset] = 0.0
         form["swing_cos_frozen"][just_reset] = 0.0
         form["swing_speed_frozen"][just_reset] = 0.0
@@ -133,6 +140,7 @@ def _inside_form_state(
     env_ids = torch.arange(env.num_envs, device=device)
     ball_pos = ball.data.root_pos_w[:, :3]
     nearest_foot = (foot_pos - ball_pos.unsqueeze(1)).norm(dim=-1).argmin(dim=1)
+    selected_pos = foot_pos[env_ids, nearest_foot]
     selected_quat = foot_quat[env_ids, nearest_foot]
     selected_pre_vel = form["prev_foot_vel"][env_ids, nearest_foot]
 
@@ -142,6 +150,15 @@ def _inside_form_state(
     inside_world_xy = quat_apply(selected_quat, inside_local)[:, :2]
     inside_world_xy = inside_world_xy / inside_world_xy.norm(dim=-1, keepdim=True).clamp_min(
         _NORM_EPS
+    )
+
+    # 目標方向とは無関係に「ボールが足の内側面側にあるか」を測る。
+    foot_to_ball_xy = ball_pos[:, :2] - selected_pos[:, :2]
+    foot_to_ball_xy = foot_to_ball_xy / foot_to_ball_xy.norm(dim=-1, keepdim=True).clamp_min(
+        _NORM_EPS
+    )
+    inside_contact_cos = torch.clamp(
+        (inside_world_xy * foot_to_ball_xy).sum(dim=-1), -1.0, 1.0
     )
 
     command = env.command_manager.get_command("kick_direction")
@@ -155,6 +172,9 @@ def _inside_form_state(
 
     touched = shared["pre_latch_touch_event"].bool()
     form["last_touch_valid"] = form["last_touch_valid"] | touched
+    form["inside_contact_cos_last_touch"] = torch.where(
+        touched, inside_contact_cos, form["inside_contact_cos_last_touch"]
+    )
     form["inside_face_cos_last_touch"] = torch.where(
         touched, inside_face_cos, form["inside_face_cos_last_touch"]
     )
@@ -168,6 +188,9 @@ def _inside_form_state(
     kick_event = shared["kick_done"] & (~form["prev_kick_done"])
     form["form_valid_frozen"] = torch.where(
         kick_event, form["last_touch_valid"], form["form_valid_frozen"]
+    )
+    form["inside_contact_cos_frozen"] = torch.where(
+        kick_event, form["inside_contact_cos_last_touch"], form["inside_contact_cos_frozen"]
     )
     form["inside_face_cos_frozen"] = torch.where(
         kick_event, form["inside_face_cos_last_touch"], form["inside_face_cos_frozen"]
@@ -183,6 +206,154 @@ def _inside_form_state(
     form["prev_kick_done"] = shared["kick_done"].clone()
     form["step"] = step
     return shared, form
+
+
+def kick_inside_contact(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_contact: float = math.radians(30.0),
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """目標方向に依存せず、ボールが足の内側面側で接触するほど高い報酬。"""
+    shared, form = _inside_form_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    angle = torch.acos(torch.clamp(form["inside_contact_cos_frozen"], -1.0, 1.0))
+    reward = torch.exp(-((angle / sigma_contact) ** 2))
+    return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
+
+
+def _set_reward_weight(env: ManagerBasedRLEnv, term_name: str, weight: float) -> None:
+    term = env.reward_manager.get_term_cfg(term_name)
+    if abs(term.weight - weight) > 1.0e-8:
+        term.weight = weight
+
+
+def inside_kick_stage_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    command_name: str,
+    inside_contact_term_name: str,
+    inside_face_term_name: str,
+    straight_swing_term_name: str,
+    opposite_direction_term_name: str,
+    inside_contact_weight: float,
+    stage2_inside_face_weight: float,
+    stage2_straight_swing_weight: float,
+    stage2_opposite_direction_weight: float,
+    inside_contact_angle_deg: float,
+    promote_kick_rate: float,
+    promote_inside_contact_rate: float,
+    start_range: tuple[float, float],
+    end_range: tuple[float, float],
+    speed_start_step: int,
+    speed_end_step: int,
+    steps_per_iteration: int = 0,
+    ema_alpha: float = 0.01,
+    speed_advance_above: float = 0.80,
+    speed_retreat_below: float = 0.50,
+    speed_advance_error_below_deg: float | None = None,
+    speed_retreat_error_above_deg: float | None = None,
+    speed_retreat_scale: float = 2.0,
+) -> dict[str, float]:
+    """内側接触を先に獲得し、その後に方向フォームと球速帯を有効化する。"""
+    if steps_per_iteration > 0:
+        now = env.common_step_counter / steps_per_iteration
+    else:
+        now = float(env.common_step_counter)
+
+    state = getattr(env, _STAGE_STATE_ATTR, None)
+    if state is None:
+        state = {
+            "stage": 1,
+            "kick_rate_ema": 1.0,
+            "inside_contact_rate_ema": 0.0,
+            "promoted_at": None,
+        }
+        setattr(env, _STAGE_STATE_ATTR, state)
+
+    command_term = env.command_manager.get_term(command_name)
+    kick_rate_metric = command_term.metrics.get("kick_rate", None)
+    form = getattr(env, _FORM_STATE_ATTR, None)
+    if kick_rate_metric is not None and env_ids is not None and len(env_ids) > 0:
+        kick_done = kick_rate_metric[env_ids]
+        kick_rate = float(kick_done.mean())
+        state["kick_rate_ema"] += ema_alpha * (kick_rate - state["kick_rate_ema"])
+
+        successful_kicks = float(kick_done.sum())
+        if form is not None and successful_kicks > 0.0:
+            valid = form["form_valid_frozen"][env_ids]
+            contact_cos = form["inside_contact_cos_frozen"][env_ids]
+            threshold_cos = math.cos(math.radians(inside_contact_angle_deg))
+            inside_success = valid & (kick_done > 0.5) & (contact_cos >= threshold_cos)
+            inside_contact_rate = float(inside_success.float().sum()) / successful_kicks
+            state["inside_contact_rate_ema"] += ema_alpha * (
+                inside_contact_rate - state["inside_contact_rate_ema"]
+            )
+
+    if (
+        state["stage"] == 1
+        and state["kick_rate_ema"] >= promote_kick_rate
+        and state["inside_contact_rate_ema"] >= promote_inside_contact_rate
+    ):
+        state["stage"] = 2
+        state["promoted_at"] = now
+
+    _set_reward_weight(env, inside_contact_term_name, inside_contact_weight)
+    if state["stage"] == 1:
+        _set_reward_weight(env, inside_face_term_name, 0.0)
+        _set_reward_weight(env, straight_swing_term_name, 0.0)
+        _set_reward_weight(env, opposite_direction_term_name, 0.0)
+        command_term.cfg.target_speed_range = start_range
+        return {
+            "stage": 1.0,
+            "stage1_kick_rate_ema": state["kick_rate_ema"],
+            "inside_contact_rate_ema": state["inside_contact_rate_ema"],
+            "speed_min": start_range[0],
+            "speed_max": start_range[1],
+            "alpha": 0.0,
+            "iterations_since_promotion": 0.0,
+        }
+
+    _set_reward_weight(env, inside_face_term_name, stage2_inside_face_weight)
+    _set_reward_weight(env, straight_swing_term_name, stage2_straight_swing_weight)
+    _set_reward_weight(env, opposite_direction_term_name, stage2_opposite_direction_weight)
+    promoted_at = state["promoted_at"]
+    speed = kick_rate_gated_speed_range(
+        env,
+        env_ids,
+        command_name=command_name,
+        start_range=start_range,
+        end_range=end_range,
+        start_step=promoted_at + speed_start_step,
+        end_step=promoted_at + speed_end_step,
+        steps_per_iteration=steps_per_iteration,
+        advance_above=speed_advance_above,
+        retreat_below=speed_retreat_below,
+        advance_error_below_deg=speed_advance_error_below_deg,
+        retreat_error_above_deg=speed_retreat_error_above_deg,
+        ema_alpha=ema_alpha,
+        retreat_scale=speed_retreat_scale,
+    )
+    return {
+        "stage": 2.0,
+        "stage1_kick_rate_ema": state["kick_rate_ema"],
+        "inside_contact_rate_ema": state["inside_contact_rate_ema"],
+        "iterations_since_promotion": now - promoted_at,
+        **speed,
+    }
 
 
 def kick_inside_face_alignment(
