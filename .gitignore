@@ -156,10 +156,11 @@ logs/rsl_rl/k1_walk_inside_kick/*
 logs/rsl_rl/k1_walk_inside_kick/2026-08-21_05-00-22/*
 !logs/rsl_rl/k1_walk_inside_kick/2026-08-21_05-00-22/model_4999.pt
 
-# walk_lob_plant の Stage 3 (rough + ボール物性 DR) の途中経過 900 iter。
+# walk_lob_plant の Stage 3 (rough + ボール物性 DR) の途中経過 (900 / 1700 iter)。
 # --resume / --load_pretrained の起点として拾えるようにしておく。
 !logs/rsl_rl/k1_walk_lob_plant_rough/
 logs/rsl_rl/k1_walk_lob_plant_rough/*
 !logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/
 logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/*
 !logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/model_900.pt
+!logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/model_1700.pt
