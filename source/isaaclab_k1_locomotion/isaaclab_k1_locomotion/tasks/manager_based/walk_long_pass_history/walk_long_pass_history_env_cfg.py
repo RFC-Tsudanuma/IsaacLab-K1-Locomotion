@@ -21,6 +21,8 @@
 内側接触報酬は両Stageで通常値の10倍にする。Stage 2では接触時の足内側面法線を
 目標方向へ向ける報酬を10倍、接触直前の足速度を目標方向へ揃える報酬を3倍で有効化する。
 球速と30度仰角は方向から独立して評価し、最終球方向は目標の反対半球だけを罰する。
+キック成立前の探索を補助するため、エピソード最初の足とボールの接触には+2を払い、
+2回目以降の接触は1回あたり-0.5として、一度の接触で蹴り切るよう誘導する。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -130,6 +132,12 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Curriculum/kick_speed_range/stage`` … 1は内側接触の獲得、2は方向フォームと球速帯。
 * ``Curriculum/kick_speed_range/inside_contact_rate_ema`` … 成功キック中、足内側30°以内で
   接触できた割合のEMA。0.80以上がStage 2への昇格条件。
+* ``Curriculum/kick_speed_range/first_touch_rate`` … 終了エピソード中、一度以上ボールへ
+  接触した割合。
+* ``Curriculum/kick_speed_range/extra_touch_count`` … 終了エピソードあたりの2回目以降の
+  接触回数。
+* ``Curriculum/kick_speed_range/touch_to_kick_rate`` … 接触した終了エピソードのうち
+  ``kick_done``まで到達した割合。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
@@ -210,6 +218,8 @@ _STRAIGHT_SWING_MULTIPLIER = 3.0
 _INSIDE_CONTACT_ANGLE_DEG = 30.0
 _INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
 _INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
+_FIRST_TOUCH_WEIGHT = 100.0  # イベント1回 × dt 0.02 = +2.0
+_EXTRA_TOUCH_WEIGHT = -25.0  # イベント1回 × dt 0.02 = -0.5
 
 # 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
 # ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
@@ -350,6 +360,12 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             },
         )
 
+        self.rewards.first_ball_touch = RewTerm(
+            func=inside_rewards.first_ball_touch,
+            weight=_FIRST_TOUCH_WEIGHT,
+            params=kick_state_params,
+        )
+
         self.rewards.kick_inside_face_alignment = RewTerm(
             func=inside_rewards.kick_inside_face_alignment,
             weight=0.0,
@@ -382,12 +398,12 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
         #
         # 観測の意味変更へ適応する間は、親の最終速度帯を最初から要求しない。
         # 親の早期報酬 weight は終値に保ち、成立率を見ながら球速帯を進退させる。
-        # 回り込み中の偶発接触そのものを罰し、P_kick で目標方向を向いた接触は
-        # ほぼ罰しない。親の extra_ball_touch は最初の偶発接触を無料にして、その後の
-        # 本命キック側へ罰を載せ得るため、この history 復旧段では置き換える。
+        # 最初の接触には定額報酬を払い、2回目以降は弱く罰して、一度の接触で
+        # kick_done まで到達するよう誘導する。回り込み中の接触姿勢罰は、従来どおり
+        # 最終速度帯へ到達した後にだけ立ち上げる。
         non_kick_touch_params = dict(self.rewards.extra_ball_touch.params)
         non_kick_touch_params["sigma_pose"] = self.rewards.ball_avoidance.params["sigma_pose"]
-        self.rewards.extra_ball_touch = None
+        self.rewards.extra_ball_touch.weight = _EXTRA_TOUCH_WEIGHT
         self.curriculum.extra_ball_touch_weight = None
         self.rewards.non_kick_ball_touch = RewTerm(
             func=mdp.non_kick_ball_touch,

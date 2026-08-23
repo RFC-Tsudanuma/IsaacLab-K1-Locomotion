@@ -235,6 +235,31 @@ def kick_inside_contact(
     return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
 
 
+def first_ball_touch(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """エピソード最初の足とボールの接触イベントだけを返す。"""
+    state = _kick_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    touched = state["pre_latch_touch_event"].bool()
+    return (touched & (state["touch_count"] == 1.0)).float()
+
+
 def _set_reward_weight(env: ManagerBasedRLEnv, term_name: str, weight: float) -> None:
     term = env.reward_manager.get_term_cfg(term_name)
     if abs(term.weight - weight) > 1.0e-8:
@@ -280,12 +305,16 @@ def inside_kick_stage_curriculum(
             "stage": 1,
             "kick_rate_ema": 1.0,
             "inside_contact_rate_ema": 0.0,
+            "first_touch_rate": 0.0,
+            "extra_touch_count": 0.0,
+            "touch_to_kick_rate": 0.0,
             "promoted_at": None,
         }
         setattr(env, _STAGE_STATE_ATTR, state)
 
     command_term = env.command_manager.get_term(command_name)
     kick_rate_metric = command_term.metrics.get("kick_rate", None)
+    touch_count_metric = command_term.metrics.get("ball_touch_count", None)
     form = getattr(env, _FORM_STATE_ATTR, None)
     if kick_rate_metric is not None and env_ids is not None and len(env_ids) > 0:
         kick_done = kick_rate_metric[env_ids]
@@ -301,6 +330,18 @@ def inside_kick_stage_curriculum(
             inside_contact_rate = float(inside_success.float().sum()) / successful_kicks
             state["inside_contact_rate_ema"] += ema_alpha * (
                 inside_contact_rate - state["inside_contact_rate_ema"]
+            )
+
+        if touch_count_metric is not None:
+            touch_count = touch_count_metric[env_ids]
+            touched = touch_count > 0.0
+            touched_count = float(touched.float().sum())
+            state["first_touch_rate"] = float(touched.float().mean())
+            state["extra_touch_count"] = float(
+                torch.clamp(touch_count - 1.0, min=0.0).mean()
+            )
+            state["touch_to_kick_rate"] = (
+                float(kick_done[touched].sum()) / touched_count if touched_count > 0.0 else 0.0
             )
 
     if (
@@ -321,6 +362,9 @@ def inside_kick_stage_curriculum(
             "stage": 1.0,
             "stage1_kick_rate_ema": state["kick_rate_ema"],
             "inside_contact_rate_ema": state["inside_contact_rate_ema"],
+            "first_touch_rate": state["first_touch_rate"],
+            "extra_touch_count": state["extra_touch_count"],
+            "touch_to_kick_rate": state["touch_to_kick_rate"],
             "speed_min": start_range[0],
             "speed_max": start_range[1],
             "alpha": 0.0,
@@ -351,6 +395,9 @@ def inside_kick_stage_curriculum(
         "stage": 2.0,
         "stage1_kick_rate_ema": state["kick_rate_ema"],
         "inside_contact_rate_ema": state["inside_contact_rate_ema"],
+        "first_touch_rate": state["first_touch_rate"],
+        "extra_touch_count": state["extra_touch_count"],
+        "touch_to_kick_rate": state["touch_to_kick_rate"],
         "iterations_since_promotion": now - promoted_at,
         **speed,
     }
