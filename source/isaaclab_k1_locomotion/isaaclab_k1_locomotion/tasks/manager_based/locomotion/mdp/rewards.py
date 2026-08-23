@@ -81,10 +81,14 @@ def feet_phase(
     adaptive: bool = False,
     l_fwd: float = 0.31,
     l_lat: float = 0.11,
+    l_back: float = 0.0,
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
     use_actual_speed: bool = False,
+    cmd_gain: float = 1.0,
+    vel_lag_s: float = 0.0,
+    vel_noise_std: float = 0.0,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -121,8 +125,9 @@ def feet_phase(
     # adaptive=True なら速度指令から周波数を決める (:func:`~.events.adaptive_phase_freq`)
     phase_left = get_gait_phase(
         env, phase_freq, adaptive=adaptive, command_name=command_name,
-        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
-        use_actual_speed=use_actual_speed,
+        l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
+        use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
+        vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
     ) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
@@ -362,10 +367,14 @@ def foot_clearance_ji(
     adaptive: bool = False,
     l_fwd: float = 0.31,
     l_lat: float = 0.11,
+    l_back: float = 0.0,
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
     use_actual_speed: bool = False,
+    cmd_gain: float = 1.0,
+    vel_lag_s: float = 0.0,
+    vel_noise_std: float = 0.0,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -389,8 +398,9 @@ def foot_clearance_ji(
     #   跳躍に退行した」履歴の一因と見て、他項と同じ get_gait_phase に統一した。
     phase_left = get_gait_phase(
         env, phase_freq, adaptive=adaptive, command_name=command_name,
-        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
-        use_actual_speed=use_actual_speed,
+        l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
+        use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
+        vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
     ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
@@ -418,10 +428,14 @@ def foot_clearance_ji_pen(
     adaptive: bool = False,
     l_fwd: float = 0.31,
     l_lat: float = 0.11,
+    l_back: float = 0.0,
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
     use_actual_speed: bool = False,
+    cmd_gain: float = 1.0,
+    vel_lag_s: float = 0.0,
+    vel_noise_std: float = 0.0,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -441,8 +455,9 @@ def foot_clearance_ji_pen(
     # feet_phase と同一の desired-stance 判定
     phase_left = get_gait_phase(
         env, phase_freq, adaptive=adaptive, command_name=command_name,
-        l_fwd=l_fwd, l_lat=l_lat, f_min=f_min, f_max=f_max, dr_base=dr_base,
-        use_actual_speed=use_actual_speed,
+        l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
+        use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
+        vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
     ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio

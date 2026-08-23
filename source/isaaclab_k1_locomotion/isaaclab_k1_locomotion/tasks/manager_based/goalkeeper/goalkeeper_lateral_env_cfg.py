@@ -120,10 +120,12 @@ H. **位相を ``f = |v_cmd| / (2 L(θ))`` にする** (``_ADAPTIVE_PHASE_PARAMS
 
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
-from ..locomotion.mdp.events import reset_gait_phase
+from ..locomotion.mdp.events import randomize_joint_offset, reset_gait_phase
 from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD
+from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1
 
 from .goalkeeper_direct_env_cfg import K1GKDirectStage1EnvCfg
 from .mdp.events import reset_lateral_buffers
@@ -198,6 +200,27 @@ PHASE_F_MAX: float = 4.0  # 4.0Hz で名目スイング 0.125s
 #     f(10mm) が 0.3 を超えたら f_max を 4.5 に戻して妥協点を探ること。
 PHASE_DR_BASE: float = 1.6  # randomize_phase_freq の base_phase_freq と揃えること
 
+# ★★ 2026-08-23: **後退専用の 1 歩あたりの進み幅** [m]。
+#   K1 の足は足首関節を中心に前後非対称 (meshes/Left_Foot.STL 実測:
+#   つま先 +0.1195 m / かかと -0.0659 m)。**後退で使える支持余裕は前進の 55%** しかない
+#   のに、これまで前後で同じ L_FWD を要求していた。
+#   0.20 = 前進の 65%。支持余裕比 0.55 と「短くしすぎてケイデンスが f_max 4.0Hz に
+#   張り付くのを避ける」の妥協点 (後退 1.0 m/s で f = 1.0/0.40 = 2.5Hz)。
+#   ☠ 効果は転倒率では見えない (後退はシムで既に引きすり率 0.1%・転倒最少)。
+#     ZMP のかかと余裕で測ること。
+L_BACK: float = 0.20
+
+# 位相周波数 DR の幅 [Hz]。
+# ☠☠ 2026-08-23: 従来は ±0.05 Hz (base 1.6 に対し **±3%**) しか振っていなかった。
+#   実機の推論が固定 1.6Hz のままで学習が 3.2〜3.9Hz だったため **2.4 倍ずれ**、
+#   横移動で 10 歩に 1 歩足を引きずっていた (シム実測: 引きずり率 10.3% vs 2.0%)。
+#   ±0.25 Hz (±15%) まで広げ、推論側の近似誤差や定数のずれに耐える方策にする。
+PHASE_FREQ_DR_RANGE: tuple[float, float] = (-0.25, 0.25)
+
+# 関節ゼロ点 (較正) オフセット DR の振れ幅 [rad]。±0.02 rad ≈ ±1.15°。
+# 既存 DR (質量・COM・摩擦・PD ゲイン・遅延) に唯一欠けていた実機由来のばらつき。
+JOINT_OFFSET_RANGE: tuple[float, float] = (-0.02, 0.02)
+
 _ADAPTIVE_PHASE_PARAMS = {
     "adaptive": LATERAL_ADAPTIVE_PHASE,
     "l_fwd": L_FWD,
@@ -216,7 +239,32 @@ _ADAPTIVE_PHASE_PARAMS = {
     #   ☠ **キーとして明示しておくこと。** `--override_json` は存在しないキーを作らない
     #     (typo 検出のため) ので、ここに無いと
     #     `gk_lateral_phase_from_speed.json` が "leaf attribute missing on dict" で落ちる。
-    "use_actual_speed": True,
+    # ☠☠ **False に変更した (2026-08-23)。** True は位相周波数を経由して真の
+    #   ``base_lin_vel`` に依存する。ところが実機の LowStateData は motors(q,dq) と
+    #   imu(rpy,gyro,acc) だけで **線速度を持たない**。つまり「学習と推論で別の式」に
+    #   なることが構造的に避けられず、事実その不一致で事故が起きた
+    #   (推論 rl_policy_slide_walk_node.cpp は固定 1.6Hz、学習は 3.2〜3.9Hz)。
+    #   代わりに ``cmd_gain`` で指令から実速度を近似する。**学習と推論が同じ式**になり、
+    #   実機に速度推定が要らない。シム実測 (左横の引きずり率 / クリアランス下位10%):
+    #       位相 1.6Hz固定 : 10.3% / 7.5mm
+    #       指令ベース      :  3.1% / 46.7mm
+    #       実速度ベース    :  2.0% / 46.5mm
+    "use_actual_speed": False,
+    # ★ 2026-08-23: **速度推定器の遅れ / ノイズ** の DR。既定 0 = 従来どおり (真値)。
+    #   ☠ actor 観測から base_lin_vel を外したのは「実機で正確に測れないから」なのに、
+    #     ``use_actual_speed`` は位相周波数を経由して真の速度への依存を裏口から復活させた。
+    #     しかも位相は積分器なので f の誤差はずれとして溜まる。実機・MuJoCo で出ている
+    #     「横移動で何回かに一回だけ歩幅が縮む / 足を引きずる」の第一容疑者。
+    #   ☠ **キーとして明示しておくこと** (`--override_json` は存在しないキーを作らない)。
+    # ★ 2026-08-23: 指令から実速度を近似するときの **定常追従率**。
+    #   `use_actual_speed=False` のときだけ効く (v = cmd_gain * |cmd|)。
+    #   1.0 = 素の指令 (旧挙動)。0.92 で実測の追従率に合わせる。
+    "cmd_gain": 0.92,
+    # 発進・反転の過渡を一次遅れで近似する [s]。☠ **推論側にも同じ式を実装すること。**
+    #   v_filt += (dt / (0.3 + dt)) * (0.92 * |cmd| - v_filt)
+    "vel_lag_s": 0.3,
+    "vel_noise_std": 0.0,
+    "l_back": L_BACK,
 }
 
 # 直前の指令を符号反転させる確率 (2026-08-21 追加)。
@@ -307,6 +355,23 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         # ☠ 位相は時間の関数ではなくアキュムレータになるので、**リセットで 0 に戻す
         #   EventTerm が必須**。登録し忘れると前エピソードの位相を引き継ぐ。
         self.events.reset_gait_phase = EventTerm(func=reset_gait_phase, mode="reset")
+
+        # --- 位相周波数 DR を ±3% → ±15% に拡大 (2026-08-23) ---
+        # 推論側の近似誤差・定数のずれに耐えるための保険。PHASE_FREQ_DR_RANGE 参照。
+        self.events.randomize_phase_freq.params["offset_range"] = PHASE_FREQ_DR_RANGE
+
+        # --- 関節ゼロ点 (較正) オフセット DR (2026-08-23、脚 12 関節のみ) ---
+        # ☠ mode="startup" 必須。default_joint_pos を書き換えるので reset だと累積して発散する。
+        self.events.randomize_joint_offset = EventTerm(
+            func=randomize_joint_offset,
+            mode="startup",
+            params={
+                "offset_range": JOINT_OFFSET_RANGE,
+                "asset_cfg": SceneEntityCfg(
+                    "robot", joint_names=JOINT_NAMES_K1, preserve_order=True
+                ),
+            },
+        )
 
         # ==================================================================
         # ★ J. 関節可動限界のペナルティを有効化 (8 本目、2026-08-22)
@@ -404,8 +469,14 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         #   「機体の震え」に変わったので、TensorBoard のタグが同じだと誤解を招く。
         #   過去の run の Episode_Reward/action_jitter とは **別物** なので比較しないこと。
         self.rewards.action_jitter = None
+        # ★★ 2026-08-23: **停止指令中のみ** に絞った (`stop_only=True`)。
+        #   実機フィードバックで「動いているときは振動しない / 止まるときに振動する」と
+        #   確認されたのに、ゲート無しだと移動中 (raw 0.57 級) が支配的になる。
+        #   iter 1844 の実測で **-1.245 と報酬セット最大の負項**、raw 0.83 でほぼ飽和。
+        #   実機で問題になっていない挙動に最大の圧をかけ、移動性能を無駄に削っていた。
+        #   w_ref=0.15 は元々停止時のレンジ (0.02〜0.2) に合わせた値なので設計とも整合する。
         self.rewards.body_jitter = RewTerm(
-            func=body_jitter, weight=-1.5, params={"w_ref": 0.15}
+            func=body_jitter, weight=-1.5, params={"w_ref": 0.15, "stop_only": True}
         )
 
         # ==================================================================

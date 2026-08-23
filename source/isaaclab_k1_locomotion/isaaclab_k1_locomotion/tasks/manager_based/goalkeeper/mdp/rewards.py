@@ -1219,6 +1219,10 @@ _BODY_JITTER_VAL_ATTR = "_gk_body_jitter_val"
 def body_jitter(
     env: "ManagerBasedRLEnv",
     w_ref: float = 0.15,
+    stop_only: bool = False,
+    command_name: str = "base_velocity",
+    cmd_threshold: float = 0.05,
+    lin_vel_max: float = 0.5,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """**胴体角速度の2階差分**を有界に罰する (N,)。weight < 0 で使う。
@@ -1245,9 +1249,19 @@ def body_jitter(
     Args:
         w_ref: 圧縮の基準 [rad/s]。0.15 なら 07-28 (0.196) で 0.57、
             目標 (0.021) で 0.12 と、**運転範囲の全域で勾配が残る**。
-            ☠ 停止時と移動中では絶対値が桁で違う (移動中は 0.57 級) ので、
-              移動中は飽和気味になる。移動中も効かせたいなら w_ref を上げるか、
-              指令ノルムで正規化した版を別に作ること。
+            ☠ 停止時と移動中では絶対値が桁で違う (移動中は 0.57 級)。
+        stop_only: True で **停止指令中だけ** 罰する (:func:`_stopped_boost` と同じゲート)。
+
+            ★★ 2026-08-23: **既定は False だが、横移動タスクでは True にすること。**
+              実機フィードバックで「動いているときは振動しない / **止まるときに振動する**」
+              と確認された。ところがゲート無しだと移動中 (raw 0.57 級) が支配的になり、
+              iter 1844 の実測で **-1.245 と報酬セット最大の負項**、しかも raw 0.83 と
+              ほぼ飽和していた。**実機で問題になっていない挙動に、報酬セット最大の圧を
+              かけている**状態で、移動性能を無駄に削る。
+              w_ref=0.15 はそもそも停止時のレンジ (0.02〜0.2) に合わせた値なので、
+              停止時に絞る方が設計とも整合する。
+        command_name / cmd_threshold / lin_vel_max: ``stop_only=True`` のときのゲート条件。
+            :func:`_stopped_boost` を参照 (実速度の条件を外し指令ノルムで判定する理由も同じ)。
     """
     robot: Articulation = env.scene[asset_cfg.name]
     w = robot.data.root_ang_vel_w
@@ -1264,4 +1278,14 @@ def body_jitter(
         hist[0] = w.detach()
         setattr(env, _BODY_JITTER_STEP_ATTR, cur)
         setattr(env, _BODY_JITTER_VAL_ATTR, d2w)
-    return d2w / (d2w + float(w_ref))
+    penalty = d2w / (d2w + float(w_ref))
+    if stop_only:
+        # _stopped_boost は scale 倍率を返すゲートなので、scale=1.0 で「停止中=1 / それ以外=0」
+        # のマスクにはならない。ここは 0/1 のマスクが要るので直接組む。
+        cmd = env.command_manager.get_command(command_name)[:, :3]
+        is_stopped = torch.norm(cmd, dim=1) < float(cmd_threshold)
+        lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+        # ☠ push で突き飛ばされた直後は外す (復帰動作を罰しないため)。閾値の根拠は
+        #   _stopped_boost の docstring と同じ。
+        penalty = penalty * (is_stopped & (lin < float(lin_vel_max))).float()
+    return penalty

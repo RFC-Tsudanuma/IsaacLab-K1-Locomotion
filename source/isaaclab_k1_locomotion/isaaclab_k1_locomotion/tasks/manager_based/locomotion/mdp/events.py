@@ -117,10 +117,14 @@ def adaptive_phase_freq(
     command_name: str = "base_velocity",
     l_fwd: float = 0.31,
     l_lat: float = 0.11,
+    l_back: float = 0.0,
     f_min: float = 1.2,
     f_max: float = 5.0,
     dr_base: float = 1.6,
     use_actual_speed: bool = False,
+    cmd_gain: float = 1.0,
+    vel_lag_s: float = 0.0,
+    vel_noise_std: float = 0.0,
 ) -> torch.Tensor:
     """速度指令とその向きから、歩行位相の周波数 [Hz] を env ごとに決める (N,)。
 
@@ -148,25 +152,59 @@ def adaptive_phase_freq(
     cmd = env.command_manager.get_command(command_name)[:, :2]
     v = torch.norm(cmd, dim=1)
     if use_actual_speed:
-        # ★ 2026-08-22: 周波数の **大きさ** を実速度から決める (向きは指令のまま)。
-        #
-        #   既定 (指令ベース) だと、指令 1.5 に対し実速度 0.94 でも位相は 4.0Hz を要求し、
-        #   方策は **届かない要求と戦い続ける**。5 本目 (f_max 5.0) はこれで位相比が
-        #   0.60 まで崩れ、位相報酬 (feet_phase / foot_clearance) がまとめて無効化された。
-        #
-        #   実速度から決めれば **位相比は常に 1 に保たれる**。位相は歩容を整える役に徹し、
-        #   速度は track_lin_vel_* と lateral_speed_bonus が押す、と役割が分離する。
-        #   → 位相と速度の綱引きが構造的に消えるので、速度を伸ばす余地が広がる見込み。
-        #
-        #   ☠ 向きまで実速度にしないのは、低速時に向きが暴れて位相が乱れるため。
-        #   ☠ 「遅い → 位相も遅い → さらに遅い」の悪循環が理屈上ありうるが、速度を
-        #     押しているのは位相ではなく追従報酬なので起きないはず。**要検証**。
+        # ☠ **推論側で真の base_lin_vel が要る。** 実機の LowStateData は motors(q,dq) と
+        #   imu(rpy,gyro,acc) だけで線速度を持たないので、この経路は「学習と推論で別の式」
+        #   になる。2026-08-23 にそれが実機の引きずりの原因と判明した (位相 3.9Hz で学習 →
+        #   実機は固定 1.6Hz)。**新しい学習では cmd_gain 方式を使うこと。**
         robot = env.scene["robot"]
         v = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
+    else:
+        # ★ 2026-08-23: 指令に **定常追従率** を掛けて実速度を近似する。
+        #
+        #   これで学習と推論が **完全に同じ式** になり、実機に速度推定が要らなくなる。
+        #   素の指令 (cmd_gain=1.0) だと届かない要求と戦って歩幅が縮む問題があったが
+        #   (横 1.444 → 0.941 m/s)、実測の追従率 0.87〜0.99 を掛ければその乖離が消える。
+        #   検算: 横 1.2 → f 2.98Hz (実速度基準 3.05Hz、誤差 2%)
+        #         横 1.5 → f 3.73Hz (実速度基準 3.89Hz、誤差 4%)
+        #   誤差 4% は位相 DR の幅と同オーダーで、B2 の実測 (遅れ40ms・ノイズ10%でも
+        #   引きずり率が悪化しない) の範囲に収まる。
+        v = v * float(cmd_gain)
+
+    # 一次遅れ (推論側の実装と一致させること)。
+    #   use_actual_speed=True では「推定器の遅れ」の DR、
+    #   cmd_gain 方式では「指令に実速度が追いつくまでの過渡」のモデルになる。
+    #   ☠ 位相は積分器なので、ここが学習と推論でずれると位相がずれ続ける。
+    if float(vel_lag_s) > 0.0:
+        prev = getattr(env, "_phase_vel_filt", None)
+        if prev is None or prev.shape[0] != v.shape[0]:
+            prev = torch.zeros_like(v)
+        alpha = float(env.step_dt) / (float(vel_lag_s) + float(env.step_dt))
+        v = prev + alpha * (v - prev)
+        env._phase_vel_filt = v.detach()
+    # 推定器のばらつき DR (推論側には実装しない。頑健性を上げるためだけの学習時ノイズ)。
+    if float(vel_noise_std) > 0.0:
+        v = v * (1.0 + torch.randn_like(v) * float(vel_noise_std))
+    v = v.clamp(min=0.0)
     safe = torch.norm(cmd, dim=1).clamp(min=1e-6)
     cx = cmd[:, 0] / safe
     cy = cmd[:, 1] / safe
-    inv_l = torch.sqrt((cx / float(l_fwd)) ** 2 + (cy / float(l_lat)) ** 2)
+    # 前後方向の 1 歩あたりの進み幅。後退は前進と別の値を使えるようにしてある。
+    #
+    # ★★ 2026-08-23: ``l_back`` を追加。K1 の足は足首関節を中心に **前後非対称**で、
+    #   meshes/Left_Foot.STL の実測は つま先 +0.1195 m / かかと -0.0659 m。
+    #   **後退で使える支持余裕は前進の 55%** しかない。同じ歩幅を要求するのが誤り。
+    #   後退の歩幅を縮める = ケイデンスが上がる = 1 歩あたりの ZMP 振れが小さくなり、
+    #   かかと側の余裕が増える。機構の非対称を歩容の非対称で吸収する。
+    #
+    #   ☠ 後退はシムでは既にほぼ完璧 (引きずり率 0.1% / 転倒最少) なので、**報酬側に
+    #     改善の勾配が残っていない**。実機だけ不安定という sim2real ギャップに対して、
+    #     方策の自由度を絞るこの手が数少ない直接のレバーになる。
+    #   ☠ 効果は転倒率では見えない (元々ほぼ 0)。ZMP のかかと余裕で測ること。
+    #
+    #   0.0 (既定) では ``l_fwd`` と同じ = 従来どおりの前後対称な挙動。
+    l_b = float(l_back) if float(l_back) > 0.0 else float(l_fwd)
+    l_x = torch.where(cx < 0.0, torch.full_like(cx, l_b), torch.full_like(cx, float(l_fwd)))
+    inv_l = torch.sqrt((cx / l_x) ** 2 + (cy / float(l_lat)) ** 2)
     f = 0.5 * v * inv_l
     f = torch.clamp(f, float(f_min), float(f_max))
 
@@ -221,9 +259,85 @@ def reset_gait_phase(env: "ManagerBasedEnv", env_ids: torch.Tensor | None):
       登録しないと前エピソードの位相を引き継ぎ、リセット直後の歩容が不連続になる。
     """
     ph: torch.Tensor | None = getattr(env, _GAIT_PHASE_ATTR, None)
-    if ph is None:
-        return
+    if ph is not None:
+        if env_ids is None:
+            ph.zero_()
+        else:
+            ph[env_ids] = 0.0
+
+    # ★ 2026-08-23: 位相周波数の一次遅れフィルタ (adaptive_phase_freq の vel_lag_s) の
+    #   状態も一緒に戻す。これが無いと新エピソードの先頭が前エピソード終盤の速度から
+    #   始まり、位相の立ち上がりが env ごとにばらつく。
+    filt: torch.Tensor | None = getattr(env, "_phase_vel_filt", None)
+    if filt is not None:
+        if env_ids is None:
+            filt.zero_()
+        else:
+            filt[env_ids] = 0.0
+
+
+def randomize_joint_offset(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    offset_range: tuple[float, float] = (-0.02, 0.02),
+    asset_cfg=None,
+) -> None:
+    """関節ゼロ点 (キャリブレーション) のずれを env ごとにランダム化する。
+
+    ★ 2026-08-23 追加。**既存の DR に唯一欠けていた実機由来のばらつき**。
+
+    実機の関節角は「組み付け + 零点較正の誤差」ぶんだけ真値からずれる。これは
+    エピソード中ずっと同じ値の **定常バイアス**で、観測ノイズ (毎ステップ引き直す
+    ``Unoise`` ±0.01〜0.03) とは性質がまったく違う ── 白色ノイズは方策が平均して
+    消せるが、定常バイアスは消せない。左右で符号が違えば立ち姿が斜めになり、
+    そのまま横移動の進行方向が傾く。
+
+    実機で観測された症状との対応 (2026-08-23):
+        「右に横移動すると斜め前に出る」。同じ ckpt をシムで左右別に測ると
+        (``eval_gk_lateral_lr.py``) ドリフトは左のほうが大きく **向きが逆**だったので、
+        学習の残差ではなく実機個体のずれが主因と判断した。個体差を学習側で吸収するには
+        「個体差そのものを学習分布に入れる」しかない。
+
+    実装:
+        ``JointPositionActionCfg(use_default_offset=True)`` と ``joint_pos_rel`` は
+        **どちらも ``robot.data.default_joint_pos`` を基準にしている**ので、ここを
+        env ごと関節ごとに ``b`` だけずらすと
+
+            * PD 目標の中立姿勢が ``b`` ぶん動く  (= 実際の立ち姿がずれる)
+            * 方策が見る関節角もその中立基準になる (= 較正がずれた機体そのもの)
+
+        の両方が一度に再現できる。
+
+    Args:
+        offset_range: 一様分布の範囲 [rad]。既定 ±0.02 rad ≈ ±1.15°。
+        asset_cfg: 対象。``joint_ids`` を絞れば脚だけに掛けられる (既定は全関節)。
+
+    ☠ **mode="startup" で使うこと。** ``default_joint_pos`` を書き換えるので、
+      mode="reset" にするとリセットのたびにバイアスが**累積して発散する**。
+    ☠ ``reset_joints_by_scale`` は ``default_joint_pos`` をスケールしてリセット姿勢を
+      作るので、そちらにもこのバイアスが乗る (意図どおり: 較正のずれた機体は
+      ずれた姿勢で立ち上がる)。
+    """
+    from isaaclab.managers import SceneEntityCfg
+
+    if asset_cfg is None:
+        asset_cfg = SceneEntityCfg("robot")
+    asset = env.scene[asset_cfg.name]
+
     if env_ids is None:
-        ph.zero_()
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    joint_ids = asset_cfg.joint_ids
+    if joint_ids is None or isinstance(joint_ids, slice):
+        joint_ids = slice(None)
+        n_joints = asset.data.default_joint_pos.shape[1]
     else:
-        ph[env_ids] = 0.0
+        n_joints = len(joint_ids)
+
+    lo, hi = float(offset_range[0]), float(offset_range[1])
+    bias = torch.empty(len(env_ids), n_joints, device=env.device).uniform_(lo, hi)
+
+    default = asset.data.default_joint_pos
+    if isinstance(joint_ids, slice):
+        default[env_ids] += bias
+    else:
+        default[env_ids[:, None], torch.as_tensor(joint_ids, device=env.device)] += bias

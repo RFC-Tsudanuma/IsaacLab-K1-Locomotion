@@ -211,3 +211,13 @@ from . import dualhist  # noqa: E402, F401
 
 # ★ ボール履歴版 (試験実装)。既存タスクには影響しない (dualhist と同じ扱い)。
 from . import ballhist  # noqa: E402, F401
+
+##
+# デュアルヒストリー版 **横移動下位ポリシー** (lateral_dh/)
+#   arXiv:2401.16889 本来の狙い (自機 I/O 履歴による暗黙のシステム同定) を、
+#   上位ではなく歩行そのものに適用した版。関節ゼロ点オフセット DR とセット。
+#   ネットワークは dualhist/networks.py を再利用し、観測・対称性は独立。
+#   既存タスクには影響しない (タスク登録以外は lateral_dh/ 配下で完結)。
+##
+
+from . import lateral_dh  # noqa: E402, F401
