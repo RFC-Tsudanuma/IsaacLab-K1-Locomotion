@@ -21,6 +21,8 @@
 キック後の採点は、最終球方向への高精度一致ではなくインサイドフォームを主目的にする。
 接触時の足内側面法線と、接触直前の足速度を目標方向へ揃え、球速と30度仰角は方向から
 独立して評価する。最終球方向は、目標の反対半球へ飛んだ場合だけ飽和ペナルティを与える。
+インサイド2項は移行開始時に通常値の10倍とし、成功キックの方向誤差 EMA が25°以下なら
+3倍へ下げ、35°以上へ戻った場合は再び10倍にする。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -126,6 +128,8 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
   インサイドフォームによって結果の方向精度が維持・改善するか。
 * ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
   成功キックだけの方向平均誤差 EMA。
+* ``Curriculum/kick_inside_face_alignment_weight/weight`` /
+  ``Curriculum/kick_straight_swing_weight/weight`` … インサイド移行用の10倍・3倍切替。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
@@ -197,6 +201,8 @@ _INSIDE_FACE_WEIGHT = 3.0
 _STRAIGHT_SWING_WEIGHT = 3.0
 _VELOCITY_TRACKING_WEIGHT = 5.0
 _OPPOSITE_DIRECTION_WEIGHT = -2.0
+_INSIDE_FORM_BOOST_MULTIPLIER = 10.0
+_INSIDE_FORM_SETTLED_MULTIPLIER = 3.0
 
 # 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
 # ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
@@ -331,29 +337,47 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
 
         self.rewards.kick_inside_face_alignment = RewTerm(
             func=inside_rewards.kick_inside_face_alignment,
-            weight=0.0,
+            weight=(
+                _INSIDE_FACE_WEIGHT * _INSIDE_FORM_BOOST_MULTIPLIER * _KICK_W_SCALE
+            ),
             params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
         )
         self.curriculum.kick_inside_face_alignment_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
+            func=mdp.kick_error_gated_reward_weight,
             params={
-                **direction_ramp,
                 "term_name": "kick_inside_face_alignment",
-                "end_weight": _INSIDE_FACE_WEIGHT * _KICK_W_SCALE,
+                "command_name": "kick_direction",
+                "boosted_weight": (
+                    _INSIDE_FACE_WEIGHT * _INSIDE_FORM_BOOST_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "settled_weight": (
+                    _INSIDE_FACE_WEIGHT * _INSIDE_FORM_SETTLED_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "settle_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "reboost_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
             },
         )
 
         self.rewards.kick_straight_swing = RewTerm(
             func=inside_rewards.kick_straight_swing,
-            weight=0.0,
+            weight=(
+                _STRAIGHT_SWING_WEIGHT * _INSIDE_FORM_BOOST_MULTIPLIER * _KICK_W_SCALE
+            ),
             params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
         )
         self.curriculum.kick_straight_swing_weight = CurrTerm(
-            func=mdp.linear_reward_weight,
+            func=mdp.kick_error_gated_reward_weight,
             params={
-                **direction_ramp,
                 "term_name": "kick_straight_swing",
-                "end_weight": _STRAIGHT_SWING_WEIGHT * _KICK_W_SCALE,
+                "command_name": "kick_direction",
+                "boosted_weight": (
+                    _STRAIGHT_SWING_WEIGHT * _INSIDE_FORM_BOOST_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "settled_weight": (
+                    _STRAIGHT_SWING_WEIGHT * _INSIDE_FORM_SETTLED_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "settle_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "reboost_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
             },
         )
 
