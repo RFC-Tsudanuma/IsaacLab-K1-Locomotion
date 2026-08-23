@@ -96,9 +96,10 @@ def pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1.
     引き継がず 0 から数え直すので、カリキュラムを生かしたままだと **全部のランプが
     巻き戻る**:
 
-    * キック報酬 4 項 (direction / scaled / inside_contact / plant_lon) が weight 0 から
-      フェードインし直す。この間 ``kick_finished`` は「残りの歩行報酬を捨てるコスト」
-      だけを課すので、**最初の 500 iteration は蹴らない方が得**が明示的に成立する
+    * キック報酬 4 項 (direction / scaled / inside_contact / foot_ceiling) が
+      weight 0 からフェードインし直す。この間 ``kick_finished`` は「残りの歩行報酬を
+      捨てるコスト」だけを課すので、**最初の 500 iteration は蹴らない方が得**が
+      明示的に成立する
       (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg._freeze_fade_in_curricula` の
       docstring にある実測。500 iteration 後に weight が戻っても、そのときには
       蹴らなくなっているので払われる先が無い)。
@@ -107,9 +108,9 @@ def pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1.
       ``approach_penalty`` が復活するので、回り込みの構えを壊す方向に更新される。
     * ``sigma_velocity`` が 0.5 → 1.0 に戻り、速度の採点が緩む
       (「指令どおりに蹴る」の圧が消える)。
-    * ``kick_plant_lon`` の ``lon_span`` が 0.15 → 0.45 に戻り、勾配が 40 → 13.3 に鈍る。
-      軸足の踏み込み (plant_lon −0.11) は実機の転倒事故への直接の対策なので、
-      ここが緩むのがいちばん困る。
+    * ``kick_foot_ceiling`` の weight が 0 に戻る。接触点をボール中心より下へ
+      置かせる圧は実機の「巻き込んで転ぶ」への直接の対策なので、ここが緩むのが
+      いちばん困る (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._FOOT_LOW_H_TARGET`)。
     * ``kick_velocity_strong`` が満額 (=「速く蹴るほど得」) で復活する。この項は
       **トーキックを名指しで要求する**項で、退場させたのが inside の肝
       (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._INSIDE_STRONG_KNOTS`)。
@@ -122,7 +123,7 @@ def pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1.
     (1) と (2) の方:
 
     * ``piecewise_reward_weight`` (strong の折れ線) と ``linear_reward_param``
-      (σ_velocity) と ``piecewise_reward_param`` (lon_span の 3 段) と
+      (σ_velocity) と ``piecewise_reward_param`` と
       ``kick_rate_gated_expansion`` (拡大ゲート) は対象外なので、そのまま巻き戻る。
     * ``kick_velocity_overshoot_weight`` の窓は 1500 → 3000 なので、
       ``before_iter = 500`` では拾えない。基準 run では完走しているので凍結が正しい。
@@ -190,8 +191,11 @@ def pin_curricula_at_end(cfg: "K1WalkKickEnvCfg", *, expansion_alpha: float = 1.
         elif func is mdp.piecewise_reward_param:
             # 折れ線の params 版。piecewise_reward_weight と同じく最後の knot で
             # 頭打ちになる (実装: step >= knots[-1][0] なら knots[-1][1])。
-            # 例: inside / lob_plant の kick_plant_lon の lon_span
-            # (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_SPAN_KNOTS`) の最終 knot = (4000, 0.15)。
+            #
+            # NOTE: **現在どの呼び出し元にも 1 つも無い。** 初出は inside / lob_plant の
+            #       ``kick_plant_lon`` の ``lon_span`` (3 段の折れ線) だったが、
+            #       軸足 2 項は 2026-08-24 に両タスクから撤去された。この分岐は
+            #       将来の折れ線 param のために残してある (無いと NotImplementedError)。
             reward_term(cfg, params["term_name"], name).params[params["param_name"]] = params["knots"][-1][1]
 
         elif func is mdp.window_reward_weight:

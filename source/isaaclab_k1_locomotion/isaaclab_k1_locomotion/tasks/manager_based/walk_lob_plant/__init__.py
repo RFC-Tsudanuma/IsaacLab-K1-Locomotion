@@ -46,9 +46,9 @@ gym.register(
 
 # --------------------------------------------------------------------------- #
 # Stage 2: 平坦でロブ本体を学習する (本命)。
-# 軸足の線形テント (kick_plant_lon / kick_plant_yaw) + 呼び水の kick_velocity_strong
-# + loft/elevation の重み倍増。ITER は 8000 以上を推奨 (lon_span の折れ線が
-# 4000 iteration で終点、apex はそこから先も伸びうる)。
+# 呼び水の kick_velocity_strong (0 → 500 で立ち上げ、500 → 1200 で退場) +
+# loft/elevation の重み倍増。軸足の項は 2026-08-24 に全部外した (報酬で誘導しない)。
+# ITER は 8000 以上を推奨 (apex はなかなか飽和しない)。
 # --------------------------------------------------------------------------- #
 gym.register(
     id="Isaac-Velocity-Flat-K1-Walk-Lob-Plant-v0",

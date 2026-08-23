@@ -27,7 +27,7 @@
 # stage 2/3 は **収束済み** checkpoint からの fine-tune。--load_pretrained は
 # common_step_counter を 0 に戻すので、カリキュラムを生かしたままだと全ランプが
 # 巻き戻る (キック報酬は 0 から / 拡大ゲートは限定レンジから / σ_velocity は 1.0 から /
-# lon_span は 0.45 から / strong は満額で復活)。特にキック報酬のフェードインは
+# strong は満額で復活)。特にキック報酬のフェードインは
 # 「最初の 500 iteration は蹴らない方が得」を明示的に作るので致命的。
 # そこで K1WalkInsideKickDualEnvCfg が _pin_curricula_at_end() で全項の終値を
 # 対象へ直接書き込み、curriculum 項そのものを None にしている。
@@ -55,10 +55,19 @@
 #   いたら checkpoint が繋がっていないので止めて引数を直す。
 # * TensorBoard の 1 iteration 目。出発点が収束済みなので、下の 4 つはほぼ基準値の
 #   はずで、そうなっていなければ引き継ぎに失敗している:
-#     Metrics/kick_direction/plant_lon      ≈ -0.11  (-0.16 より後ろへ戻ったら失格。
-#                                                     実機の転倒事故の直接原因)
+#     Metrics/kick_direction/sole_height_at_kick ≈ 0.087 が基準。2026-08-24 の
+#                                                     変更 (接触点を 0.05 側へ) で
+#                                                     下がるのが正常。段を越えて
+#                                                     0.087 へ戻るなら低い当て方を
+#                                                     壊している = 実機の巻き込み事故
+#                                                     の直接原因が復活している
 #     Metrics/kick_direction/foot_kick_dot  ≈  0.00  (1 へ上がったらトーキック回帰)
-#     Metrics/kick_direction/kick_vel_ratio ≈  0.89
+#     Metrics/kick_direction/kick_vel_ratio ≈  0.89  (水平成分。use_3d_speed=True に
+#                                                     したので仰角ぶん下がって見える
+#                                                     のは正常)
+#     Metrics/kick_direction/plant_lon      ≈ -0.11  (**観察用**。2026-08-24 に報酬
+#                                                     から外した = 採否の判断材料に
+#                                                     しない)
 #     Metrics/kick_direction/kick_rate      ≈  1.00  (stage 3 は序盤に落ちてよい。
 #                                                     数百 iteration で戻らなければ
 #                                                     地形が厳しすぎる)

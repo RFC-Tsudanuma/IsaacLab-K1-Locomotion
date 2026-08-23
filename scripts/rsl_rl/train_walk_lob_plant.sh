@@ -9,14 +9,17 @@
 #
 #   Stage 2: Isaac-Velocity-Flat-K1-Walk-Lob-Plant-v0              (ロブ本体 / 平坦)
 #            **この系列の本体。** walk_lob のロブ報酬 (kick_velocity_scaled 撤去 /
-#            vz_sat 5.0 / phi_sat 60° / σ_direction 0.6) を土台に 6 点を足す:
+#            vz_sat 5.0 / phi_sat 60° / σ_direction 0.6) を土台に 5 点を足す:
 #              1. ガウス版の軸足 kick_plant_foot を項ごと撤去 (5 run 反証済み)
-#              2. 線形テントの kick_plant_lon + kick_plant_yaw を追加 (inside の流儀)
-#              3. kick_velocity_strong を折れ線で復活 = **発見の呼び水**
+#              2. kick_velocity_strong を折れ線で復活 = **発見の呼び水**
 #                 [(0,0), (500,W), (1200,0)] — 立ち上げてから退場させる
-#              4. kick_loft / kick_elevation を 5.0 → 10.0、kick_foot_lift を 2.0 → 6.0
-#              5. 接触幾何のメトリクスを出す (plant_yaw_dot が見えるようになる)
-#              6. 全カリキュラムの steps_per_iteration を 48 に統一
+#              3. kick_loft / kick_elevation を 5.0 → 10.0、kick_foot_lift を 2.0 → 6.0
+#              4. 接触幾何のメトリクスを出す (plant_yaw_dot が見えるようになる)
+#              5. 全カリキュラムの steps_per_iteration を 48 に統一
+#            NOTE: 初版には「線形テントの kick_plant_lon + kick_plant_yaw を追加」が
+#                  あったが、2026-08-24 に撤去した (軸足は報酬で誘導しない。
+#                  run 2026-08-23_08-05-22 で kick_plant_lon の払いは ≈0.009 = 死亡、
+#                  plant_yaw_dot は最初から 0.93 で飽和。B-Human の観察とも一致)。
 #
 #   Stage 3: Isaac-Velocity-Rough-K1-Walk-Lob-Plant-v0             (凹凸 + ボール DR)
 #            凹凸地形 (±1-4 cm) と、ボール DR の 4 点セット (足の反発 / ボール物性 /
@@ -39,8 +42,7 @@
 #
 # ITER が長いのはロブだから
 # -------------------------
-# stage 2 の既定は 8000。カリキュラムの終点が lon_span の第 3 段 (5000 iteration) に
-# あることに加えて、**ロブは apex がなかなか飽和しない** — loop_shoot 系では
+# stage 2 の既定は 8000。**ロブは apex がなかなか飽和しない** — loop_shoot 系では
 # 10000 iteration を超えても apex が上がり続けていた。途中で止めた値を「頭打ち」と
 # 読まないこと。
 #
@@ -59,20 +61,15 @@
 #                                            立ち上がらなければ呼び水 (strong) の失敗。
 #   Metrics/kick_direction/kick_apex_height  本命。旧 flat lob の頭打ち 0.425 を
 #                                            超えて 0.9 へ向かうか。
-#   Metrics/kick_direction/plant_lon         -0.42 から 0 側へ動くか。3000 iteration
-#                                            までに -0.30 側へ動いていなければ、span の
-#                                            絞り (3000 で 0.35) で勾配が潰れる。その
-#                                            ときは折れ線ではなく軸足が動かない原因
-#                                            (歩幅と接触位相) を疑う。
-#   Metrics/kick_direction/plant_yaw_dot     **1 iteration 目の値を必ず記録する**
-#                                            (ロブ系での実測がまだ無い。1 = 蹴り方向 /
-#                                            0 = 真横。素で 0.9 級ならこの項は効かない
-#                                            ので yaw_span を絞る側で考え直す)。
+#   Metrics/kick_direction/plant_lon         **観察用** (2026-08-24 に報酬から外した)。
+#   Metrics/kick_direction/plant_lat         apex が動いたときに軸足がどう動いたかの
+#   Metrics/kick_direction/plant_yaw_dot     記録。実測の基準は plant_lon -0.42〜-0.50 /
+#                                            plant_yaw_dot 0.93 (飽和)。目標へ寄ったか
+#                                            どうかは判定材料にしない。
 #   Metrics/kick_direction/kick_vel_ratio    副作用の監視。apex ∝ (v·sinφ)² なので
 #   Metrics/kick_direction/foot_vz           apex は実質ボール速度が支配している。
-#                                            軸足 2 項が威力を食っていないかはここでしか
-#                                            見えない。落ちながら plant_lon だけ動いて
-#                                            いるなら span を緩める。
+#                                            loft/elevation の重み倍増が威力を食って
+#                                            いないかはここでしか見えない。
 #
 # 使ってはいけないフラグ
 # ----------------------

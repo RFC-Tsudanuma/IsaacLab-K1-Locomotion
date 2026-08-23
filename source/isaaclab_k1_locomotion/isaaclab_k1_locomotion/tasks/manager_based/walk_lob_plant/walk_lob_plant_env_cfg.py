@@ -15,9 +15,11 @@
 ----------------------------------------
 1. **浮かせることが最優先。** ``kick_loft`` / ``kick_elevation`` を「壊れない範囲で
    最強」に置く (5.0 → **10.0** × :data:`~..walk_kick.walk_kick_env_cfg._KICK_W_SCALE`)。
-2. 軸足の扱いは **インサイドキックで実証済みの流儀**をそのまま持ち込む
-   (線形テント / 重みは objective 段 / span カリキュラム / 軸足のヨー)。
-   ガウスの ``kick_plant_foot`` は使わない。
+2. **軸足は報酬で誘導しない** (ユーザー判断 2026-08-24)。ガウスの
+   ``kick_plant_foot`` も、一度は入れた線形テントの ``kick_plant_lon`` /
+   ``kick_plant_yaw`` も **全部外す**。軸足は「物理的に無理な場所になければよい」
+   だけで、当たりの質を決めるのは接触点であって軸足ではない (B-Human の観察
+   2026-08-23 + 下の実測)。指標としては出し続ける。
 3. 段は「歩行 → flat で浮かせる → rough + ボール DR」の 3 つ。
 
 なぜ walk_lob_rough を直さずに新しい系列を立てるのか
@@ -44,16 +46,18 @@
 記録                                     このタスクでの扱い
 ======================================  ==================================================
 **apex 0.425 m でプラトー**              目標 0.9 m に対して半分以下。loft/elevation の
-(flat lob it11500、elevation 23.7°)      重みを 5.0 → 10.0 へ上げる (第 4 節)。
+(flat lob it11500、elevation 23.7°)      重みを 5.0 → 10.0 へ上げる (第 3 節)。
 **plant_lon −0.42 で完全に不動**         ガウス (σ_lon 0.10) は実測位置で f ≈ 5e-4 =
-(5 run、``kick_plant_foot`` は 0.0002)   真っ平ら。**線形テント** ``kick_plant_lon`` に
-                                         置き換える (第 2 節)。
+(5 run、``kick_plant_foot`` は 0.0002)   真っ平ら。一度は **線形テント**
+                                         ``kick_plant_lon`` に置き換えたが、それも
+                                         2026-08-24 に撤去した (下の「軸足の項を
+                                         全部外した経緯」)。軸足は報酬で誘導しない。
 **「地面との間で弾ませる」exploit**      Isaac の反発 e≈0.6 でだけ成立し MuJoCo・実機
 (walk_lob の変更点 7)                    (e≈0) で消える解。歯止めは φ_sat 60° +
-                                         方向ゲートで、どちらも外さない (第 4 節)。
+                                         方向ゲートで、どちらも外さない (第 3 節)。
 **walk phase → lob が直行しない**        ``kick_velocity_scaled`` を撤去したので「まず
 (2026-08-18、eplen 25 のまま 400 iter)   ボールに触りにいく」動機が無い。``strong`` の
-                                         折れ線で呼び水を作る (第 3 節)。
+                                         折れ線で呼び水を作る (第 2 節)。
 **``r_stance`` を動かしても効かない**    0.25 → 0.15 で plant_lon は 1.3 cm しか動かず
 (2026-08-18)                             vel_ratio が 0.525 → 0.401 に落ちた。
                                          **触らない** (walk_lob 既定 0.25 のまま)。
@@ -62,21 +66,36 @@
                                          (下の「入れないもの」)。
 ======================================  ==================================================
 
-.. warning::
-   **軸足の項は「威力」とトレードしうる。** 3 run から出た定量則は
+軸足の項を全部外した経緯 (2026-08-24)
+-------------------------------------
+初版 (2026-08-23) はインサイドの流儀をそのまま持ち込み、線形テントの
+``kick_plant_lon`` (weight 6.0 / span 0.60 → 0.35 → 0.25) と ``kick_plant_yaw``
+(weight 3.0 / 半幅 90°) を入れていた。**1 run で決着がついた。**
+
+* run 2026-08-23_08-05-22 (stage 3) の ``Episode_Reward/kick_plant_lon`` は
+  **≈ 0.009** = 実質 1 円も払われていない。plant_lon はむしろ **−0.50** 側へ流れた。
+  線形テントにしても、ロブでは軸足が報酬で動かなかった。
+* ``Metrics/kick_direction/plant_yaw_dot`` は **最初から 0.93 で飽和**。
+  「素の値が既に 0.9 級ならこの項は効きようが無い」と初版で自分で書いた条件が
+  そのまま当たり、``kick_plant_yaw`` は誘導する余地が無かった。
+* B-Human の観察 (2026-08-23) — 軸足の位置も向きも当たりの質と無関係。
+  軸足は後ろ寄りでよく、効くのは **接触点がボール中心より下かどうか**。
+
+インサイド側では weight 6.0 で plant_lon を −0.23 → −0.11 まで動かせた実績がある
+が、**当たりの質が良くなった証拠が無い** (実機の巻き込み事故は消えず、真因は
+接触点の高さだった)。よってこの系列でも軸足 2 項は撤去し、方針を
+「**軸足は物理的に無理な場所になければよく、報酬で誘導しない**」に統一した。
+
+.. note::
+   **威力とのトレードの監視は残す。** 3 run から出た定量則
 
        apex 上昇 ∝ (kick_vel_ratio · sin φ)²
 
-   で、仰角の変動幅 (24-28°) よりボール速度の変動幅 (0.40-0.70) の方がずっと大きい。
-   つまり **apex は実質ボール速度が支配している**。``kick_plant_lon`` /
-   ``kick_plant_yaw`` は「構え」を指定する項なので、構えを取るためにスイングを
-   短くすれば apex は下がりうる。インサイドでは vel_ratio 0.887 を保ったまま
-   plant_lon が −0.23 → −0.107 まで動いた実績があるが、**あれは強い蹴りを目的に
-   含むタスクでの話**で、ロブでは目的が高さに寄っているぶん逃げ道が違う。
-   副作用の監視は ``Metrics/kick_direction/kick_vel_ratio`` と
-   ``Metrics/kick_direction/foot_vz`` の 2 つ。どちらかが落ちながら plant_lon だけが
-   動いているなら、軸足の項が威力を食っている。そのときは weight ではなく
-   **span を緩める側** (第 2 節の折れ線の後段を後ろへずらす) で調整すること。
+   で、仰角の変動幅 (24-28°) よりボール速度の変動幅 (0.40-0.70) の方がずっと大きい
+   = **apex は実質ボール速度が支配している**。軸足 2 項を外したので「構えのために
+   スイングを削る」経路は無くなったが、``kick_loft`` / ``kick_elevation`` の重み
+   倍増そのものが同じトレードを持つ。監視するのは
+   ``Metrics/kick_direction/kick_vel_ratio`` と ``Metrics/kick_direction/foot_vz``。
 
 観測レイアウト — walk_kick 素の 55 / 61 を使う
 ----------------------------------------------
@@ -118,17 +137,20 @@ stage 1 だけは引き継ぎ元 (共用の歩行 checkpoint) が **1 フレー�
 
 入れないもの (すべて意図的)
 ---------------------------
-* ``kick_plant_foot`` (ガウス版の軸足) — 反証済み。第 2 節で項ごと外す。
+* ``kick_plant_foot`` (ガウス版の軸足) — 反証済み。第 1 節で項ごと外す。
 * ``kick_contact_height`` (低く当てるほど得) — 反証済み (apex 0.340 → 0.234)。
-* ``kick_foot_ceiling`` (足を上げすぎない天井) — インサイドでは入れているが、
-  **ロブでは入れない**。ロブが欲しいのは「ボールの下に潜る」ことで、天井は
-  その方向と正面から競合しうる。加えて今回は「軸足 2 項 + loft/elevation の
-  重み倍増」を同時に入れており、これ以上変更点を増やすと apex が動いた/動かない
-  原因を帰属できなくなる。効かなかったときの次の一手として温存する。
+* ``kick_plant_lon`` / ``kick_plant_yaw`` (線形テントの軸足 2 項) — 初版では
+  入れていたが 2026-08-24 に撤去 (上の「軸足の項を全部外した経緯」)。
+* ``kick_foot_ceiling`` (接触点の高さ) — インサイドでは入れているが、
+  **ロブでは入れない**。inside は 2026-08-24 にこの項を「天井」から
+  「低いほど得 (h_target 0.05)」へ振り直したが、ロブが欲しいのは
+  「ボールの下に潜る」ことで、**低く当てる圧は立ち位置を詰めさせてスイング長 =
+  ボール速度を削る**という反証が既にこの系列にある (``kick_contact_height``、
+  apex 0.340 → 0.234)。効かなかったときの次の一手として温存する。
 * ``r_stance`` の変更 — 反証済み (0.25 → 0.15 で vel_ratio が落ちただけ)。
 * ``kick_velocity_scaled`` の復活 — ロブの設計そのもの。「指令の速さに一致しろ」は
   vz = v·sin φ の最大化と衝突する (:mod:`..walk_lob` の変更点 1)。
-  ブートストラップは ``strong`` の折れ線が担う (第 3 節)。
+  ブートストラップは ``strong`` の折れ線が担う (第 2 節)。
 * 回り込み型 G (``apply_orbit_params``) / 拡大ゲート — インサイドのレシピには
   入っているが、こちらは loop_shoot 由来のコマンド設計をそのまま使う。
   変更点を「浮かせる」ことに絞るため。
@@ -137,16 +159,14 @@ TensorBoard で見るもの
 ----------------------
 * ``Metrics/kick_direction/kick_rate`` — **最初に見るのはこれ**。インサイドは
   250 iteration で 0.85 を超えた。呼び水 (strong) が効いていれば 500 iteration まで
-  には立ち上がる。立ち上がらなければ第 3 節の設計が失敗したということなので、
+  には立ち上がる。立ち上がらなければ第 2 節の設計が失敗したということなので、
   walk_lob_rough と同じ「キック段を挟む」へ戻す判断になる。
 * ``Metrics/kick_direction/kick_apex_height`` — 本命。0.425 (旧 flat lob の頭打ち)
   を超えて 0.9 へ向かうか。
-* ``Metrics/kick_direction/plant_lon`` — −0.42 から 0 側へ動くか
-  (``kick_plant_lon`` が効いているかの唯一の判定材料)。
-* ``Metrics/kick_direction/plant_yaw_dot`` — ``kick_plant_yaw`` の対象。
-  **1 iteration 目の値を必ず記録すること** (ロブ系での実測がまだ無い。
-  1 = 蹴り方向、0 = 真横)。素の値が既に 0.9 級ならこの項は効きようが無いので、
-  weight ではなく ``yaw_span`` を絞る側で考え直す。
+* ``Metrics/kick_direction/plant_lon`` / ``plant_lat`` / ``plant_yaw_dot`` —
+  **すべて観察用 (報酬からは外した)**。実測の基準は plant_lon −0.42〜−0.50 /
+  plant_yaw_dot 0.93 (飽和)。apex が動いたときに軸足がどう動いたかを後から
+  読むための記録で、これらが目標へ寄ったかどうかは判定材料ではない。
 * ``Metrics/kick_direction/kick_vel_ratio`` / ``foot_vz`` — 副作用の監視
   (上の warning)。
 * ``Train/mean_episode_length`` と ``Episode_Termination/base_height`` — 段の
@@ -173,8 +193,6 @@ from ..walk_inside_kick.walk_inside_kick_env_cfg import (
     _BALL_AVOIDANCE_SIGMA_POSE,
     _BALL_AVOIDANCE_SIGMA_SOLE,
     _INSIDE_STRONG_KNOTS,
-    _PLANT_LON_TARGET,
-    _PLANT_YAW_SPAN,
     _ROUGH_BALL_DYNAMIC_FRICTION_RANGE,
     _ROUGH_BALL_MASS_SCALE_RANGE,
     _ROUGH_BALL_RESTITUTION_RANGE,
@@ -302,73 +320,25 @@ _ELEVATION_WEIGHT = 10.0
 _FOOT_LIFT_WEIGHT = 6.0
 
 # --------------------------------------------------------------------------- #
-# 軸足の前後位置 (kick_plant_lon) の最終重み (× _KICK_W_SCALE)
+# 撤去した軸足 2 項の記録 (kick_plant_lon / kick_plant_yaw) — 2026-08-24
 #
-# インサイドの :data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_WEIGHT`
-# と同じ 6.0 = direction 同格 = 「形の項が目的の項を出し抜かない」序列の上限。
-# あちら側のコメントにある上限の根拠 (r_direction 乗算なので農作の抜け道は構造で
-# 塞がれており、残る壊れ方は「威力・精度を削ってでも軸足を置く」トレードだけ) は
-# ロブでもそのまま成り立つ。
+# ここには ``_PLANT_LON_WEIGHT`` (6.0)、``_PLANT_YAW_WEIGHT`` (3.0)、そして
+# ロブ専用の span 折れ線 ``_LOB_PLANT_LON_SPAN_KNOTS``
+# ``[(0, 0.60), (1500, 0.60), (3000, 0.35), (5000, 0.25)]`` が並んでいた。
+# inside から import していた ``_PLANT_LON_TARGET`` / ``_PLANT_YAW_SPAN`` ともども
+# **定数ごと消した** (inside 側でも同じ日に消えている)。
 #
-# ただし **ロブでは objective が loft/elevation (10.0 ずつ) の側にある**ので、
-# 6.0 は inside と違って「objective より下」。形が高さを出し抜けない配分になっている。
+# 撤去の理由 (経緯の全文はモジュール docstring「軸足の項を全部外した経緯」):
+#   * run 2026-08-23_08-05-22 で ``Episode_Reward/kick_plant_lon`` ≈ 0.009 = 死亡。
+#     plant_lon はむしろ −0.50 へ流れ、線形テントにしても軸足は動かなかった。
+#   * ``plant_yaw_dot`` は最初から 0.93 で飽和 = ``kick_plant_yaw`` に余地が無い。
+#   * B-Human の観察 (2026-08-23): 軸足の位置も向きも当たりの質と無関係。
 #
-# 目標値 (:data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_LON_TARGET` = 0.0)
-# は inside から **import してそのまま使う**。span の折れ線だけはロブ専用
-# (:data:`_LOB_PLANT_LON_SPAN_KNOTS`、下)。
+# 指標 (``plant_lon`` / ``plant_lat`` / ``plant_yaw_dot``) は
+# ``log_contact_geometry`` を立ててあるので出続ける (第 4 節: メトリクス)。報酬関数
+# :func:`~..walk_kick.mdp.rewards.kick_plant_lon` /
+# :func:`~..walk_kick.mdp.rewards.kick_plant_yaw` も残っている。
 # --------------------------------------------------------------------------- #
-_PLANT_LON_WEIGHT = 6.0
-
-# --------------------------------------------------------------------------- #
-# span の折れ線 (ロブ専用)。inside の ``_PLANT_LON_SPAN_KNOTS`` (0.45 → 0.25 → 0.15)
-# を **そのまま使ってはいけない**。
-#
-# ロブの実測 plant_lon は **−0.42** (走り出しの最悪値) で、inside の出発点 −0.23 より
-# ずっと後ろ。inside の初期半幅 0.45 だと f = 1 − 0.42/0.45 = 0.07 と勾配が薄く、
-# 第 2 段 (1500 → 3000 で 0.25 まで絞る) に入った時点で −0.42 の位置は f = 0 に潰れる。
-# 「ポリシーの居る場所で報酬が真っ平ら」はこの系列で kick_plant_foot を殺した
-# 死因そのものなので、出発点に合わせて広く始め、絞りも遅らせる:
-#
-#   iteration    0     1500    3000    5000
-#   span        0.60   0.60    0.35    0.25
-#   f(−0.42)    0.30   0.30    0.0*    —        * ここまで一歩も動いていなければ別の問題
-#   f(−0.30)    0.50   0.50    0.14    —
-#   f(−0.15)    0.75   0.75    0.57    0.40
-#   勾配 W/span 10     10      17      24
-#
-# 終値 0.25 は inside の第 2 段と同じ値 (inside がそこから −0.11 まで踏み込めた実績)。
-# inside の第 3 段 (0.15) までは絞らない — ロブは apex 優先で、軸足の圧を上げ切る
-# より「威力と軸足のトレード」が apex に出ないことを先に確かめる。
-# 絞りの開始 1500 は strong の退場 (1200) の後 (トーキック期の居場所を潰さない)。
-#
-# .. warning::
-#    ``Metrics/kick_direction/plant_lon`` が 3000 iteration までに −0.30 側へ
-#    動いていなければ、第 2 段で f が 0 に潰れる。そのときは折れ線を後ろへずらすのでは
-#    なく、**軸足が報酬で動かない別の原因** (歩幅と接触位相、walk_lob_rough の記録) を
-#    疑うこと。折れ線の形は 1 本の piecewise で書くこと (2 本並べると同じ param に
-#    書き手が 2 人になる。:func:`~..walk_kick.mdp.curriculums.piecewise_reward_param`)。
-# --------------------------------------------------------------------------- #
-_LOB_PLANT_LON_SPAN_KNOTS = [(0, 0.60), (1500, 0.60), (3000, 0.35), (5000, 0.25)]
-
-# --------------------------------------------------------------------------- #
-# 軸足の向き (kick_plant_yaw) の最終重み (× _KICK_W_SCALE)
-#
-# インサイドの :data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_YAW_WEIGHT`
-# と同じ 3.0 = 「形の項は objective の半分から入れる」。
-# span は :data:`~..walk_inside_kick.walk_inside_kick_env_cfg._PLANT_YAW_SPAN`
-# (π/2 = 90°) を import。
-#
-# ロブでこの項に期待する働きは inside と少し違う。あちらは「軸足が斜めだと骨盤も
-# 斜めになり、振り足のインサイド面がキック線に正対しない = 当たりが薄い」だった。
-# こちらは **軸足が蹴り方向を向いていれば骨盤が開き、振り足をボールの下へ潜らせる
-# 余地が増える** という仮説。どちらも「軸足の向きが振り足の通り道を決める」という
-# 同じ幾何の話なので、実証済みの形をそのまま流用する。
-#
-# NOTE: ``Metrics/kick_direction/plant_yaw_dot`` の **ロブ系での実測がまだ無い**。
-#       1 iteration 目の値を必ず記録すること (素の値が既に 0.9 級ならこの項は
-#       効きようが無いので、weight ではなく yaw_span を絞る側で考え直す)。
-# --------------------------------------------------------------------------- #
-_PLANT_YAW_WEIGHT = 3.0
 
 # キック報酬のフェードイン窓 [iteration]。基底 walk_kick の _phase2 と同じ 0 → 500 で、
 # 新設 3 項も既存項と同時に立ち上げる (発見期には既に満額で乗っている状態にする)。
@@ -423,11 +393,16 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
     やること (番号は下のコメントと対応):
 
     1. ``kick_plant_foot`` (ガウス) を項ごと撤去
-    2. ``kick_plant_lon`` (線形テント) + ``kick_plant_yaw`` を追加
-    3. ``kick_velocity_strong`` を折れ線で復活 = 発見の呼び水
-    4. ``kick_loft`` / ``kick_elevation`` / ``kick_foot_lift`` の終値を引き上げ
-    5. 接触幾何のメトリクスを出す
-    6. 全カリキュラムの時間単位を :data:`_SPI` へ統一
+    2. ``kick_velocity_strong`` を折れ線で復活 = 発見の呼び水
+    3. ``kick_loft`` / ``kick_elevation`` / ``kick_foot_lift`` の終値を引き上げ
+    4. 接触幾何のメトリクスを出す
+    5. 全カリキュラムの時間単位を :data:`_SPI` へ統一
+
+    .. note::
+       初版 (2026-08-23) はここに「``kick_plant_lon`` (線形テント) +
+       ``kick_plant_yaw`` を追加」という節があった。**2026-08-24 に撤去**
+       (モジュール docstring の「軸足の項を全部外した経緯」)。軸足は報酬で
+       誘導せず、指標としてだけ見る。
     """
     # -- 1. ガウス版の軸足 (kick_plant_foot) を項ごと撤去 -------------------- #
     #
@@ -442,7 +417,9 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
     # f = exp(−0.39²/(2·0.10²)) ≈ 5e-4 = **裾の完全な外側で真っ平ら**。
     # ``Episode_Reward/kick_plant_foot`` の実測 0.0002 がその帰結。
     # 「軸足は動かない」のではなく「動かす勾配が無かった」というのが 2026-08-23 の
-    # 読み直しで、下の第 2 節がそこを線形テントで置き換える。
+    # 読み直しで、一度は線形テントの ``kick_plant_lon`` で置き換えた。その線形テントも
+    # 2026-08-24 に撤去済み (モジュール docstring「軸足の項を全部外した経緯」) なので、
+    # **いまはガウス版を消すだけで軸足の項は 1 つも残らない**。
     #
     # walk_lob_rough が試した「目標を動かすカリキュラム」(kick_plant_foot_lon_target /
     # _sigma_lon) はこの系列には存在しないが、将来 walk_lob 側に足されたときに
@@ -452,90 +429,7 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
         if getattr(cfg.curriculum, _curr, None) is not None:
             setattr(cfg.curriculum, _curr, None)
 
-    # -- 2a. 軸足の前後位置を線形テントで誘導する (kick_plant_lon) ----------- #
-    #
-    # インサイドキックで実証済みの形をそのまま持ち込む。
-    # :func:`~..walk_kick.mdp.rewards.kick_plant_lon` は半幅 ``lon_span`` の線形テントで、
-    # −0.42 でも f = 0.07、−0.23 で f = 0.51 と **ポリシーが実際に居る場所に傾きが残る**。
-    # これが撤去したガウス版との唯一にして決定的な違い。
-    # lat (横) は掛けない — plant_lat は walk_lob の実測で目標 0.19 に対して 0.17 と
-    # 最初から合っており、掛けると「横が外れているあいだ lon の勾配も死ぬ」という
-    # kick_plant_foot の失敗を作り直すことになる。
-    #
-    # 目標 (0.0) は inside から import、span の折れ線はロブ専用
-    # (:data:`_LOB_PLANT_LON_SPAN_KNOTS`: 出発点 −0.42 に合わせて広く始める)。
-    # 初期 span は折れ線の先頭 knot からそのまま読む。
-    #
-    # sigma_direction は **このタスクの他のキック項と必ず同じ値** (0.6)。
-    # 項ごとに違うと方位を外したときの損得が食い違って何を最適化しているのか読めなくなる
-    # (:mod:`..walk_lob` の変更点 4)。
-    cfg.rewards.kick_plant_lon = RewTerm(
-        func=mdp.kick_plant_lon,
-        weight=0.0,
-        params={
-            **_KICK_STATE_PARAMS,
-            "sigma_direction": _LOB_SIGMA_DIRECTION,
-            "lon_target": _PLANT_LON_TARGET,
-            "lon_span": _LOB_PLANT_LON_SPAN_KNOTS[0][1],
-        },
-    )
-    cfg.curriculum.kick_plant_lon_weight = CurrTerm(
-        func=mdp.linear_reward_weight,
-        params={
-            "term_name": "kick_plant_lon",
-            "start_weight": 0.0,
-            "end_weight": _PLANT_LON_WEIGHT * _KICK_W_SCALE,
-            "start_step": 0,
-            "end_step": _FADE_IN_END_ITER,
-            "steps_per_iteration": _SPI,
-        },
-    )
-
-    # span の折れ線 (0.60 → 0.35 → 0.25、:data:`_LOB_PLANT_LON_SPAN_KNOTS`)。
-    # テントの勾配は W/span なので、weight を上限で止めたあとの増強は **span を絞る側**
-    # で行う、という inside の設計を引き継ぐ。ただし出発点が −0.42 と後ろなので
-    # inside の数列は使わない (定数のコメント参照)。3 段を **1 本の折れ線** で書くこと
-    # (linear_reward_param を 2 本並べると同じ param に書き手が 2 人になり、最終値が
-    # CurriculumManager の実行順で決まってしまう。
-    # :func:`~..walk_kick.mdp.curriculums.piecewise_reward_param` の docstring)。
-    cfg.curriculum.kick_plant_lon_span = CurrTerm(
-        func=mdp.piecewise_reward_param,
-        params={
-            "term_name": "kick_plant_lon",
-            "param_name": "lon_span",
-            "knots": _LOB_PLANT_LON_SPAN_KNOTS,
-            "steps_per_iteration": _SPI,
-        },
-    )
-
-    # -- 2b. 軸足の向きを誘導する (kick_plant_yaw) -------------------------- #
-    #
-    # 軸足のつま先を蹴り方向へ向かせる項 (角度に対する線形テント、半幅 90°)。
-    # 2a とは **加算** で並べる。掛け算にすると「片方が外れているあいだ両方の勾配が
-    # 死ぬ」という kick_plant_foot の失敗を作り直す。位置が合っていても向きは独立に
-    # 外れるので、項を分けるのが正しい。
-    cfg.rewards.kick_plant_yaw = RewTerm(
-        func=mdp.kick_plant_yaw,
-        weight=0.0,
-        params={
-            **_KICK_STATE_PARAMS,
-            "sigma_direction": _LOB_SIGMA_DIRECTION,
-            "yaw_span": _PLANT_YAW_SPAN,
-        },
-    )
-    cfg.curriculum.kick_plant_yaw_weight = CurrTerm(
-        func=mdp.linear_reward_weight,
-        params={
-            "term_name": "kick_plant_yaw",
-            "start_weight": 0.0,
-            "end_weight": _PLANT_YAW_WEIGHT * _KICK_W_SCALE,
-            "start_step": 0,
-            "end_step": _FADE_IN_END_ITER,
-            "steps_per_iteration": _SPI,
-        },
-    )
-
-    # -- 3. 発見の呼び水: kick_velocity_strong を折れ線で復活させる ---------- #
+    # -- 2. 発見の呼び水: kick_velocity_strong を折れ線で復活させる ---------- #
     #
     # **walk_lob_rough の「キック段 (stage 2) を挟む」を置き換えるのがこの節。**
     #
@@ -584,7 +478,7 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
         },
     )
 
-    # -- 4. 「浮かせる」項の終値を引き上げる -------------------------------- #
+    # -- 3. 「浮かせる」項の終値を引き上げる -------------------------------- #
     #
     # loft 5.0 → 10.0 / elevation 5.0 → 10.0 / foot_lift 2.0 → 6.0。
     # 根拠は :data:`_LOFT_WEIGHT` と :data:`_FOOT_LIFT_WEIGHT` のコメント。
@@ -603,17 +497,21 @@ def _apply_lob_plant_recipe(cfg: "K1WalkLobEnvCfg") -> None:
     #        r_direction への **乗算**で、direction を経由してしか払われないため。
     #        乗算の係数と加算の項を同じ土俵で比べる必要はない。)
 
-    # -- 5. 接触の幾何をメトリクスに出す ------------------------------------ #
+    # -- 4. 接触の幾何をメトリクスに出す ------------------------------------ #
     #
-    # ``Metrics/kick_direction/plant_yaw_dot`` (第 2b 節の対象) と foot_kick_dot /
-    # ball_side が出るようになる。既定 False = 他タスクの TB タグ集合を変えないため
+    # ``Metrics/kick_direction/plant_yaw_dot`` と foot_kick_dot / ball_side が
+    # 出るようになる。既定 False = 他タスクの TB タグ集合を変えないため
     # (:class:`~..walk_kick.mdp.commands.KickDirectionCommandCfg` の同名フラグ)。
+    #
+    # 軸足の 3 指標 (plant_lon / plant_lat / plant_yaw_dot) は **報酬から外した
+    # あとも出し続ける** (2026-08-24)。apex や当たり方が変わったときに軸足がどう
+    # 動いたかを後から読むための記録。
     #
     # ``plant_lon`` / ``plant_lat`` / ``sole_height_at_kick`` / ``foot_vz`` は
     # このフラグとは無関係に常時出る。
     cfg.commands.kick_direction.log_contact_geometry = True
 
-    # -- 6. カリキュラムの時間単位を _SPI へ統一 ---------------------------- #
+    # -- 5. カリキュラムの時間単位を _SPI へ統一 ---------------------------- #
     #
     # **必ず最後**。ここまでで登録した全ての項 (継承分 + 新設分) が対象。
     # 理由は :data:`_SPI` のコメント。
@@ -720,8 +618,7 @@ class K1WalkLobPlantEnvCfg(K1WalkLobEnvCfg):
     引き継ぎ元は stage 1 の checkpoint (履歴 → 履歴なので warm start 不要)。
 
     .. note::
-       ``ITER`` の既定は 8000 と長い。カリキュラムの終点が lon_span の第 3 段
-       (5000 iteration) にあることに加えて、**ロブは apex がなかなか飽和しない** —
+       ``ITER`` の既定は 8000 と長い。**ロブは apex がなかなか飽和しない** —
        loop_shoot 系では 10000 iteration を超えても apex が上がり続けていた。
        途中で止めた値を「頭打ち」と読まないこと。
     """
@@ -778,15 +675,14 @@ class K1WalkLobPlantRoughEnvCfg(K1WalkLobPlantEnvCfg):
     ``--load_pretrained`` は ``--resume`` と違って ``common_step_counter`` を
     引き継がず 0 から数え直すので、カリキュラムを生かしたままだと全ランプが巻き戻る:
 
-    * キック報酬 5 項 (direction / loft / elevation / foot_lift / plant_lon /
-      plant_yaw) が weight 0 からフェードインし直す。この間 ``kick_finished`` は
+    * キック報酬 4 項 (direction / loft / elevation / foot_lift) が weight 0 から
+      フェードインし直す。この間 ``kick_finished`` は
       「残りの歩行報酬を捨てるコスト」だけを課すので **最初の 500 iteration は
       蹴らない方が得**が明示的に成立し、蹴らなくなった後に weight が戻ってきても
       払われる先が無い。
-    * ``kick_plant_lon`` の ``lon_span`` が 0.25 → 0.60 に戻り、勾配が 24 → 10 に鈍る。
     * **``kick_velocity_strong`` が満額で復活する。** これがいちばん危ない。
       あの項は「速いほど得」= 低い弾道のトーキックを名指しで要求する呼び水で、
-      退場させたのが stage 2 の肝 (:func:`_apply_lob_plant_recipe` の第 3 節)。
+      退場させたのが stage 2 の肝 (:func:`_apply_lob_plant_recipe` の第 2 節)。
       折れ線の最終 knot は (1200, 0.0) なので、固定すると正しく 0 になる。
 
     :func:`~..walk_kick.curriculum_pin.pin_curricula_at_end` は終値を対象へ直接
@@ -1062,7 +958,7 @@ def _apply_fewa_ball_obs(cfg) -> None:
     :class:`~..walk_lob.walk_lob_env_cfg.K1WalkLobEnvCfg` が ``__post_init__`` の
     最後で :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` を呼び、
     policy の ``prev_ball_pos`` を :func:`~..walk_kick.mdp.observations.noisy_ball_pos_b`
-    (エピソードごとランダム遅延 2-6 step + 30Hz サンプル&ホールド + ガウスジッタ
+    (エピソードごとランダム遅延 0-6 step + 30Hz サンプル&ホールド + ガウスジッタ
     σ=0.067 / クリップ ±0.2) にしている。これを **素の** :func:`~..walk_kick.mdp.observations.prev_ball_pos_b`
     へ戻してから fewa 側を掛ける。戻さないと 2 つの壊れ方をする:
 

@@ -93,13 +93,19 @@ _KICK_STATE_REWARD_TERMS = (
     # getattr の None ガードで飛ばされる = 完全に no-op。
     "kick_inside_contact",
     "inside_foot_orient",
-    # 軸足の前後位置だけを線形テントで誘導する項 (walk_inside_kick のみ)。
-    # kick_plant_foot とは別項で、あちらは触らない。他タスクの cfg には属性が
-    # 存在しないので、上と同じく getattr の None ガードで飛ばされる = 完全に no-op。
+    # 軸足の前後位置だけを線形テントで誘導する項。kick_plant_foot とは別項。
+    #
+    # NOTE: **2026-08-24 現在、この項を作る cfg は 1 つも無い** (walk_inside_kick と
+    #       walk_lob_plant が同日に撤去した — 「軸足は報酬で誘導しない」)。
+    #       名簿は None ガード付きの配布先リストなので、載っていても完全に no-op。
+    #       報酬関数 :func:`~..walk_kick.mdp.rewards.kick_plant_lon` も残してあり、
+    #       また試したくなったときはこの行がそのまま入口になる。
     "kick_plant_lon",
-    # 軸足の **向き** (kick_plant_yaw) と、足を上げすぎない天井 (kick_foot_ceiling)。
-    # どちらも walk_inside_kick が実機フィードバック 2 回目で足した項で、上と同じく
-    # 他タスクの cfg には属性が無いので None ガードで飛ばされる = 完全に no-op。
+    # 軸足の **向き** (kick_plant_yaw) と、接触点の高さ (kick_foot_ceiling)。
+    # どちらも walk_inside_kick が実機フィードバック 2 回目で足した項。
+    # kick_plant_yaw は kick_plant_lon と同じ理由で 2026-08-24 に cfg 側から消えた
+    # (名簿には残す)。kick_foot_ceiling は現役で、2026-08-24 から「天井」ではなく
+    # 「接触点を低くする」向きで使っている。
     #
     # NOTE: walk_long_pass_orbit/orbit_mods.py は **自前の同名リストを持っている** が、
     #       あちらには手を入れない。この 2 項を足すのは walk_inside_kick の cfg だけで、
