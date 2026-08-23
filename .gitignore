@@ -164,3 +164,16 @@ logs/rsl_rl/k1_walk_lob_plant_rough/*
 logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/*
 !logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/model_900.pt
 !logs/rsl_rl/k1_walk_lob_plant_rough/2026-08-23_08-05-22/model_1700.pt
+
+# walk_lob_plant の Stage 2 (平坦・ロブ本体) の最終 checkpoint 7600 iter。
+# 360° 系統 (Stage 2b, Isaac-Velocity-Flat-K1-Walk-Lob-Plant-360-v0) の
+# --load_pretrained 元。**学習インスタンス側に無いと通しスクリプトが起点を
+# 見つけられない** ので追跡する (2026-08-23 に実際に踏んだ)。
+# 実測 (iter 7600): apex 0.600 / elevation 30.7° / kick_rate 0.998 /
+# vel_ratio 0.666 / kick_dir_error 7.9°。4300 iteration で頭打ちなので、
+# それ以降を範囲の拡大に使うのが 360° 系統の趣旨。
+!logs/rsl_rl/k1_walk_lob_plant/
+logs/rsl_rl/k1_walk_lob_plant/*
+!logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/
+logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/*
+!logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/model_7600.pt
