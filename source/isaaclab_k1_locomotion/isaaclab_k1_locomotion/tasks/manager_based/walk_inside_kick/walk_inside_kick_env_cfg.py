@@ -355,7 +355,12 @@ from ..walk_kick.walk_kick_env_cfg import (
     _SIGMA_DIRECTION,
     K1WalkKickEnvCfg,
 )
-from ..walk_kick_dual.walk_kick_dual_env_cfg import enable_obs_history
+from ..walk_kick_dual.walk_kick_dual_env_cfg import (
+    disable_landing_shaping,
+    enable_obs_history,
+    rebalance_gait_vs_kick,
+)
+from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import _FEWA_NOISY_FLAT_TERRAIN_CFG
 from ..walk_middle_kick.walk_middle_kick_env_cfg import _apply_middle_kick_recipe
 from ..walk_weak_kick.walk_weak_kick_env_cfg import _STRONG_W
 from ..walk_weak_kick_orbit.orbit_mods import (
@@ -1124,11 +1129,30 @@ from ..walk_kick.curriculum_pin import pin_curricula_at_end as _pin_curricula_at
 class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
     """stage 2 (平坦): actor に 100 フレームの観測履歴を与える。
 
-    :class:`K1WalkInsideKickEnvCfg` との差は **2 つだけ**:
+    :class:`K1WalkInsideKickEnvCfg` との差:
 
     1. カリキュラムを全て終値に固定する (:func:`_pin_curricula_at_end`)。
     2. policy 観測グループを 100 フレームの履歴にする
        (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。
+    3. **fewa の 3 点セット** (2026-08-24 追加): 実機で明確に滑らかだった
+       fewa/47b8863 の歩容側設定をそのまま持ち込む。
+
+       * 着地 shaping 3 項 (feet_landing_impact / feet_landing_vel /
+         feet_heel_strike) を無効化
+         (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.disable_landing_shaping`)。
+         接地イベント瞬間だけのスパース項で、蹴りのスイングを硬くする側にしか
+         働かないことが 47b8863 のコミット記録で示されている。
+       * ``feet_phase`` 2.0 → 0.8
+         (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.rebalance_gait_vs_kick`)。
+         位相報酬で歩容を縛る力を fewa と同じまで緩める。
+       * 地形を完全平面 → NOISY_FLAT (random_rough 0.7 / plane 0.3、±1-4 cm、
+         :data:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg._FEWA_NOISY_FLAT_TERRAIN_CFG`)。
+         平面だけで学習した足運びは「地面が完璧」前提で硬くなる。blind
+         (height_scanner 無し) なので観測の次元は変わらない。
+
+       3 つとも fewa の実機で滑らかさとして実証済みの組み合わせなので、
+       個別の ablation はしない。リスク (着地 shaping を外すと kick_rate が
+       停滞した系列もある) は fewa の実機実績で引き受ける。
 
     ``__post_init__`` の順序に意味がある::
 
@@ -1154,9 +1178,10 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
     * ``_apply_phase_offset`` (歩行位相の初期オフセット {0, π}) — 両足で蹴れるように
       するための変更。**このタスクは右足専用** (``kick_inside_contact`` が右足ゲート付き)
       なので、蹴り足を割る意味が無い。
-    * ``disable_landing_shaping`` / ``rebalance_gait_vs_kick`` — 報酬の変更。stage 1 が
-      その報酬集合で収束しているので、ここで動かすと「履歴の効果」が読めなくなる。
-      必要になったら **別の段** として足すこと。
+    * (2026-08-24 撤回) ``disable_landing_shaping`` / ``rebalance_gait_vs_kick`` は
+      当初「履歴の効果に帰属させる」ため持ち込まない方針だったが、**fewa の実機が
+      明確に滑らかだった**ため方針転換して入れた (下の「fewa の 3 点セット」)。
+      帰属の純度より実機の歩容を優先する。
     * ``enable_obs_delay`` — ボール観測にはこのタスク独自の認識パイプライン
       (:func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs`: エピソードごとの
       ランダム遅延 0-6 step + 30 Hz サンプル&ホールド + フレーム同期ジッタ) が
@@ -1186,7 +1211,21 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
         # 全部が巻き戻る。理由の詳細は :func:`_pin_curricula_at_end`。
         _pin_curricula_at_end(self)
 
-        # -- 2. 観測履歴 (この段で変えるのはここだけ) --------------------- #
+        # -- 2. fewa の 3 点セット (docstring の差分 3) ------------------- #
+        #
+        # 順序: pin の後 (feet_phase の weight を curriculum が上書きしないことは
+        # pin 済みなので保証される)、履歴化の前。
+        disable_landing_shaping(self)
+        rebalance_gait_vs_kick(self)
+        self.scene.terrain.terrain_type = "generator"
+        self.scene.terrain.terrain_generator = _FEWA_NOISY_FLAT_TERRAIN_CFG
+        self.scene.terrain.max_init_terrain_level = None
+        # generator 地形では env origin の z が「その patch の代表高さ」なので、
+        # ボールを凹凸 (±4 cm) にめり込ませないよう上から落とす。rough 段の
+        # :func:`~..walk_kick.walk_kick_env_cfg._apply_rough_terrain` と同じ値。
+        self.events.reset_ball.params["spawn_clearance"] = 0.05
+
+        # -- 3. 観測履歴 ------------------------------------------------- #
         #
         # 必ず最後。policy グループの構成が固まってから (N, H, 55) に変える。
         enable_obs_history(self)
