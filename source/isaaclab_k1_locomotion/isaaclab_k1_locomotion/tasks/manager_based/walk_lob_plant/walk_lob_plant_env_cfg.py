@@ -161,12 +161,17 @@ TensorBoard で見るもの
 * ``--reset_noise_std`` — 歩行 checkpoint のスイングを壊す。
 """
 
+import math
+
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
 from ..locomotion.rough_env_cfg import _apply_play_viewer
 from ..walk_inside_kick.walk_inside_kick_env_cfg import (
+    _BALL_AVOIDANCE_SIGMA_POSE,
+    _BALL_AVOIDANCE_SIGMA_SOLE,
     _INSIDE_STRONG_KNOTS,
     _PLANT_LON_TARGET,
     _PLANT_YAW_SPAN,
@@ -186,6 +191,15 @@ from ..walk_kick.walk_kick_env_cfg import (
 )
 from ..walk_kick_dual.walk_kick_dual_env_cfg import enable_obs_history
 from ..walk_lob.walk_lob_env_cfg import _LOB_SIGMA_DIRECTION, K1WalkLobEnvCfg
+from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import (
+    _BALL_OBS_DELAY_MAX_S as _FEWA_BALL_OBS_DELAY_MAX_S,
+)
+from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import (
+    _OBS_DELAY_MAX_S as _FEWA_OBS_DELAY_MAX_S,
+)
+from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import (
+    enable_obs_delay as _fewa_enable_obs_delay,
+)
 from ..walk_weak_kick_orbit.orbit_mods import apply_ball_param_dr
 
 # --------------------------------------------------------------------------- #
@@ -860,4 +874,393 @@ class K1WalkLobPlantRoughEnvCfg_PLAY(K1WalkLobPlantRoughEnvCfg):
         super().__post_init__()
         _apply_play_tweaks(self)
         _disable_ball_obs_jitter(self)
+        _apply_play_viewer(self)
+
+
+# =========================================================================== #
+# 360° 系統 (stage 2b / 3b) — 全方位ロブ + fewa 実績準拠の観測ノイズ
+#
+# 既存の stage 2 / stage 3 (K1WalkLobPlantEnvCfg / K1WalkLobPlantRoughEnvCfg) は
+# **1 行も変えない**。あちらの run
+# (k1_walk_lob_plant/2026-08-23_02-19-00, k1_walk_lob_plant_rough/2026-08-23_08-05-22)
+# は git 追跡下の checkpoint を持っていて、cfg を書き換えると「その model_*.pt が
+# どの設定で出たのか」が読めなくなるため。新しい系統は継承で足す。
+#
+# 何を変えるのか (2026-08-23 のログ分析より)
+# ------------------------------------------
+# 1. **全方位化**。stage 2 は heading ±45° / half_angle 60° / dist 0.5-0.8 の
+#    限定レンジで 4300 iteration に頭打ち (apex 0.615 → 7700 iteration まで平ら)。
+#    残りを範囲の拡大に使う。
+# 2. **観測ノイズを fewa 方式へ全面置換**。lob_plant には内界センサ (IMU /
+#    エンコーダ) の遅延が 1 つも入っていなかった。fewa の stage 4 は
+#    「凹凸 + 360° + フルノイズ」で方向誤差 7.1-7.9° / 追従 0.86 を 3 run 一致で
+#    出しており (band6 / band6calm / band6grounded)、この組み合わせが成立する
+#    ことの実証になっている。
+#
+# 拡大を壁時計ではなくゲートで進める理由と、そのゲートに apex を足した理由は
+# :data:`_LOB_360_APEX_ADVANCE_ABOVE` のコメント。
+# =========================================================================== #
+
+# --------------------------------------------------------------------------- #
+# 拡大の始点 (= stage 2 の限定レンジそのもの) と終点 (= 全方位)。
+#
+# 値は :mod:`..walk_inside_kick` の同名定数と同一。inside から import せずに
+# 書き下しているのは、あちらが「インサイドキックの拡大」用に調整を入れたときに
+# こちらが黙って追随しないようにするため (段の性格が違う)。
+# --------------------------------------------------------------------------- #
+_LOB_360_BALL_HALF_ANGLE_RANGE = (1.047, math.pi)
+_LOB_360_BALL_DIST_START = (0.5, 0.8)
+_LOB_360_BALL_DIST_END = (0.5, 1.5)
+_LOB_360_HEADING_HALFWIDTH_RANGE = (math.pi / 4, math.pi)
+
+# --------------------------------------------------------------------------- #
+# 拡大ゲートの窓 [iteration]
+#
+# 始点 200: この段は **収束済みの stage 2 checkpoint から入る** ので、inside の
+# 500 (ゼロから型を発見する段) ほど待つ必要がない。ただし --load_pretrained は
+# 環境が変わった直後に必ず一度崩れるので、その復帰ぶんだけは置く。
+# 終点 3000: α が 0 → 1 に届くまでの最短時間。ゲートが閉じている間は進まないので
+#            実際にはこれより長くかかる (窓であって予定ではない)。
+# --------------------------------------------------------------------------- #
+_LOB_360_EXPANSION_START_ITER = 200
+_LOB_360_EXPANSION_END_ITER = 3000
+
+# --------------------------------------------------------------------------- #
+# apex 込みゲートの閾値 (ユーザー指示 2026-08-23: 「緩めの apex 込みゲート」)
+#
+# **なぜ kick_rate だけでは駄目か。** :func:`~..walk_kick.mdp.curriculums.kick_rate_gated_expansion`
+# が既定で見る ``kick_rate`` は「蹴れたか」しか測らない。ロブを捨ててトーキックで
+# 転がしても 1.0 のままなので、apex が 1 度も立ち上がらないままゲートだけが
+# 全方位へ開き切る。ロブ系にそのまま持ち込むといちばん起きやすい失敗。
+#
+# 閾値の根拠は stage 2 の実測 (run 2026-08-23_02-19-00):
+#
+#   * 収束値 apex 0.60 (4300 iteration でピーク 0.615、7700 まで平ら)
+#   * 前進 0.40 = その 2/3。全方位へ広げれば apex はある程度落ちるので、
+#     「stage 2 の 2/3 を保てているなら広げてよい」という緩さにする。
+#   * 後退 0.25 = 凹凸段 (k1_walk_lob_plant_rough/2026-08-23_08-05-22) が転移で
+#     壊れたときの底 0.24 相当。**そこまで落ちたら明確に壊れている**ので戻す。
+#
+# 前進は kick_rate と AND、後退はどちらか一方で OR。緩めたいときは前進側
+# (0.40) を下げること。後退側 (0.25) を下げると「壊れても戻らない」になる。
+# --------------------------------------------------------------------------- #
+_LOB_360_APEX_ADVANCE_ABOVE = 0.40
+_LOB_360_APEX_RETREAT_BELOW = 0.25
+
+# 接近圧 (approach_penalty) / 回り込み圧 (ball_avoidance) の終値。inside と同じ。
+_LOB_360_APPROACH_END_WEIGHT = -3.0
+_LOB_360_AVOIDANCE_END_WEIGHT = -3.0
+
+# --------------------------------------------------------------------------- #
+# エピソード長 [s]
+#
+# 15.0 は全方位版の共通値 (K1WalkKick360EnvCfg / walk_inside_kick /
+# walk_long_pass_fewa と同じ)。ゲートが開き切ると 1.5 m + 半周の回り込みで移動が
+# 2.5-3 m になるので、stage 2 の 10.0 のままだと時間切れが増える。
+#
+# **段の途中で変えない。** 同じ run の中でエピソード長が変わると「時間切れの
+# 起きやすさ」が変わり、拡大の効果と混ざって読めなくなる (inside の第 3 節と同じ判断)。
+# --------------------------------------------------------------------------- #
+_LOB_360_EPISODE_LENGTH_S = 15.0
+
+
+def _apply_lob_360_expansion(cfg) -> None:
+    """限定レンジ → 全方位を 1 本の α で進める拡大ゲートを載せる。
+
+    **:func:`~..walk_kick.curriculum_pin.pin_curricula_at_end` の後に呼ぶこと。**
+    あちらの docstring は「固定した後に新しいランプを足すな」と書いているが、
+    ここでは **それが意図** — この段で唯一生かしたいカリキュラムが拡大ゲートで、
+    他の全ランプ (キック報酬のフェードイン / strong の折れ線 / σ_velocity /
+    lon_span) は収束済み checkpoint に合わせて終値で固定しておきたい。
+
+    inside の :func:`~..walk_inside_kick.walk_inside_kick_env_cfg._apply_inside_kick_recipe`
+    の第 3-5 節をロブ用に移したもので、違いは 3 点:
+
+    1. ゲートに ``apex_metric_name="kick_apex_height"`` を渡す (理由は
+       :data:`_LOB_360_APEX_ADVANCE_ABOVE` のコメント)。
+    2. ``approach_fade_iterations=0``。inside は 0 → 500 iteration で接近圧を
+       立ち上げるが、こちらは **既に接近も蹴りもできるポリシー**から始めるので、
+       壁時計のフェードインを掛けると `pin_curricula_at_end` が終値 (-3.0) へ
+       固定した接近圧が 0 に戻ってから 500 iteration かけて復帰する = 巻き戻る。
+    3. ``kick_velocity_strong`` には触らない (stage 2 の呼び水は既に退場済み)。
+    """
+    # -- 1. エピソード長 ---------------------------------------------------- #
+    cfg.episode_length_s = _LOB_360_EPISODE_LENGTH_S
+
+    # -- 2. 拡大の始点を明示する (ここからゲートが動かす) -------------------- #
+    cfg.events.reset_ball.params["half_angle"] = _LOB_360_BALL_HALF_ANGLE_RANGE[0]
+    cfg.events.reset_ball.params["dist_range"] = _LOB_360_BALL_DIST_START
+    cfg.commands.kick_direction.ranges.heading = (
+        -_LOB_360_HEADING_HALFWIDTH_RANGE[0],
+        _LOB_360_HEADING_HALFWIDTH_RANGE[0],
+    )
+
+    # -- 3. ball_avoidance を weight 0 で置く ------------------------------- #
+    #
+    # 「構えができるまでボールに寄るな」の抑止。全方位になってから効かせるので、
+    # 重みはゲートが α に比例して立ち上げる。stage 2 (限定レンジ) には存在しない
+    # 項なので、ここで新設する。
+    cfg.rewards.ball_avoidance = RewTerm(
+        func=mdp.ball_avoidance,
+        weight=0.0,
+        params={
+            **_KICK_STATE_PARAMS,
+            "sigma_sole": _BALL_AVOIDANCE_SIGMA_SOLE,
+            "sigma_pose": _BALL_AVOIDANCE_SIGMA_POSE,
+        },
+    )
+
+    # -- 4. 拡大ゲート ------------------------------------------------------ #
+    #
+    # ボール出現範囲・蹴り方向範囲・approach_penalty / ball_avoidance の重みを
+    # 1 本の α で同時に動かす。approach_penalty の weight の書き手はこの関数 1 つに
+    # 絞る (pin_curricula_at_end が curriculum.approach_penalty_weight を既に
+    # None にしているので、二重書きにはならない)。
+    cfg.curriculum.kick_expansion = CurrTerm(
+        func=mdp.kick_rate_gated_expansion,
+        params={
+            "command_name": "kick_direction",
+            "start_step": _LOB_360_EXPANSION_START_ITER,
+            "end_step": _LOB_360_EXPANSION_END_ITER,
+            "steps_per_iteration": _SPI,
+            "apex_metric_name": "kick_apex_height",
+            "apex_advance_above": _LOB_360_APEX_ADVANCE_ABOVE,
+            "apex_retreat_below": _LOB_360_APEX_RETREAT_BELOW,
+            "ball_event_name": "reset_ball",
+            "half_angle_range": _LOB_360_BALL_HALF_ANGLE_RANGE,
+            "dist_range_start": _LOB_360_BALL_DIST_START,
+            "dist_range_end": _LOB_360_BALL_DIST_END,
+            "heading_halfwidth_range": _LOB_360_HEADING_HALFWIDTH_RANGE,
+            "approach_term_name": "approach_penalty",
+            "approach_end_weight": _LOB_360_APPROACH_END_WEIGHT,
+            "approach_fade_iterations": 0,
+            "avoidance_term_name": "ball_avoidance",
+            "avoidance_end_weight": _LOB_360_AVOIDANCE_END_WEIGHT,
+        },
+    )
+
+
+def _apply_fewa_ball_obs(cfg) -> None:
+    """観測ノイズを fewa (Stage 4) 方式へ **全面置換**する。
+
+    入る中身は 4 つ:
+
+    * IMU (``projected_gravity`` / ``base_ang_vel``) の遅延 ``[0, 0.02]`` s。
+      group ``imu`` で乱数を共有する (同じセンサ読み出しなので独立には遅れない)。
+    * エンコーダ (``joint_pos`` / ``joint_vel``) の遅延 ``[0, 0.02]`` s。group ``encoder``。
+    * 視覚 (``ball_vel`` / ``prev_ball_pos``) の遅延 ``0.02 + [0, 0.06]`` = 0.02-0.08 s。
+      group ``vision``。
+    * ボール観測ノイズを一様 位置 ±0.07 m / 速度 ±0.5 m/s へ広げる。
+
+    **内界センサの遅延はこの系列に 1 つも入っていなかった** (lob_plant / walk_lob /
+    walk_loop_shoot のどれも ``enable_obs_delay`` を呼んでいない)。実機の IMU も
+    エンコーダも「測ってから policy に届くまで」に遅れがあり、遅延ゼロで学習すると
+    遅れた観測に過剰反応する方策になる。とくに ``base_ang_vel`` は歩行の安定化に直結する。
+
+    ガウス認識パイプラインを先に剥がすこと
+    --------------------------------------
+    :class:`~..walk_lob.walk_lob_env_cfg.K1WalkLobEnvCfg` が ``__post_init__`` の
+    最後で :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` を呼び、
+    policy の ``prev_ball_pos`` を :func:`~..walk_kick.mdp.observations.noisy_ball_pos_b`
+    (エピソードごとランダム遅延 2-6 step + 30Hz サンプル&ホールド + ガウスジッタ
+    σ=0.067 / クリップ ±0.2) にしている。これを **素の** :func:`~..walk_kick.mdp.observations.prev_ball_pos_b`
+    へ戻してから fewa 側を掛ける。戻さないと 2 つの壊れ方をする:
+
+    1. ``params`` にガウス側のキー (``delay_step_range`` / ``camera_hz`` /
+       ``jitter_std`` / ``jitter_clip``) が残る。fewa の ``enable_obs_delay`` は
+       ``term.params = {**term.params, ...}`` と **マージ** するので、差し替え後の
+       :func:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.delayed_prev_ball_pos_b`
+       へ未知のキーワード引数として渡り ``TypeError`` になる。
+    2. :mod:`..walk_kick_dual` 側の ``enable_obs_delay`` を使った場合は
+       ``_PIPELINE_BALL_POS_FUNCS`` ガードに掛かって ``prev_ball_pos`` だけ黙って
+       スキップされ、``ball_vel`` のノイズだけ広がった食い違い状態になる。
+
+    なぜ :mod:`..walk_kick_dual` ではなく :mod:`..walk_long_pass_fewa` の
+    ``enable_obs_delay`` を使うのか
+    --------------------------------------------------------------------------
+    あちらの ``_DELAYED_OBS_TERMS`` は both_feet の 2 スロット構成前提で
+    ``ball_pos`` (3 次元) を含む。この系列は walk_kick 素の 55 次元レイアウト
+    (``prev_ball_pos`` 1 スロット) なので、その項が無く ``AttributeError`` で落ちる。
+    fewa 側はまさにこのレイアウト用のローカルコピーで、6 項ちょうど一致する。
+
+    **観測の次元・並びは変わらない** (func / params / noise だけ差し替え) ので、
+    ノイズを入れる前後で checkpoint はそのまま繋がる。
+    """
+    # -- 1. ガウス認識パイプラインを素へ戻す -------------------------------- #
+    #
+    # 継承元 (K1WalkKickPolicyCfg) の宣言そのものに戻す: func / params / noise の 3 点。
+    policy = cfg.observations.policy
+    policy.prev_ball_pos.func = mdp.prev_ball_pos_b
+    policy.prev_ball_pos.params = {}
+    policy.prev_ball_pos.noise = Unoise(n_min=-0.02, n_max=0.02)
+
+    # -- 2. fewa の遅延 DR + ボールノイズ ----------------------------------- #
+    #
+    # noise は関数側が ±0.07 / ±0.5 へ上書きするので、上の ±0.02 は通過点。
+    _fewa_enable_obs_delay(cfg, _FEWA_OBS_DELAY_MAX_S, _FEWA_BALL_OBS_DELAY_MAX_S)
+
+
+# =========================================================================== #
+# Stage 2b: 平坦 + 全方位 (apex 込みゲートで漸進)
+# =========================================================================== #
+@configclass
+class K1WalkLobPlant360EnvCfg(K1WalkLobPlantEnvCfg):
+    """Stage 2b: stage 2 の収束済み checkpoint から、限定レンジ → 全方位へ広げる。
+
+    引き継ぎ元は stage 2 の checkpoint
+    (``logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/model_7600.pt``)。
+    履歴 → 履歴なので ``--warm_start_from_single_frame`` は不要。
+
+    ``__post_init__`` の順序に意味がある::
+
+        super()                    … stage 2 一式 (報酬・カリキュラム・履歴化まで)
+        pin_curricula_at_end()     … 全ランプを終値へ固定して項ごと None に
+        _apply_lob_360_expansion() … **その後**。唯一生かすカリキュラム = 拡大ゲート
+
+    観測は stage 2 のまま (ガウス認識パイプライン)。ノイズの入れ替えは
+    :class:`K1WalkLobPlant360RoughEnvCfg` (stage 3b) の仕事で、ここで一緒に変えると
+    「全方位で落ちたのか、ノイズで落ちたのか」が切り分けられなくなる。
+
+    TensorBoard で最初に見るもの
+    ----------------------------
+    * ``Curriculum/kick_expansion/alpha`` — 0 → 1。**止まっているのが正常な状態**も
+      ある (ゲートが閉じている = 今の実力の上限)。3000 iteration 使っても 0.3 程度で
+      止まるなら、全方位はこのポリシーには早い。
+    * ``Curriculum/kick_expansion/apex_ema`` — 0.40 を割ると拡大が止まる。
+      0.25 を割ると戻り始める。
+    * ``Metrics/kick_direction/kick_apex_height`` — 基準は stage 2 の 0.60。
+      α が進むほど落ちるのは想定内だが、0.25 まで落ちたらゲートが戻すはず。
+      **戻らないのにここが 0.25 以下なら、ゲートが機能していない** (apex_ema は
+      EMA なので実測より遅れる。100 iteration 単位で見ること)。
+    * ``Metrics/kick_direction/kick_dir_error_deg`` — stage 2 の基準は 7.7°。
+      全方位化で悪化するが、fewa は 360° + フルノイズで 7.1-7.9° を出している
+      ので、15° を超えたまま戻らないなら回り込みが成立していない。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. カリキュラムを終値へ固定して項ごと外す ---------------------- #
+        #
+        # --load_pretrained は common_step_counter を 0 に戻すので、固定しないと
+        # キック報酬のフェードインからやり直しになる (= 最初の 500 iteration は
+        # 蹴らない方が得)。詳細は pin_curricula_at_end の docstring。
+        pin_curricula_at_end(self)
+
+        # -- 2. 拡大ゲートだけを載せ直す ------------------------------------ #
+        _apply_lob_360_expansion(self)
+
+
+@configclass
+class K1WalkLobPlant360EnvCfg_PLAY(K1WalkLobPlant360EnvCfg):
+    """Stage 2b の PLAY。
+
+    観測は stage 2 と同じガウス認識パイプラインなので、後始末も stage 2 と同じ
+    (``enable_corruption = False`` は ObsTerm の ``noise`` しか切らないため、
+    関数側へ移したジッタは :func:`~..walk_kick.walk_kick_env_cfg._disable_ball_obs_jitter`
+    で別途 0 にする)。
+
+    .. note::
+       拡大ゲート (``curriculum.kick_expansion``) は PLAY でも生きている。
+       CurriculumManager は PLAY でも ``common_step_counter`` 0 から走るので、
+       **PLAY で見えるのは α = 0 = 限定レンジ**になる。全方位の挙動を見たいときは
+       :class:`K1WalkLobPlant360RoughEnvCfg_PLAY` (α を 1 に固定済み) を使うか、
+       ``env.curriculum.kick_expansion = None`` にしたうえで
+       ``events.reset_ball`` / ``commands.kick_direction.ranges.heading`` を
+       手で全方位へ書くこと。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
+        _disable_ball_obs_jitter(self)
+
+
+# =========================================================================== #
+# Stage 3b: 凹凸 + ボール DR + fewa 方式の観測ノイズ (実機へ寄せる最終段)
+# =========================================================================== #
+@configclass
+class K1WalkLobPlant360RoughEnvCfg(K1WalkLobPlant360EnvCfg):
+    """Stage 3b: stage 2b の上に、凹凸地形・ボール DR・fewa のノイズを載せる。
+
+    引き継ぎ元は stage 2b の checkpoint (履歴 → 履歴、warm start 不要)。
+
+    ``__post_init__`` の順序::
+
+        super()                  … stage 2b 一式 (拡大ゲートが 1 本だけ生きている)
+        pin_curricula_at_end()   … その拡大ゲートを α = 1 (全方位) で固定して外す
+        _apply_rough_terrain()   … 地形だけ凹凸へ (±1-4 cm)
+        apply_ball_param_dr()    … ボール DR の 4 点セット (足の反発 / 物性 / 初期回転 /
+                                   転がり減速)
+        _apply_fewa_ball_obs()   … **最後**。観測の差し替えは他が全部済んでから
+
+    2 回目の ``pin_curricula_at_end`` が拡大ゲートを畳む
+    ---------------------------------------------------
+    1 回目 (stage 2b) は全ランプを固定し、その後に拡大ゲートを 1 本足した。
+    ここでもう一度呼ぶと、残っているのはその 1 本だけなので
+    :func:`~..walk_kick.curriculum_pin.pin_expansion_gate` が α = 1 の値
+    (half_angle π / dist 0.5-1.5 / heading ±π / approach 0 / avoidance -3.0) を
+    直接書き込んで項ごと外す。**stage 2b で α が 1 に届いていることが前提** —
+    届いていない checkpoint から入ると、実力より広い範囲を「ゲートが戻せない
+    状態で」固定することになる。``Curriculum/kick_expansion/alpha`` を必ず確認すること。
+    届いていないなら ``expansion_alpha`` にその値を渡す。
+
+    足の反発 DR は残す (ユーザー判断 2026-08-23)
+    -------------------------------------------
+    :func:`~..walk_weak_kick_orbit.orbit_mods.apply_ball_param_dr` の第 1 項は
+    ロボット全 body の反発係数を (0.3, 0.7) にする。足↔ボールは average で効くので
+    実効反発が stage 2 の 0.00-0.35 から 0.15-0.70 へ倍増し、既存 stage 3 の
+    apex 崩壊 (0.60 → 0.24) の最有力候補だったが、**実機へ寄せる方向としては
+    正しい**ため入れたまま進める判断になった。apex がまた落ちるようなら、
+    ここを (0.0, 0.0) に戻す ablation が最初の切り分けになる。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        # -- 1. 拡大ゲートを α = 1 (全方位) で固定して外す ------------------ #
+        pin_curricula_at_end(self, expansion_alpha=1.0)
+
+        # -- 2. 地形だけ凹凸へ --------------------------------------------- #
+        _apply_rough_terrain(self)
+
+        # -- 3. ボール DR の 4 点セット (帯は loop_shoot 相当を明示) --------- #
+        apply_ball_param_dr(
+            self,
+            static_friction_range=_ROUGH_BALL_STATIC_FRICTION_RANGE,
+            dynamic_friction_range=_ROUGH_BALL_DYNAMIC_FRICTION_RANGE,
+            restitution_range=_ROUGH_BALL_RESTITUTION_RANGE,
+            mass_scale_range=_ROUGH_BALL_MASS_SCALE_RANGE,
+        )
+
+        # -- 4. 観測ノイズを fewa 方式へ全面置換 ---------------------------- #
+        #
+        # 必ず最後。ガウスパイプラインを剥がしてから掛けるので、他の変更が
+        # 観測に触らないことが前提になる。
+        _apply_fewa_ball_obs(self)
+
+
+@configclass
+class K1WalkLobPlant360RoughEnvCfg_PLAY(K1WalkLobPlant360RoughEnvCfg):
+    """Stage 3b の PLAY。
+
+    観測は fewa 方式 (連続遅延 + 一様ノイズ) に差し替わっているので、
+    :func:`~..walk_kick.walk_kick_env_cfg._disable_ball_obs_jitter` は
+    **呼んではいけない** — あちらは ``prev_ball_pos.params["jitter_std"] = 0.0`` を
+    書き込む関数で、差し替え後の ``delayed_prev_ball_pos_b`` には存在しない
+    キーワード引数なので ``TypeError`` になる。一様ノイズは
+    ``enable_corruption = False`` だけで落ちる (ObsTerm の ``noise`` そのものなので)。
+    遅延は観測パイプラインの構造なので PLAY でも残す。
+
+    generator 地形用のカメラ設定を足すのは
+    :class:`K1WalkLobPlantRoughEnvCfg_PLAY` と同じ理由 (world 固定カメラだと
+    ``play.py --video`` に地形しか映らない)。
+
+    カリキュラムは親で全て ``None`` になっているので、PLAY でも巻き戻らない
+    (拡大ゲートも 2 回目の ``pin_curricula_at_end`` で畳まれている = 全方位が見える)。
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _apply_play_tweaks(self)
         _apply_play_viewer(self)

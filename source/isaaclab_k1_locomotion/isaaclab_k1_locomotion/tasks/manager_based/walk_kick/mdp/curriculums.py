@@ -508,6 +508,9 @@ def kick_rate_gated_expansion(
     retreat_below: float = 0.50,
     ema_alpha: float = 0.01,
     retreat_scale: float = 2.0,
+    apex_metric_name: str | None = None,
+    apex_advance_above: float = 0.40,
+    apex_retreat_below: float = 0.25,
     ball_event_name: str = "reset_ball",
     half_angle_range: tuple[float, float] = (1.047, math.pi),
     dist_range_start: tuple[float, float] = (0.5, 0.8),
@@ -563,6 +566,25 @@ def kick_rate_gated_expansion(
     自己回復しない。ゲート付きなら崩れた時点で止まり、崩れ続ければ蹴れていた範囲まで
     戻る。
 
+    第 2 の指標でゲートを絞る (``apex_metric_name``)
+    ------------------------------------------------
+    既定 ``None`` = **キック成立率だけ**を見る従来の挙動 (inside / weak / middle の
+    呼び出し元は 1 ビットも変わらない)。
+
+    ロブ系ではこれだけでは足りない。``kick_rate`` は「蹴れたか」しか見ないので、
+    **浮かせるのをやめてトーキックで転がしても 1.0 のまま**になり、apex が
+    立ち上がらないままゲートだけが全方位まで開き切る。そこで
+    ``apex_metric_name="kick_apex_height"`` を渡すと、同じ command term の
+    メトリクスをもう 1 本 EMA で追い、次の複合条件で α を動かす::
+
+        前進: kick_rate_ema >= advance_above  かつ  apex_ema >= apex_advance_above
+        後退: kick_rate_ema <  retreat_below  または apex_ema <  apex_retreat_below
+        それ以外は据え置き (ヒステリシス)
+
+    「前進は AND / 後退は OR」なので、**どちらか一方が崩れた時点で拡大が止まる**。
+    第 2 指標の EMA は ``apex_advance_above`` から始める (``kick_rate_ema`` の初期値
+    1.0 と同じ「まだ実測が無いうちは前進を妨げない」向き)。
+
     実装の重複について
     ------------------
     ゲートの計算そのものは :func:`kick_rate_gated_speed_range` とほぼ同じコードだが、
@@ -589,7 +611,15 @@ def kick_rate_gated_expansion(
         state = {}
         env._kick_expansion_gate_state = state
     if command_name not in state:
-        state[command_name] = {"alpha": 0.0, "kick_rate_ema": 1.0, "last_now": now}
+        # apex_ema の初期値を「前進を妨げない値」に置くのは kick_rate_ema = 1.0 と同じ趣旨。
+        # ema_alpha = 0.01 では最初の 100 iteration 程度は初期値が支配するので、
+        # ここを 0 にすると実測が溜まる前に後退側へ倒れてしまう。
+        state[command_name] = {
+            "alpha": 0.0,
+            "kick_rate_ema": 1.0,
+            "apex_ema": apex_advance_above,
+            "last_now": now,
+        }
     gate = state[command_name]
 
     # -- 直近に終わったエピソード群のキック成立率を EMA に入れる
@@ -598,22 +628,40 @@ def kick_rate_gated_expansion(
     # ここで env_ids を見ると Metrics/<command>/kick_rate として記録されるのと同じ値を
     # ゼロ化前に読める (kick_rate_gated_speed_range と同じ読み方)。
     command_term = env.command_manager.get_term(command_name)
+    have_episodes = env_ids is not None and len(env_ids) > 0
     metric = command_term.metrics.get("kick_rate", None)
-    if metric is not None and env_ids is not None and len(env_ids) > 0:
+    if metric is not None and have_episodes:
         kick_rate = float(metric[env_ids].mean())
         gate["kick_rate_ema"] += ema_alpha * (kick_rate - gate["kick_rate_ema"])
+
+    # -- 第 2 の指標 (ロブなら kick_apex_height) も同じ読み方で EMA に入れる
+    if apex_metric_name is not None:
+        apex_metric = command_term.metrics.get(apex_metric_name, None)
+        if apex_metric is None:
+            raise KeyError(
+                f"command '{command_name}' に metrics['{apex_metric_name}'] がありません。"
+                " apex_metric_name の綴りか、その指標を出す設定 (KickDirectionCommandCfg) を"
+                " 確認してください。"
+            )
+        if have_episodes:
+            apex = float(apex_metric[env_ids].mean())
+            gate["apex_ema"] += ema_alpha * (apex - gate["apex_ema"])
 
     # -- ゲートの開閉に応じて α を進める / 戻す
     elapsed = max(0.0, now - gate["last_now"])
     gate["last_now"] = now
     ema = gate["kick_rate_ema"]
+    apex_ema = gate["apex_ema"]
+    # apex_metric_name = None のときは第 2 条件を恒真 / 恒偽にして従来の挙動に落とす。
+    apex_ok = True if apex_metric_name is None else apex_ema >= apex_advance_above
+    apex_bad = False if apex_metric_name is None else apex_ema < apex_retreat_below
     if now >= start_step:
         delta = elapsed / (end_step - start_step)
-        if ema >= advance_above:
+        if ema >= advance_above and apex_ok:
             gate["alpha"] += delta
-        elif ema < retreat_below:
+        elif ema < retreat_below or apex_bad:
             gate["alpha"] -= delta * retreat_scale
-        # advance_above > ema >= retreat_below は据え置き (ヒステリシス)。
+        # 前進条件を満たさず後退条件にも掛からない範囲は据え置き (ヒステリシス)。
         gate["alpha"] = min(max(gate["alpha"], 0.0), 1.0)
 
     if _GATE_DEBUG:
@@ -653,7 +701,7 @@ def kick_rate_gated_expansion(
     if abs(avoidance_term.weight - avoidance_weight) > 1e-8:
         avoidance_term.weight = avoidance_weight
 
-    return {
+    logged = {
         "alpha": alpha,
         "kick_rate_ema": ema,
         "half_angle": half_angle,
@@ -662,3 +710,7 @@ def kick_rate_gated_expansion(
         "approach_weight": approach_weight,
         "avoidance_weight": avoidance_weight,
     }
+    # 第 2 指標を使う呼び出し元でだけ TB タグを 1 本増やす (使わない側のタグ集合は不変)。
+    if apex_metric_name is not None:
+        logged["apex_ema"] = apex_ema
+    return logged

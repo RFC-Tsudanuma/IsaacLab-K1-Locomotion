@@ -92,3 +92,37 @@ class K1WalkLobPlantRoughPPORunnerCfg(K1WalkLobPPORunnerCfg):
         self.experiment_name = "k1_walk_lob_plant_rough"
         self.num_steps_per_env = _NUM_STEPS_PER_ENV
         _use_history_cnn_policy(self)
+
+
+@configclass
+class K1WalkLobPlant360PPORunnerCfg(K1WalkLobPPORunnerCfg):
+    """Stage 2b (平坦・全方位)。``k1_walk_lob_plant`` から始める前提。
+
+    環境の差は「拡大ゲートが 1 本生きていること」と 15 秒エピソードだけで、観測の
+    次元・並びは stage 2 と同一。ネットワークと PPO ハイパラも stage 2 と完全に
+    同じで、experiment_name だけ分けてログが混ざらないようにする。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_lob_plant_360"
+        self.num_steps_per_env = _NUM_STEPS_PER_ENV
+        _use_history_cnn_policy(self)
+
+
+@configclass
+class K1WalkLobPlant360RoughPPORunnerCfg(K1WalkLobPPORunnerCfg):
+    """Stage 3b (凹凸 + ボール DR + fewa 方式の観測ノイズ)。
+
+    ``k1_walk_lob_plant_360`` から始める前提。観測は **次元・並びとも stage 2b と
+    同一** (差し替えたのは各項の func / params / noise だけ) なので、checkpoint は
+    そのまま載る。ネットワークと PPO ハイパラも同じ。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        self.experiment_name = "k1_walk_lob_plant_360_rough"
+        self.num_steps_per_env = _NUM_STEPS_PER_ENV
+        _use_history_cnn_policy(self)

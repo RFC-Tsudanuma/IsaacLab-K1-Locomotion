@@ -94,3 +94,65 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobPlantRoughPPORunnerCfg",
     },
 )
+
+# --------------------------------------------------------------------------- #
+# Stage 2b: 平坦 + 全方位。stage 2 の収束済み checkpoint から、限定レンジ
+# (heading ±45° / half_angle 60° / dist 0.5-0.8) を apex 込みゲートで全方位
+# (heading ±180° / half_angle 180° / dist 0.5-1.5) へ広げる。
+#
+# ゲートは kick_rate だけでなく kick_apex_height も見る。kick_rate は「蹴れたか」
+# しか測らないので、ロブを捨ててトーキックで転がしても 1.0 のままになり、apex が
+# 立ち上がらないまま全方位まで開き切ってしまうため。
+#
+# ITER は 3000 以上を推奨 (拡大ゲートの窓が 200 → 3000 iteration。ゲートが閉じて
+# いる間は進まないので、実際にはこれより長くかかる)。
+# --------------------------------------------------------------------------- #
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Lob-Plant-360-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_lob_plant_env_cfg:K1WalkLobPlant360EnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobPlant360PPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Lob-Plant-360-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_lob_plant_env_cfg:K1WalkLobPlant360EnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobPlant360PPORunnerCfg",
+    },
+)
+
+# --------------------------------------------------------------------------- #
+# Stage 3b: 凹凸地形 + ボール DR + fewa (Stage 4) 方式の観測ノイズ。
+#
+# stage 3 (Isaac-Velocity-Rough-K1-Walk-Lob-Plant-v0) との差は 2 つ:
+#   * 全方位 (stage 2b から継ぐので拡大ゲートは α = 1 で固定済み)
+#   * 観測ノイズが fewa 方式へ全面置換 (IMU / エンコーダの遅延が新規に入る)
+#
+# 旧 stage 3 は既存 run (k1_walk_lob_plant_rough/2026-08-23_08-05-22) の帰属を
+# 保つために残してある。新規の学習はこちらを使うこと。
+# --------------------------------------------------------------------------- #
+gym.register(
+    id="Isaac-Velocity-Rough-K1-Walk-Lob-Plant-360-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_lob_plant_env_cfg:K1WalkLobPlant360RoughEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobPlant360RoughPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Rough-K1-Walk-Lob-Plant-360-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.walk_lob_plant_env_cfg:K1WalkLobPlant360RoughEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkLobPlant360RoughPPORunnerCfg",
+    },
+)
