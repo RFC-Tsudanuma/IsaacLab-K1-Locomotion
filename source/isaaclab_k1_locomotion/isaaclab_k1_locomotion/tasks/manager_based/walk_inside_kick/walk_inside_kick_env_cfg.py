@@ -276,11 +276,25 @@ run 2026-08-22_11-56-42 (3600 iteration) で収束した::
 分ける。1 run でまとめて掛けると、崩れたときに履歴のせいなのか地形のせいなのか
 DR のせいなのか切り分けられないため。
 
-* **stage 2** = :class:`K1WalkInsideKickDualEnvCfg` (平坦、観測履歴のみ)
+* **stage 2** = :class:`K1WalkInsideKickDualEnvCfg` (平坦、観測履歴 + fewa の束)
 
   actor の入力を 100 フレームの履歴にする (:func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`)。
-  **変えるのはそれだけ。** 報酬・コマンド・地形・ボール DR は stage 1 と同一なので、
-  ここで指標が動いたら原因は履歴以外にあり得ない。
+  初版は「変えるのはそれだけ」= 履歴の効果に帰属させる段だったが、実機の
+  フィードバックを受けて **2026-08-24 に帰属の純度を捨て、fewa/47b8863 の設定を
+  丸ごと持ち込む段へ変えた**:
+
+  * 歩容側の 3 点 (着地 shaping 3 項を無効化 / ``feet_phase`` 2.0 → 0.8 /
+    地形を NOISY_FLAT)。
+  * **観測パイプラインごと fewa 方式へ** (2026-08-24): 継承元の
+    :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` (30 Hz サンプル&
+    ホールドのガウス系パイプライン) を捨て、fewa の
+    :func:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.enable_obs_delay`
+    (連続遅延 + 一様ノイズ、IMU / エンコーダにも遅延) に置き換える。
+    そのために継承元を :class:`K1WalkInsideKickCleanEnvCfg` へ張り替えてある。
+
+  理由は :class:`K1WalkInsideKickDualEnvCfg` の docstring の
+  「観測パイプラインを fewa 方式へ (2026-08-24)」節。ここで指標が動いても
+  **原因を 1 つに帰属させることはできない** (それを承知で束ごと合わせる段)。
 
 * **stage 3** = :class:`K1WalkInsideKickDualRoughEnvCfg` (凹凸 + ボール物性 DR 拡大)
 
@@ -326,9 +340,20 @@ TensorBoard で最初に見るもの (stage 2/3 共通)
   ここが動いていても採否の判断材料にはしない。
 * ``Metrics/kick_direction/kick_rate`` ≈ 1.0。stage 3 は地形と DR が乗るので
   最初の数百 iteration は落ちてよいが、戻ってこなければ地形が厳しすぎる。
+* ``Metrics/kick_direction/kick_dir_error_deg`` (基準 4.2°) と ``kick_rate`` は、2026-08-24 に
+  ボール観測を fewa 方式へ張り替えた影響が **最初に出る場所**。位置ノイズが
+  ±0.02 m (+ 関数内ジッタ σ 0.067) → **±0.07 m 一様**、速度ノイズが ±0.4 → ±0.5、
+  さらに IMU / エンコーダにも 0-0.02 s の遅延が乗るので、1 iteration 目から
+  多少悪化するのは想定内。数百 iteration で戻らないなら
+  :func:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.enable_obs_delay` の
+  ``_BALL_POS_NOISE`` が今の当て方には広すぎるということ (fewa は ±0.1 で崩れて
+  ±0.07 に緩めた経緯があるので、同じ症状を見ている可能性が高い)。
 
-いずれも 1 iteration 目からほぼ基準値のはずで、**そうなっていなければ
+その他は 1 iteration 目からほぼ基準値のはずで、**そうなっていなければ
 checkpoint が繋がっていない** (起動ログの "Skipped N tensors" を見ること)。
+観測の次元も並びも変わっていない (:func:`enable_obs_delay` は ``func`` と
+``params`` を差し替えるだけ) ので、stage 1 → stage 2 の引き継ぎはこれまでどおり
+成立する。
 
 禁止フラグ (stage 1 と同じ)
 ---------------------------
@@ -360,7 +385,14 @@ from ..walk_kick_dual.walk_kick_dual_env_cfg import (
     enable_obs_history,
     rebalance_gait_vs_kick,
 )
-from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import _FEWA_NOISY_FLAT_TERRAIN_CFG
+# stage 2 は観測パイプラインごと fewa (47b8863 = 実機実証済み) に合わせる。
+# 遅延の実装も定数も **fewa のものをそのまま** 使う (自前で書き直すと「fewa と同じ」
+# が保証できなくなる)。詳細は :class:`K1WalkInsideKickDualEnvCfg` の docstring。
+from ..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg import (
+    _FEWA_NOISY_FLAT_TERRAIN_CFG,
+    _OBS_DELAY_MAX_S as _FEWA_OBS_DELAY_MAX_S,
+    enable_obs_delay as fewa_enable_obs_delay,
+)
 from ..walk_middle_kick.walk_middle_kick_env_cfg import _apply_middle_kick_recipe
 from ..walk_weak_kick.walk_weak_kick_env_cfg import _STRONG_W
 from ..walk_weak_kick_orbit.orbit_mods import (
@@ -1126,10 +1158,17 @@ from ..walk_kick.curriculum_pin import pin_curricula_at_end as _pin_curricula_at
 
 
 @configclass
-class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
-    """stage 2 (平坦): actor に 100 フレームの観測履歴を与える。
+class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickCleanEnvCfg):
+    """stage 2 (平坦): actor に 100 フレームの観測履歴を与え、観測を fewa 方式に揃える。
 
-    :class:`K1WalkInsideKickEnvCfg` との差:
+    **継承元は :class:`K1WalkInsideKickCleanEnvCfg`** (本命の
+    :class:`K1WalkInsideKickEnvCfg` ではない)。両者の差は
+    :func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs` を呼ぶかどうかだけで、
+    レシピも観測の次元・並びも同一。この段はボール観測を fewa 方式へ張り替えるので、
+    **ガウス系パイプラインが載っていない方から始める** 必要がある (理由は下の
+    「観測パイプラインを fewa 方式へ」節)。
+
+    stage 1 (:class:`K1WalkInsideKickEnvCfg`) との差:
 
     1. カリキュラムを全て終値に固定する (:func:`_pin_curricula_at_end`)。
     2. policy 観測グループを 100 フレームの履歴にする
@@ -1154,10 +1193,81 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
        個別の ablation はしない。リスク (着地 shaping を外すと kick_rate が
        停滞した系列もある) は fewa の実機実績で引き受ける。
 
+    4. **観測パイプラインを丸ごと fewa 方式へ** (2026-08-24 追加、下の節)。
+
+    観測パイプラインを fewa 方式へ (2026-08-24)
+    -------------------------------------------
+    ボール観測を、継承元のガウス系パイプライン
+    (:func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs`: ランダム遅延
+    0-6 step + 30 Hz サンプル&ホールド + フレーム同期ジッタ σ 0.067、**位置スロット
+    だけ**) から、fewa の
+    :func:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.enable_obs_delay`
+    (連続遅延 + 一様ノイズ、位置と速度の両方、加えて IMU / エンコーダにも遅延) へ
+    **束ごと** 張り替える。
+
+    これは 2026-08-24 以前にこの docstring が書いていた
+    「``enable_obs_delay`` は入れない」の **明示的な撤回** である。撤回にあたって、
+    相反する 2 つの事実を両方とも記録しておく:
+
+    * **実機の知覚は本当に 30 Hz の階段である。** カメラが 30 Hz なら、その間の
+      フレームでボール位置は動かない。ガウス系パイプラインが模していたこの構造は
+      実機に実在するもので、「間違っていたから捨てた」のではない。
+    * **それでも fewa の束の方を採る。** 実機で動作確認できているキックは
+      fewa/47b8863 の系統 **だけ** で、その束のどこが効いているのかは分かっていない
+      (歩容 3 点なのか、観測の作り方なのか、その組み合わせなのか)。帰属が不明な
+      以上、部分的に真似て「良いところ取り」を狙うより、**丸ごと同じにする** 方が
+      実機で動く確率が高い。階段構造を戻すのは、fewa の束のまま実機で動くことを
+      確認した後に、単独の変更として足せばよい。
+
+    張り替えで直る不整合
+    ....................
+    継承元のガウス系パイプラインは **``prev_ball_pos`` だけ** を遅延させ、
+    ``ball_vel`` は生のまま (遅延 0) にしていた。同じカメラフレームから出る 2 つの量の
+    レイテンシが違うのは実機ではあり得ず、policy は「遅れた位置」と「今の速度」を
+    突き合わせて動きを先読みできてしまう。fewa の
+    ``enable_obs_delay`` は位置と速度を同じ "vision" group に入れて **同じ乱数** を
+    引かせ、``ball_vel`` には ``base_delay_s`` = 0.02 s を足して
+    ``prev_ball_pos`` の設計上の 1 ステップと実効遅延を揃える (単一カメラの整合性)。
+
+    実効的な遅延とノイズ (この段の最終状態)::
+
+        prev_ball_pos    0.02 + [0, 0.06] s (vision)   一様 ±0.07 m
+        ball_vel         0.02 + [0, 0.06] s (vision)   一様 ±0.5 m/s
+        projected_gravity      [0, 0.02] s (imu)       継承のまま ±0.05
+        base_ang_vel           [0, 0.02] s (imu)       継承のまま ±0.2
+        joint_pos              [0, 0.02] s (encoder)   継承のまま ±0.03
+        joint_vel              [0, 0.02] s (encoder)   継承のまま ±1.5
+
+    IMU / エンコーダの遅延はこのタスクにこれまで **無かった** もの (fewa には
+    Stage 1 から入っている)。
+
+    なぜ継承元を Clean へ張り替える必要があったか
+    ..............................................
+    fewa の ``enable_obs_delay`` は ObsTerm の ``func`` と ``params`` を **無条件で**
+    差し替える (walk_kick_dual 版にある「パイプライン付きの位置スロットは飛ばす」
+    ガードを持たない。あちらは移植元 47b8863 に無かった安全弁で、fewa 側は逐語コピーを
+    優先して入れていない)。本命の :class:`K1WalkInsideKickEnvCfg` を継承したまま呼ぶと、
+    ``_apply_noisy_ball_obs`` が入れた ``delay_step_range`` / ``camera_hz`` /
+    ``jitter_std`` / ``jitter_clip`` が ``params`` に残ったまま
+    ``delayed_prev_ball_pos_b`` へ渡り、未知のキーワード引数で落ちる。
+    ガードのある版を使って「飛ばす」のは今回の趣旨 (ボール観測こそ fewa に合わせる) と
+    正反対なので、**ガウス系パイプラインを最初から載せない**
+    :class:`K1WalkInsideKickCleanEnvCfg` を継承元に選んだ。
+
+    checkpoint の引き継ぎ
+    ....................
+    ``enable_obs_delay`` は既存の ObsTerm の ``func`` / ``params`` / ``noise`` を
+    差し替えるだけで **項を作り直さない** ので、policy 55 次元 / critic 61 次元と
+    その並びは変わらない。stage 1 からの ``--load_pretrained``
+    (+ ``--warm_start_from_single_frame``) はこれまでどおり繋がる。
+
     ``__post_init__`` の順序に意味がある::
 
-        super()                 … インサイドのレシピ + ボール観測ノイズ (継承のまま)
+        super()                 … インサイドのレシピ (ガウス系パイプラインは無し)
         _pin_curricula_at_end() … 報酬・イベント・コマンドが全部揃った後に固定する
+        fewa の 3 点セット      … 報酬 weight と地形。pin の後 (curriculum に上書き
+                                  されないことが保証されてから)
+        enable_obs_delay()      … 観測項の func/params を差し替える。履歴化の前
         enable_obs_history()    … **最後**。観測グループの構成が固まってから履歴化する
 
     ``enable_obs_history`` を最後に置くのは walk_lob_rough の Stage 3
@@ -1168,8 +1278,9 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
 
     dual 系から **持ち込まないもの** (全て意図的)
     ---------------------------------------------
-    :mod:`..walk_kick_dual` は履歴のほかに 4 つの変更を畳み込んでいるが、この段は
-    **観測履歴だけを変えて効果を帰属させる**のが目的なので 1 つも入れない:
+    :mod:`..walk_kick_dual` は履歴のほかに 4 つの変更を畳み込んでいる。初版は
+    「観測履歴だけを変えて効果を帰属させる」ため 1 つも入れなかったが、2026-08-24 に
+    2 つは方針転換で入れた (下の 2 つの「撤回」)。いま入れていないのは残り 2 つ:
 
     * ``K1WalkKickBothFeetObservationsCfg`` (観測スロット 3 を左足裏 → ボール 3D 位置、
       critic 58 次元) — 入れると stage 1 の checkpoint が **意味の上で** 繋がらなくなる
@@ -1182,13 +1293,20 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
       当初「履歴の効果に帰属させる」ため持ち込まない方針だったが、**fewa の実機が
       明確に滑らかだった**ため方針転換して入れた (下の「fewa の 3 点セット」)。
       帰属の純度より実機の歩容を優先する。
-    * ``enable_obs_delay`` — ボール観測にはこのタスク独自の認識パイプライン
-      (:func:`~..walk_kick.walk_kick_env_cfg._apply_noisy_ball_obs`: エピソードごとの
-      ランダム遅延 0-6 step + 30 Hz サンプル&ホールド + フレーム同期ジッタ) が
-      既に載っており、``enable_obs_delay`` はパイプライン付きの位置スロットを
-      **二重掛け防止のため飛ばす** 作りなので、掛けても実質 IMU / エンコーダにしか
-      効かない。内界センサの遅延 DR は「履歴の効果を見る」この段の目的と別件なので、
-      入れるなら stage 3 以降に単独で足す。
+    * (2026-08-24 撤回) ``enable_obs_delay`` — 当初はこう書いていた:
+      「ボール観測にはこのタスク独自の認識パイプライン (``_apply_noisy_ball_obs``:
+      ランダム遅延 0-6 step + 30 Hz サンプル&ホールド + フレーム同期ジッタ) が既に
+      載っており、``enable_obs_delay`` はパイプライン付きの位置スロットを二重掛け
+      防止のため飛ばす作りなので、掛けても実質 IMU / エンコーダにしか効かない。
+      内界センサの遅延 DR は『履歴の効果を見る』この段の目的と別件なので、入れるなら
+      stage 3 以降に単独で足す。」
+
+      **この判断は撤回した。** 実機の知覚が 30 Hz の階段であること自体は今も正しいが、
+      実機で動くと確認できているのは fewa の束 **だけ** で、束のどこが効いているのかが
+      分からない。帰属が不明なまま良いところ取りをするより丸ごと合わせる方が確度が
+      高いので、ボール観測ごと fewa 方式へ張り替えた (fewa 版の ``enable_obs_delay`` は
+      「飛ばす」ガードを持たないので、継承元も Clean へ張り替えてある)。
+      経緯と実効値は上の「観測パイプラインを fewa 方式へ (2026-08-24)」節。
     * mirror loss (``PPOSparseMirror`` / ``_use_mirror_loss``) — 右足専用タスクなので
       鏡像対称性が成り立たない。RunnerCfg 側の話なので
       :mod:`.agents.rsl_rl_ppo_cfg` の ``_use_history_cnn_policy`` を参照。
@@ -1211,7 +1329,7 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
         # 全部が巻き戻る。理由の詳細は :func:`_pin_curricula_at_end`。
         _pin_curricula_at_end(self)
 
-        # -- 2. fewa の 3 点セット (docstring の差分 3) ------------------- #
+        # -- 2. fewa の歩容 3 点セット (docstring の差分 3) --------------- #
         #
         # 順序: pin の後 (feet_phase の weight を curriculum が上書きしないことは
         # pin 済みなので保証される)、履歴化の前。
@@ -1225,7 +1343,20 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
         # :func:`~..walk_kick.walk_kick_env_cfg._apply_rough_terrain` と同じ値。
         self.events.reset_ball.params["spawn_clearance"] = 0.05
 
-        # -- 3. 観測履歴 ------------------------------------------------- #
+        # -- 3. 観測パイプラインを fewa 方式へ (docstring の差分 4) -------- #
+        #
+        # ボール 2 項 (prev_ball_pos / ball_vel) を同じ "vision" group の連続遅延
+        # 0.02-0.08 s + 一様ノイズ ±0.07 m / ±0.5 m/s に、IMU / エンコーダ 4 項を
+        # 0-0.02 s の遅延にする。呼び方は fewa の Stage 4 と同じ
+        # (:class:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.K1WalkLongPassFewaEnvCfg`)。
+        #
+        # 継承元が Clean = ガウス系パイプラインが載っていないので、ボール位置スロットも
+        # 素の prev_ball_pos_b のまま差し替えられる (本命の K1WalkInsideKickEnvCfg を
+        # 継承していると params にガウス側のキーが残って落ちる。docstring 参照)。
+        # func と params の差し替えだけなので観測の次元も並びも変わらない。
+        fewa_enable_obs_delay(self, _FEWA_OBS_DELAY_MAX_S)
+
+        # -- 4. 観測履歴 ------------------------------------------------- #
         #
         # 必ず最後。policy グループの構成が固まってから (N, H, 55) に変える。
         enable_obs_history(self)
@@ -1233,10 +1364,22 @@ class K1WalkInsideKickDualEnvCfg(K1WalkInsideKickEnvCfg):
 
 @configclass
 class K1WalkInsideKickDualEnvCfg_PLAY(K1WalkInsideKickDualEnvCfg):
-    """stage 2 の PLAY。:class:`K1WalkInsideKickEnvCfg_PLAY` と同じ調整。
+    """stage 2 の PLAY。
 
     カリキュラムは親で全て ``None`` にしてあるので、PLAY でも
     ``common_step_counter`` 0 から巻き戻る心配は無い (項が 1 つも無い)。
+
+    :class:`K1WalkInsideKickEnvCfg_PLAY` と違い
+    :func:`~..walk_kick.walk_kick_env_cfg._disable_ball_obs_jitter` は **呼ばない**
+    (2026-08-24)。この段のボール観測は fewa 方式に張り替わっていて、あちらが書き込む
+    ``jitter_std`` を受け取る関数がもう居ない (未知のキーワード引数で落ちる)。
+
+    fewa 方式では **ノイズは全て ObsTerm の ``noise`` (Unoise) 側にある** ので、
+    ``enable_corruption = False`` だけで位置 ±0.07 m / 速度 ±0.5 m/s とも切れる。
+    遅延 (0.02-0.08 s / 0-0.02 s) は関数側にあるので残る = 観測パイプラインの構造は
+    PLAY でも見える。これは fewa の PLAY
+    (:class:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.K1WalkLongPassFewaEnvCfg_PLAY`)
+    と同じ扱い。
     """
 
     def __post_init__(self) -> None:
@@ -1247,11 +1390,6 @@ class K1WalkInsideKickDualEnvCfg_PLAY(K1WalkInsideKickDualEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
-
-        # enable_corruption = False は ObsTerm の noise しか切らないので、
-        # 関数側に移したジッタは別途切る。遅延とサンプル&ホールドは観測パイプラインの
-        # 構造 (= PLAY で見たいもの) なので残す。
-        _disable_ball_obs_jitter(self)
 
 
 @configclass
@@ -1267,13 +1405,23 @@ class K1WalkInsideKickDualRoughEnvCfg(K1WalkInsideKickDualEnvCfg):
     2. ボール物性 DR の帯を walk_loop_shoot 相当まで広げる
        (:data:`_ROUGH_BALL_STATIC_FRICTION_RANGE` ほか)。
 
+    観測は stage 2 のまま (2026-08-24)
+    ---------------------------------
+    ボール / IMU / エンコーダの遅延と一様ノイズは stage 2 の
+    :func:`~..walk_long_pass_fewa.walk_long_pass_fewa_env_cfg.enable_obs_delay` が
+    ``super()`` の中で 1 回だけ掛けている。この段では **触らない** ので二重掛けは
+    起きない (仮に 2 回呼んでも ``func`` / ``params`` の上書きなので冪等だが、
+    呼ばないのが意図)。地形の DR を広げる段であって知覚を変える段ではない。
+
     ``__post_init__`` の順序について
     --------------------------------
     ``super()`` が既に :func:`~..walk_kick_dual.walk_kick_dual_env_cfg.enable_obs_history`
     を掛け終わっているが、**問題ない**。:func:`_apply_rough_terrain` が触るのは
     ``scene.terrain`` の 3 属性と ``events.reset_ball.params["spawn_clearance"]`` だけで、
     観測グループにも報酬にもコマンドにも一切触らないため (あちらの docstring と実装を
-    確認済み)。同じ理由で :func:`~..walk_weak_kick_orbit.orbit_mods.apply_ball_param_dr`
+    確認済み)。stage 2 が入れた NOISY_FLAT 地形と ``spawn_clearance`` = 0.05 は
+    ここで凹凸地形と同じ値に上書きされる (どちらも generator、clearance も同値)。
+    同じ理由で :func:`~..walk_weak_kick_orbit.orbit_mods.apply_ball_param_dr`
     の再呼び出しも観測に影響しない。
 
     ``apply_ball_param_dr`` を 2 回呼ぶことについて
@@ -1323,6 +1471,10 @@ class K1WalkInsideKickDualRoughEnvCfg_PLAY(K1WalkInsideKickDualRoughEnvCfg):
     terrain generator は env origin を地形グリッドに割り当てるので、既定の
     world 固定カメラ (原点を見つめたまま動かない) だと ``play.py --video`` に
     **地形しか映らない**。
+
+    stage 2 の PLAY と同じく :func:`~..walk_kick.walk_kick_env_cfg._disable_ball_obs_jitter`
+    は **呼ばない** (2026-08-24)。理由は :class:`K1WalkInsideKickDualEnvCfg_PLAY` の
+    docstring。
     """
 
     def __post_init__(self) -> None:
@@ -1334,5 +1486,4 @@ class K1WalkInsideKickDualRoughEnvCfg_PLAY(K1WalkInsideKickDualRoughEnvCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
 
-        _disable_ball_obs_jitter(self)
         _apply_play_viewer(self)
