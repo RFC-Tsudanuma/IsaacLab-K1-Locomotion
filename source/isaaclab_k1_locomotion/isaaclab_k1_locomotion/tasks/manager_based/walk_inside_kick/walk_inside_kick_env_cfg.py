@@ -381,6 +381,7 @@ from ..walk_kick.walk_kick_env_cfg import (
     K1WalkKickEnvCfg,
 )
 from ..walk_kick_dual.walk_kick_dual_env_cfg import (
+    apply_sigma_direction_anneal,
     disable_landing_shaping,
     enable_obs_history,
     rebalance_gait_vs_kick,
@@ -423,21 +424,42 @@ _SPI = 24
 #   0.035 = 0.145 より内側なので、0.15 はそのすぐ外側。これより広げると「軸足で
 #   ボールを踏む」構えまで指令が許すことになる。
 #
-# r_stance = 0.20:
+# r_stance = 0.25 (2026-08-25 に 0.20 から戻した):
 #   P_kick (理想キック立ち位置) をボール後方どれだけの点に置くか [m]。
-#   既定 0.25 はつま先で突く前提の距離で、インサイドは足の側面を当てるぶん
-#   ボールに近づいて構える。0.20 は run 2026-08-21_05-00-22 でインサイドの型
-#   (dot≈0 / ball_side 0.145 / vel_ratio 0.91) を作った実績値。
+#
+#   **変更の目的は回り込み中の接触を減らすこと。** 実機フィードバック (2026-08-25):
+#   「基本的によく蹴れているが、回り込みのときたまにボールにぶつかる」。
+#   0.20 は run 2026-08-21_05-00-22 でインサイドの型 (dot≈0 / ball_side 0.145 /
+#   vel_ratio 0.91) を作った実績値だが、インサイドは足の側面を当てるぶん近づいて
+#   構える、という理由で選ばれた値で、**接近経路の余裕を検討して選んだ値ではない**。
+#
+#   r_stance を上げると接近経路 **全体** が外へ出る。ρ (G を置く円の半径) は r_max
+#   (=0.5) から r_stance へ補間される量なので、下限を 0.20 → 0.25 に上げれば、
+#   真後ろへ回り込む途中のどの角度でも ρ が 5 cm 大きくなる。終着点だけの変更では
+#   ないので、回り込み中の接触に効く。
+#
+#   NOTE: これで足りない場合の次の一手は ``ball_avoidance`` の σ_sole (=0.20)。
+#         あちらは「円弧 (r_max=0.5) の上では罰が実質消える」ように **意図的に**
+#         絞ってあり (0.5 m 地点で係数 exp(−(0.5/0.20)²) ≈ 0.002)、回り込み中の
+#         接近には効きが薄い。根拠は :data:`_BALL_AVOIDANCE_SIGMA_SOLE` の
+#         コメントと walk_weak_kick_orbit の orbit_mods。
+#
+#   NOTE: 一度 0.10 まで詰めたことがあるが、あれは **軸足を前に出す目的** の変更で、
+#         6700 iteration 回して plant_lon は -0.23 から動かなかった
+#         (run 2026-08-21_10-41-17)。P_kick は報酬にほとんど流れないので、
+#         軸足を動かすレバーにはならない。**この「r_stance を変えても軸足は動かない」
+#         という実測こそが、0.25 へ戻すリスクが低いことの根拠でもある** —
+#         r_stance は構えの型を決めておらず、決めているのは当たり所の項だから。
 #
 #   NOTE: 一度 0.10 まで詰めたことがあるが、あれは **軸足を前に出す目的** の変更で、
 #         6700 iteration 回して plant_lon は -0.23 から動かなかった
 #         (run 2026-08-21_10-41-17)。P_kick は報酬にほとんど流れないので、
 #         軸足を動かすレバーにはならない。一時は
 #         :func:`~..walk_kick.mdp.rewards.kick_plant_lon` に軸足の誘導を分離したが、
-#         それも 2026-08-24 に撤去した (軸足は報酬で誘導しない)。いずれにせよ
-#         r_stance は「望む構えを妨害しない胴体の終着指令」として実績値へ戻す。
-#         0.10 はボール半径 0.11 より内側 = 指令の立ち位置がボールの後縁より内側で、
-#         ゼロから学習する場合は接近中に体がボールへ触れる事故を増やすだけになる。
+#         一時は :func:`~..walk_kick.mdp.rewards.kick_plant_lon` に軸足の誘導を
+#         分離したが、それも 2026-08-24 に撤去した (軸足は報酬で誘導しない)。
+#         r_stance は「望む構えを妨害しない胴体の終着指令」であり、その役割は
+#         「妨害しないこと」までである。
 #
 # overshoot_margin = 0.30:
 #   overshoot 罰 (キック線 R を跨いで反対側へ入ったら 1 エピソードに 1 回だけ罰) の
@@ -460,7 +482,7 @@ _SPI = 24
 # --------------------------------------------------------------------------- #
 _INSIDE_PARAMS = {
     "lateral_band": (-0.15, 0.0),
-    "r_stance": 0.20,
+    "r_stance": 0.25,
     "overshoot_margin": 0.30,
     "style_halfwidth": 0.698,
 }
@@ -641,6 +663,123 @@ _BALL_DIST_START = (0.5, 0.8)
 _BALL_DIST_END = (0.5, 1.5)
 _KICK_HEADING_HALFWIDTH_RANGE = (math.pi / 4, math.pi)
 
+# --------------------------------------------------------------------------- #
+# 指令帯 (2026-08-25 に (3.2, 4.5) から広げた)
+#
+# 目的は「弱いキックも指令どおりに出せるようにする」こと。middle の帯 (3.2, 4.5) は
+# 戦略要求 5-10 m のためのもので、実機計測 (2026-08-24, large field 22×14 m) でも
+# 指令 3.2 でセンターから 6-9 m 飛んでいる。**帯の全域が要求の上半分に張り付いていて、
+# 5 m 未満のパスは原理的に出せない** 状態だった。
+#
+# 下端 1.5 の根拠は 2 つ:
+#
+# * **latch 機構が今と 1 ビットも変わらない。** weak のレシピが入れる
+#   ``v_thresh_eff = clamp(0.6 · v_target, 0.2, 0.8)`` は 0.6 · v_target が 0.8 を
+#   超える限り clamp 上限に張り付く。境界は 0.8 / 0.6 = 1.333 m/s なので、下端 1.5
+#   なら帯のどこでも実効閾値 0.8 固定 = middle と同一挙動。1.33 を下回る帯にすると
+#   初めて latch が指令連動になり、「弱い指令では latch が発火せずキック報酬が全滅」
+#   のリスク領域に入る (middle の docstring の警告参照)。
+# * **飛距離として意味がある。** 実機の 2 点 (3.2 → 7.5 m / 4.5 → 10.0 m) に
+#   べき乗則を当てると d ≈ 2.84 · v^0.84 で、v = 1.5 は d ≈ 4 m。5 m 未満の短いパスが
+#   出せるようになる。ただしこれは帯の外への外挿なので、実測で確かめること。
+#
+# 上端 4.5 は据え置き。実機で指令 4.5 → 実蹴り速度 ≈ 4.5 m/s とほぼ天井であり
+# (sim でも kick_vel_ratio が 0.86 で上端に届いていない)、ここを上げると
+# ``kick_velocity_scaled`` が上端付近で常に 0 点になって勾配が消える。
+#
+# WARNING: 帯を広げたら **必ず低指令域のメトリクスで判定すること**。
+#          全 env 平均の ``kick_vel_ratio`` は「下端で出しすぎ + 上端で足りない」が
+#          打ち消し合って健全に見える (実機の 2 点がまさにそうだった: 指令 3.2 で
+#          追従率 1.21、指令 4.5 で 0.99、回帰の傾きは 0.46 まで圧縮)。見るのは
+#          ``kick_rate_low`` / ``kick_vel_ratio_low`` / ``kick_low_frac``
+#          (:class:`~..walk_kick.mdp.commands.BallFollowVelocityCommand` が
+#          ``low_speed_threshold`` 未満の env だけを切り出して出している)。
+# --------------------------------------------------------------------------- #
+_INSIDE_SPEED_RANGE = (1.5, 4.5)
+
+# --------------------------------------------------------------------------- #
+# σ_velocity を指令相対にするときの基準速度 [m/s]
+#
+# σ_eff = sigma_velocity × clamp(v_target / v_ref, 0.3, 1.0) (実装と根拠は
+# :func:`~..walk_kick.mdp.rewards.kick_velocity_scaled` の
+# 「σ_velocity の指令相対化」節)。
+#
+# **帯の上端そのものを入れる。** こうすると係数は上端で 1.0 に飽和するので、
+# 上端の採点は middle から 1 ビットも変わらず (σ = アニール終値 0.5 のまま)、
+# 下端だけが同じ相対精度まで締まる:
+#
+#     v_target = 4.5 -> σ_eff = 0.5 × 1.000 = 0.500  (±11%、middle と同一)
+#     v_target = 3.2 -> σ_eff = 0.5 × 0.711 = 0.356  (±11%)
+#     v_target = 1.5 -> σ_eff = 0.5 × 0.333 = 0.167  (±11%)
+#
+# 固定 0.5 のままだと下端は ±33% (飛距離では ±67%) の許容になり、弱い指令が
+# 事実上「当たれば何でもよい」になる。実機で測った傾き 0.46 の圧縮は、この
+# 「下端だけ緩い」構造が許していた可能性が高い。
+#
+# NOTE: σ アニール (kick_velocity_scaled_sigma、1.0 → 0.5 を 500-3000 iteration) は
+#       **そのまま**。係数が掛かるのはアニール後の値なので、発見期は帯のどこでも
+#       比例して緩く、終盤は帯のどこでも比例して締まる、という設計が保たれる。
+# --------------------------------------------------------------------------- #
+_INSIDE_SIGMA_VELOCITY_V_REF = 4.5
+
+# --------------------------------------------------------------------------- #
+# σ_direction のアニール (DR 段 = stage 3 だけで回す)
+#
+# 目的は方向精度。DR 段の実測 (run 2026-08-24_08-50-27) は |誤差| 14.85° で
+# 15.7° から傾き −0.22/500 の **ほぼ平坦**、つまり回しても下がらない状態だった。
+# 一方 kick_direction は σ_direction = 0.35 rad (20.1°) 固定のままで、
+# **inside は dual 系列で唯一このアニールを持っていなかった**。
+#
+# 終点 0.20 の根拠 (2 つの制約の交点)
+# ------------------------------------
+# 報酬の形は :func:`~..walk_kick.mdp.rewards.kick_direction` の
+#
+#     f_dir = exp(−τ² / (2 σ²))
+#     r_dir = clamp((f_dir − 0.5) × 2 × p_style, min=0)
+#
+# 1. **勾配**: |∂f/∂τ| = (τ/σ²)·exp(−τ²/2σ²) は σ = τ/√2 で最大。現状の
+#    τ = 14.85° = 0.2588 rad なら最適 σ は 0.183。現行 0.35 は最大の 57% しか
+#    出ていない。σ を 0.20 にすると 99%、つまり **勾配が 1.74 倍**になる。
+#
+# 2. **ゼロ足切り**: r_dir は f_dir < 0.5 で 0 にクランプされる。境界は
+#    τ = 1.177 σ なので、σ を絞るほど「報酬が 1 点も出ない蹴り」が増える::
+#
+#        σ = 0.35 -> 23.6° 超がゼロ (現状の分布の 20%)
+#        σ = 0.25 -> 16.9° 超がゼロ (36%)
+#        σ = 0.20 -> 13.5° 超がゼロ (47%)
+#        σ = 0.15 -> 10.1° 超がゼロ (59%)
+#
+#    **これは方向報酬だけの話ではない。** kick_velocity_scaled / _strong は
+#    どちらも内部で r_dir を掛けている (``r_dir * f_vel`` / ``r_dir * v_ball``)
+#    ので、足切りに掛かった蹴りは **速度報酬もゼロ**になる。帯を (1.5, 4.5) へ
+#    広げた直後の run で σ = 0.15 まで絞ると、弱い指令を覚えている最中に
+#    「方向が 10° に収まらないと速度報酬が一切もらえない」状態になり、下端が
+#    立ち上がらないリスクがある。
+#
+# 0.20 は 1 をほぼ満たしつつ 2 を 47% に留める点。**0.15 は次の run** —
+# 誤差が 12° 台に入ってから (σ = 0.15 は τ = 12.2° に対して勾配最適) 絞る。
+# 目標の 10° には σ ≈ 0.123 が対応するが、そこは 2 段階目以降の話。
+#
+# 窓 (500 → 2500 iteration) の根拠
+# ---------------------------------
+# 開始を 0 にしないのは、DR 段が **前段の checkpoint から地形とボール DR を
+# 載せた直後に一度悪化する** ため (実測で 9.58° → 15.7°)。悪化しきる前に σ を
+# 絞り始めると、足切りに掛かる割合が一時的に跳ね上がる。500 iteration は
+# 実測で誤差が底を打つまでの時間。終了 2500 は既定 ITER=3000 に対して、
+# 終値で 500 iteration ぶん学習する余裕を残すため。
+#
+# WARNING: この段では `kick_rate` と `kick_rate_low` を必ず監視すること。
+#          σ を絞るのは「方向が悪い蹴りの報酬を消す」操作なので、絞りすぎると
+#          蹴ること自体を避ける方向に倒れる (キック報酬が消えれば kick_finished が
+#          残りの歩行報酬を捨てるコストだけが残る、という middle の警告と同じ構造)。
+# --------------------------------------------------------------------------- #
+_INSIDE_SIGMA_DIRECTION_ANNEAL = {
+    "start_value": 0.35,
+    "end_value": 0.20,
+    "start_step": 500,
+    "end_step": 2500,
+}
+
 # ball_avoidance の σ_sole。apply_orbit_params が入れるのと同じ値を明示しておく
 # (回り込み半径の決定を罰から指令へ移すためのもの。理由は orbit_mods 参照)。
 _BALL_AVOIDANCE_SIGMA_SOLE = 0.20
@@ -740,6 +879,22 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
     #     呼び水 (:data:`_INSIDE_STRONG_KNOTS`) なので、当たり所の型が決まる時期には
     #     もう居ない。
     cfg.rewards.kick_velocity_scaled.params["use_3d_speed"] = True
+
+    # -- 1d. 指令帯を (3.2, 4.5) -> (1.5, 4.5) へ広げる -------------------- #
+    #
+    # middle のレシピが入れた帯を、このタスクだけ下へ広げる。目的は「弱いキックも
+    # 指令どおりに出せるようにする」こと。根拠と各値の意味は
+    # :data:`_INSIDE_SPEED_RANGE` / :data:`_INSIDE_SIGMA_VELOCITY_V_REF` を参照。
+    cfg.commands.kick_direction.target_speed_range = _INSIDE_SPEED_RANGE
+
+    # -- 1e. σ_velocity を指令相対にする ----------------------------------- #
+    #
+    # 帯を広げるならこれが **必須**。固定 σ のままだと下端の相対許容だけが緩くなり、
+    # 「弱い指令のときは当たれば何でもよい」という抜け道ができる (詳細は
+    # :func:`~..walk_kick.mdp.rewards.kick_velocity_scaled` の同名節の warning)。
+    cfg.rewards.kick_velocity_scaled.params[
+        "sigma_velocity_v_ref"
+    ] = _INSIDE_SIGMA_VELOCITY_V_REF
 
     # -- 2. kick_plant_foot を外す ----------------------------------------- #
     #
@@ -1460,6 +1615,24 @@ class K1WalkInsideKickDualRoughEnvCfg(K1WalkInsideKickDualEnvCfg):
             restitution_range=_ROUGH_BALL_RESTITUTION_RANGE,
             mass_scale_range=_ROUGH_BALL_MASS_SCALE_RANGE,
         )
+
+        # -- 3. σ_direction のアニール (0.35 -> 0.20) ---------------------- #
+        #
+        # **super() の _pin_curricula_at_end より後に足すのが正しい。** あちらは
+        # 「その時点で登録済みの」ランプを終値に固定する関数なので、後から足した
+        # このランプだけが生きた状態で残る (curriculum_pin の docstring が
+        # 「固定した後に新しいランプを足すと、その 1 本だけが巻き戻る側に残る」と
+        # 書いている状態で、ここではそれが意図)。
+        #
+        # 値と窓の根拠は :data:`_INSIDE_SIGMA_DIRECTION_ANNEAL` のコメント。
+        for term_name in apply_sigma_direction_anneal(self):
+            params = getattr(self.curriculum, f"{term_name}_sigma_direction").params
+            params["start_value"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["start_value"]
+            params["end_value"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["end_value"]
+            params["start_step"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["start_step"]
+            params["end_step"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["end_step"]
+            # steps_per_iteration は apply_sigma_direction_anneal が既に入れている
+            # (walk_kick_dual の _STEPS_PER_ITERATION = 48)。ここでは触らない。
 
 
 @configclass

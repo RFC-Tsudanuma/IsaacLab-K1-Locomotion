@@ -27,6 +27,19 @@ from ...locomotion.mdp.rewards import (
 )
 from .kick_state import _foot_body_ids, _foot_forward_xy, kick_state
 
+# --------------------------------------------------------------------------- #
+# kick_velocity_scaled の σ_velocity を「指令相対」にするときの下限係数
+#
+# σ_eff = sigma_velocity × clamp(v_target / v_ref, _SIGMA_VELOCITY_REL_FLOOR, 1.0)
+#
+# 0.3 の根拠: 帯の下端が v_ref の 30% を下回っても σ をそれ以上は絞らない、という
+# 安全弁。指令に完全比例させると v_target → 0 で σ → 0 になり、どんな蹴りも
+# f_vel ≈ 0 になって勾配が消える (弱い指令ほど学習不能になる、という逆転が起きる)。
+# 帯 (1.5, 4.5) では 1.5/4.5 = 0.333 なので **この床には当たらない**。帯の下端を
+# 4.5 × 0.3 = 1.35 m/s より下げたときに初めて効き始める。
+# --------------------------------------------------------------------------- #
+_SIGMA_VELOCITY_REL_FLOOR = 0.3
+
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
@@ -133,6 +146,7 @@ def kick_velocity_scaled(
     v_thresh: float,
     sigma_direction: float = 0.35,
     sigma_velocity: float = 1.0,
+    sigma_velocity_v_ref: float | None = None,
     use_3d_speed: bool = False,
     r_max: float | None = None,
     orbit_beta: float = 0.6,
@@ -150,6 +164,29 @@ def kick_velocity_scaled(
     (walk_loop) 用。仰角 30° で蹴ると水平成分は 3D ノルムの 0.87 倍しかないため、
     水平で測ったままだと「指令速度に届いていない」と誤判定され、φ 報酬（浮かせろ）と
     速度報酬（もっと強く）が恒常的に綱引きしてしまう。
+
+    σ_velocity の指令相対化 (``sigma_velocity_v_ref``)
+    --------------------------------------------------
+    既定 (``None``) では σ は帯のどこでも同じ絶対値なので、**要求する相対精度が
+    帯の中で大きく食い違う**。帯 (1.5, 4.5) に σ=0.5 を当てると、上端では ±11% な
+    のに下端では ±33% になる。飛距離は d = v²/2a で速度の 2 乗に効くので、下端の
+    ±33% は飛距離では ±67% (4 m 狙いが 2.7-5.6 m) という許容になり、弱い指令が
+    事実上「当たれば何でもよい」になってしまう。
+
+    ``sigma_velocity_v_ref`` を渡すと σ を指令に比例させる::
+
+        σ_eff = sigma_velocity × clamp(v_target / v_ref, 0.3, 1.0)
+
+    係数は ``v_ref`` で 1.0 に飽和するので、**帯の上端を v_ref に置けば上端の挙動は
+    従来と完全に同一**になり、下端だけが同じ相対精度まで締まる。既存の σ アニール
+    (``linear_reward_param`` が ``sigma_velocity`` を 1.0 → 終値へ動かす) とも噛み合う:
+    アニールが動かすのは係数の掛かる前の値なので、発見期は帯のどこでも比例して緩く、
+    終盤は帯のどこでも比例して締まる、という設計がそのまま保たれる。
+
+    warning:
+        帯を広げたときに **これを入れないと下端は機能しない**。実機計測 (2026-08-24)
+        で指令と実蹴り速度の回帰の傾きが 0.46 まで圧縮されていることが分かっており、
+        σ が下端で緩いままだとその圧縮を許す方向に働く。
     """
     r_dir, state = _r_direction(
         env,
@@ -166,7 +203,21 @@ def kick_velocity_scaled(
 
     v_meas = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
     v_err = v_meas - state["v_target"]
-    f_vel = torch.exp(-((v_err / sigma_velocity) ** 2))
+
+    # σ_velocity を指令相対にする (sigma_velocity_v_ref が None なら従来どおり固定)。
+    # 係数は v_ref で 1.0 になるので、**帯の上端を v_ref に置けば上端の挙動は
+    # 従来と 1 ビットも変わらない**。下端だけが比例して締まる。
+    if sigma_velocity_v_ref is not None:
+        scale = torch.clamp(
+            state["v_target"] / sigma_velocity_v_ref,
+            min=_SIGMA_VELOCITY_REL_FLOOR,
+            max=1.0,
+        )
+        sigma_eff = sigma_velocity * scale
+    else:
+        sigma_eff = sigma_velocity
+
+    f_vel = torch.exp(-((v_err / sigma_eff) ** 2))
     return r_dir * f_vel
 
 
