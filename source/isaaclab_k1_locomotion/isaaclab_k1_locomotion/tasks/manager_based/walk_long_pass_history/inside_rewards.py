@@ -11,7 +11,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 from ..walk_kick.mdp.curriculums import kick_rate_gated_speed_range
 from ..walk_kick.mdp.kick_state import kick_state
@@ -110,11 +110,13 @@ def _inside_form_state(
             "prev_kick_done": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "last_touch_valid": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "inside_contact_cos_last_touch": torch.zeros(env.num_envs, device=device),
+            "contact_local_x_last_touch": torch.zeros(env.num_envs, device=device),
             "inside_face_cos_last_touch": torch.zeros(env.num_envs, device=device),
             "swing_cos_last_touch": torch.zeros(env.num_envs, device=device),
             "swing_speed_last_touch": torch.zeros(env.num_envs, device=device),
             "form_valid_frozen": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
             "inside_contact_cos_frozen": torch.zeros(env.num_envs, device=device),
+            "contact_local_x_frozen": torch.zeros(env.num_envs, device=device),
             "inside_face_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_speed_frozen": torch.zeros(env.num_envs, device=device),
@@ -128,11 +130,13 @@ def _inside_form_state(
         form["prev_kick_done"][just_reset] = False
         form["last_touch_valid"][just_reset] = False
         form["inside_contact_cos_last_touch"][just_reset] = 0.0
+        form["contact_local_x_last_touch"][just_reset] = 0.0
         form["inside_face_cos_last_touch"][just_reset] = 0.0
         form["swing_cos_last_touch"][just_reset] = 0.0
         form["swing_speed_last_touch"][just_reset] = 0.0
         form["form_valid_frozen"][just_reset] = False
         form["inside_contact_cos_frozen"][just_reset] = 0.0
+        form["contact_local_x_frozen"][just_reset] = 0.0
         form["inside_face_cos_frozen"][just_reset] = 0.0
         form["swing_cos_frozen"][just_reset] = 0.0
         form["swing_speed_frozen"][just_reset] = 0.0
@@ -143,6 +147,7 @@ def _inside_form_state(
     selected_pos = foot_pos[env_ids, nearest_foot]
     selected_quat = foot_quat[env_ids, nearest_foot]
     selected_pre_vel = form["prev_foot_vel"][env_ids, nearest_foot]
+    ball_in_foot = quat_apply_inverse(selected_quat, ball_pos - selected_pos)
 
     # URDF の中立姿勢では左足の内側が local -Y、右足の内側が local +Y。
     inside_local = torch.zeros(env.num_envs, 3, device=device, dtype=foot_pos.dtype)
@@ -175,6 +180,9 @@ def _inside_form_state(
     form["inside_contact_cos_last_touch"] = torch.where(
         touched, inside_contact_cos, form["inside_contact_cos_last_touch"]
     )
+    form["contact_local_x_last_touch"] = torch.where(
+        touched, ball_in_foot[:, 0], form["contact_local_x_last_touch"]
+    )
     form["inside_face_cos_last_touch"] = torch.where(
         touched, inside_face_cos, form["inside_face_cos_last_touch"]
     )
@@ -191,6 +199,9 @@ def _inside_form_state(
     )
     form["inside_contact_cos_frozen"] = torch.where(
         kick_event, form["inside_contact_cos_last_touch"], form["inside_contact_cos_frozen"]
+    )
+    form["contact_local_x_frozen"] = torch.where(
+        kick_event, form["contact_local_x_last_touch"], form["contact_local_x_frozen"]
     )
     form["inside_face_cos_frozen"] = torch.where(
         kick_event, form["inside_face_cos_last_touch"], form["inside_face_cos_frozen"]
@@ -232,6 +243,34 @@ def kick_inside_contact(
     )
     angle = torch.acos(torch.clamp(form["inside_contact_cos_frozen"], -1.0, 1.0))
     reward = torch.exp(-((angle / sigma_contact) ** 2))
+    return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
+
+
+def kick_ankle_contact(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    target_x: float = -0.004,
+    sigma_x: float = 0.025,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """本命キックの接触位置を、踵から60 mm（足local X=-4 mm）へ誘導する。"""
+    shared, form = _inside_form_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    error_x = (form["contact_local_x_frozen"] - target_x) / sigma_x
+    reward = torch.exp(-(error_x**2))
     return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
 
 

@@ -210,6 +210,7 @@ _STEPS_PER_ITERATION = 48
 _INSIDE_FACE_WEIGHT = 3.0
 _STRAIGHT_SWING_WEIGHT = 3.0
 _INSIDE_CONTACT_WEIGHT = 3.0
+_ANKLE_CONTACT_WEIGHT = 3.0
 _VELOCITY_TRACKING_WEIGHT = 5.0
 _OPPOSITE_DIRECTION_WEIGHT = -2.0
 _INSIDE_CONTACT_MULTIPLIER = 10.0
@@ -219,6 +220,9 @@ _STRAIGHT_SWING_MULTIPLIER = 3.0
 # 昇格判定は下の 30 deg のままなので、Stage 2 条件自体は緩めない。
 _INSIDE_CONTACT_REWARD_SIGMA_DEG = 90.0
 _INSIDE_CONTACT_ANGLE_DEG = 30.0
+# 足collisionの踵はfoot_link原点から約-64 mm。踵から60 mmを狙うためlocal X=-4 mm。
+_ANKLE_CONTACT_TARGET_X = -0.004
+_ANKLE_CONTACT_SIGMA_X = 0.025
 _INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
 _INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
 _FIRST_TOUCH_WEIGHT = 100.0  # イベント1回 × dt 0.02 = +2.0
@@ -391,6 +395,16 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             params={
                 **kick_state_params,
                 "sigma_contact": math.radians(_INSIDE_CONTACT_REWARD_SIGMA_DEG),
+            },
+        )
+
+        self.rewards.kick_ankle_contact = RewTerm(
+            func=inside_rewards.kick_ankle_contact,
+            weight=_ANKLE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE,
+            params={
+                **kick_state_params,
+                "target_x": _ANKLE_CONTACT_TARGET_X,
+                "sigma_x": _ANKLE_CONTACT_SIGMA_X,
             },
         )
 
