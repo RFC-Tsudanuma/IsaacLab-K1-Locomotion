@@ -5,15 +5,21 @@
 
 from isaaclab.utils import configclass
 
+from isaaclab_rl.rsl_rl import RslRlSymmetryCfg
+
 from ...walk_long_pass.agents.rsl_rl_ppo_cfg import K1WalkLongPassPPORunnerCfg
+from ..symmetry import compute_symmetric_states
+
+_MIRROR_LOSS_COEFF = 0.5
 
 
 @configclass
 class K1WalkLongPassHistoryPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
     """ロングパス + 短期 I/O 履歴用。
 
-    **ネットワーク構造と PPO 設定は long_pass と同一に保つ**。隠れ層・活性化・
-    PPO 本体のハイパラは変えず、actor 入力幅だけを 55 → 223 に広げる。
+    **ネットワーク構造は long_pass と同一に保つ**。隠れ層・活性化・
+    PPO 本体のハイパラは変えない。変更点は actor 入力幅 55 → 223 と、
+    係数 0.5 の mirror loss だけ。data augmentation は使わない。
 
     experiment_name だけ分けて、他のキック run とログが混ざらないようにする。
 
@@ -27,3 +33,9 @@ class K1WalkLongPassHistoryPPORunnerCfg(K1WalkLongPassPPORunnerCfg):
 
         self.experiment_name = "k1_walk_long_pass_history"
         self.max_iterations = 5000
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_symmetric_states,
+            mirror_loss_coeff=_MIRROR_LOSS_COEFF,
+        )

@@ -6,7 +6,7 @@
 """K1 ロングパス + 短期 I/O 履歴 (short history) 環境。
 
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
-**短期履歴用** バリアント。行動空間を継承し、policy 観測の
+**短期履歴 + 左右対称学習用** バリアント。行動空間を継承し、policy 観測の
 本体状態 5 項に 0.1 秒ぶんの履歴を付ける。さらに、左足裏だけを見る 3 次元スロットを
 ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、報酬と同じ真のコマンド方向を
 現在のbase座標へ変換してactorへ渡す。観測フィールド名と順序は継承元のままなので、
@@ -128,8 +128,8 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 
 見るべきもの
 ------------
-* ``Metrics/kick_direction/kick_rate`` … 観測の意味変更へ適応する間の成立率を監視する。
-  旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
+* ``Metrics/kick_direction/kick_rate`` … 観測の意味変更と mirror loss 導入時の過渡を
+  監視する。旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
 * ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
 * ``Metrics/kick_direction/kick_dir_error_deg`` … 報酬から高精度方向一致を外した後も、
   インサイドフォームによって結果の方向精度が維持・改善するか。
@@ -183,6 +183,7 @@ from .pre_walk_curriculum import (
     pre_walk_inside_kick_curriculum,
     reset_ball_for_pre_walk_kick,
 )
+from .symmetry import HISTORY_LEN as _SYMMETRY_HISTORY_LEN
 
 # --------------------------------------------------------------------------- #
 # 短期履歴の長さ
@@ -200,6 +201,11 @@ _SIM_DT = 0.005
 _DECIMATION = 4
 _CTRL_DT = _SIM_DT * _DECIMATION  # 0.02 s = 50 Hz
 _HISTORY_LEN = max(4, round(_HISTORY_S / _CTRL_DT))  # 5
+if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
+    raise ValueError(
+        "walk_long_pass_history の履歴長と mirror 写像が一致しません: "
+        f"{_HISTORY_LEN} != {_SYMMETRY_HISTORY_LEN}"
+    )
 
 # PPO runner の num_steps_per_env。カリキュラムの step を iteration へ換算する値なので、
 # runner 側を変えた場合はここも同時に変えること。
