@@ -8,9 +8,9 @@
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
 **短期履歴 + 左右対称学習用** バリアント。行動空間を継承し、policy 観測の
 本体状態 5 項に 0.1 秒ぶんの履歴を付ける。さらに、左足裏だけを見る 3 次元スロットを
-ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、固定global目標と遅延・DR済み
-自己位置からactor用のlocal方向を計算し、キックlatch時に凍結する。観測フィールド名と
-順序は継承元のままなので、policy / critic の次元は 223 / 61 を維持する。
+ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、報酬と同じ真のコマンド方向を
+現在のbase座標へ変換してactorへ渡す。観測フィールド名と順序は継承元のままなので、
+policy / critic の次元は 223 / 61 を維持する。
 
 観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
 親から変更する。Stage 1では目標方向を採点せず、足中心から見たボール方向が内側面法線
@@ -65,9 +65,7 @@ term                    dim   意味
 
 付けない (タスク条件付け項):
 
-* ``kick_direction`` … 自己位置の遅延・DRにより時変だが、223次元と既存mirror/checkpoint
-  契約を維持するため現在値だけを渡す。actorには遅延を厳密に復元させるのではなく、
-  誤差に対してロバストな動作を学習させる。
+* ``kick_direction`` … 現在の真のyawでbase座標へ変換した方向。履歴化せず現在値だけを渡す。
 * ``target_kick_velocity`` … エピソード中ずっと定数。履歴を取ると同じ値が5回並ぶだけ。
 * ``gait_phase`` / ``gait_phase_factor_offset`` … 位相は時刻の決定的関数なので、
   履歴は現在値から復元できる。
@@ -169,12 +167,6 @@ from ..walk_kick.walk_kick_env_cfg import (
 from . import inside_rewards
 from .observations import (
     BALL_POSITION_NOISE_MAX_M,
-    LOCALIZATION_DELAY_BASE_S,
-    LOCALIZATION_DELAY_JITTER_S,
-    LOCALIZATION_POSITION_ERROR_MAX_M,
-    LOCALIZATION_YAW_ERROR_MAX_RAD,
-    MAP_TARGET_DISTANCE_RANGE_M,
-    FrozenMapTargetKickDirection,
     SharedDelayedBallPosition,
 )
 from .symmetry import HISTORY_LEN as _SYMMETRY_HISTORY_LEN
@@ -215,6 +207,9 @@ _OPPOSITE_DIRECTION_WEIGHT = -2.0
 _INSIDE_CONTACT_MULTIPLIER = 10.0
 _INSIDE_FACE_MULTIPLIER = 10.0
 _STRAIGHT_SWING_MULTIPLIER = 3.0
+# Stage 1 の接触角報酬は、横向き接触からも内側面へ向かう勾配が残る幅にする。
+# 昇格判定は下の 30 deg のままなので、Stage 2 条件自体は緩めない。
+_INSIDE_CONTACT_REWARD_SIGMA_DEG = 90.0
 _INSIDE_CONTACT_ANGLE_DEG = 30.0
 _INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
 _INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
@@ -283,7 +278,8 @@ class K1WalkLongPassHistoryPolicyCfg(K1WalkKickPolicyCfg):
 
     ``sole_pos`` は継承元の項順を保つための属性名。値は左足裏ではなく、
     実機 vision の遅延を表す1制御ステップ前のボール3D位置である。
-    ``prev_ball_pos`` と ``kick_direction`` の計算も同じノイズ標本を共有する。
+    ``prev_ball_pos`` は同じ遅延・ノイズ標本を共有する。``kick_direction`` は
+    自己位置の遅延・位置/yawバイアスを掛けず、報酬と同じ真のコマンド方向を使う。
     """
 
     sole_pos = ObsTerm(
@@ -291,16 +287,8 @@ class K1WalkLongPassHistoryPolicyCfg(K1WalkKickPolicyCfg):
         params={"delay_steps": 1, "dim": 3, "noise_max": BALL_POSITION_NOISE_MAX_M},
     )
     kick_direction = ObsTerm(
-        func=FrozenMapTargetKickDirection,
-        params={
-            "command_name": "kick_direction",
-            "delay_s": LOCALIZATION_DELAY_BASE_S,
-            "delay_jitter_s": LOCALIZATION_DELAY_JITTER_S,
-            "pos_err_max": LOCALIZATION_POSITION_ERROR_MAX_M,
-            "yaw_err_max": LOCALIZATION_YAW_ERROR_MAX_RAD,
-            "dist_range": MAP_TARGET_DISTANCE_RANGE_M,
-            "ball_noise_max": BALL_POSITION_NOISE_MAX_M,
-        },
+        func=mdp.kick_dir_b,
+        params={"command_name": "kick_direction"},
     )
     prev_ball_pos = ObsTerm(
         func=SharedDelayedBallPosition,
@@ -356,14 +344,20 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             weight=_INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE,
             params={
                 **kick_state_params,
-                "sigma_contact": math.radians(_INSIDE_CONTACT_ANGLE_DEG),
+                "sigma_contact": math.radians(_INSIDE_CONTACT_REWARD_SIGMA_DEG),
             },
         )
 
         self.rewards.first_ball_touch = RewTerm(
             func=inside_rewards.first_ball_touch,
             weight=_FIRST_TOUCH_WEIGHT,
-            params=kick_state_params,
+            params={
+                **kick_state_params,
+                # 接触だけなら +0.5、latch 閾値まで加速できれば +20.0。
+                # 接触率は上がったが kick へ変換されない Stage 1 の局所解を崩す。
+                "base_fraction": 0.25,
+                "speed_bonus_scale": 9.75,
+            },
         )
 
         self.rewards.kick_inside_face_alignment = RewTerm(

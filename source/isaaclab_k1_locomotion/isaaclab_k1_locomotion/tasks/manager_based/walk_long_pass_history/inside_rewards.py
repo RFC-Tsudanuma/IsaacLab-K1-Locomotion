@@ -240,12 +240,14 @@ def first_ball_touch(
     r_stance: float,
     alpha: float,
     v_thresh: float,
+    base_fraction: float = 0.25,
+    speed_bonus_scale: float = 1.75,
     r_max: float | None = None,
     orbit_beta: float = 0.6,
     overshoot_margin: float = 0.0,
     lateral_band: tuple[float, float] | None = None,
 ) -> torch.Tensor:
-    """エピソード最初の足とボールの接触イベントだけを返す。"""
+    """最初の接触を返し、接触後の球速が latch 閾値へ近いほど増幅する。"""
     state = _kick_state(
         env,
         r_stance,
@@ -257,7 +259,13 @@ def first_ball_touch(
         lateral_band=lateral_band,
     )
     touched = state["pre_latch_touch_event"].bool()
-    return (touched & (state["touch_count"] == 1.0)).float()
+    first_touch = touched & (state["touch_count"] == 1.0)
+    speed_ratio = torch.clamp(
+        state["prev_v_ball"] / state["v_thresh_eff"].clamp_min(_NORM_EPS),
+        min=0.0,
+        max=1.0,
+    )
+    return first_touch.float() * (base_fraction + speed_bonus_scale * speed_ratio)
 
 
 def _set_reward_weight(env: ManagerBasedRLEnv, term_name: str, weight: float) -> None:
