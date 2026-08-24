@@ -6,8 +6,11 @@
 # に 0.1 秒 = 5 ステップの履歴を付ける。arXiv:2401.16889 の short history 相当。
 # ネットワーク構造・行動空間は変えない。観測変更への適応中にキックを
 # 維持するため、球速帯を成立率で進退させ、非キック接触罰を最終帯到達後に立ち上げる。
-# ミラー可能にするため、policy / critic の左足裏 3D スロットはボール位置へ変える。
-# PPO には係数 0.5 の mirror loss を追加し、data augmentation は使わない。
+# policy / critic の左足裏 3D スロットはボール位置へ変える。mirror loss / data
+# augmentation は使わず、左右両側の初期配置を実際にサンプリングする。
+# 学習は静止インサイドキックから始め、方向を±10°→±30°→±45°→±60°→±90°へ
+# 広げた後、通常の歩行開始位置へ移る。静止段階では初期の胴体yawからのずれを罰し、
+# 胴体の向きを保ったまま蹴らせる。キック後2秒の回復区間は全段共通。
 #
 # 他の train_*.sh と決定的に違う点: **checkpoint をそのまま渡せない**。
 # policy 観測が 55 -> 223 次元になるので、train.py の --load_pretrained
@@ -39,7 +42,7 @@
 #   ITER=7000 ./scripts/rsl_rl/train_walk_long_pass_history.sh    # gate が止まる場合に延長
 #
 # 見るべきもの (TensorBoard):
-#   Metrics/kick_direction/kick_rate       … 観測変更と mirror loss 導入の過渡を監視
+#   Metrics/kick_direction/kick_rate       … 各方向帯でキック成立率を監視
 #   Metrics/kick_direction/kick_vel_ratio  … 履歴で改善するか
 #   Metrics/kick_direction/kick_dir_error_deg … 同上
 #   Metrics/kick_direction/ball_touch_count … 回り込み中の偶発接触が減るか
@@ -47,6 +50,8 @@
 #   Curriculum/kick_speed_range/alpha      … 球速帯の進捗。停止/後退も正常動作
 #   Curriculum/kick_speed_range/kick_rate_ema … gate が見る成立率
 #   Curriculum/non_kick_ball_touch_weight/weight … 最終帯到達までは 0
+#   Curriculum/pre_walk_inside_kick/level  … 0-4が静止方向帯、5が歩行段階
+#   Curriculum/pre_walk_inside_kick/direction_half_angle_deg … 現在の方向半幅
 #   Train/mean_episode_length              … 転倒が減れば伸びる
 
 set -euo pipefail

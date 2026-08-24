@@ -24,6 +24,14 @@ policy / critic の次元は 223 / 61 を維持する。
 キック成立前の探索を補助するため、エピソード最初の足とボールの接触には+2を払い、
 2回目以降の接触は1回あたり-0.5として、一度の接触で蹴り切るよう誘導する。
 
+歩行の前に、現在の立位から左右どちらかの足で直接蹴る前段を置く。ボールは蹴り方向に
+合わせてbaseから``r_stance``だけ先へ置き、左右の足側を等確率で選ぶ。方向帯は
+±10°→±30°→±45°→±60°→±90°、位置ジッタは0→1→2→3→4cmと広げる。
+各段はキック成立率・インサイド接触率・方向誤差で昇格し、最後の±90°帯を達成した
+次段で通常の歩行指令と前方半円0.5-1.5mのボール配置へ切り替える。報酬構成と
+キック後2秒の回復区間は全段で共通とし、静止段階だけはリセット時の胴体yawからの
+ずれを罰して、胴体の初期向きを保ったまま蹴るようにする。
+
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
 
@@ -145,6 +153,7 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 import math
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.utils import configclass
@@ -168,6 +177,11 @@ from . import inside_rewards
 from .observations import (
     BALL_POSITION_NOISE_MAX_M,
     SharedDelayedBallPosition,
+)
+from .pre_walk_curriculum import (
+    pre_walk_initial_yaw_deviation,
+    pre_walk_inside_kick_curriculum,
+    reset_ball_for_pre_walk_kick,
 )
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +223,14 @@ _INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
 _INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
 _FIRST_TOUCH_WEIGHT = 100.0  # イベント1回 × dt 0.02 = +2.0
 _EXTRA_TOUCH_WEIGHT = -25.0  # イベント1回 × dt 0.02 = -0.5
+
+# 歩行前の静止インサイドキック段階。方向を左右各10°から90°まで広げ、同時に
+# ボール位置の前後・左右ジッタも0→4cmへ広げる。最後の90°帯を達成した次段で
+# 通常の歩行開始位置（前方半円、0.5-1.5m）へ切り替える。
+_PRE_WALK_DIRECTION_HALF_ANGLES_DEG = (10.0, 30.0, 45.0, 60.0, 90.0)
+_PRE_WALK_POSITION_JITTER_M = (0.0, 0.01, 0.02, 0.03, 0.04)
+_PRE_WALK_SIDE_OFFSET_M = 0.096
+_PRE_WALK_INITIAL_YAW_DEVIATION_WEIGHT = -5.0
 
 # 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
 # ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
@@ -314,6 +336,36 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        # -- 0. 歩行前に、現在の立位から左右どちらかの足で蹴る技能を獲得する
+        #
+        # commandはbase yaw相対で引かれる。ボールをその方向へr_stanceだけ進め、
+        # 左右どちらかへスタンス半幅だけずらすので、方向帯を広げても初期姿勢から
+        # 直接インサイドキックできる。前段中はbase_velocity指令を0にし、最後の
+        # ±90°帯を達成した次段で通常の歩行指令と0.5-1.5m配置へ戻す。
+        _initial_half_angle = math.radians(_PRE_WALK_DIRECTION_HALF_ANGLES_DEG[0])
+        self.commands.kick_direction.ranges.heading = (-_initial_half_angle, _initial_half_angle)
+        self.commands.base_velocity.max_vel = 0.0
+        self.commands.base_velocity.max_ang_vel = 0.0
+        self.events.reset_ball = EventTerm(
+            func=reset_ball_for_pre_walk_kick,
+            mode="reset",
+            params={
+                "command_name": "kick_direction",
+                "r_stance": self.terminations.kick_finished.params["r_stance"],
+                "side_offset": _PRE_WALK_SIDE_OFFSET_M,
+                "longitudinal_jitter": _PRE_WALK_POSITION_JITTER_M[0],
+                "lateral_jitter": _PRE_WALK_POSITION_JITTER_M[0],
+                "aligned_to_kick_direction": True,
+                "walk_dist_range": (0.5, 1.5),
+                "walk_half_angle": math.pi / 2,
+                "ball_radius": 0.11,
+            },
+        )
+        self.rewards.pre_walk_initial_yaw_deviation = RewTerm(
+            func=pre_walk_initial_yaw_deviation,
+            weight=_PRE_WALK_INITIAL_YAW_DEVIATION_WEIGHT,
+        )
 
         # -- 1. 最終球方向中心の報酬をインサイドフォーム中心へ置換
         #
@@ -447,6 +499,20 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             },
         )
 
+        self.curriculum.pre_walk_inside_kick = CurrTerm(
+            func=pre_walk_inside_kick_curriculum,
+            params={
+                "command_name": "kick_direction",
+                "reset_event_name": "reset_ball",
+                "direction_half_angles_deg": _PRE_WALK_DIRECTION_HALF_ANGLES_DEG,
+                "position_jitter_m": _PRE_WALK_POSITION_JITTER_M,
+                "promote_kick_rate": _INSIDE_STAGE_PROMOTE_KICK_RATE,
+                "promote_inside_contact_rate": _INSIDE_STAGE_PROMOTE_CONTACT_RATE,
+                "promote_direction_error_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "inside_contact_angle_deg": _INSIDE_CONTACT_ANGLE_DEG,
+            },
+        )
+
         # -- 3. policy 観測の本体状態 5 項に履歴を付ける
         #
         # ObsGroup 側の history_length は **使わない**。グループに設定すると
@@ -487,7 +553,12 @@ class K1WalkLongPassHistoryEnvCfg_PLAY(K1WalkLongPassHistoryEnvCfg):
         # --kick_speed の指定が上書きされる (K1WalkLongPassEnvCfg_PLAY と同じ理由)。
         # 親が K1WalkLongPassEnvCfg_PLAY ではないので、ここで同じ処理を行う。
         self.curriculum.kick_speed_range = None
+        self.curriculum.pre_walk_inside_kick = None
         self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+        self.commands.kick_direction.ranges.heading = (-math.pi / 2, math.pi / 2)
+        self.commands.base_velocity.max_vel = 1.0
+        self.commands.base_velocity.max_ang_vel = 1.0
+        self.events.reset_ball.params["aligned_to_kick_direction"] = False
         self.rewards.kick_inside_face_alignment.weight = (
             _INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE
         )
