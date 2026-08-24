@@ -33,8 +33,8 @@ gym.register(
 
 # NOTE: policy 観測が 55 -> 223 次元に変わる (履歴 5 × 42 + 非履歴 13)。
 #       左足裏だけだった 3 次元スロットはボール 3D 位置へ置換し、
-#       policy 223 / critic 61 / action 12 の全ベクトに mirror 写像を定義する。
-#       PPO は data augmentation なし、係数 0.5 の mirror loss を使う。
+#       policy 223 / critic 61 / action 12 の次元契約は維持する。
+#       PPO は継承元と同じ設定を使い、mirror loss / data augmentation は使わない。
 #
 #       long_pass の checkpoint はそのままでは読めないので、形状を合わせる場合は
 #       scripts/rsl_rl/expand_checkpoint_history.py で列を並べ替え + ゼロ埋めする。
