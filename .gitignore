@@ -177,3 +177,25 @@ logs/rsl_rl/k1_walk_lob_plant/*
 !logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/
 logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/*
 !logs/rsl_rl/k1_walk_lob_plant/2026-08-23_02-19-00/model_7600.pt
+
+# walk_inside_kick の Stage 3 (凹凸 + ボール物性 DR) の最終 checkpoint 2999 iter。
+# **2026-08-25 の 3 変更 (r_stance 0.20->0.25 / 帯 (3.2,4.5)->(1.5,4.5) /
+# σ_direction アニール 0.35->0.20 を DR 段に追加) を入れて回した最初の run** で、
+# 次の DR 段を --load_pretrained で積むときの起点。
+# 実測 (最終 500 iteration 平均): kick_dir_error 12.5° / vel_ratio 0.865 /
+# kick_rate 0.984 / foot_kick_dot 0.048 / ball_touch_count 1.96。
+# 直前の run (2026-08-24_08-50-27、3 変更なし) の 14.85° / 0.789 / 0.104 から
+# 全指標が改善している。
+# **頭打ちしていない**のが重要 — 最後の 1000 iteration の傾きが −0.70/500 で
+# むしろ加速中、mean_noise_std も 0.107 -> 0.127 と探索が生きたまま 3000 で
+# 切れただけ。ここから再開して詰める前提の checkpoint なので追跡する。
+#
+# NOTE: 再開時は σ_direction のアニール定数を start_value 0.20 (= この run の終値)
+#       へ書き換えること。_pin_curricula_at_end より後に足した「生きたランプ」なので、
+#       そのまま再開すると 0.35 へ巻き戻ってこの run の成果を捨てる。
+#       詳細は walk_inside_kick_env_cfg.py の _INSIDE_SIGMA_DIRECTION_ANNEAL。
+!logs/rsl_rl/k1_walk_inside_kick_dual_rough/
+logs/rsl_rl/k1_walk_inside_kick_dual_rough/*
+!logs/rsl_rl/k1_walk_inside_kick_dual_rough/2026-08-25_00-13-00/
+logs/rsl_rl/k1_walk_inside_kick_dual_rough/2026-08-25_00-13-00/*
+!logs/rsl_rl/k1_walk_inside_kick_dual_rough/2026-08-25_00-13-00/model_2999.pt
