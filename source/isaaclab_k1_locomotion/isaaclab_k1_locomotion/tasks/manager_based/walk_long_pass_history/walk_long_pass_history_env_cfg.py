@@ -113,6 +113,8 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 ``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
 500 iteration までに終わる報酬 weight のランプだけは終値に固定する。Stage 1では
 内側接触だけを採点し、Stage 2昇格後に500 iterationの安定期間を置いて球速帯を進める。
+方向誤差 EMA が20°未満になると不可逆にStage 3へ進み、最終球方向の正報酬を
+200 iterationかけて立ち上げる。
 球速帯はキック成立率 EMA が0.80以上かつ成功キックの方向平均誤差 EMA が25°以下なら
 進み、成立率が0.50未満または方向誤差が35°以上なら2倍速で戻る。最終帯へ到達した後だけ
 ``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
@@ -123,17 +125,21 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Metrics/kick_direction/kick_rate`` … 観測の意味変更と mirror loss 導入時の過渡を
   監視する。旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
 * ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
-* ``Metrics/kick_direction/kick_dir_error_deg`` … 報酬から高精度方向一致を外した後も、
-  インサイドフォームによって結果の方向精度が維持・改善するか。
+* ``Metrics/kick_direction/kick_dir_error_deg`` … インサイドフォームとStage 3の
+  最終球方向報酬によって、結果の方向精度が維持・改善するか。
 * ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
   成功キックだけの方向平均誤差 EMA。
-* ``Curriculum/kick_speed_range/stage`` … 1は内側接触の獲得、2は方向フォームと球速帯。
+* ``Curriculum/kick_speed_range/stage`` … 1は内側接触、2は方向フォームと球速帯、
+  3は最終球方向精度の直接学習。
 * ``Curriculum/kick_speed_range/inside_contact_rate_ema`` … 成功キック中、足内側30°以内で
   接触できた割合のEMA。0.80以上がStage 2への昇格条件。
 * ``Curriculum/kick_speed_range/inside_face_phase`` … 足内側面報酬の段階。
   -1=Stage 1、2=粗調整、1=精密化、0=維持。
 * ``Curriculum/kick_speed_range/inside_face_multiplier`` / ``inside_face_sigma_deg`` /
   ``inside_face_weight`` … 現在適用中の足内側面報酬の倍率、Gaussian幅、実weight。
+* ``Curriculum/kick_speed_range/direction_accuracy_alpha`` / ``direction_accuracy_weight`` …
+  Stage 3で立ち上げる最終球方向報酬の進捗と実weight。
+* ``Episode_Reward/kick_direction_accuracy`` … Stage 3で追加される最終球方向の正報酬。
 * ``Curriculum/kick_speed_range/first_touch_rate`` … 終了エピソード中、一度以上ボールへ
   接触した割合。
 * ``Curriculum/kick_speed_range/extra_touch_count`` … 終了エピソードあたりの2回目以降の
@@ -226,6 +232,11 @@ _INSIDE_FACE_PRECISION_SIGMA_DEG = 30.0
 _INSIDE_FACE_MAINTAIN_SIGMA_DEG = math.degrees(_SIGMA_DIRECTION)
 _INSIDE_FACE_PRECISION_ENTER_BELOW_DEG = 30.0
 _INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG = 10.0
+# Stage 3 は方向誤差 EMA が20 deg未満になった時点で不可逆に有効化し、旧方向報酬の
+# nominal weight 6.0を200 iterationかけて復帰する。実weightの終値は6.0*0.3=1.8。
+_DIRECTION_ACCURACY_WEIGHT = 6.0
+_DIRECTION_ACCURACY_PROMOTE_ERROR_DEG = 20.0
+_DIRECTION_ACCURACY_RAMP_ITERATIONS = 200
 # 足collisionの踵はfoot_link原点から約-64 mm。踵から60 mmを狙うためlocal X=-4 mm。
 _ANKLE_CONTACT_TARGET_X = -0.004
 _ANKLE_CONTACT_SIGMA_X = 0.025
@@ -341,11 +352,12 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
 
         # -- 1. 最終球方向中心の報酬をインサイドフォーム中心へ置換
         #
-        # 旧 kick_direction (nominal 6) は、接触時のインサイド面角度 (3) と
+        # 旧 kick_direction (nominal 6) はStage 1/2では、接触時のインサイド面角度 (3) と
         # 接触直前の足速度方向 (3) に分ける。球速と30度仰角からは _r_direction を外し、
-        # 最終球方向は反対半球だけを飽和ペナルティ (-2) で禁止する。
-        # 既存の方向誤差 metric は報酬から独立して残るので、結果の精度は引き続き観測できる。
-        kick_state_params = dict(self.rewards.kick_direction.params)
+        # 反対半球だけを飽和ペナルティ (-2) で禁止する。方向誤差 EMA が20 deg未満になった
+        # Stage 3でのみ、旧kick_directionを単独の正報酬として徐々に復帰する。
+        direction_accuracy_params = dict(self.rewards.kick_direction.params)
+        kick_state_params = dict(direction_accuracy_params)
         for name in ("sigma_direction", "v_gate_frac", "sigma_gate"):
             kick_state_params.pop(name, None)
 
@@ -356,6 +368,12 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
 
         self.rewards.kick_direction = None
         self.curriculum.kick_direction_weight = None
+
+        self.rewards.kick_direction_accuracy = RewTerm(
+            func=mdp.kick_direction,
+            weight=0.0,
+            params=direction_accuracy_params,
+        )
 
         self.rewards.kick_inside_contact = RewTerm(
             func=inside_rewards.kick_inside_contact,
@@ -455,6 +473,7 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                 "inside_face_term_name": "kick_inside_face_alignment",
                 "straight_swing_term_name": "kick_straight_swing",
                 "opposite_direction_term_name": "kick_opposite_direction",
+                "direction_accuracy_term_name": "kick_direction_accuracy",
                 "inside_contact_weight": (
                     _INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE
                 ),
@@ -465,6 +484,11 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                     _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
                 ),
                 "stage2_opposite_direction_weight": _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE,
+                "stage3_direction_accuracy_weight": (
+                    _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE
+                ),
+                "stage3_promote_error_below_deg": _DIRECTION_ACCURACY_PROMOTE_ERROR_DEG,
+                "stage3_direction_ramp_iterations": _DIRECTION_ACCURACY_RAMP_ITERATIONS,
                 "inside_contact_angle_deg": _INSIDE_CONTACT_ANGLE_DEG,
                 "promote_kick_rate": _INSIDE_STAGE_PROMOTE_KICK_RATE,
                 "promote_inside_contact_rate": _INSIDE_STAGE_PROMOTE_CONTACT_RATE,
@@ -545,3 +569,4 @@ class K1WalkLongPassHistoryEnvCfg_PLAY(K1WalkLongPassHistoryEnvCfg):
             _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
         )
         self.rewards.kick_opposite_direction.weight = _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE
+        self.rewards.kick_direction_accuracy.weight = _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE

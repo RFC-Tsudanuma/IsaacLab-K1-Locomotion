@@ -329,10 +329,14 @@ def inside_kick_stage_curriculum(
     inside_face_term_name: str,
     straight_swing_term_name: str,
     opposite_direction_term_name: str,
+    direction_accuracy_term_name: str,
     inside_contact_weight: float,
     stage2_inside_face_weight: float,
     stage2_straight_swing_weight: float,
     stage2_opposite_direction_weight: float,
+    stage3_direction_accuracy_weight: float,
+    stage3_promote_error_below_deg: float,
+    stage3_direction_ramp_iterations: int,
     inside_contact_angle_deg: float,
     promote_kick_rate: float,
     promote_inside_contact_rate: float,
@@ -360,7 +364,8 @@ def inside_kick_stage_curriculum(
 
     Stage 2 の足内側面報酬は、成功キックの方向誤差 EMA に合わせて粗調整・精密化・
     維持の3段階で weight と Gaussian 幅を切り替える。一度進んだ段階は精度が悪化しても
-    戻さず、粗調整から精密化、精密化から維持へ一方向にだけ進める。
+    戻さず、粗調整から精密化、精密化から維持へ一方向にだけ進める。方向誤差 EMA が
+    閾値を下回ると不可逆に Stage 3 へ進み、最終球方向の正報酬を時間基準で立ち上げる。
     """
     if steps_per_iteration > 0:
         now = env.common_step_counter / steps_per_iteration
@@ -377,6 +382,7 @@ def inside_kick_stage_curriculum(
             "extra_touch_count": 0.0,
             "touch_to_kick_rate": 0.0,
             "promoted_at": None,
+            "direction_promoted_at": None,
             "inside_face_phase": "rough",
         }
         setattr(env, _STAGE_STATE_ATTR, state)
@@ -426,6 +432,7 @@ def inside_kick_stage_curriculum(
         _set_reward_weight(env, inside_face_term_name, 0.0)
         _set_reward_weight(env, straight_swing_term_name, 0.0)
         _set_reward_weight(env, opposite_direction_term_name, 0.0)
+        _set_reward_weight(env, direction_accuracy_term_name, 0.0)
         command_term.cfg.target_speed_range = start_range
         return {
             "stage": 1.0,
@@ -442,6 +449,9 @@ def inside_kick_stage_curriculum(
             "inside_face_multiplier": 0.0,
             "inside_face_sigma_deg": math.degrees(inside_face_maintain_sigma_angle),
             "inside_face_weight": 0.0,
+            "direction_accuracy_alpha": 0.0,
+            "direction_accuracy_weight": 0.0,
+            "iterations_since_direction_promotion": 0.0,
         }
 
     _set_reward_weight(env, straight_swing_term_name, stage2_straight_swing_weight)
@@ -464,6 +474,24 @@ def inside_kick_stage_curriculum(
         retreat_scale=speed_retreat_scale,
     )
     direction_error_ema = speed["kick_dir_error_ema_deg"]
+    if state["stage"] == 2 and direction_error_ema < stage3_promote_error_below_deg:
+        state["stage"] = 3
+        state["direction_promoted_at"] = now
+
+    direction_promoted_at = state["direction_promoted_at"]
+    if state["stage"] == 3:
+        iterations_since_direction_promotion = max(0.0, now - direction_promoted_at)
+        direction_accuracy_alpha = min(
+            iterations_since_direction_promotion / stage3_direction_ramp_iterations,
+            1.0,
+        )
+        direction_accuracy_weight = stage3_direction_accuracy_weight * direction_accuracy_alpha
+    else:
+        iterations_since_direction_promotion = 0.0
+        direction_accuracy_alpha = 0.0
+        direction_accuracy_weight = 0.0
+    _set_reward_weight(env, direction_accuracy_term_name, direction_accuracy_weight)
+
     phase = state["inside_face_phase"]
     if phase == "rough":
         if direction_error_ema <= inside_face_precision_enter_below_deg:
@@ -497,7 +525,7 @@ def inside_kick_stage_curriculum(
         inside_face_sigma_angle,
     )
     return {
-        "stage": 2.0,
+        "stage": float(state["stage"]),
         "stage1_kick_rate_ema": state["kick_rate_ema"],
         "inside_contact_rate_ema": state["inside_contact_rate_ema"],
         "first_touch_rate": state["first_touch_rate"],
@@ -508,6 +536,9 @@ def inside_kick_stage_curriculum(
         "inside_face_multiplier": inside_face_multiplier,
         "inside_face_sigma_deg": math.degrees(inside_face_sigma_angle),
         "inside_face_weight": inside_face_weight,
+        "direction_accuracy_alpha": direction_accuracy_alpha,
+        "direction_accuracy_weight": direction_accuracy_weight,
+        "iterations_since_direction_promotion": iterations_since_direction_promotion,
         **speed,
     }
 
