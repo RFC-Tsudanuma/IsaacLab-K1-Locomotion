@@ -130,6 +130,10 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Curriculum/kick_speed_range/stage`` … 1は内側接触の獲得、2は方向フォームと球速帯。
 * ``Curriculum/kick_speed_range/inside_contact_rate_ema`` … 成功キック中、足内側30°以内で
   接触できた割合のEMA。0.80以上がStage 2への昇格条件。
+* ``Curriculum/kick_speed_range/inside_face_phase`` … 足内側面報酬の段階。
+  -1=Stage 1、2=粗調整、1=精密化、0=維持。
+* ``Curriculum/kick_speed_range/inside_face_multiplier`` / ``inside_face_sigma_deg`` /
+  ``inside_face_weight`` … 現在適用中の足内側面報酬の倍率、Gaussian幅、実weight。
 * ``Curriculum/kick_speed_range/first_touch_rate`` … 終了エピソード中、一度以上ボールへ
   接触した割合。
 * ``Curriculum/kick_speed_range/extra_touch_count`` … 終了エピソードあたりの2回目以降の
@@ -212,6 +216,19 @@ _STRAIGHT_SWING_MULTIPLIER = 3.0
 # 昇格判定は下の 30 deg のままなので、Stage 2 条件自体は緩めない。
 _INSIDE_CONTACT_REWARD_SIGMA_DEG = 90.0
 _INSIDE_CONTACT_ANGLE_DEG = 30.0
+# Stage 2 の足内側面報酬。最終方向誤差が大きい間は幅を広げて勾配を残し、
+# 30 deg / 10 deg を下回るごとに倍率と幅を絞る。復帰側を 35 deg / 15 deg にして、
+# EMA が境界付近で揺れても設定が往復しないようにする。
+_INSIDE_FACE_ROUGH_MULTIPLIER = 2.0
+_INSIDE_FACE_PRECISION_MULTIPLIER = 1.5
+_INSIDE_FACE_MAINTAIN_MULTIPLIER = 1.0
+_INSIDE_FACE_ROUGH_SIGMA_DEG = 45.0
+_INSIDE_FACE_PRECISION_SIGMA_DEG = 30.0
+_INSIDE_FACE_MAINTAIN_SIGMA_DEG = math.degrees(_SIGMA_DIRECTION)
+_INSIDE_FACE_PRECISION_ENTER_BELOW_DEG = 30.0
+_INSIDE_FACE_ROUGH_REENTER_ABOVE_DEG = 35.0
+_INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG = 10.0
+_INSIDE_FACE_PRECISION_REENTER_ABOVE_DEG = 15.0
 # 足collisionの踵はfoot_link原点から約-64 mm。踵から60 mmを狙うためlocal X=-4 mm。
 _ANKLE_CONTACT_TARGET_X = -0.004
 _ANKLE_CONTACT_SIGMA_X = 0.025
@@ -464,6 +481,26 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                 "speed_advance_error_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
                 "speed_retreat_error_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
                 "speed_retreat_scale": _SPEED_GATE_RETREAT_SCALE,
+                "inside_face_rough_multiplier": _INSIDE_FACE_ROUGH_MULTIPLIER,
+                "inside_face_precision_multiplier": _INSIDE_FACE_PRECISION_MULTIPLIER,
+                "inside_face_maintain_multiplier": _INSIDE_FACE_MAINTAIN_MULTIPLIER,
+                "inside_face_rough_sigma_angle": math.radians(_INSIDE_FACE_ROUGH_SIGMA_DEG),
+                "inside_face_precision_sigma_angle": math.radians(
+                    _INSIDE_FACE_PRECISION_SIGMA_DEG
+                ),
+                "inside_face_maintain_sigma_angle": math.radians(
+                    _INSIDE_FACE_MAINTAIN_SIGMA_DEG
+                ),
+                "inside_face_precision_enter_below_deg": (
+                    _INSIDE_FACE_PRECISION_ENTER_BELOW_DEG
+                ),
+                "inside_face_rough_reenter_above_deg": _INSIDE_FACE_ROUGH_REENTER_ABOVE_DEG,
+                "inside_face_maintain_enter_below_deg": (
+                    _INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG
+                ),
+                "inside_face_precision_reenter_above_deg": (
+                    _INSIDE_FACE_PRECISION_REENTER_ABOVE_DEG
+                ),
             },
         )
 

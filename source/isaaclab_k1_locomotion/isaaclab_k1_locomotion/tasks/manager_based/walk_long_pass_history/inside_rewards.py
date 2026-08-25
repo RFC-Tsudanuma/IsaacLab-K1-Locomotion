@@ -313,6 +313,14 @@ def _set_reward_weight(env: ManagerBasedRLEnv, term_name: str, weight: float) ->
         term.weight = weight
 
 
+def _set_reward_param(
+    env: ManagerBasedRLEnv, term_name: str, param_name: str, value: float
+) -> None:
+    term = env.reward_manager.get_term_cfg(term_name)
+    if abs(float(term.params[param_name]) - value) > 1.0e-8:
+        term.params[param_name] = value
+
+
 def inside_kick_stage_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
@@ -339,8 +347,23 @@ def inside_kick_stage_curriculum(
     speed_advance_error_below_deg: float | None = None,
     speed_retreat_error_above_deg: float | None = None,
     speed_retreat_scale: float = 2.0,
+    inside_face_rough_multiplier: float = 2.0,
+    inside_face_precision_multiplier: float = 1.5,
+    inside_face_maintain_multiplier: float = 1.0,
+    inside_face_rough_sigma_angle: float = math.radians(45.0),
+    inside_face_precision_sigma_angle: float = math.radians(30.0),
+    inside_face_maintain_sigma_angle: float = math.radians(20.0),
+    inside_face_precision_enter_below_deg: float = 30.0,
+    inside_face_rough_reenter_above_deg: float = 35.0,
+    inside_face_maintain_enter_below_deg: float = 10.0,
+    inside_face_precision_reenter_above_deg: float = 15.0,
 ) -> dict[str, float]:
-    """内側接触を先に獲得し、その後に方向フォームと球速帯を有効化する。"""
+    """内側接触を先に獲得し、その後に方向フォームと球速帯を有効化する。
+
+    Stage 2 の足内側面報酬は、成功キックの方向誤差 EMA に合わせて粗調整・精密化・
+    維持の3段階で weight と Gaussian 幅を切り替える。10/15 deg と 30/35 deg の
+    ヒステリシスにより、閾値付近で報酬設定が往復するのを防ぐ。
+    """
     if steps_per_iteration > 0:
         now = env.common_step_counter / steps_per_iteration
     else:
@@ -356,6 +379,7 @@ def inside_kick_stage_curriculum(
             "extra_touch_count": 0.0,
             "touch_to_kick_rate": 0.0,
             "promoted_at": None,
+            "inside_face_phase": "rough",
         }
         setattr(env, _STAGE_STATE_ATTR, state)
 
@@ -416,9 +440,12 @@ def inside_kick_stage_curriculum(
             "speed_max": start_range[1],
             "alpha": 0.0,
             "iterations_since_promotion": 0.0,
+            "inside_face_phase": -1.0,
+            "inside_face_multiplier": 0.0,
+            "inside_face_sigma_deg": math.degrees(inside_face_maintain_sigma_angle),
+            "inside_face_weight": 0.0,
         }
 
-    _set_reward_weight(env, inside_face_term_name, stage2_inside_face_weight)
     _set_reward_weight(env, straight_swing_term_name, stage2_straight_swing_weight)
     _set_reward_weight(env, opposite_direction_term_name, stage2_opposite_direction_weight)
     promoted_at = state["promoted_at"]
@@ -438,6 +465,48 @@ def inside_kick_stage_curriculum(
         ema_alpha=ema_alpha,
         retreat_scale=speed_retreat_scale,
     )
+    direction_error_ema = speed["kick_dir_error_ema_deg"]
+    phase = state["inside_face_phase"]
+    if phase == "rough":
+        if direction_error_ema <= inside_face_maintain_enter_below_deg:
+            phase = "maintain"
+        elif direction_error_ema <= inside_face_precision_enter_below_deg:
+            phase = "precision"
+    elif phase == "precision":
+        if direction_error_ema > inside_face_rough_reenter_above_deg:
+            phase = "rough"
+        elif direction_error_ema <= inside_face_maintain_enter_below_deg:
+            phase = "maintain"
+    elif phase == "maintain":
+        if direction_error_ema > inside_face_rough_reenter_above_deg:
+            phase = "rough"
+        elif direction_error_ema > inside_face_precision_reenter_above_deg:
+            phase = "precision"
+    else:
+        raise ValueError(f"未知の inside_face_phase: {phase}")
+    state["inside_face_phase"] = phase
+
+    if phase == "rough":
+        inside_face_multiplier = inside_face_rough_multiplier
+        inside_face_sigma_angle = inside_face_rough_sigma_angle
+        inside_face_phase_metric = 2.0
+    elif phase == "precision":
+        inside_face_multiplier = inside_face_precision_multiplier
+        inside_face_sigma_angle = inside_face_precision_sigma_angle
+        inside_face_phase_metric = 1.0
+    else:
+        inside_face_multiplier = inside_face_maintain_multiplier
+        inside_face_sigma_angle = inside_face_maintain_sigma_angle
+        inside_face_phase_metric = 0.0
+
+    inside_face_weight = stage2_inside_face_weight * inside_face_multiplier
+    _set_reward_weight(env, inside_face_term_name, inside_face_weight)
+    _set_reward_param(
+        env,
+        inside_face_term_name,
+        "sigma_angle",
+        inside_face_sigma_angle,
+    )
     return {
         "stage": 2.0,
         "stage1_kick_rate_ema": state["kick_rate_ema"],
@@ -446,6 +515,10 @@ def inside_kick_stage_curriculum(
         "extra_touch_count": state["extra_touch_count"],
         "touch_to_kick_rate": state["touch_to_kick_rate"],
         "iterations_since_promotion": now - promoted_at,
+        "inside_face_phase": inside_face_phase_metric,
+        "inside_face_multiplier": inside_face_multiplier,
+        "inside_face_sigma_deg": math.degrees(inside_face_sigma_angle),
+        "inside_face_weight": inside_face_weight,
         **speed,
     }
 
