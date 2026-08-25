@@ -354,15 +354,13 @@ def inside_kick_stage_curriculum(
     inside_face_precision_sigma_angle: float = math.radians(30.0),
     inside_face_maintain_sigma_angle: float = math.radians(20.0),
     inside_face_precision_enter_below_deg: float = 30.0,
-    inside_face_rough_reenter_above_deg: float = 35.0,
     inside_face_maintain_enter_below_deg: float = 10.0,
-    inside_face_precision_reenter_above_deg: float = 15.0,
 ) -> dict[str, float]:
     """内側接触を先に獲得し、その後に方向フォームと球速帯を有効化する。
 
     Stage 2 の足内側面報酬は、成功キックの方向誤差 EMA に合わせて粗調整・精密化・
-    維持の3段階で weight と Gaussian 幅を切り替える。10/15 deg と 30/35 deg の
-    ヒステリシスにより、閾値付近で報酬設定が往復するのを防ぐ。
+    維持の3段階で weight と Gaussian 幅を切り替える。一度進んだ段階は精度が悪化しても
+    戻さず、粗調整から精密化、精密化から維持へ一方向にだけ進める。
     """
     if steps_per_iteration > 0:
         now = env.common_step_counter / steps_per_iteration
@@ -468,21 +466,12 @@ def inside_kick_stage_curriculum(
     direction_error_ema = speed["kick_dir_error_ema_deg"]
     phase = state["inside_face_phase"]
     if phase == "rough":
-        if direction_error_ema <= inside_face_maintain_enter_below_deg:
-            phase = "maintain"
-        elif direction_error_ema <= inside_face_precision_enter_below_deg:
+        if direction_error_ema <= inside_face_precision_enter_below_deg:
             phase = "precision"
     elif phase == "precision":
-        if direction_error_ema > inside_face_rough_reenter_above_deg:
-            phase = "rough"
-        elif direction_error_ema <= inside_face_maintain_enter_below_deg:
+        if direction_error_ema <= inside_face_maintain_enter_below_deg:
             phase = "maintain"
-    elif phase == "maintain":
-        if direction_error_ema > inside_face_rough_reenter_above_deg:
-            phase = "rough"
-        elif direction_error_ema > inside_face_precision_reenter_above_deg:
-            phase = "precision"
-    else:
+    elif phase != "maintain":
         raise ValueError(f"未知の inside_face_phase: {phase}")
     state["inside_face_phase"] = phase
 
