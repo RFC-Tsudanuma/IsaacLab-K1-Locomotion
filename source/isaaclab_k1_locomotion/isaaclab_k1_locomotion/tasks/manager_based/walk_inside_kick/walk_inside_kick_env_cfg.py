@@ -363,6 +363,7 @@ checkpoint が繋がっていない** (起動ログの "Skipped N tensors" を�
 """
 
 import math
+import os
 
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -697,6 +698,10 @@ _KICK_HEADING_HALFWIDTH_RANGE = (math.pi / 4, math.pi)
 # --------------------------------------------------------------------------- #
 _INSIDE_SPEED_RANGE = (1.5, 4.5)
 
+# 低指令域メトリクス (kick_rate_low / kick_vel_ratio_low / kick_low_frac) の切り出し
+# 閾値 [m/s]。根拠は使用箇所のコメント。帯を変えたらここも見直すこと。
+_INSIDE_LOW_SPEED_THRESHOLD = 2.5
+
 # --------------------------------------------------------------------------- #
 # σ_velocity を指令相対にするときの基準速度 [m/s]
 #
@@ -730,55 +735,103 @@ _INSIDE_SIGMA_VELOCITY_V_REF = 4.5
 # 一方 kick_direction は σ_direction = 0.35 rad (20.1°) 固定のままで、
 # **inside は dual 系列で唯一このアニールを持っていなかった**。
 #
-# 終点 0.20 の根拠 (2 つの制約の交点)
-# ------------------------------------
+# 初回 run (2026-08-25_00-13-00、0.35 -> 0.20) の実測: 14.85° -> **12.55°**。
+# kick_rate 0.984 / vel_ratio 0.865 / foot_kick_dot 0.048 と他の指標も落ちていない。
+#
+# 終点の根拠 (2 つの制約の交点)
+# ------------------------------
 # 報酬の形は :func:`~..walk_kick.mdp.rewards.kick_direction` の
 #
 #     f_dir = exp(−τ² / (2 σ²))
 #     r_dir = clamp((f_dir − 0.5) × 2 × p_style, min=0)
 #
-# 1. **勾配**: |∂f/∂τ| = (τ/σ²)·exp(−τ²/2σ²) は σ = τ/√2 で最大。現状の
-#    τ = 14.85° = 0.2588 rad なら最適 σ は 0.183。現行 0.35 は最大の 57% しか
-#    出ていない。σ を 0.20 にすると 99%、つまり **勾配が 1.74 倍**になる。
+# 1. **勾配**: |∂f/∂τ| = (τ/σ²)·exp(−τ²/2σ²) は σ = τ/√2 で最大。つまり
+#    **最適な σ は「現在の平均誤差 [rad] ÷ √2」** で、誤差が下がったら追随させる。
+#
+#        誤差 14.85° (0.259 rad) -> 最適 σ 0.183
+#        誤差 12.55° (0.219 rad) -> 最適 σ 0.155
+#        誤差 10.0°  (0.175 rad) -> 最適 σ 0.123
 #
 # 2. **ゼロ足切り**: r_dir は f_dir < 0.5 で 0 にクランプされる。境界は
 #    τ = 1.177 σ なので、σ を絞るほど「報酬が 1 点も出ない蹴り」が増える::
 #
-#        σ = 0.35 -> 23.6° 超がゼロ (現状の分布の 20%)
-#        σ = 0.25 -> 16.9° 超がゼロ (36%)
-#        σ = 0.20 -> 13.5° 超がゼロ (47%)
-#        σ = 0.15 -> 10.1° 超がゼロ (59%)
+#        σ = 0.35 -> 23.6° 超がゼロ
+#        σ = 0.20 -> 13.5° 超がゼロ
+#        σ = 0.15 -> 10.1° 超がゼロ
 #
 #    **これは方向報酬だけの話ではない。** kick_velocity_scaled / _strong は
 #    どちらも内部で r_dir を掛けている (``r_dir * f_vel`` / ``r_dir * v_ball``)
-#    ので、足切りに掛かった蹴りは **速度報酬もゼロ**になる。帯を (1.5, 4.5) へ
-#    広げた直後の run で σ = 0.15 まで絞ると、弱い指令を覚えている最中に
-#    「方向が 10° に収まらないと速度報酬が一切もらえない」状態になり、下端が
-#    立ち上がらないリスクがある。
+#    ので、足切りに掛かった蹴りは **速度報酬もゼロ**になる。絞りすぎると
+#    「蹴ること自体を避ける」方向に倒れるので、kick_rate を必ず監視すること。
 #
-# 0.20 は 1 をほぼ満たしつつ 2 を 47% に留める点。**0.15 は次の run** —
-# 誤差が 12° 台に入ってから (σ = 0.15 は τ = 12.2° に対して勾配最適) 絞る。
-# 目標の 10° には σ ≈ 0.123 が対応するが、そこは 2 段階目以降の話。
+# 初回は 0.20 (誤差 14.85° に対して足切り 47%)、再開は 0.15 (誤差 12.55° に対して
+# ほぼ勾配最適で、足切りは 52%)。
 #
-# 窓 (500 → 2500 iteration) の根拠
-# ---------------------------------
-# 開始を 0 にしないのは、DR 段が **前段の checkpoint から地形とボール DR を
-# 載せた直後に一度悪化する** ため (実測で 9.58° → 15.7°)。悪化しきる前に σ を
-# 絞り始めると、足切りに掛かる割合が一時的に跳ね上がる。500 iteration は
-# 実測で誤差が底を打つまでの時間。終了 2500 は既定 ITER=3000 に対して、
-# 終値で 500 iteration ぶん学習する余裕を残すため。
+# ===========================================================================
+# 再開 (INSIDE_SIGMA_DIR_RESUME=1) — **DR 段を積み増すときは必須**
+# ===========================================================================
+# ``--load_pretrained`` は ``common_step_counter`` を 0 に戻す。このアニールは
+# :func:`_pin_curricula_at_end` の **後** に足した「生きたランプ」なので、
+# 素で再開すると **σ が終値 0.20 から開始値 0.35 へ巻き戻り、前 run の成果を捨てる**。
 #
-# WARNING: この段では `kick_rate` と `kick_rate_low` を必ず監視すること。
-#          σ を絞るのは「方向が悪い蹴りの報酬を消す」操作なので、絞りすぎると
-#          蹴ること自体を避ける方向に倒れる (キック報酬が消えれば kick_finished が
-#          残りの歩行報酬を捨てるコストだけが残る、という middle の警告と同じ構造)。
+# 2026-08-25 に実際に踏んだ (run 2026-08-25_04-34-43): 12.55° の checkpoint から
+# 再開したのに σ が 0.35 に戻り、誤差は 13.2-13.4° で横ばい。**元の位置へ戻るためだけに
+# 2500 iteration を使う**ことになった。
+#
+# 環境変数 ``INSIDE_SIGMA_DIR_RESUME=1`` を立てると、開始値を前 run の終値に、
+# 開始 iteration を 0 にした「続きから」の窓に切り替わる::
+#
+#     INSIDE_SIGMA_DIR_RESUME=1 \
+#     DUAL_CKPT=logs/.../k1_walk_inside_kick_dual_rough/<run>/model_XXXX.pt \
+#     STAGE=3 ROUGH_ITER=6000 ./scripts/rsl_rl/train_walk_inside_kick_dual.sh
+#
+# start_step を 0 にできるのは再開だからである。初回が 500 待つのは「前段から地形と
+# ボール DR を載せた直後に一度悪化する」ため (実測 9.58° -> 15.7°) だが、再開は
+# 同じ環境の続きなのでその悪化が無い。
+#
+# NOTE: 定数を手で書き換える運用にしていないのは、書き換え忘れが **静かに** 効くため。
+#       σ が巻き戻っても学習は正常に進んでいるように見えるので、TB の
+#       Curriculum/kick_direction_sigma_direction を開くまで気付けない。
 # --------------------------------------------------------------------------- #
-_INSIDE_SIGMA_DIRECTION_ANNEAL = {
+_INSIDE_SIGMA_DIRECTION_ANNEAL_INITIAL = {
     "start_value": 0.35,
     "end_value": 0.20,
     "start_step": 500,
     "end_step": 2500,
 }
+
+_INSIDE_SIGMA_DIRECTION_ANNEAL_RESUME = {
+    "start_value": 0.20,
+    "end_value": 0.15,
+    "start_step": 0,
+    "end_step": 3000,
+}
+
+_INSIDE_SIGMA_DIR_RESUME_ENV = "INSIDE_SIGMA_DIR_RESUME"
+
+
+def _inside_sigma_direction_anneal() -> dict:
+    """このプロセスで使う σ_direction アニールの窓を返す。
+
+    ``INSIDE_SIGMA_DIR_RESUME`` が truthy なら「続きから」の窓
+    (:data:`_INSIDE_SIGMA_DIRECTION_ANNEAL_RESUME`)、それ以外は初回の窓。
+    どちらを使ったかは **必ず標準出力に出す** (取り違えたまま数千 iteration 回すのが
+    一番高くつくので、起動ログで確認できるようにする)。
+    """
+    raw = os.environ.get(_INSIDE_SIGMA_DIR_RESUME_ENV, "").strip().lower()
+    resume = raw not in ("", "0", "false", "no")
+    params = (
+        _INSIDE_SIGMA_DIRECTION_ANNEAL_RESUME
+        if resume
+        else _INSIDE_SIGMA_DIRECTION_ANNEAL_INITIAL
+    )
+    print(
+        f"[inside_kick] sigma_direction anneal = "
+        f"{'RESUME' if resume else 'INITIAL'} "
+        f"({params['start_value']} -> {params['end_value']}, "
+        f"iter {params['start_step']} -> {params['end_step']})"
+    )
+    return params
 
 # ball_avoidance の σ_sole。apply_orbit_params が入れるのと同じ値を明示しておく
 # (回り込み半径の決定を罰から指令へ移すためのもの。理由は orbit_mods 参照)。
@@ -886,6 +939,22 @@ def _apply_inside_kick_recipe(cfg: "K1WalkKickEnvCfg") -> None:
     # 指令どおりに出せるようにする」こと。根拠と各値の意味は
     # :data:`_INSIDE_SPEED_RANGE` / :data:`_INSIDE_SIGMA_VELOCITY_V_REF` を参照。
     cfg.commands.kick_direction.target_speed_range = _INSIDE_SPEED_RANGE
+
+    # 低指令域メトリクスの切り出し位置を、新しい帯に合わせて上げる。
+    #
+    # 既定 0.8 は weak の帯 (0.25, 2.0) 用の値で、**帯 (1.5, 4.5) では下端 1.5 でも
+    # 0.8 を超えるので、低指令域に分類される env が 1 つも出ない**。実際 run
+    # 2026-08-25_00-13-00 では kick_low_frac / kick_rate_low / kick_vel_ratio_low が
+    # 全ブロックで 0.000 になり、**帯を広げた下端が機能しているかを一度も測れなかった**。
+    #
+    # 2.5 は帯の下 1/3 (1.5-2.5) を切り出す位置。全 env 平均の kick_vel_ratio は
+    # 「下端で出しすぎ + 上端で足りない」が打ち消し合って健全に見えるので
+    # (実機の 2 点がまさにそうだった)、下端の成否はこちらで判定すること。
+    #
+    # NOTE: これは **メトリクスの切り出し位置だけ** で、報酬にも latch にも
+    #       コマンドのサンプリングにも一切影響しない (commands.py の _update_metrics
+    #       が is_low マスクに使うだけ)。
+    cfg.commands.kick_direction.low_speed_threshold = _INSIDE_LOW_SPEED_THRESHOLD
 
     # -- 1e. σ_velocity を指令相対にする ----------------------------------- #
     #
@@ -1624,13 +1693,15 @@ class K1WalkInsideKickDualRoughEnvCfg(K1WalkInsideKickDualEnvCfg):
         # 「固定した後に新しいランプを足すと、その 1 本だけが巻き戻る側に残る」と
         # 書いている状態で、ここではそれが意図)。
         #
-        # 値と窓の根拠は :data:`_INSIDE_SIGMA_DIRECTION_ANNEAL` のコメント。
+        # 値と窓の根拠、および **再開時に必要な INSIDE_SIGMA_DIR_RESUME=1** は
+        # :func:`_inside_sigma_direction_anneal` のコメント。
+        anneal = _inside_sigma_direction_anneal()
         for term_name in apply_sigma_direction_anneal(self):
             params = getattr(self.curriculum, f"{term_name}_sigma_direction").params
-            params["start_value"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["start_value"]
-            params["end_value"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["end_value"]
-            params["start_step"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["start_step"]
-            params["end_step"] = _INSIDE_SIGMA_DIRECTION_ANNEAL["end_step"]
+            params["start_value"] = anneal["start_value"]
+            params["end_value"] = anneal["end_value"]
+            params["start_step"] = anneal["start_step"]
+            params["end_step"] = anneal["end_step"]
             # steps_per_iteration は apply_sigma_direction_anneal が既に入れている
             # (walk_kick_dual の _STEPS_PER_ITERATION = 48)。ここでは触らない。
 
