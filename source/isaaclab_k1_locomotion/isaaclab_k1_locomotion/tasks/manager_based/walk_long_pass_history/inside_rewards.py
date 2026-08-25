@@ -15,6 +15,7 @@ from isaaclab.utils.math import quat_apply, quat_apply_inverse
 
 from ..walk_kick.mdp.curriculums import kick_rate_gated_speed_range
 from ..walk_kick.mdp.kick_state import kick_state
+from ..walk_kick.mdp.rewards import kick_direction as base_kick_direction
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 
 _FORM_STATE_ATTR = "_inside_kick_form_state"
 _STAGE_STATE_ATTR = "_inside_kick_stage_state"
+_BODY_FACING_STATE_ATTR = "_inside_kick_body_facing_state"
 _FOOT_IDS_ATTR = "_inside_kick_foot_body_ids"
 _NORM_EPS = 1.0e-6
 _MOVING_EPS = 1.0e-3
@@ -48,6 +50,107 @@ def _kick_state(
         overshoot_margin=overshoot_margin,
         lateral_band=lateral_band,
     )
+
+
+def _front_factor(state: dict, *, frozen: bool) -> torch.Tensor:
+    """接触直前の胴体正面にボールがある度合い。横から後方は0、正面は1。"""
+    if frozen:
+        return torch.clamp(state["body_ball_cos_frozen"], min=0.0, max=1.0)
+    return torch.clamp(state["body_ball_cos_pre_step"], min=0.0, max=1.0)
+
+
+def body_ball_facing(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_angle: float = math.radians(60.0),
+    sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """最終接近の正対度がエピソード内の自己ベストを更新した分だけ払う。"""
+    state = _kick_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    angle = torch.acos(torch.clamp(state["body_ball_cos"], -1.0, 1.0))
+    alignment = torch.exp(-((angle / sigma_angle) ** 2))
+    final_approach = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2))
+    potential = alignment * final_approach
+
+    # 状態値を毎step払い続けると、P_kickで正対したままtime-outまで報酬を稼げる。
+    # エピソード内の最大値を更新した差分だけにすれば、正のshapingを保ちながら
+    # 立ち止まりや姿勢の往復では追加報酬が出ない。差分の総和は最大1で有界。
+    step = int(env.common_step_counter)
+    facing_state = getattr(env, _BODY_FACING_STATE_ATTR, None)
+    if facing_state is not None and facing_state["step"] == step:
+        return facing_state["reward"]
+    if facing_state is None:
+        facing_state = {
+            "step": -1,
+            "best": potential.clone(),
+            "reward": torch.zeros_like(potential),
+        }
+        setattr(env, _BODY_FACING_STATE_ATTR, facing_state)
+
+    just_reset = env.episode_length_buf == 1
+    previous_best = torch.where(just_reset, potential, facing_state["best"])
+    improvement = torch.clamp(potential - previous_best, min=0.0)
+    reward = improvement * (~just_reset).float() * (~state["kick_done"]).float()
+
+    facing_state["best"] = torch.maximum(previous_best, potential)
+    facing_state["reward"] = reward
+    facing_state["step"] = step
+    return reward
+
+
+def kick_direction_front_gated(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_direction: float = 0.35,
+    v_gate_frac: float = 0.0,
+    sigma_gate: float = 0.05,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """既存の方向精度報酬を、キック時の胴体―ボール前方係数でゲートする。"""
+    reward = base_kick_direction(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        sigma_direction=sigma_direction,
+        v_gate_frac=v_gate_frac,
+        sigma_gate=sigma_gate,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    state = _kick_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    return reward * _front_factor(state, frozen=True)
 
 
 def _foot_body_ids(env: ManagerBasedRLEnv, robot) -> list[int]:
@@ -243,7 +346,12 @@ def kick_inside_contact(
     )
     angle = torch.acos(torch.clamp(form["inside_contact_cos_frozen"], -1.0, 1.0))
     reward = torch.exp(-((angle / sigma_contact) ** 2))
-    return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
+    return (
+        reward
+        * form["form_valid_frozen"].float()
+        * shared["kick_done"].float()
+        * _front_factor(shared, frozen=True)
+    )
 
 
 def kick_ankle_contact(
@@ -271,7 +379,12 @@ def kick_ankle_contact(
     )
     error_x = (form["contact_local_x_frozen"] - target_x) / sigma_x
     reward = torch.exp(-(error_x**2))
-    return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
+    return (
+        reward
+        * form["form_valid_frozen"].float()
+        * shared["kick_done"].float()
+        * _front_factor(shared, frozen=True)
+    )
 
 
 def first_ball_touch(
@@ -304,7 +417,11 @@ def first_ball_touch(
         min=0.0,
         max=1.0,
     )
-    return first_touch.float() * (base_fraction + speed_bonus_scale * speed_ratio)
+    return (
+        first_touch.float()
+        * (base_fraction + speed_bonus_scale * speed_ratio)
+        * _front_factor(state, frozen=False)
+    )
 
 
 def _set_reward_weight(env: ManagerBasedRLEnv, term_name: str, weight: float) -> None:
@@ -381,6 +498,8 @@ def inside_kick_stage_curriculum(
             "first_touch_rate": 0.0,
             "extra_touch_count": 0.0,
             "touch_to_kick_rate": 0.0,
+            "body_ball_angle_at_kick_deg": 0.0,
+            "body_ball_angle_sample_count": 0.0,
             "promoted_at": None,
             "direction_promoted_at": None,
             "inside_face_phase": "rough",
@@ -397,6 +516,7 @@ def inside_kick_stage_curriculum(
         state["kick_rate_ema"] += ema_alpha * (kick_rate - state["kick_rate_ema"])
 
         successful_kicks = float(kick_done.sum())
+        state["body_ball_angle_sample_count"] = successful_kicks
         if form is not None and successful_kicks > 0.0:
             valid = form["form_valid_frozen"][env_ids]
             contact_cos = form["inside_contact_cos_frozen"][env_ids]
@@ -406,6 +526,16 @@ def inside_kick_stage_curriculum(
             state["inside_contact_rate_ema"] += ema_alpha * (
                 inside_contact_rate - state["inside_contact_rate_ema"]
             )
+
+        kick_latch = getattr(env, "_kick_latch_state", None)
+        if kick_latch is not None and successful_kicks > 0.0:
+            kicked = kick_done > 0.5
+            body_ball_angle = torch.rad2deg(
+                torch.acos(
+                    torch.clamp(kick_latch["body_ball_cos_frozen"][env_ids], -1.0, 1.0)
+                )
+            )
+            state["body_ball_angle_at_kick_deg"] = float(body_ball_angle[kicked].mean())
 
         if touch_count_metric is not None:
             touch_count = touch_count_metric[env_ids]
@@ -441,6 +571,8 @@ def inside_kick_stage_curriculum(
             "first_touch_rate": state["first_touch_rate"],
             "extra_touch_count": state["extra_touch_count"],
             "touch_to_kick_rate": state["touch_to_kick_rate"],
+            "body_ball_angle_at_kick_deg": state["body_ball_angle_at_kick_deg"],
+            "body_ball_angle_sample_count": state["body_ball_angle_sample_count"],
             "speed_min": start_range[0],
             "speed_max": start_range[1],
             "alpha": 0.0,
@@ -531,6 +663,8 @@ def inside_kick_stage_curriculum(
         "first_touch_rate": state["first_touch_rate"],
         "extra_touch_count": state["extra_touch_count"],
         "touch_to_kick_rate": state["touch_to_kick_rate"],
+        "body_ball_angle_at_kick_deg": state["body_ball_angle_at_kick_deg"],
+        "body_ball_angle_sample_count": state["body_ball_angle_sample_count"],
         "iterations_since_promotion": now - promoted_at,
         "inside_face_phase": inside_face_phase_metric,
         "inside_face_multiplier": inside_face_multiplier,
@@ -567,7 +701,12 @@ def kick_inside_face_alignment(
     )
     angle = torch.acos(torch.clamp(form["inside_face_cos_frozen"], -1.0, 1.0))
     reward = torch.exp(-((angle / sigma_angle) ** 2))
-    return reward * form["form_valid_frozen"].float() * shared["kick_done"].float()
+    return (
+        reward
+        * form["form_valid_frozen"].float()
+        * shared["kick_done"].float()
+        * _front_factor(shared, frozen=True)
+    )
 
 
 def kick_straight_swing(
@@ -600,6 +739,7 @@ def kick_straight_swing(
         * moving.float()
         * form["form_valid_frozen"].float()
         * shared["kick_done"].float()
+        * _front_factor(shared, frozen=True)
     )
 
 
@@ -628,7 +768,7 @@ def kick_velocity_independent(
     )
     speed = state["v_ball_3d_frozen"] if use_3d_speed else state["v_ball_frozen"]
     reward = torch.exp(-(((speed - state["v_target"]) / sigma_velocity) ** 2))
-    return reward * state["kick_done"].float()
+    return reward * state["kick_done"].float() * _front_factor(state, frozen=True)
 
 
 def kick_opposite_direction(
@@ -685,4 +825,4 @@ def kick_elevation_independent(
         reward = torch.clamp(phi / phi_sat, min=0.0, max=1.0)
     else:
         reward = torch.exp(-(((phi - phi_target) / sigma_phi) ** 2))
-    return reward * state["kick_done"].float()
+    return reward * state["kick_done"].float() * _front_factor(state, frozen=True)

@@ -24,6 +24,14 @@ policy / critic の次元は 223 / 61 を維持する。
 キック成立前の探索を補助するため、エピソード最初の足とボールの接触には+2を払い、
 2回目以降の接触は1回あたり-0.5として、一度の接触で蹴り切るよう誘導する。
 
+後ろ向きキックの抜け道を塞ぐため、P_kick付近では胴体をボールへ向ける広角の
+正対shapingを有効にする。さらに接触直前の胴体―ボール角度をキック成立時に凍結し、
+ボールが横から後方にあるほど全ての正のキック報酬を減らし、90°以上では0にする。
+正対shapingはエピソード内の自己ベスト更新分だけを払い、構えたままの報酬稼ぎを防ぐ。
+
+ボールは実機で使用する4号球に合わせて半径0.1025 mとし、質量はstartup時に
+0.35--0.39 kgから環境ごとにサンプルする。
+
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
 
@@ -127,6 +135,9 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
 * ``Metrics/kick_direction/kick_dir_error_deg`` … インサイドフォームとStage 3の
   最終球方向報酬によって、結果の方向精度が維持・改善するか。
+* ``Curriculum/kick_speed_range/body_ball_angle_at_kick_deg`` … 成功キック時にボールが
+  胴体正面へあるか。0°が正対、90°以上はキックの正報酬が0になる。成功キックがない
+  reset batchでは直前の有効値を保持するので、``body_ball_angle_sample_count``も併せて見る。
 * ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
   成功キックだけの方向平均誤差 EMA。
 * ``Curriculum/kick_speed_range/stage`` … 1は内側接触、2は方向フォームと球速帯、
@@ -140,6 +151,7 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 * ``Curriculum/kick_speed_range/direction_accuracy_alpha`` / ``direction_accuracy_weight`` …
   Stage 3で立ち上げる最終球方向報酬の進捗と実weight。
 * ``Episode_Reward/kick_direction_accuracy`` … Stage 3で追加される最終球方向の正報酬。
+* ``Episode_Reward/body_ball_facing`` … P_kick付近で胴体をボールへ向ける広角の正対報酬。
 * ``Curriculum/kick_speed_range/first_touch_rate`` … 終了エピソード中、一度以上ボールへ
   接触した割合。
 * ``Curriculum/kick_speed_range/extra_touch_count`` … 終了エピソードあたりの2回目以降の
@@ -154,9 +166,12 @@ critic に履歴は付けない。左足裏スロットだけは遅延なしボ�
 
 import math
 
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
@@ -207,6 +222,11 @@ if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
 # runner 側を変えた場合はここも同時に変えること。
 _STEPS_PER_ITERATION = 48
 
+# 実機で使用する4号球。半径は固定し、個体差を含む規格範囲は質量DRで直接サンプルする。
+_BALL_RADIUS = 0.1025
+_BALL_MASS_NOMINAL = 0.37
+_BALL_MASS_RANGE = (0.35, 0.39)
+
 # インサイドフォームへ配分する nominal weight。post-latch の実 weight は親と同じく
 # _KICK_W_SCALE を掛け、2 秒の支払い窓を変えてもキック 1 回の収益を維持する。
 _INSIDE_FACE_WEIGHT = 3.0
@@ -237,6 +257,14 @@ _INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG = 10.0
 _DIRECTION_ACCURACY_WEIGHT = 6.0
 _DIRECTION_ACCURACY_PROMOTE_ERROR_DEG = 20.0
 _DIRECTION_ACCURACY_RAMP_ITERATIONS = 200
+# 最終接近ではボール方向へ胴体を向ける。インサイドの左右オフセットを許すため広角にし、
+# P_kickから遠い回り込み中には効かないよう既存の構え距離sigmaでゲートする。
+# 報酬関数は正対potentialの自己ベスト更新差分（1episode合計最大1）を返す。
+# RewardManagerがdtを掛けるため、weight=1/dtで最大収益を+1.0に戻す。
+_BODY_BALL_FACING_MAX_RETURN = 1.0
+_BODY_BALL_FACING_WEIGHT = _BODY_BALL_FACING_MAX_RETURN / _CTRL_DT
+_BODY_BALL_FACING_SIGMA_DEG = 60.0
+_BODY_BALL_FACING_SIGMA_POSE = 0.3
 # 足collisionの踵はfoot_link原点から約-64 mm。踵から60 mmを狙うためlocal X=-4 mm。
 _ANKLE_CONTACT_TARGET_X = -0.004
 _ANKLE_CONTACT_SIGMA_X = 0.025
@@ -350,6 +378,30 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        # -- 0. 実機で使用する4号球へ合わせる
+        #
+        # 親の5号球相当設定をこのHistoryタスク内だけで上書きし、他のWalk-Kick派生
+        # タスクや既存DRの質量範囲には波及させない。半径はspawn後にenvごとへ変更
+        # できないため固定し、質量だけ規格範囲350--390 gをstartup時に直接設定する。
+        self.scene.soccer_ball.spawn.radius = _BALL_RADIUS
+        self.scene.soccer_ball.spawn.mass_props.mass = _BALL_MASS_NOMINAL
+        ball_init_pos = self.scene.soccer_ball.init_state.pos
+        self.scene.soccer_ball.init_state.pos = (
+            ball_init_pos[0],
+            ball_init_pos[1],
+            _BALL_RADIUS,
+        )
+        self.events.reset_ball.params["ball_radius"] = _BALL_RADIUS
+        self.events.ball_mass = EventTerm(
+            func=loco_mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "mass_distribution_params": _BALL_MASS_RANGE,
+                "operation": "abs",
+            },
+        )
+
         # -- 1. 最終球方向中心の報酬をインサイドフォーム中心へ置換
         #
         # 旧 kick_direction (nominal 6) はStage 1/2では、接触時のインサイド面角度 (3) と
@@ -370,9 +422,19 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
         self.curriculum.kick_direction_weight = None
 
         self.rewards.kick_direction_accuracy = RewTerm(
-            func=mdp.kick_direction,
+            func=inside_rewards.kick_direction_front_gated,
             weight=0.0,
             params=direction_accuracy_params,
+        )
+
+        self.rewards.body_ball_facing = RewTerm(
+            func=inside_rewards.body_ball_facing,
+            weight=_BODY_BALL_FACING_WEIGHT,
+            params={
+                **kick_state_params,
+                "sigma_angle": math.radians(_BODY_BALL_FACING_SIGMA_DEG),
+                "sigma_pose": _BODY_BALL_FACING_SIGMA_POSE,
+            },
         )
 
         self.rewards.kick_inside_contact = RewTerm(
