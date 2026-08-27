@@ -6,8 +6,31 @@
 """K1 ロングパス + 短期 I/O 履歴 (short history) 環境。
 
 :class:`~..walk_long_pass.walk_long_pass_env_cfg.K1WalkLongPassEnvCfg` の
-**継続学習用** バリアント。報酬・コマンド分布・カリキュラム・行動空間・critic 観測は
-一切変えず、**policy 観測の本体状態 5 項に 0.1 秒ぶんの履歴を付ける** だけ。
+**短期履歴 + 左右対称学習用** バリアント。行動空間を継承し、policy 観測の
+本体状態 5 項に 0.1 秒ぶんの履歴を付ける。さらに、左足裏だけを見る 3 次元スロットを
+ミラー可能なボール 3D 位置へ差し替える。蹴り方向は、報酬と同じ真のコマンド方向を
+現在のbase座標へ変換してactorへ渡す。観測フィールド名と順序は継承元のままなので、
+policy / critic の次元は 223 / 61 を維持する。
+
+観測の意味変更に適応する間に「蹴らない」へ崩れないよう、継続学習用のカリキュラムだけ
+親から変更する。Stage 1では目標方向を採点せず、足中心から見たボール方向が内側面法線
+から30°以内になる接触を先に学ぶ。キック成立率と内側接触率のEMAがともに0.80以上に
+なったら一方向にStage 2へ進み、面角度・直線スイング・逆方向罰則と、精度ゲート付きの
+球速帯カリキュラムを有効化する。
+
+内側接触報酬は両Stageで通常値の10倍にする。Stage 2では接触時の足内側面法線を
+目標方向へ向ける報酬を10倍、接触直前の足速度を目標方向へ揃える報酬を3倍で有効化する。
+球速と30度仰角は方向から独立して評価し、最終球方向は目標の反対半球だけを罰する。
+キック成立前の探索を補助するため、エピソード最初の足とボールの接触には+2を払い、
+2回目以降の接触は1回あたり-0.5として、一度の接触で蹴り切るよう誘導する。
+
+後ろ向きキックの抜け道を塞ぐため、P_kick付近では胴体をボールへ向ける広角の
+正対shapingを有効にする。さらに接触直前の胴体―ボール角度をキック成立時に凍結し、
+ボールが横から後方にあるほど全ての正のキック報酬を減らし、90°以上では0にする。
+正対shapingはエピソード内の自己ベスト更新分だけを払い、構えたままの報酬稼ぎを防ぐ。
+
+ボールは実機で使用する4号球に合わせて半径0.1025 mとし、質量はstartup時に
+0.35--0.39 kgから環境ごとにサンプルする。
 
 arXiv:2401.16889 (Locomotion policy に短期の観測+行動履歴を与える) 相当。
 ネットワーク構造 (MLP / 隠れ層) は変更しない。増えるのは入力層の幅だけ。
@@ -48,18 +71,17 @@ term                    dim   意味
 ``prev_joint_request``  12    **actions** (前ステップの目標関節角)
 ======================  ====  =========================================
 
-付けない (タスク条件付け項 = 履歴化しても情報が増えない):
+付けない (タスク条件付け項):
 
-* ``kick_direction`` / ``target_kick_velocity`` … エピソード中ずっと定数。
-  履歴を取ると同じ値が 5 回並ぶだけ。
+* ``kick_direction`` … 現在の真のyawでbase座標へ変換した方向。履歴化せず現在値だけを渡す。
+* ``target_kick_velocity`` … エピソード中ずっと定数。履歴を取ると同じ値が5回並ぶだけ。
 * ``gait_phase`` / ``gait_phase_factor_offset`` … 位相は時刻の決定的関数なので、
   履歴は現在値から復元できる。
 * ``ball_vel`` / ``prev_ball_pos`` … **既に履歴になっている**。``prev_ball_pos`` は
   遅延させたボール位置そのもの、``ball_vel`` はその差分。ここに history_length を
   重ねると同じ情報を二重に持つことになる (指示の「既存の ball history と重複しない」)。
-* ``sole_pos`` … 本体状態ではあるが今回の対象リストに入っていない。
-  履歴化したければ ``_HISTORY_TERMS`` に ``"sole_pos"`` を足すだけでよい
-  (policy 223 → 235 次元。checkpoint 拡張スクリプト側の表も同時に直すこと)。
+* ``sole_pos`` … 順序保持のため属性名だけを残した、1 ステップ遅延の
+  **ボール 3D 位置**。既存の ``prev_ball_pos`` / ``ball_vel`` と同様に履歴化しない。
 
 次元
 ----
@@ -71,9 +93,9 @@ critic    61      61       変更なし
 action    12      12       変更なし
 ========  ======  =======  ==============================================
 
-critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延なしボール位置を
-特権情報として持っており、履歴が埋めるはずの「観測できない状態」を直接見ている
-ため。value の精度が上がる余地が小さい割に、次元が 305 に膨らむ。
+critic に履歴は付けない。左足裏スロットだけは遅延なしボール位置へ
+置換するが、既存の特権情報 ``ball_pos_rel`` も残し、61 次元と checkpoint の
+形状契約を変えない。どちらもミラー写像では (x, y, z) → (x, −y, z) とする。
 
 既存 checkpoint からの引き継ぎ (重要)
 --------------------------------------
@@ -90,33 +112,89 @@ critic を触らないのは、critic は既に真の ``base_lin_vel`` と遅延
         logs/rsl_rl/k1_walk_long_pass/<run>/model_<N>.pt \\
         -o /tmp/long_pass_history_init.pt
 
-元の重み列を各履歴ブロックの **最新スロット** に置き、残り 4 スロットを 0 で埋めるので、
-拡張直後のポリシーは **元と挙動が完全に一致する** (過去フレームは無視される)。
-そこから fine-tune する。通し実行は
-``./scripts/rsl_rl/train_walk_long_pass_history.sh``。
+このスクリプトは履歴ブロックの列を拡張して **形状上は** 読み込めるようにする。
+ただし、元 checkpoint の左足裏スロットの重みと正規化統計は、新タスクでは
+ボール位置に対して適用される。したがって **意味的に互換ではなく、挙動も一致しない**。
+利用する場合は近似的な初期化として扱うこと。通し実行は
+``./scripts/rsl_rl/train_walk_long_pass_history.sh`` だが、これも同じ近似初期化を使う。
 
-カリキュラムは :func:`~..walk_long_pass.walk_long_pass_env_cfg._freeze_curricula_at_final`
-で全部終値に固定してあるので、``common_step_counter`` が 0 でも iter 0 から親タスクの
-収束状態で始まる。``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
+``common_step_counter`` が 0 に戻る ``--load_pretrained`` でもキック報酬を消さないため、
+500 iteration までに終わる報酬 weight のランプだけは終値に固定する。Stage 1では
+内側接触だけを採点し、Stage 2昇格後に500 iterationの安定期間を置いて球速帯を進める。
+方向誤差 EMA が20°未満になると不可逆にStage 3へ進み、最終球方向の正報酬を
+200 iterationかけて立ち上げる。
+球速帯はキック成立率 EMA が0.80以上かつ成功キックの方向平均誤差 EMA が25°以下なら
+進み、成立率が0.50未満または方向誤差が35°以上なら2倍速で戻る。最終帯へ到達した後だけ
+``non_kick_ball_touch`` を 500 iteration かけて 0 → -25 へ立ち上げる。
+``--reset_noise_std`` は **付けないこと** (蹴り方を壊す)。
 
 見るべきもの
 ------------
-* ``Metrics/kick_direction/kick_rate`` … 0.99 付近を維持するはず。拡張が正しければ
-  iter 0 の時点で親と同じ値が出る。ここが最初から低いなら checkpoint 拡張の失敗。
-* ``Metrics/kick_direction/kick_vel_ratio`` / ``kick_dir_error_deg`` … 履歴で改善するか。
+* ``Metrics/kick_direction/kick_rate`` … 観測の意味変更と mirror loss 導入時の過渡を
+  監視する。旧 checkpoint を使う場合も iter 0 で親と同じ値になる保証はない。
+* ``Metrics/kick_direction/kick_vel_ratio`` … 独立した球速追従が指令速度へ収束するか。
+* ``Metrics/kick_direction/kick_dir_error_deg`` … インサイドフォームとStage 3の
+  最終球方向報酬によって、結果の方向精度が維持・改善するか。
+* ``Curriculum/kick_speed_range/body_ball_angle_at_kick_deg`` … 成功キック時にボールが
+  胴体正面へあるか。0°が正対、90°以上はキックの正報酬が0になる。成功キックがない
+  reset batchでは直前の有効値を保持するので、``body_ball_angle_sample_count``も併せて見る。
+* ``Curriculum/kick_speed_range/kick_dir_error_ema_deg`` … 速度帯ゲートが見る、
+  成功キックだけの方向平均誤差 EMA。
+* ``Curriculum/kick_speed_range/stage`` … 1は内側接触、2は方向フォームと球速帯、
+  3は最終球方向精度の直接学習。
+* ``Curriculum/kick_speed_range/inside_contact_rate_ema`` … 成功キック中、足内側30°以内で
+  接触できた割合のEMA。0.80以上がStage 2への昇格条件。
+* ``Curriculum/kick_speed_range/inside_face_phase`` … 足内側面報酬の段階。
+  -1=Stage 1、2=粗調整、1=精密化、0=維持。
+* ``Curriculum/kick_speed_range/inside_face_multiplier`` / ``inside_face_sigma_deg`` /
+  ``inside_face_weight`` … 現在適用中の足内側面報酬の倍率、Gaussian幅、実weight。
+* ``Curriculum/kick_speed_range/direction_accuracy_alpha`` / ``direction_accuracy_weight`` …
+  Stage 3で立ち上げる最終球方向報酬の進捗と実weight。
+* ``Episode_Reward/kick_direction_accuracy`` … Stage 3で追加される最終球方向の正報酬。
+* ``Episode_Reward/body_ball_facing`` … P_kick付近で胴体をボールへ向ける広角の正対報酬。
+* ``Curriculum/kick_speed_range/first_touch_rate`` … 終了エピソード中、一度以上ボールへ
+  接触した割合。
+* ``Curriculum/kick_speed_range/extra_touch_count`` … 終了エピソードあたりの2回目以降の
+  接触回数。
+* ``Curriculum/kick_speed_range/touch_to_kick_rate`` … 接触した終了エピソードのうち
+  ``kick_done``まで到達した割合。
 * ``Train/mean_episode_length`` … 履歴は転倒直前の兆候 (角速度の発散) を見せるので、
   転倒が減れば伸びる。
 * ``Policy/mean_noise_std`` … 入力層だけが広がった状態からの再学習なので、std が
   暴れないか。暴れるなら learning_rate を下げる。
 """
 
+import math
+
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
+from isaaclab.managers import EventTermCfg as EventTerm
+from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import RewardTermCfg as RewTerm
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 
 from ..walk_long_pass.walk_long_pass_env_cfg import (
     _LONG_PASS_SPEED_RANGE,
+    _LONG_PASS_SPEED_RANGE_START,
+    _SPEED_RAMP_END_ITER,
+    _SPEED_RAMP_START_ITER,
     K1WalkLongPassEnvCfg,
-    _freeze_curricula_at_final,
 )
+from ..walk_kick import mdp
+from ..walk_kick.walk_kick_env_cfg import (
+    _KICK_W_SCALE,
+    _SIGMA_DIRECTION,
+    K1WalkKickCriticCfg,
+    K1WalkKickObservationsCfg,
+    K1WalkKickPolicyCfg,
+)
+from . import inside_rewards
+from .observations import (
+    BALL_POSITION_NOISE_MAX_M,
+    SharedDelayedBallPosition,
+)
+from .symmetry import HISTORY_LEN as _SYMMETRY_HISTORY_LEN
 
 # --------------------------------------------------------------------------- #
 # 短期履歴の長さ
@@ -134,6 +212,77 @@ _SIM_DT = 0.005
 _DECIMATION = 4
 _CTRL_DT = _SIM_DT * _DECIMATION  # 0.02 s = 50 Hz
 _HISTORY_LEN = max(4, round(_HISTORY_S / _CTRL_DT))  # 5
+if _HISTORY_LEN != _SYMMETRY_HISTORY_LEN:
+    raise ValueError(
+        "walk_long_pass_history の履歴長と mirror 写像が一致しません: "
+        f"{_HISTORY_LEN} != {_SYMMETRY_HISTORY_LEN}"
+    )
+
+# PPO runner の num_steps_per_env。カリキュラムの step を iteration へ換算する値なので、
+# runner 側を変えた場合はここも同時に変えること。
+_STEPS_PER_ITERATION = 48
+
+# 実機で使用する4号球。半径は固定し、個体差を含む規格範囲は質量DRで直接サンプルする。
+_BALL_RADIUS = 0.1025
+_BALL_MASS_NOMINAL = 0.37
+_BALL_MASS_RANGE = (0.35, 0.39)
+
+# インサイドフォームへ配分する nominal weight。post-latch の実 weight は親と同じく
+# _KICK_W_SCALE を掛け、2 秒の支払い窓を変えてもキック 1 回の収益を維持する。
+_INSIDE_FACE_WEIGHT = 3.0
+_STRAIGHT_SWING_WEIGHT = 3.0
+_INSIDE_CONTACT_WEIGHT = 3.0
+_ANKLE_CONTACT_WEIGHT = 3.0
+_VELOCITY_TRACKING_WEIGHT = 5.0
+_OPPOSITE_DIRECTION_WEIGHT = -2.0
+_INSIDE_CONTACT_MULTIPLIER = 10.0
+_INSIDE_FACE_MULTIPLIER = 10.0
+_STRAIGHT_SWING_MULTIPLIER = 3.0
+# Stage 1 の接触角報酬は、横向き接触からも内側面へ向かう勾配が残る幅にする。
+# 昇格判定は下の 30 deg のままなので、Stage 2 条件自体は緩めない。
+_INSIDE_CONTACT_REWARD_SIGMA_DEG = 90.0
+_INSIDE_CONTACT_ANGLE_DEG = 30.0
+# Stage 2 の足内側面報酬。最終方向誤差が大きい間は幅を広げて勾配を残し、
+# 30 deg / 10 deg を下回るごとに倍率と幅を絞る。一度進んだ段階は戻さない。
+_INSIDE_FACE_ROUGH_MULTIPLIER = 2.0
+_INSIDE_FACE_PRECISION_MULTIPLIER = 1.5
+_INSIDE_FACE_MAINTAIN_MULTIPLIER = 1.0
+_INSIDE_FACE_ROUGH_SIGMA_DEG = 45.0
+_INSIDE_FACE_PRECISION_SIGMA_DEG = 30.0
+_INSIDE_FACE_MAINTAIN_SIGMA_DEG = math.degrees(_SIGMA_DIRECTION)
+_INSIDE_FACE_PRECISION_ENTER_BELOW_DEG = 30.0
+_INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG = 10.0
+# Stage 3 は方向誤差 EMA が20 deg未満になった時点で不可逆に有効化し、旧方向報酬の
+# nominal weight 6.0を200 iterationかけて復帰する。実weightの終値は6.0*0.3=1.8。
+_DIRECTION_ACCURACY_WEIGHT = 6.0
+_DIRECTION_ACCURACY_PROMOTE_ERROR_DEG = 20.0
+_DIRECTION_ACCURACY_RAMP_ITERATIONS = 200
+# 最終接近ではボール方向へ胴体を向ける。インサイドの左右オフセットを許すため広角にし、
+# P_kickから遠い回り込み中には効かないよう既存の構え距離sigmaでゲートする。
+# 報酬関数は正対potentialの自己ベスト更新差分（1episode合計最大1）を返す。
+# RewardManagerがdtを掛けるため、weight=1/dtで最大収益を+1.0に戻す。
+_BODY_BALL_FACING_MAX_RETURN = 1.0
+_BODY_BALL_FACING_WEIGHT = _BODY_BALL_FACING_MAX_RETURN / _CTRL_DT
+_BODY_BALL_FACING_SIGMA_DEG = 60.0
+_BODY_BALL_FACING_SIGMA_POSE = 0.3
+# 足collisionの踵はfoot_link原点から約-64 mm。踵から60 mmを狙うためlocal X=-4 mm。
+_ANKLE_CONTACT_TARGET_X = -0.004
+_ANKLE_CONTACT_SIGMA_X = 0.025
+_INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
+_INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
+_FIRST_TOUCH_WEIGHT = 100.0  # イベント1回 × dt 0.02 = +2.0
+_EXTRA_TOUCH_WEIGHT = -25.0  # イベント1回 × dt 0.02 = -0.5
+_FAILED_KICK_WEIGHT = -50.0  # イベント1回 × dt 0.02 = -1.0
+_ACTION_SMOOTHNESS_WEIGHT = -0.30
+_DOF_ACC_L2_WEIGHT = -2.0e-6
+
+# 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
+# ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
+_SPEED_GATE_ADVANCE_ABOVE = 0.80
+_SPEED_GATE_RETREAT_BELOW = 0.50
+_SPEED_GATE_ADVANCE_ERROR_BELOW_DEG = 25.0
+_SPEED_GATE_RETREAT_ERROR_ABOVE_DEG = 35.0
+_SPEED_GATE_RETREAT_SCALE = 2.0
 
 # --------------------------------------------------------------------------- #
 # 履歴を付ける policy 観測項 (K1WalkKickPolicyCfg の項名)
@@ -156,21 +305,298 @@ _HISTORY_TERMS = (
 )
 
 
+def _freeze_fade_in_curricula(cfg, before_iter: int) -> list[str]:
+    """``before_iter`` までに終わる報酬 weight のランプだけを終値に固定する。
+
+    継続学習の開始時にキック報酬を 0 へ戻すと、適応期間中に「蹴らない方が得」という
+    収支を作ってしまう。一方、球速帯と後段の非キック接触罰は今回の復旧順序に必要なので、
+    ``mdp.linear_reward_weight`` かつ早期に終わる項だけを対象にする。
+
+    Returns:
+        定数化した curriculum term の名前。
+    """
+    frozen: list[str] = []
+    for name in dir(cfg.curriculum):
+        if name.startswith("_"):
+            continue
+        term = getattr(cfg.curriculum, name, None)
+        if term is None or getattr(term, "func", None) is not mdp.linear_reward_weight:
+            continue
+        params = term.params
+        if "end_step" not in params or params["end_step"] > before_iter:
+            continue
+        if params["start_weight"] == params["end_weight"]:
+            continue
+        params["start_weight"] = params["end_weight"]
+        frozen.append(name)
+    return frozen
+
+
+@configclass
+class K1WalkLongPassHistoryPolicyCfg(K1WalkKickPolicyCfg):
+    """223 次元 actor 観測の 1 フレーム分の定義。
+
+    ``sole_pos`` は継承元の項順を保つための属性名。値は左足裏ではなく、
+    実機 vision の遅延を表す1制御ステップ前のボール3D位置である。
+    ``prev_ball_pos`` は同じ遅延・ノイズ標本を共有する。``kick_direction`` は
+    自己位置の遅延・位置/yawバイアスを掛けず、報酬と同じ真のコマンド方向を使う。
+    """
+
+    sole_pos = ObsTerm(
+        func=SharedDelayedBallPosition,
+        params={"delay_steps": 1, "dim": 3, "noise_max": BALL_POSITION_NOISE_MAX_M},
+    )
+    kick_direction = ObsTerm(
+        func=mdp.kick_dir_b,
+        params={"command_name": "kick_direction"},
+    )
+    prev_ball_pos = ObsTerm(
+        func=SharedDelayedBallPosition,
+        params={"delay_steps": 1, "dim": 2, "noise_max": BALL_POSITION_NOISE_MAX_M},
+    )
+
+
+@configclass
+class K1WalkLongPassHistoryCriticCfg(K1WalkKickCriticCfg):
+    """61 次元 critic 観測。同じスロットを遅延なしボール位置に置換する。"""
+
+    sole_pos = ObsTerm(
+        func=mdp.delayed_ball_pos_b,
+        params={"delay_steps": 0, "dim": 3},
+    )
+
+
+@configclass
+class K1WalkLongPassHistoryObservationsCfg(K1WalkKickObservationsCfg):
+    policy: K1WalkLongPassHistoryPolicyCfg = K1WalkLongPassHistoryPolicyCfg()
+    critic: K1WalkLongPassHistoryCriticCfg = K1WalkLongPassHistoryCriticCfg()
+
+
 @configclass
 class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
-    """ロングパス + 短期 I/O 履歴。蹴り方そのものは long_pass と同一。"""
+    """ロングパス + 短期 I/O 履歴 + ミラー可能な観測。"""
+
+    observations: K1WalkLongPassHistoryObservationsCfg = K1WalkLongPassHistoryObservationsCfg()
 
     def __post_init__(self) -> None:
         super().__post_init__()
 
-        # -- 1. カリキュラムを終値で固定する（継続学習タスクなので必須）
-        #
-        # --load_pretrained は common_step_counter を 0 のままにするので、放置すると
-        # キック報酬の weight も速度帯も親のランプをやり直してしまう。理由の詳細は
-        # _freeze_curricula_at_final の docstring 参照。
-        _freeze_curricula_at_final(self)
+        self.rewards.action_smoothness_l2.weight = _ACTION_SMOOTHNESS_WEIGHT
+        self.rewards.dof_acc_l2.weight = _DOF_ACC_L2_WEIGHT
 
-        # -- 2. policy 観測の本体状態 5 項に履歴を付ける
+        # -- 0. 実機で使用する4号球へ合わせる
+        #
+        # 親の5号球相当設定をこのHistoryタスク内だけで上書きし、他のWalk-Kick派生
+        # タスクや既存DRの質量範囲には波及させない。半径はspawn後にenvごとへ変更
+        # できないため固定し、質量だけ規格範囲350--390 gをstartup時に直接設定する。
+        self.scene.soccer_ball.spawn.radius = _BALL_RADIUS
+        self.scene.soccer_ball.spawn.mass_props.mass = _BALL_MASS_NOMINAL
+        ball_init_pos = self.scene.soccer_ball.init_state.pos
+        self.scene.soccer_ball.init_state.pos = (
+            ball_init_pos[0],
+            ball_init_pos[1],
+            _BALL_RADIUS,
+        )
+        self.events.reset_ball.params["ball_radius"] = _BALL_RADIUS
+        self.events.ball_mass = EventTerm(
+            func=loco_mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "mass_distribution_params": _BALL_MASS_RANGE,
+                "operation": "abs",
+            },
+        )
+
+        # -- 1. 最終球方向中心の報酬をインサイドフォーム中心へ置換
+        #
+        # 旧 kick_direction (nominal 6) はStage 1/2では、接触時のインサイド面角度 (3) と
+        # 接触直前の足速度方向 (3) に分ける。球速と30度仰角からは _r_direction を外し、
+        # 反対半球だけを飽和ペナルティ (-2) で禁止する。方向誤差 EMA が20 deg未満になった
+        # Stage 3でのみ、旧kick_directionを単独の正報酬として徐々に復帰する。
+        direction_accuracy_params = dict(self.rewards.kick_direction.params)
+        kick_state_params = dict(direction_accuracy_params)
+        for name in ("sigma_direction", "v_gate_frac", "sigma_gate"):
+            kick_state_params.pop(name, None)
+
+        velocity_params = dict(self.rewards.kick_velocity_scaled.params)
+        velocity_params.pop("sigma_direction", None)
+        elevation_params = dict(self.rewards.kick_elevation.params)
+        elevation_params.pop("sigma_direction", None)
+
+        self.rewards.kick_direction = None
+        self.curriculum.kick_direction_weight = None
+
+        self.rewards.kick_direction_accuracy = RewTerm(
+            func=inside_rewards.kick_direction_front_gated,
+            weight=0.0,
+            params=direction_accuracy_params,
+        )
+
+        self.rewards.body_ball_facing = RewTerm(
+            func=inside_rewards.body_ball_facing,
+            weight=_BODY_BALL_FACING_WEIGHT,
+            params={
+                **kick_state_params,
+                "sigma_angle": math.radians(_BODY_BALL_FACING_SIGMA_DEG),
+                "sigma_pose": _BODY_BALL_FACING_SIGMA_POSE,
+            },
+        )
+
+        self.rewards.kick_inside_contact = RewTerm(
+            func=inside_rewards.kick_inside_contact,
+            weight=_INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE,
+            params={
+                **kick_state_params,
+                "sigma_contact": math.radians(_INSIDE_CONTACT_REWARD_SIGMA_DEG),
+            },
+        )
+
+        self.rewards.kick_ankle_contact = RewTerm(
+            func=inside_rewards.kick_ankle_contact,
+            weight=_ANKLE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE,
+            params={
+                **kick_state_params,
+                "target_x": _ANKLE_CONTACT_TARGET_X,
+                "sigma_x": _ANKLE_CONTACT_SIGMA_X,
+            },
+        )
+
+        self.rewards.first_ball_touch = RewTerm(
+            func=inside_rewards.first_ball_touch,
+            weight=_FIRST_TOUCH_WEIGHT,
+            params={
+                **kick_state_params,
+                # 接触だけなら +0.5、latch 閾値まで加速できれば +20.0。
+                # 接触率は上がったが kick へ変換されない Stage 1 の局所解を崩す。
+                "base_fraction": 0.25,
+                "speed_bonus_scale": 9.75,
+            },
+        )
+
+        self.rewards.kick_inside_face_alignment = RewTerm(
+            func=inside_rewards.kick_inside_face_alignment,
+            weight=0.0,
+            params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
+        )
+
+        self.rewards.kick_straight_swing = RewTerm(
+            func=inside_rewards.kick_straight_swing,
+            weight=0.0,
+            params={**kick_state_params, "sigma_angle": _SIGMA_DIRECTION},
+        )
+
+        self.rewards.kick_velocity_scaled.func = inside_rewards.kick_velocity_independent
+        self.rewards.kick_velocity_scaled.params = velocity_params
+        self.curriculum.kick_velocity_scaled_weight.params["end_weight"] = (
+            _VELOCITY_TRACKING_WEIGHT * _KICK_W_SCALE
+        )
+
+        self.rewards.kick_elevation.func = inside_rewards.kick_elevation_independent
+        self.rewards.kick_elevation.params = elevation_params
+
+        self.rewards.kick_opposite_direction = RewTerm(
+            func=inside_rewards.kick_opposite_direction,
+            weight=0.0,
+            params=kick_state_params,
+        )
+        self.curriculum.kick_opposite_direction_weight = None
+        self.rewards.failed_inside_kick = RewTerm(
+            func=inside_rewards.failed_inside_kick_attempt,
+            weight=0.0,
+            params={**kick_state_params, "confirmation_window_s": 0.20},
+        )
+
+        # -- 2. 継続学習用の復旧カリキュラム
+        #
+        # 観測の意味変更へ適応する間は、親の最終速度帯を最初から要求しない。
+        # 親の早期報酬 weight は終値に保ち、成立率を見ながら球速帯を進退させる。
+        # 最初の接触には定額報酬を払い、2回目以降は弱く罰して、一度の接触で
+        # kick_done まで到達するよう誘導する。回り込み中の接触姿勢罰は、従来どおり
+        # 最終速度帯へ到達した後にだけ立ち上げる。
+        non_kick_touch_params = dict(self.rewards.extra_ball_touch.params)
+        non_kick_touch_params["sigma_pose"] = self.rewards.ball_avoidance.params["sigma_pose"]
+        self.rewards.extra_ball_touch.weight = _EXTRA_TOUCH_WEIGHT
+        self.curriculum.extra_ball_touch_weight = None
+        self.rewards.non_kick_ball_touch = RewTerm(
+            func=mdp.non_kick_ball_touch,
+            weight=0.0,
+            params=non_kick_touch_params,
+        )
+        self.curriculum.non_kick_ball_touch_weight = CurrTerm(
+            func=mdp.linear_reward_weight_after_speed_gate,
+            params={
+                "term_name": "non_kick_ball_touch",
+                "start_weight": 0.0,
+                # RewardManager は dt=0.02 を掛けるので、最大で1接触あたり-0.5。
+                "end_weight": -25.0,
+                "command_name": "kick_direction",
+                "ramp_iterations": 500,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+            },
+        )
+
+        _freeze_fade_in_curricula(self, before_iter=_SPEED_RAMP_START_ITER)
+
+        self.curriculum.kick_speed_range = CurrTerm(
+            func=inside_rewards.inside_kick_stage_curriculum,
+            params={
+                "command_name": "kick_direction",
+                "inside_contact_term_name": "kick_inside_contact",
+                "inside_face_term_name": "kick_inside_face_alignment",
+                "straight_swing_term_name": "kick_straight_swing",
+                "opposite_direction_term_name": "kick_opposite_direction",
+                "direction_accuracy_term_name": "kick_direction_accuracy",
+                "failed_kick_term_name": "failed_inside_kick",
+                "inside_contact_weight": (
+                    _INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_inside_face_weight": (
+                    _INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_straight_swing_weight": (
+                    _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
+                ),
+                "stage2_opposite_direction_weight": _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE,
+                "stage3_direction_accuracy_weight": (
+                    _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE
+                ),
+                "failed_kick_weight": _FAILED_KICK_WEIGHT,
+                "stage3_promote_error_below_deg": _DIRECTION_ACCURACY_PROMOTE_ERROR_DEG,
+                "stage3_direction_ramp_iterations": _DIRECTION_ACCURACY_RAMP_ITERATIONS,
+                "inside_contact_angle_deg": _INSIDE_CONTACT_ANGLE_DEG,
+                "promote_kick_rate": _INSIDE_STAGE_PROMOTE_KICK_RATE,
+                "promote_inside_contact_rate": _INSIDE_STAGE_PROMOTE_CONTACT_RATE,
+                "start_range": _LONG_PASS_SPEED_RANGE_START,
+                "end_range": _LONG_PASS_SPEED_RANGE,
+                "speed_start_step": _SPEED_RAMP_START_ITER,
+                "speed_end_step": _SPEED_RAMP_END_ITER,
+                "steps_per_iteration": _STEPS_PER_ITERATION,
+                "speed_advance_above": _SPEED_GATE_ADVANCE_ABOVE,
+                "speed_retreat_below": _SPEED_GATE_RETREAT_BELOW,
+                "speed_advance_error_below_deg": _SPEED_GATE_ADVANCE_ERROR_BELOW_DEG,
+                "speed_retreat_error_above_deg": _SPEED_GATE_RETREAT_ERROR_ABOVE_DEG,
+                "speed_retreat_scale": _SPEED_GATE_RETREAT_SCALE,
+                "inside_face_rough_multiplier": _INSIDE_FACE_ROUGH_MULTIPLIER,
+                "inside_face_precision_multiplier": _INSIDE_FACE_PRECISION_MULTIPLIER,
+                "inside_face_maintain_multiplier": _INSIDE_FACE_MAINTAIN_MULTIPLIER,
+                "inside_face_rough_sigma_angle": math.radians(_INSIDE_FACE_ROUGH_SIGMA_DEG),
+                "inside_face_precision_sigma_angle": math.radians(
+                    _INSIDE_FACE_PRECISION_SIGMA_DEG
+                ),
+                "inside_face_maintain_sigma_angle": math.radians(
+                    _INSIDE_FACE_MAINTAIN_SIGMA_DEG
+                ),
+                "inside_face_precision_enter_below_deg": (
+                    _INSIDE_FACE_PRECISION_ENTER_BELOW_DEG
+                ),
+                "inside_face_maintain_enter_below_deg": (
+                    _INSIDE_FACE_MAINTAIN_ENTER_BELOW_DEG
+                ),
+            },
+        )
+
+        # -- 3. policy 観測の本体状態 5 項に履歴を付ける
         #
         # ObsGroup 側の history_length は **使わない**。グループに設定すると
         # ObservationManager が全項に一括で配ってしまい (observation_manager.py の
@@ -211,3 +637,12 @@ class K1WalkLongPassHistoryEnvCfg_PLAY(K1WalkLongPassHistoryEnvCfg):
         # 親が K1WalkLongPassEnvCfg_PLAY ではないので、ここで同じ処理を行う。
         self.curriculum.kick_speed_range = None
         self.commands.kick_direction.target_speed_range = _LONG_PASS_SPEED_RANGE
+        self.rewards.kick_inside_face_alignment.weight = (
+            _INSIDE_FACE_WEIGHT * _INSIDE_FACE_MULTIPLIER * _KICK_W_SCALE
+        )
+        self.rewards.kick_straight_swing.weight = (
+            _STRAIGHT_SWING_WEIGHT * _STRAIGHT_SWING_MULTIPLIER * _KICK_W_SCALE
+        )
+        self.rewards.kick_opposite_direction.weight = _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE
+        self.rewards.kick_direction_accuracy.weight = _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE
+        self.rewards.failed_inside_kick.weight = _FAILED_KICK_WEIGHT

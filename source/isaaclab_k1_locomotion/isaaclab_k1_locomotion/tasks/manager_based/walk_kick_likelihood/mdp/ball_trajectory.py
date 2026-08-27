@@ -42,3 +42,33 @@ def build_ball_trajectory(
     spawn_position = spawn_distance.unsqueeze(-1) * radial
     velocity = base_speed.unsqueeze(-1) * direction
     return spawn_position, velocity
+
+
+def build_incoming_trajectory_near_robot(
+    path_length: torch.Tensor,
+    approach_heading: torch.Tensor,
+    closest_approach_radius: torch.Tensor,
+    closest_approach_side: torch.Tensor,
+    speed: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build a straight incoming path whose closest point is around the robot.
+
+    The closest point is sampled in the reset robot's XY frame.  A uniformly
+    sampled heading plus a random normal-side sign covers front, rear, left,
+    right, and diagonal closest points instead of limiting misses to the
+    lateral axis.  ``path_length`` is the distance travelled before reaching
+    that point, so every non-zero-speed sample initially approaches the robot.
+    """
+    direction = torch.stack(
+        (torch.cos(approach_heading), torch.sin(approach_heading)),
+        dim=-1,
+    )
+    normal = torch.stack((-direction[:, 1], direction[:, 0]), dim=-1)
+    closest_point = (
+        closest_approach_radius.unsqueeze(-1)
+        * closest_approach_side.unsqueeze(-1)
+        * normal
+    )
+    spawn_position = closest_point - path_length.unsqueeze(-1) * direction
+    velocity = speed.unsqueeze(-1) * direction
+    return spawn_position, velocity

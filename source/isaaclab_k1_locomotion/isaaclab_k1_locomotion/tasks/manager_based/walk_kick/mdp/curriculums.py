@@ -335,20 +335,25 @@ def kick_rate_gated_speed_range(
     steps_per_iteration: int = 0,
     advance_above: float = 0.80,
     retreat_below: float = 0.50,
+    advance_error_below_deg: float | None = None,
+    retreat_error_above_deg: float | None = None,
     ema_alpha: float = 0.01,
     retreat_scale: float = 2.0,
 ) -> dict[str, float]:
-    """キック成立率で開閉するゲート付きの ``target_speed_range`` カリキュラム。
+    """キック成立率と方向精度で開閉する ``target_speed_range`` カリキュラム。
 
     :func:`linear_command_speed_range` の壁時計版に対して、**帯を進めるかどうかを
     ポリシーの実績で決める**。進捗 ``progress`` は iteration と同じ単位の内部時計で、
-    直近のキック成立率 (EMA) が
+    直近のキック成立率と、成功キックだけの方向平均誤差 (ともに EMA) が
 
-    * ``advance_above`` 以上 … 経過ぶんだけ進む (= 壁時計版と同じ速さ)
-    * ``retreat_below`` 未満 … ``retreat_scale`` 倍の速さで戻る
-    * その間             … その場で止まる
+    * 成立率が ``advance_above`` 以上、かつ方向誤差が
+      ``advance_error_below_deg`` 以下 … 経過ぶんだけ進む (= 壁時計版と同じ速さ)
+    * 成立率が ``retreat_below`` 未満、または方向誤差が
+      ``retreat_error_above_deg`` 以上 … ``retreat_scale`` 倍の速さで戻る
+    * その間 … その場で止まる
 
     と動く。α は ``progress`` を ``start_step`` → ``end_step`` に写した値。
+    方向誤差の閾値を ``None`` にすると、その側の精度条件は無効になる。
 
     **なぜ壁時計ではだめか**
 
@@ -373,12 +378,15 @@ def kick_rate_gated_speed_range(
     ``Metrics/kick_direction/kick_rate`` として記録されるのと同じ値
     (= 今終わったエピソード群の成立率) をゼロ化前に読める。
 
-    EMA の初期値は 1.0。``start_step`` までは帯が動かないので、そこまでに実測値へ
-    十分収束する (4096 env なら 1 iteration あたり数百エピソードが終わる)。
+    成立率 EMA の初期値は 1.0。方向誤差 EMA は最初の成功キック群の平均値で初期化し、
+    成功キックを一度も観測していない間は帯を進めない。``start_step`` までは帯が
+    動かないので、そこまでに実測値へ十分収束する
+    (4096 env なら 1 iteration あたり数百エピソードが終わる)。
 
     Returns:
         TensorBoard に ``Curriculum/<term_name>/`` 以下で出る値。``alpha`` が止まって
-        いるのに ``kick_rate_ema`` が低いままなら、その帯がスイングの実質的な上限。
+        いるときは ``kick_rate_ema`` と ``kick_dir_error_ema_deg`` のどちらが
+        ゲートを閉じているかを確認できる。
     """
     if end_step <= start_step:
         raise ValueError(f"end_step ({end_step}) は start_step ({start_step}) より大きくすること。")
@@ -387,21 +395,42 @@ def kick_rate_gated_speed_range(
         now = env.common_step_counter / steps_per_iteration
     else:
         now = float(env.common_step_counter)
+    accuracy_gate_enabled = advance_error_below_deg is not None or retreat_error_above_deg is not None
 
     state = getattr(env, "_kick_speed_gate_state", None)
     if state is None:
         state = {}
         env._kick_speed_gate_state = state
     if command_name not in state:
-        state[command_name] = {"alpha": 0.0, "kick_rate_ema": 1.0, "last_now": now}
+        state[command_name] = {
+            "alpha": 0.0,
+            "kick_rate_ema": 1.0,
+            "kick_dir_error_ema_deg": 0.0,
+            "kick_dir_error_seen": False,
+            "last_now": now,
+        }
     gate = state[command_name]
 
-    # -- 直近に終わったエピソード群のキック成立率を EMA に入れる
+    # -- 直近に終わったエピソード群の成立率と、成功キックだけの方向平均誤差を EMA に入れる
     command_term = env.command_manager.get_term(command_name)
-    metric = command_term.metrics.get("kick_rate", None)
-    if metric is not None and env_ids is not None and len(env_ids) > 0:
-        kick_rate = float(metric[env_ids].mean())
+    kick_rate_metric = command_term.metrics.get("kick_rate", None)
+    direction_error_metric = command_term.metrics.get("kick_dir_error_deg", None)
+    if kick_rate_metric is not None and env_ids is not None and len(env_ids) > 0:
+        kick_done = kick_rate_metric[env_ids]
+        kick_rate = float(kick_done.mean())
         gate["kick_rate_ema"] += ema_alpha * (kick_rate - gate["kick_rate_ema"])
+
+        if accuracy_gate_enabled and direction_error_metric is not None:
+            successful_kicks = float(kick_done.sum())
+            if successful_kicks > 0.0:
+                direction_error = float(direction_error_metric[env_ids].sum()) / successful_kicks
+                if gate["kick_dir_error_seen"]:
+                    gate["kick_dir_error_ema_deg"] += ema_alpha * (
+                        direction_error - gate["kick_dir_error_ema_deg"]
+                    )
+                else:
+                    gate["kick_dir_error_ema_deg"] = direction_error
+                    gate["kick_dir_error_seen"] = True
 
     # -- ゲートの開閉に応じて α を進める / 戻す
     #
@@ -409,23 +438,46 @@ def kick_rate_gated_speed_range(
     # 落ち着き期間)。その後の公称速度は壁時計版と同じ 1/(end_step - start_step) / iteration。
     elapsed = max(0.0, now - gate["last_now"])
     gate["last_now"] = now
-    ema = gate["kick_rate_ema"]
+    kick_rate_ema = gate["kick_rate_ema"]
+    direction_error_ema = gate["kick_dir_error_ema_deg"]
+    direction_error_seen = gate["kick_dir_error_seen"]
+    accuracy_allows_advance = advance_error_below_deg is None or (
+        direction_error_seen and direction_error_ema <= advance_error_below_deg
+    )
+    accuracy_requires_retreat = (
+        retreat_error_above_deg is not None
+        and direction_error_seen
+        and direction_error_ema >= retreat_error_above_deg
+    )
     if now >= start_step:
         delta = elapsed / (end_step - start_step)
-        if ema >= advance_above:
-            gate["alpha"] += delta
-        elif ema < retreat_below:
-            gate["alpha"] -= delta * retreat_scale
-        # advance_above > ema >= retreat_below は据え置き (ヒステリシス)。
+        if accuracy_gate_enabled:
+            if kick_rate_ema < retreat_below or accuracy_requires_retreat:
+                gate["alpha"] -= delta * retreat_scale
+            elif kick_rate_ema >= advance_above and accuracy_allows_advance:
+                gate["alpha"] += delta
+        else:
+            if kick_rate_ema >= advance_above:
+                gate["alpha"] += delta
+            elif kick_rate_ema < retreat_below:
+                gate["alpha"] -= delta * retreat_scale
+        # 成立率または方向精度がヒステリシスの中間帯なら据え置く。
         gate["alpha"] = min(max(gate["alpha"], 0.0), 1.0)
 
     if _GATE_DEBUG:
         gate["calls"] = gate.get("calls", 0) + 1
         if gate["calls"] <= 5 or gate["calls"] % 25 == 0:
-            print(
-                f"[gate] calls={gate['calls']} now={now:.3f} elapsed={elapsed:.5f}"
-                f" alpha={gate['alpha']:.6f} ema={ema:.4f} id(env)={id(env)}"
-            )
+            if accuracy_gate_enabled:
+                print(
+                    f"[gate] calls={gate['calls']} now={now:.3f} elapsed={elapsed:.5f}"
+                    f" alpha={gate['alpha']:.6f} rate_ema={kick_rate_ema:.4f}"
+                    f" error_ema_deg={direction_error_ema:.2f} id(env)={id(env)}"
+                )
+            else:
+                print(
+                    f"[gate] calls={gate['calls']} now={now:.3f} elapsed={elapsed:.5f}"
+                    f" alpha={gate['alpha']:.6f} ema={kick_rate_ema:.4f} id(env)={id(env)}"
+                )
 
     alpha = gate["alpha"]
     speed_min = start_range[0] + (end_range[0] - start_range[0]) * alpha
@@ -433,9 +485,12 @@ def kick_rate_gated_speed_range(
 
     command_term.cfg.target_speed_range = (speed_min, speed_max)
 
-    return {
+    result = {
         "speed_min": speed_min,
         "speed_max": speed_max,
         "alpha": alpha,
-        "kick_rate_ema": ema,
+        "kick_rate_ema": kick_rate_ema,
     }
+    if accuracy_gate_enabled:
+        result["kick_dir_error_ema_deg"] = direction_error_ema
+    return result

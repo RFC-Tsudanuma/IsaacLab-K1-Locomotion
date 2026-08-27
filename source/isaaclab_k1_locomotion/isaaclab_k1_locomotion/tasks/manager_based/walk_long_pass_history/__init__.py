@@ -32,9 +32,14 @@ gym.register(
 )
 
 # NOTE: policy 観測が 55 -> 223 次元に変わる (履歴 5 × 42 + 非履歴 13)。
-#       行動 12 と critic 観測 61 は据え置き。long_pass の checkpoint はそのままでは
-#       読めないので、必ず scripts/rsl_rl/expand_checkpoint_history.py で列を
-#       並べ替え + ゼロ埋めしてから --load_pretrained に渡すこと。
+#       左足裏だけだった 3 次元スロットはボール 3D 位置へ置換し、
+#       policy 223 / critic 61 / action 12 の全ベクトに mirror 写像を定義する。
+#       PPO は data augmentation なし、係数 0.5 の mirror loss を使う。
+#
+#       long_pass の checkpoint はそのままでは読めないので、形状を合わせる場合は
+#       scripts/rsl_rl/expand_checkpoint_history.py で列を並べ替え + ゼロ埋めする。
+#       ただし左足裏の重み/統計がボール位置に渡るため、これは形状互換な
+#       近似初期化に過ぎず、元との挙動一致は保証しない。
 #       walk_long_pass_flag 用の expand_checkpoint_kick_flag.py は **使えない**
 #       (あちらは末尾にゼロを足すだけで、途中に挿入される履歴スロットを扱えない)。
 #       通し実行は scripts/rsl_rl/train_walk_long_pass_history.sh。

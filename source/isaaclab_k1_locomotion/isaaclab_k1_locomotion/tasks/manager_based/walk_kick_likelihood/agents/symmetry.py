@@ -8,8 +8,14 @@ nearly equal left/right kick costs unconstrained.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tensordict import TensorDict
+
+    from isaaclab.envs import ManagerBasedRLEnv
 
 LOCOMOTION_OBSERVATION_SIZE = 47
 HORIZON_TOKEN_SIZE = 6
@@ -37,6 +43,16 @@ GAIT_PHASE_SLICE = slice(9, 11)
 JOINT_POSITION_SLICE = slice(11, 23)
 JOINT_VELOCITY_SLICE = slice(23, 35)
 PREVIOUS_ACTION_SLICE = slice(35, 47)
+
+INSIDE_OBSERVATION_SIZE = 223
+INSIDE_CVKF_OBSERVATION_SIZE = INSIDE_OBSERVATION_SIZE + 83
+
+
+def _inside_symmetry_module():
+    """Import the sibling contract lazily so legacy standalone tests still import."""
+    from ...walk_long_pass_history import symmetry as inside_symmetry
+
+    return inside_symmetry
 
 
 def expected_direct_kicking_observation_size(horizon_count: int) -> int:
@@ -193,15 +209,95 @@ def weighted_mirror_consistency_loss(
     return torch.mean(weight * per_sample_error)
 
 
+def mirror_inside_cvkf_observation(
+    observation: torch.Tensor,
+    horizon_count: int = 13,
+) -> torch.Tensor:
+    """Mirror the 223D inside observation and appended 83D CVKF belief."""
+    expected_size = INSIDE_OBSERVATION_SIZE + horizon_count * HORIZON_TOKEN_SIZE + 5
+    if observation.ndim == 0 or observation.shape[-1] != expected_size:
+        raise ValueError(f"Inside+CVKF observation must end with {expected_size} values")
+
+    mirrored = observation.clone()
+    inside_symmetry = _inside_symmetry_module()
+    mirrored[..., :INSIDE_OBSERVATION_SIZE] = inside_symmetry.mirror_last_dim(
+        observation[..., :INSIDE_OBSERVATION_SIZE]
+    )
+    forecast_start = INSIDE_OBSERVATION_SIZE
+    forecast_end = forecast_start + horizon_count * HORIZON_TOKEN_SIZE
+    forecast = observation[..., forecast_start:forecast_end].reshape(
+        observation.shape[:-1] + (horizon_count, HORIZON_TOKEN_SIZE)
+    )
+    mirrored_forecast = forecast.clone()
+    mirrored_forecast[..., RELATIVE_Y_INDEX] = -forecast[..., RELATIVE_Y_INDEX]
+    mirrored_forecast[..., CORRELATION_INDEX] = -forecast[..., CORRELATION_INDEX]
+    mirrored[..., forecast_start:forecast_end] = mirrored_forecast.reshape(
+        observation.shape[:-1] + (horizon_count * HORIZON_TOKEN_SIZE,)
+    )
+    velocity_start = forecast_end
+    mirrored[..., velocity_start : velocity_start + BELIEF_VELOCITY_SIZE] = (
+        observation[..., velocity_start : velocity_start + BELIEF_VELOCITY_SIZE]
+        * observation.new_tensor((1.0, -1.0))
+    )
+    return mirrored
+
+
+@torch.no_grad()
+def compute_inside_cvkf_symmetric_states(
+    env: "ManagerBasedRLEnv",
+    obs: "TensorDict | None" = None,
+    actions: torch.Tensor | None = None,
+):
+    """Return original and sagittally mirrored inside+CVKF PPO batches."""
+    del env
+    inside_symmetry = _inside_symmetry_module()
+
+    if obs is not None:
+        groups = set(obs.keys())
+        unknown = groups - {"policy", "critic"}
+        if unknown:
+            raise ValueError(f"Inside+CVKF mirror has unknown groups: {sorted(unknown)}")
+        batch_size = obs.batch_size[0]
+        obs_aug = obs.repeat(2)
+        for group in groups:
+            obs_aug[group][:batch_size] = obs[group]
+            mirrored = (
+                mirror_inside_cvkf_observation(obs[group])
+                if group == "policy"
+                else inside_symmetry.mirror_last_dim(obs[group])
+            )
+            obs_aug[group][batch_size:] = mirrored
+    else:
+        obs_aug = None
+
+    if actions is not None:
+        batch_size = actions.shape[0]
+        actions_aug = torch.empty(
+            (batch_size * 2, actions.shape[1]),
+            device=actions.device,
+            dtype=actions.dtype,
+        )
+        actions_aug[:batch_size] = actions
+        actions_aug[batch_size:] = inside_symmetry.mirror_last_dim(actions)
+    else:
+        actions_aug = None
+
+    return obs_aug, actions_aug
+
+
 __all__ = [
     "BELIEF_STATUS_SIZE",
     "BELIEF_VELOCITY_SIZE",
     "DIRECT_KICKING_ACTION_SIZE",
     "HORIZON_TOKEN_SIZE",
+    "INSIDE_CVKF_OBSERVATION_SIZE",
+    "INSIDE_OBSERVATION_SIZE",
     "LOCOMOTION_OBSERVATION_SIZE",
     "NON_FORECAST_OBSERVATION_SIZE",
     "expected_direct_kicking_observation_size",
     "kick_feasibility_ambiguity_weight",
+    "compute_inside_cvkf_symmetric_states",
+    "mirror_inside_cvkf_observation",
     "mirror_direct_kicking_observation",
     "mirror_leg_actions",
     "weighted_mirror_consistency_loss",

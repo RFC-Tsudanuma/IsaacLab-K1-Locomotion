@@ -1,19 +1,18 @@
 #!/usr/bin/env bash
-# Train the DirectKicking-compatible policy in three stages:
+# Train the inside-kick + CVKF policy in two phases:
 #
-#   1. Walk only, while preserving the 132D observation/model contract.
-#   2. Kick a stationary ball toward a randomized global target.
-#   3. Continue from Stage 2 with the incoming-ball TTC distance/speed curriculum.
+#   1. Learn the history/inside stationary-ball task with the appended CVKF.
+#   2. Continue from Phase 1 with incoming balls.  Speed and the robot-frame
+#      closest-point radius progress together through 0--2.0 m/s.
 #
-# Each transition uses --load_pretrained rather than --resume.  This transfers
-# the identical model weights without carrying the preceding environment's
-# iteration counter into the next stage's curriculum.
+# Both phases use the same 306D actor schema (inside 223D + CVKF 83D).  The
+# transition uses --load_pretrained so Phase 2 starts its moving-ball curriculum
+# at stage zero without carrying Phase 1's iteration counter.
 #
 # Examples:
 #   ./scripts/rsl_rl/train_walk_kick_likelihood.sh
-#   STAGE=2 WALK_CKPT=logs/.../model_19999.pt \
-#       ./scripts/rsl_rl/train_walk_kick_likelihood.sh
-#   STAGE=3 STATIONARY_CKPT=logs/.../model_19999.pt \
+#   STAGE=1 ./scripts/rsl_rl/train_walk_kick_likelihood.sh
+#   STAGE=2 STATIONARY_CKPT=logs/.../model_4999.pt \
 #       ./scripts/rsl_rl/train_walk_kick_likelihood.sh
 
 set -euo pipefail
@@ -74,18 +73,15 @@ echo "[INFO] python: $LAB_PY"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 NUM_ENVS=${NUM_ENVS:-4096}
-ITER=${ITER:-20000}
-WALK_ITER=${WALK_ITER:-$ITER}
+ITER=${ITER:-5000}
 STATIONARY_ITER=${STATIONARY_ITER:-$ITER}
 MOVING_ITER=${MOVING_ITER:-$ITER}
 STAGE=${STAGE:-all}
 
-WALK_TASK=${WALK_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Likelihood-Global-Target-Walk-Phase-v0"}
-STATIONARY_TASK=${STATIONARY_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Likelihood-Global-Target-Stationary-v0"}
-MOVING_TASK=${MOVING_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Likelihood-Global-Target-v0"}
+STATIONARY_TASK=${STATIONARY_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Stationary-v0"}
+MOVING_TASK=${MOVING_TASK:-"Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Moving-v0"}
 
-WALK_LOG_ROOT=${WALK_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick_likelihood_global_target_walk_phase"}
-STATIONARY_LOG_ROOT=${STATIONARY_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick_likelihood_global_target_stationary"}
+STATIONARY_LOG_ROOT=${STATIONARY_LOG_ROOT:-"logs/rsl_rl/k1_walk_kick_inside_cvkf_stationary"}
 
 should_run() {
     local stage_number=$1
@@ -144,23 +140,18 @@ run_stage() {
 }
 
 if should_run 1; then
-    run_stage "Stage 1/3: walk phase" "$WALK_TASK" "$WALK_ITER" "" "$@"
-fi
-
-if should_run 2; then
-    WALK_CKPT=${WALK_CKPT:-$(find_latest_ckpt "$WALK_LOG_ROOT")}
     run_stage \
-        "Stage 2/3: stationary-ball kick" \
+        "Phase 1/2: stationary inside kick + CVKF" \
         "$STATIONARY_TASK" \
         "$STATIONARY_ITER" \
-        "$WALK_CKPT" \
+        "" \
         "$@"
 fi
 
-if should_run 3; then
+if should_run 2; then
     STATIONARY_CKPT=${STATIONARY_CKPT:-$(find_latest_ckpt "$STATIONARY_LOG_ROOT")}
     run_stage \
-        "Stage 3/3: moving-ball curriculum" \
+        "Phase 2/2: incoming-ball speed/near-point curriculum" \
         "$MOVING_TASK" \
         "$MOVING_ITER" \
         "$STATIONARY_CKPT" \

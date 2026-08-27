@@ -8,7 +8,10 @@ import torch
 
 from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 
-from .ball_trajectory import build_ball_trajectory
+from .ball_trajectory import (
+    build_ball_trajectory,
+    build_incoming_trajectory_near_robot,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -21,6 +24,9 @@ _VISION_MAX_DISTANCE_M = 10.0
 _INITIAL_BALL_SPEED_ATTR = "_walk_kick_likelihood_initial_ball_speed"
 _BALL_INCOMING_ATTR = "_walk_kick_likelihood_ball_incoming"
 _BALL_SPEED_CAP_ATTR = "_walk_kick_likelihood_ball_speed_cap"
+_CLOSEST_APPROACH_RADIUS_CAP_ATTR = (
+    "_walk_kick_likelihood_closest_approach_radius_cap"
+)
 _BALL_RESET_METADATA_VALID_ATTR = "_walk_kick_likelihood_ball_reset_metadata_valid"
 
 
@@ -216,6 +222,158 @@ def reset_moving_ball_trajectory(
         closest_approach_offset,
         base_speed,
         incoming,
+    )
+
+    robot_pos_w = robot.data.root_pos_w[env_ids]
+    robot_quat_w = robot.data.root_quat_w[env_ids]
+    qw, qx, qy, qz = (
+        robot_quat_w[:, 0],
+        robot_quat_w[:, 1],
+        robot_quat_w[:, 2],
+        robot_quat_w[:, 3],
+    )
+    robot_yaw = torch.atan2(
+        2.0 * (qw * qz + qx * qy),
+        1.0 - 2.0 * (qy.square() + qz.square()),
+    )
+    cosine = torch.cos(robot_yaw)
+    sine = torch.sin(robot_yaw)
+
+    world_spawn_xy = torch.stack(
+        (
+            cosine * local_spawn_xy[:, 0] - sine * local_spawn_xy[:, 1],
+            sine * local_spawn_xy[:, 0] + cosine * local_spawn_xy[:, 1],
+        ),
+        dim=-1,
+    )
+    world_velocity_xy = torch.stack(
+        (
+            cosine * local_velocity_xy[:, 0] - sine * local_velocity_xy[:, 1],
+            sine * local_velocity_xy[:, 0] + cosine * local_velocity_xy[:, 1],
+        ),
+        dim=-1,
+    )
+
+    state = ball.data.default_root_state[env_ids].clone()
+    state[:, :2] = robot_pos_w[:, :2] + world_spawn_xy
+    state[:, 2] = env.scene.env_origins[env_ids, 2] + ball_radius
+    state[:, 3:7] = state.new_tensor((1.0, 0.0, 0.0, 0.0))
+    state[:, 7:] = 0.0
+    state[:, 7:9] = world_velocity_xy
+    state[:, 10] = -world_velocity_xy[:, 1] / ball_radius
+    state[:, 11] = world_velocity_xy[:, 0] / ball_radius
+    ball.write_root_state_to_sim(state, env_ids=env_ids)
+
+
+def reset_incoming_ball_near_robot(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    ball_radius: float,
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    speed_range_mps: tuple[float, float] = (0.0, 0.0),
+    path_length_range_m: tuple[float, float] = (1.5, 3.0),
+    closest_approach_radius_range_m: tuple[float, float] = (0.0, 0.0),
+    approach_heading_range_rad: tuple[float, float] = (-3.14159265, 3.14159265),
+    nominal_ttc_range_s: tuple[float, float] | None = (1.5, 5.0),
+) -> None:
+    """Reset a ball on an incoming path near the robot in every XY direction.
+
+    The path's true closest point is sampled uniformly by area from an annulus
+    in the reset robot frame.  Its polar direction therefore spans front,
+    rear, left, right, and diagonals.  The ball never receives an initially
+    outgoing velocity; after an unsuccessful pass it may naturally move away
+    once it has crossed the closest point.
+    """
+    if len(env_ids) == 0:
+        return
+
+    speed_range = _validated_range(
+        speed_range_mps,
+        "speed_range_mps",
+        non_negative=True,
+    )
+    path_range = _validated_range(
+        path_length_range_m,
+        "path_length_range_m",
+        positive=True,
+    )
+    radius_range = _validated_range(
+        closest_approach_radius_range_m,
+        "closest_approach_radius_range_m",
+        non_negative=True,
+    )
+    heading_range = _validated_range(
+        approach_heading_range_rad,
+        "approach_heading_range_rad",
+    )
+    ttc_range = (
+        None
+        if nominal_ttc_range_s is None
+        else _validated_range(
+            nominal_ttc_range_s,
+            "nominal_ttc_range_s",
+            positive=True,
+        )
+    )
+    maximum_spawn_distance = (
+        path_range[1] ** 2 + radius_range[1] ** 2
+    ) ** 0.5
+    if maximum_spawn_distance >= _VISION_MAX_DISTANCE_M:
+        raise ValueError("incoming trajectory spawn distance must stay inside vision range")
+
+    ball = env.scene[ball_cfg.name]
+    robot = env.scene["robot"]
+    count = len(env_ids)
+
+    path_length = _sample_uniform(path_range, count, env.device)
+    approach_heading = _sample_uniform(heading_range, count, env.device)
+    radius_squared = _sample_uniform(
+        (radius_range[0] ** 2, radius_range[1] ** 2),
+        count,
+        env.device,
+    )
+    closest_approach_radius = torch.sqrt(radius_squared)
+    closest_approach_side = torch.where(
+        torch.rand(count, device=env.device) < 0.5,
+        -torch.ones(count, device=env.device),
+        torch.ones(count, device=env.device),
+    )
+    if ttc_range is None:
+        speed = _sample_uniform(speed_range, count, env.device)
+    else:
+        nominal_ttc = _sample_uniform(ttc_range, count, env.device)
+        speed = torch.clamp(
+            path_length / nominal_ttc,
+            min=speed_range[0],
+            max=speed_range[1],
+        )
+
+    metadata_env_ids = env_ids.to(device=env.device, dtype=torch.long)
+    speed_buffer = _episode_metadata_buffer(
+        env, _INITIAL_BALL_SPEED_ATTR, speed.dtype
+    )
+    incoming_buffer = _episode_metadata_buffer(env, _BALL_INCOMING_ATTR, torch.bool)
+    speed_cap_buffer = _episode_metadata_buffer(
+        env, _BALL_SPEED_CAP_ATTR, speed.dtype
+    )
+    radius_cap_buffer = _episode_metadata_buffer(
+        env, _CLOSEST_APPROACH_RADIUS_CAP_ATTR, speed.dtype
+    )
+    valid_buffer = _episode_metadata_buffer(
+        env, _BALL_RESET_METADATA_VALID_ATTR, torch.bool
+    )
+    speed_buffer[metadata_env_ids] = speed
+    incoming_buffer[metadata_env_ids] = True
+    speed_cap_buffer[metadata_env_ids] = speed_range[1]
+    radius_cap_buffer[metadata_env_ids] = radius_range[1]
+    valid_buffer[metadata_env_ids] = True
+
+    local_spawn_xy, local_velocity_xy = build_incoming_trajectory_near_robot(
+        path_length,
+        approach_heading,
+        closest_approach_radius,
+        closest_approach_side,
+        speed,
     )
 
     robot_pos_w = robot.data.root_pos_w[env_ids]

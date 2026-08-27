@@ -8,8 +8,10 @@
 値 latch (凍結) と状態 latch (フラグ) を厳密に分けて保持する。
 
 * 値 latch: トリガー L (既定は ``v_ball > v_thresh``、opt-in では足とボールの物理的な
-  速度変化) の発火時に τ_direction / v_ball / v_ball_3d / φ (仰角) / p_style を
-  **同時に**スナップショットして固定する。以降はその凍結値で dense に払う。
+  速度変化) の発火時に τ_direction / v_ball / v_ball_3d / φ (仰角) / p_style /
+  胴体正面とボール方向の cosine を **同時に**スナップショットして
+  固定する。cosineだけは接触後のボール移動を避けるため、直前の制御step値を接触時近似として
+  保存する。以降はその凍結値で dense に払う。
 * 状態 latch: ``kick_done`` (L 発火) と ``overshoot_fired`` (後方レイ R の左右跨ぎ)。
   いずれもエピソード内で一度立ったら解除しない。
 
@@ -287,6 +289,13 @@ def kick_state(
     yaw = torch.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
     forward = torch.stack([torch.cos(yaw), torch.sin(yaw)], dim=-1)
 
+    # 胴体正面と「胴体中心→ボール」の水平角度。p_style は胴体と蹴り方向しか見ないため、
+    # ボールを背後に置いたまま踵で目標方向へ蹴る抜け道を区別できない。生のcosineは
+    # 接近中の正対シェイピングに使い、値latchでも凍結してキック時の角度と前方係数を作る。
+    body_to_ball = ball_pos - robot_pos
+    body_to_ball_dir = body_to_ball / body_to_ball.norm(dim=-1, keepdim=True).clamp_min(1.0e-6)
+    body_ball_cos = torch.clamp((forward * body_to_ball_dir).sum(dim=-1), -1.0, 1.0)
+
     if state is None:
         state = {
             "step": -1,
@@ -317,6 +326,9 @@ def kick_state(
             "v_ball_3d_frozen": torch.zeros(env.num_envs, device=device),
             "phi_frozen": torch.zeros(env.num_envs, device=device),
             "p_style_frozen": torch.zeros(env.num_envs, device=device),
+            "body_ball_cos_pre_step": torch.zeros(env.num_envs, device=device),
+            "prev_body_ball_cos": torch.zeros(env.num_envs, device=device),
+            "body_ball_cos_frozen": torch.zeros(env.num_envs, device=device),
             "apex_height": torch.zeros(env.num_envs, device=device),
             "prev_v_ball": torch.zeros(env.num_envs, device=device),
             "prev_ball_pos_w": torch.zeros(env.num_envs, 3, device=device),
@@ -325,6 +337,7 @@ def kick_state(
             "touch_count": torch.zeros(env.num_envs, device=device),
             "touch_refractory": torch.zeros(env.num_envs, dtype=torch.int32, device=device),
             "extra_touch_event": torch.zeros(env.num_envs, device=device),
+            "pre_latch_touch_event": torch.zeros(env.num_envs, device=device),
             "sole_height_last_touch": torch.zeros(env.num_envs, device=device),
             "sole_height_at_kick": torch.zeros(env.num_envs, device=device),
             # 軸足 (蹴っていない方の足) のボール相対位置。値 latch で凍結する。
@@ -393,15 +406,26 @@ def kick_state(
         state["v_ball_3d_frozen"][just_reset] = 0.0
         state["phi_frozen"][just_reset] = 0.0
         state["p_style_frozen"][just_reset] = 0.0
+        state["body_ball_cos_pre_step"][just_reset] = body_ball_cos[just_reset]
+        state["prev_body_ball_cos"][just_reset] = body_ball_cos[just_reset]
+        state["body_ball_cos_frozen"][just_reset] = 0.0
         state["apex_height"][just_reset] = 0.0
         state["prev_v_ball"][just_reset] = 0.0
         state["touch_count"][just_reset] = 0.0
         state["touch_refractory"][just_reset] = 0
+        state["pre_latch_touch_event"][just_reset] = 0.0
         state["sole_height_last_touch"][just_reset] = 0.0
         state["sole_height_at_kick"][just_reset] = 0.0
         state["plant_lon_frozen"][just_reset] = 0.0
         state["plant_lat_frozen"][just_reset] = 0.0
         state["foot_vz_frozen"][just_reset] = 0.0
+
+    # 接触は4 physics substepの途中で起きる一方、速度triggerを読むのは制御step末尾。
+    # 3--5 m/sのボールはその間に数cm進むため、現在位置では胴体の側面を跨いだ後を
+    # 採点し得る。接触判定と同じ1制御step遅れの近似として、直前stepの正対度を使う。
+    state["body_ball_cos_pre_step"] = torch.where(
+        just_reset, body_ball_cos, state["prev_body_ball_cos"]
+    )
 
     # ------------------------------------------------------------------ #
     # 転がるボール用: latch 前は P_kick を現在のボール位置から毎ステップ引き直す。
@@ -598,6 +622,9 @@ def kick_state(
     state["touch_count"] = state["touch_count"] + touched.float()
     # 2 回目以降の接触が起きたステップだけ 1。1 回目 (touch_count == 1) は無料。
     state["extra_touch_event"] = (touched & (state["touch_count"] >= 2.0)).float()
+    # latch 前に始まった接触。正しいキックの接触stepも含め、姿勢の良否は報酬側で
+    # 判定する。既にlatchした後のボールとの再接触だけは対象外。
+    state["pre_latch_touch_event"] = (touched & (~state["kick_done"])).float()
 
     state["touch_refractory"] = torch.where(
         touched,
@@ -664,6 +691,9 @@ def kick_state(
         state["v_ball_3d_frozen"] = torch.where(trigger, v_ball_3d, state["v_ball_3d_frozen"])
         state["phi_frozen"] = torch.where(trigger, phi, state["phi_frozen"])
         state["p_style_frozen"] = torch.where(trigger, p_style, state["p_style_frozen"])
+        state["body_ball_cos_frozen"] = torch.where(
+            trigger, state["body_ball_cos_pre_step"], state["body_ball_cos_frozen"]
+        )
         # latch を起こした接触 = キック本体。その足裏高さを凍結する。
         # 接触検出 (touched) は同じ関数内でこの上に走っているので、キックと同じ
         # ステップなら sole_height_last_touch は既に今回の値に更新されている。
@@ -796,6 +826,8 @@ def kick_state(
     state["d_sole_to_ball_mean"] = d_foot_to_ball.mean(dim=1)
 
     state["p_style"] = p_style
+    state["body_ball_cos"] = body_ball_cos
+    state["prev_body_ball_cos"] = body_ball_cos.clone()
     state["d_to_P_kick"] = (robot_pos - state["P_kick"]).norm(dim=-1)
 
     # 次ステップの物理判定用履歴。reset 行を含め、現在値で環境ごとに更新する。

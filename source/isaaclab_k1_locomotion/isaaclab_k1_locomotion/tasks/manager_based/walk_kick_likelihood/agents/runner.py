@@ -17,7 +17,7 @@ from rsl_rl.modules import (
 )
 from rsl_rl.runners import OnPolicyRunner
 
-from .model import DirectKickingActorCritic
+from .model import DirectKickingActorCritic, InsideCVKFActorCritic
 from .ppo import DirectKickingPPO
 
 
@@ -25,6 +25,7 @@ _POLICY_CLASSES = {
     "ActorCritic": ActorCritic,
     "ActorCriticRecurrent": ActorCriticRecurrent,
     "DirectKickingActorCritic": DirectKickingActorCritic,
+    "InsideCVKFActorCritic": InsideCVKFActorCritic,
 }
 _ALGORITHM_CLASSES = {
     "PPO": PPO,

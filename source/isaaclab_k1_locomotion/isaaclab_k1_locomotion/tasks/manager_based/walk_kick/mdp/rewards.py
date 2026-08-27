@@ -876,6 +876,43 @@ def extra_ball_touch(
     return state["extra_touch_event"]
 
 
+def non_kick_ball_touch(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    sigma_pose: float = 0.3,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """キック姿勢ができていないボール接触。負の重みで使う。shape: (N,)
+
+    latch前に始まった接触イベントへ、:func:`ball_avoidance` と同じキック姿勢のズレ
+    ``1 - exp(-(d_to_P_kick/sigma_pose)^2) * p_style`` を掛ける。回り込み途中の接触は
+    最大1、P_kickで目標方向を向いた正規のキック接触は0に近づく。latch後の再接触は0。
+
+    :func:`extra_ball_touch` は1回目を無料にして2回目以降を罰するため、最初の偶発接触
+    ではなく、その後の本命キック側へ罰が乗り得る。この項はその逆で、接触回数ではなく
+    「キック姿勢になる前に接触したか」を判定する。速度閾値だけで正規キックを分類
+    しないため、接触初期の球速が低いすくい上げキックも一律には罰しない。
+    """
+    state = kick_state(
+        env,
+        r_stance=r_stance,
+        alpha=alpha,
+        v_thresh=v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    pose_match = torch.exp(-((state["d_to_P_kick"] / sigma_pose) ** 2)) * state["p_style"]
+    pose_mismatch = 1.0 - pose_match
+    return state["pre_latch_touch_event"] * pose_mismatch
+
+
 def kick_latch_bonus(
     env: ManagerBasedRLEnv,
     r_stance: float,

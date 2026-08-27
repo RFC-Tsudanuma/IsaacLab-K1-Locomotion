@@ -14,8 +14,11 @@ from typing import Any
 import torch
 from torch import nn
 from torch.distributions import Normal
+from rsl_rl.modules import ActorCritic
 
 from .symmetry import (
+    BELIEF_STATUS_SIZE,
+    BELIEF_VELOCITY_SIZE,
     DIRECT_KICKING_ACTION_SIZE,
     HORIZON_TOKEN_SIZE,
     LOCOMOTION_OBSERVATION_SIZE,
@@ -44,6 +47,10 @@ DEFAULT_PREDICTION_HORIZONS_S = (
 
 _ACTOR_HIDDEN_DIMS = (256, 128, 128)
 _CRITIC_HIDDEN_DIMS = (256, 256, 128)
+
+INSIDE_OBSERVATION_SIZE = 223
+INSIDE_PRIVILEGED_OBSERVATION_SIZE = 61
+INSIDE_CVKF_OBSERVATION_SIZE = INSIDE_OBSERVATION_SIZE + 83
 
 
 def _concatenate_groups(
@@ -106,6 +113,154 @@ class DirectKickingObservationEncoder(nn.Module):
             dim=-1,
         )
         return torch.cat((non_forecast, hidden[-1]), dim=-1)
+
+
+class InsideCVKFObservationEncoder(nn.Module):
+    """Encode only the appended CVKF horizon and preserve the 223D inside input."""
+
+    def __init__(
+        self,
+        horizon_count: int,
+        hidden_size: int,
+        num_layers: int,
+    ) -> None:
+        super().__init__()
+        self.horizon_count = int(horizon_count)
+        self.hidden_size = int(hidden_size)
+        self.forecast_start = INSIDE_OBSERVATION_SIZE
+        self.forecast_end = self.forecast_start + self.horizon_count * HORIZON_TOKEN_SIZE
+        self.output_size = (
+            INSIDE_OBSERVATION_SIZE
+            + BELIEF_VELOCITY_SIZE
+            + BELIEF_STATUS_SIZE
+            + self.hidden_size
+        )
+        self.lstm = nn.LSTM(
+            input_size=HORIZON_TOKEN_SIZE,
+            hidden_size=self.hidden_size,
+            num_layers=int(num_layers),
+            batch_first=True,
+        )
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        if observation.dim() != 2:
+            raise ValueError("Inside+CVKF encoder expects a two-dimensional batch")
+        if observation.shape[-1] != INSIDE_CVKF_OBSERVATION_SIZE:
+            raise ValueError(
+                f"Inside+CVKF observation must have {INSIDE_CVKF_OBSERVATION_SIZE} values"
+            )
+        forecast = observation[:, self.forecast_start : self.forecast_end]
+        forecast = forecast.reshape(
+            observation.shape[0],
+            self.horizon_count,
+            HORIZON_TOKEN_SIZE,
+        )
+        _, (hidden, _) = self.lstm(forecast)
+        non_forecast = torch.cat(
+            (
+                observation[:, : self.forecast_start],
+                observation[:, self.forecast_end :],
+            ),
+            dim=-1,
+        )
+        return torch.cat((non_forecast, hidden[-1]), dim=-1)
+
+
+class InsideCVKFActor(nn.Module):
+    """Inside-kick MLP fed by raw inside features and the CVKF LSTM latent."""
+
+    def __init__(
+        self,
+        num_actions: int,
+        horizon_count: int,
+        hidden_size: int,
+        num_layers: int,
+        hidden_dims: Sequence[int],
+    ) -> None:
+        super().__init__()
+        self.encoder = InsideCVKFObservationEncoder(
+            horizon_count,
+            hidden_size,
+            num_layers,
+        )
+        dims = (self.encoder.output_size, *tuple(int(value) for value in hidden_dims))
+        layers: list[nn.Module] = []
+        for input_dim, output_dim in zip(dims, dims[1:]):
+            layers.extend((nn.Linear(input_dim, output_dim), nn.ELU()))
+        layers.append(nn.Linear(dims[-1], int(num_actions)))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, observation: torch.Tensor) -> torch.Tensor:
+        return self.network(self.encoder(observation))
+
+
+class InsideCVKFActorCritic(ActorCritic):
+    """Inside actor/critic contract with an appended stateless CVKF horizon LSTM."""
+
+    is_recurrent = False
+    observation_schema = "walk_long_pass_history_inside_plus_cvkf_v1"
+
+    def __init__(
+        self,
+        obs: Mapping[str, torch.Tensor],
+        obs_groups: Mapping[str, Sequence[str]],
+        num_actions: int,
+        *,
+        prediction_horizons_s: Sequence[float] = DEFAULT_PREDICTION_HORIZONS_S,
+        lstm_hidden_size: int = 64,
+        lstm_num_layers: int = 1,
+        actor_hidden_dims: Sequence[int] = (512, 256, 128),
+        critic_hidden_dims: Sequence[int] = (512, 256, 128),
+        activation: str = "elu",
+        **kwargs: Any,
+    ) -> None:
+        horizons = tuple(float(value) for value in prediction_horizons_s)
+        if len(horizons) * HORIZON_TOKEN_SIZE + INSIDE_OBSERVATION_SIZE + 5 != (
+            INSIDE_CVKF_OBSERVATION_SIZE
+        ):
+            raise ValueError("Inside+CVKF horizon count does not match the 306D schema")
+        actor_example = _concatenate_groups(obs, obs_groups["policy"])
+        critic_example = _concatenate_groups(obs, obs_groups["critic"])
+        if actor_example.shape[-1] != INSIDE_CVKF_OBSERVATION_SIZE:
+            raise ValueError(
+                f"Inside+CVKF actor expected 306 observations, got {actor_example.shape[-1]}"
+            )
+        if critic_example.shape[-1] != INSIDE_PRIVILEGED_OBSERVATION_SIZE:
+            raise ValueError(
+                "Inside+CVKF critic must preserve the 61D inside privileged contract"
+            )
+        if activation.lower() != "elu":
+            raise ValueError("Inside+CVKF policy requires ELU activation")
+
+        super().__init__(
+            obs,
+            obs_groups,
+            num_actions,
+            actor_hidden_dims=list(actor_hidden_dims),
+            critic_hidden_dims=list(critic_hidden_dims),
+            activation=activation,
+            **kwargs,
+        )
+        self.prediction_horizons_s = horizons
+        self.lstm_hidden_size = int(lstm_hidden_size)
+        self.lstm_num_layers = int(lstm_num_layers)
+        self.actor = InsideCVKFActor(
+            num_actions,
+            len(horizons),
+            self.lstm_hidden_size,
+            self.lstm_num_layers,
+            actor_hidden_dims,
+        )
+
+    def checkpoint_metadata(self) -> dict[str, Any]:
+        return {
+            "observation_schema": self.observation_schema,
+            "policy_observation_size": INSIDE_CVKF_OBSERVATION_SIZE,
+            "critic_observation_size": INSIDE_PRIVILEGED_OBSERVATION_SIZE,
+            "prediction_horizons_s": list(self.prediction_horizons_s),
+            "lstm_hidden_size": self.lstm_hidden_size,
+            "lstm_num_layers": self.lstm_num_layers,
+        }
 
 
 class DirectKickingActor(nn.Module):

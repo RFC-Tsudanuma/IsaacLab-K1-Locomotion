@@ -83,3 +83,67 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1WalkKickLikelihoodPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Stationary-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.walk_kick_inside_cvkf_env_cfg:"
+            "K1WalkKickInsideCVKFStationaryEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:"
+            "K1WalkKickInsideCVKFStationaryPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Stationary-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.walk_kick_inside_cvkf_env_cfg:"
+            "K1WalkKickInsideCVKFStationaryEnvCfg_PLAY"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:"
+            "K1WalkKickInsideCVKFStationaryPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Moving-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.walk_kick_inside_cvkf_env_cfg:"
+            "K1WalkKickInsideCVKFMovingEnvCfg"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:"
+            "K1WalkKickInsideCVKFMovingPPORunnerCfg"
+        ),
+    },
+)
+
+gym.register(
+    id="Isaac-Velocity-Flat-K1-Walk-Kick-Inside-CVKF-Moving-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": (
+            f"{__name__}.walk_kick_inside_cvkf_env_cfg:"
+            "K1WalkKickInsideCVKFMovingEnvCfg_PLAY"
+        ),
+        "rsl_rl_cfg_entry_point": (
+            f"{agents.__name__}.rsl_rl_ppo_cfg:"
+            "K1WalkKickInsideCVKFMovingPPORunnerCfg"
+        ),
+    },
+)

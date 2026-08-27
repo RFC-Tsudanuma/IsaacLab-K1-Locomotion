@@ -9,9 +9,17 @@ import math
 
 from isaaclab.utils import configclass
 
-from isaaclab_rl.rsl_rl import RslRlPpoActorCriticCfg, RslRlPpoAlgorithmCfg
+from isaaclab_rl.rsl_rl import (
+    RslRlPpoActorCriticCfg,
+    RslRlPpoAlgorithmCfg,
+    RslRlSymmetryCfg,
+)
 
 from ...walk_kick.agents.rsl_rl_ppo_cfg import K1WalkKickPPORunnerCfg
+from ...walk_long_pass_history.agents.rsl_rl_ppo_cfg import (
+    K1WalkLongPassHistoryPPORunnerCfg,
+)
+from .symmetry import compute_inside_cvkf_symmetric_states
 
 
 @configclass
@@ -106,3 +114,68 @@ class K1WalkKickLikelihoodStationaryPPORunnerCfg(K1WalkKickLikelihoodPPORunnerCf
     def __post_init__(self) -> None:
         super().__post_init__()
         self.experiment_name = "k1_walk_kick_likelihood_global_target_stationary"
+
+
+@configclass
+class InsideCVKFActorCriticCfg(RslRlPpoActorCriticCfg):
+    """Inside 223D MLP contract with the appended 83D CVKF horizon encoder."""
+
+    class_name: str = "InsideCVKFActorCritic"
+    init_noise_std: float = 0.7207805082202461
+    actor_obs_normalization: bool = True
+    critic_obs_normalization: bool = True
+    actor_hidden_dims: list[int] = [512, 256, 128]
+    critic_hidden_dims: list[int] = [512, 256, 128]
+    activation: str = "elu"
+    prediction_horizons_s: list[float] = [
+        0.0,
+        0.05,
+        0.10,
+        0.15,
+        0.20,
+        0.30,
+        0.50,
+        0.75,
+        1.00,
+        1.50,
+        2.00,
+        2.50,
+        3.00,
+    ]
+    lstm_hidden_size: int = 64
+    lstm_num_layers: int = 1
+
+
+@configclass
+class K1WalkKickInsideCVKFStationaryPPORunnerCfg(
+    K1WalkLongPassHistoryPPORunnerCfg
+):
+    """Phase 1 runner for stationary inside kicks with the 306D actor schema."""
+
+    class_name: str = "DirectKickingOnPolicyRunner"
+    obs_groups: dict[str, list[str]] = {
+        "policy": ["policy"],
+        "critic": ["critic"],
+    }
+    policy: InsideCVKFActorCriticCfg = InsideCVKFActorCriticCfg()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.experiment_name = "k1_walk_kick_inside_cvkf_stationary"
+        self.algorithm.symmetry_cfg = RslRlSymmetryCfg(
+            use_data_augmentation=False,
+            use_mirror_loss=True,
+            data_augmentation_func=compute_inside_cvkf_symmetric_states,
+            mirror_loss_coeff=0.5,
+        )
+
+
+@configclass
+class K1WalkKickInsideCVKFMovingPPORunnerCfg(
+    K1WalkKickInsideCVKFStationaryPPORunnerCfg
+):
+    """Phase 2 runner for the coupled incoming-ball curriculum."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.experiment_name = "k1_walk_kick_inside_cvkf_moving"

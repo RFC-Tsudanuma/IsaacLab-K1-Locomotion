@@ -43,6 +43,12 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
             float(value) for value in params["spawn_distance_max_stages_m"]
         )
         self._distance_min = float(params["spawn_distance_min_m"])
+        radius_stages = params.get("closest_approach_radius_max_stages_m")
+        self._approach_radius_max_stages = (
+            None
+            if radius_stages is None
+            else tuple(float(value) for value in radius_stages)
+        )
         self._success_threshold = float(params["success_threshold"])
         self._frontier_fraction = float(params["frontier_fraction"])
         self._min_episodes_per_direction = int(params["min_episodes_per_direction"])
@@ -51,7 +57,11 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
         self._reset_event_name = str(params.get("reset_event_name", "reset_ball"))
 
         reset_event_cfg = env.event_manager.get_term_cfg(self._reset_event_name)
-        incoming_probability = float(reset_event_cfg.params["incoming_probability"])
+        incoming_probability = (
+            1.0
+            if self._approach_radius_max_stages is not None
+            else float(reset_event_cfg.params["incoming_probability"])
+        )
         if not 0.0 <= incoming_probability <= 1.0:
             raise ValueError("reset incoming_probability must be in [0, 1]")
         self._require_incoming = incoming_probability > 0.0
@@ -82,12 +92,14 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
         min_episodes_per_direction: int,
         required_consecutive_windows: int,
         warmup_steps: int,
+        closest_approach_radius_max_stages_m: Sequence[float] | None = None,
         reset_event_name: str = "reset_ball",
     ) -> dict[str, float]:
         del (
             stages_mps,
             spawn_distance_max_stages_m,
             spawn_distance_min_m,
+            closest_approach_radius_max_stages_m,
             success_threshold,
             frontier_fraction,
             min_episodes_per_direction,
@@ -106,7 +118,7 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
 
     def state_dict(self) -> dict[str, Any]:
         """Return all mutable promotion state in a weights-only-safe payload."""
-        return {
+        state = {
             "schema_version": _STATE_SCHEMA_VERSION,
             "stages_mps": list(self._stages),
             "spawn_distance_max_stages_m": list(self._distance_max_stages),
@@ -124,6 +136,11 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
             "last_incoming_success_rate": self._last_incoming_success_rate,
             "last_outgoing_success_rate": self._last_outgoing_success_rate,
         }
+        if self._approach_radius_max_stages is not None:
+            state["closest_approach_radius_max_stages_m"] = list(
+                self._approach_radius_max_stages
+            )
+        return state
 
     def load_state_dict(self, state: Mapping[str, Any]) -> None:
         """Restore a checkpointed curriculum and immediately apply its stage."""
@@ -149,6 +166,17 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
                 "Moving-ball distance curriculum does not match the checkpoint: "
                 f"configured=({self._distance_min}, {self._distance_max_stages}), "
                 f"checkpoint=({saved_distance_min}, {saved_distance_stages})"
+            )
+        saved_radius_stages = state.get("closest_approach_radius_max_stages_m")
+        configured_radius_stages = self._approach_radius_max_stages
+        if saved_radius_stages is None:
+            if configured_radius_stages is not None:
+                raise ValueError(
+                    "Moving-ball closest-approach curriculum is missing from checkpoint"
+                )
+        elif tuple(float(value) for value in saved_radius_stages) != configured_radius_stages:
+            raise ValueError(
+                "Moving-ball closest-approach curriculum does not match checkpoint"
             )
 
         stage_index = int(state["stage_index"])
@@ -196,6 +224,25 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
             )
         ):
             raise ValueError("spawn_distance_max_stages_m must be non-decreasing")
+        if self._approach_radius_max_stages is not None:
+            if len(self._approach_radius_max_stages) != len(self._stages):
+                raise ValueError(
+                    "closest_approach_radius_max_stages_m must match speed stages"
+                )
+            if any(value < 0.0 for value in self._approach_radius_max_stages):
+                raise ValueError(
+                    "closest_approach_radius_max_stages_m must be non-negative"
+                )
+            if any(
+                left > right
+                for left, right in zip(
+                    self._approach_radius_max_stages,
+                    self._approach_radius_max_stages[1:],
+                )
+            ):
+                raise ValueError(
+                    "closest_approach_radius_max_stages_m must be non-decreasing"
+                )
         if not 0.0 <= self._success_threshold <= 1.0:
             raise ValueError("success_threshold must be in [0, 1]")
         if not 0.0 <= self._frontier_fraction <= 1.0:
@@ -316,12 +363,17 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
         event_cfg = self._env.event_manager.get_term_cfg(self._reset_event_name)
         event_cfg.params["speed_range_mps"] = (0.0, speed_cap)
         distance_range = (self._distance_min, distance_cap)
-        event_cfg.params["incoming_spawn_distance_range_m"] = distance_range
-        event_cfg.params["outgoing_spawn_distance_range_m"] = distance_range
+        if self._approach_radius_max_stages is not None:
+            radius_cap = self._approach_radius_max_stages[self._current_stage]
+            event_cfg.params["path_length_range_m"] = distance_range
+            event_cfg.params["closest_approach_radius_range_m"] = (0.0, radius_cap)
+        else:
+            event_cfg.params["incoming_spawn_distance_range_m"] = distance_range
+            event_cfg.params["outgoing_spawn_distance_range_m"] = distance_range
 
     def _log_state(self, *, warmup_complete: bool, promoted: bool) -> dict[str, float]:
         current_cap = self._stages[self._current_stage]
-        return {
+        state = {
             "stage": float(self._current_stage),
             "speed_cap_mps": current_cap,
             "spawn_distance_max_m": self._distance_max_stages[self._current_stage],
@@ -342,6 +394,11 @@ class MovingBallSpeedCurriculum(ManagerTermBase):
             "warmup_complete": float(warmup_complete),
             "promoted": float(promoted),
         }
+        if self._approach_radius_max_stages is not None:
+            state["closest_approach_radius_max_m"] = self._approach_radius_max_stages[
+                self._current_stage
+            ]
+        return state
 
     @staticmethod
     def _current_rate(successes: int, eligible: int, fallback: float) -> float:
