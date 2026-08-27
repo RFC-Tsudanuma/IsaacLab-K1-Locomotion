@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 _FORM_STATE_ATTR = "_inside_kick_form_state"
 _STAGE_STATE_ATTR = "_inside_kick_stage_state"
 _BODY_FACING_STATE_ATTR = "_inside_kick_body_facing_state"
+_MISS_STATE_ATTR = "_inside_kick_miss_state"
 _FOOT_IDS_ATTR = "_inside_kick_foot_body_ids"
 _NORM_EPS = 1.0e-6
 _MOVING_EPS = 1.0e-3
@@ -223,6 +224,7 @@ def _inside_form_state(
             "inside_face_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_cos_frozen": torch.zeros(env.num_envs, device=device),
             "swing_speed_frozen": torch.zeros(env.num_envs, device=device),
+            "attempt_candidate": torch.zeros(env.num_envs, dtype=torch.bool, device=device),
         }
         setattr(env, _FORM_STATE_ATTR, form)
 
@@ -243,6 +245,7 @@ def _inside_form_state(
         form["inside_face_cos_frozen"][just_reset] = 0.0
         form["swing_cos_frozen"][just_reset] = 0.0
         form["swing_speed_frozen"][just_reset] = 0.0
+        form["attempt_candidate"][just_reset] = False
 
     env_ids = torch.arange(env.num_envs, device=device)
     ball_pos = ball.data.root_pos_w[:, :3]
@@ -277,6 +280,14 @@ def _inside_form_state(
     swing_speed = swing_xy.norm(dim=-1)
     swing_dir = swing_xy / swing_speed.unsqueeze(-1).clamp_min(_NORM_EPS)
     swing_cos = torch.clamp((swing_dir * target_dir).sum(dim=-1), -1.0, 1.0)
+    nearest_distance = (selected_pos - ball_pos).norm(dim=-1)
+    form["attempt_candidate"] = (
+        (nearest_distance <= 0.23)
+        & (swing_speed >= 0.2)
+        & (inside_contact_cos >= math.cos(math.radians(60.0)))
+        & (~just_reset)
+        & (~shared["kick_done"])
+    )
 
     touched = shared["pre_latch_touch_event"].bool()
     form["last_touch_valid"] = form["last_touch_valid"] | touched
@@ -320,6 +331,71 @@ def _inside_form_state(
     form["prev_kick_done"] = shared["kick_done"].clone()
     form["step"] = step
     return shared, form
+
+
+def failed_inside_kick_attempt(
+    env: ManagerBasedRLEnv,
+    r_stance: float,
+    alpha: float,
+    v_thresh: float,
+    confirmation_window_s: float = 0.20,
+    r_max: float | None = None,
+    orbit_beta: float = 0.6,
+    overshoot_margin: float = 0.0,
+    lateral_band: tuple[float, float] | None = None,
+) -> torch.Tensor:
+    """インサイドキック動作後、猶予内にキック成立しなかった試行を一度だけ返す。"""
+    shared, form = _inside_form_state(
+        env,
+        r_stance,
+        alpha,
+        v_thresh,
+        r_max=r_max,
+        orbit_beta=orbit_beta,
+        overshoot_margin=overshoot_margin,
+        lateral_band=lateral_band,
+    )
+    step = int(env.common_step_counter)
+    state = getattr(env, _MISS_STATE_ATTR, None)
+    if state is not None and state["step"] == step:
+        return state["event"]
+    if state is None:
+        state = {
+            "step": -1,
+            "candidate_prev": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            "active": torch.zeros(env.num_envs, dtype=torch.bool, device=env.device),
+            "steps_left": torch.zeros(env.num_envs, dtype=torch.int32, device=env.device),
+            "event": torch.zeros(env.num_envs, device=env.device),
+        }
+        setattr(env, _MISS_STATE_ATTR, state)
+
+    just_reset = env.episode_length_buf == 1
+    if just_reset.any():
+        state["candidate_prev"][just_reset] = False
+        state["active"][just_reset] = False
+        state["steps_left"][just_reset] = 0
+
+    candidate = form["attempt_candidate"]
+    started = candidate & (~state["candidate_prev"]) & (~state["active"])
+    confirmation_steps = max(1, int(round(confirmation_window_s / float(env.step_dt))))
+    state["active"] = state["active"] | started
+    state["steps_left"] = torch.where(
+        started,
+        torch.full_like(state["steps_left"], confirmation_steps),
+        state["steps_left"],
+    )
+    state["active"] = state["active"] & (~shared["kick_done"])
+    state["steps_left"] = torch.where(
+        state["active"],
+        torch.clamp(state["steps_left"] - 1, min=0),
+        torch.zeros_like(state["steps_left"]),
+    )
+    miss = state["active"] & (state["steps_left"] == 0)
+    state["active"] = state["active"] & (~miss)
+    state["candidate_prev"] = candidate
+    state["event"] = miss.float()
+    state["step"] = step
+    return state["event"]
 
 
 def kick_inside_contact(
@@ -447,11 +523,13 @@ def inside_kick_stage_curriculum(
     straight_swing_term_name: str,
     opposite_direction_term_name: str,
     direction_accuracy_term_name: str,
+    failed_kick_term_name: str,
     inside_contact_weight: float,
     stage2_inside_face_weight: float,
     stage2_straight_swing_weight: float,
     stage2_opposite_direction_weight: float,
     stage3_direction_accuracy_weight: float,
+    failed_kick_weight: float,
     stage3_promote_error_below_deg: float,
     stage3_direction_ramp_iterations: int,
     inside_contact_angle_deg: float,
@@ -563,6 +641,7 @@ def inside_kick_stage_curriculum(
         _set_reward_weight(env, straight_swing_term_name, 0.0)
         _set_reward_weight(env, opposite_direction_term_name, 0.0)
         _set_reward_weight(env, direction_accuracy_term_name, 0.0)
+        _set_reward_weight(env, failed_kick_term_name, 0.0)
         command_term.cfg.target_speed_range = start_range
         return {
             "stage": 1.0,
@@ -586,6 +665,7 @@ def inside_kick_stage_curriculum(
             "iterations_since_direction_promotion": 0.0,
         }
 
+    _set_reward_weight(env, failed_kick_term_name, failed_kick_weight)
     _set_reward_weight(env, straight_swing_term_name, stage2_straight_swing_weight)
     _set_reward_weight(env, opposite_direction_term_name, stage2_opposite_direction_weight)
     promoted_at = state["promoted_at"]

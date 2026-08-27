@@ -272,6 +272,9 @@ _INSIDE_STAGE_PROMOTE_KICK_RATE = 0.80
 _INSIDE_STAGE_PROMOTE_CONTACT_RATE = 0.80
 _FIRST_TOUCH_WEIGHT = 100.0  # イベント1回 × dt 0.02 = +2.0
 _EXTRA_TOUCH_WEIGHT = -25.0  # イベント1回 × dt 0.02 = -0.5
+_FAILED_KICK_WEIGHT = -50.0  # イベント1回 × dt 0.02 = -1.0
+_ACTION_SMOOTHNESS_WEIGHT = -0.30
+_DOF_ACC_L2_WEIGHT = -2.0e-6
 
 # 球速帯を進退させるキック成立率と方向平均誤差のヒステリシス。どちらかが中間帯に
 # ある間は停止し、成立率が崩れるか方向誤差が広がった場合は進行時の2倍速で戻す。
@@ -377,6 +380,9 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        self.rewards.action_smoothness_l2.weight = _ACTION_SMOOTHNESS_WEIGHT
+        self.rewards.dof_acc_l2.weight = _DOF_ACC_L2_WEIGHT
 
         # -- 0. 実機で使用する4号球へ合わせる
         #
@@ -495,6 +501,11 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
             params=kick_state_params,
         )
         self.curriculum.kick_opposite_direction_weight = None
+        self.rewards.failed_inside_kick = RewTerm(
+            func=inside_rewards.failed_inside_kick_attempt,
+            weight=0.0,
+            params={**kick_state_params, "confirmation_window_s": 0.20},
+        )
 
         # -- 2. 継続学習用の復旧カリキュラム
         #
@@ -536,6 +547,7 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                 "straight_swing_term_name": "kick_straight_swing",
                 "opposite_direction_term_name": "kick_opposite_direction",
                 "direction_accuracy_term_name": "kick_direction_accuracy",
+                "failed_kick_term_name": "failed_inside_kick",
                 "inside_contact_weight": (
                     _INSIDE_CONTACT_WEIGHT * _INSIDE_CONTACT_MULTIPLIER * _KICK_W_SCALE
                 ),
@@ -549,6 +561,7 @@ class K1WalkLongPassHistoryEnvCfg(K1WalkLongPassEnvCfg):
                 "stage3_direction_accuracy_weight": (
                     _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE
                 ),
+                "failed_kick_weight": _FAILED_KICK_WEIGHT,
                 "stage3_promote_error_below_deg": _DIRECTION_ACCURACY_PROMOTE_ERROR_DEG,
                 "stage3_direction_ramp_iterations": _DIRECTION_ACCURACY_RAMP_ITERATIONS,
                 "inside_contact_angle_deg": _INSIDE_CONTACT_ANGLE_DEG,
@@ -632,3 +645,4 @@ class K1WalkLongPassHistoryEnvCfg_PLAY(K1WalkLongPassHistoryEnvCfg):
         )
         self.rewards.kick_opposite_direction.weight = _OPPOSITE_DIRECTION_WEIGHT * _KICK_W_SCALE
         self.rewards.kick_direction_accuracy.weight = _DIRECTION_ACCURACY_WEIGHT * _KICK_W_SCALE
+        self.rewards.failed_inside_kick.weight = _FAILED_KICK_WEIGHT
