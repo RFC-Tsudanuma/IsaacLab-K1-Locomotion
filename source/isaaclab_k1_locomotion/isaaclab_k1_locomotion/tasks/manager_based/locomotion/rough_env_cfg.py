@@ -7,7 +7,7 @@ import os
 import torch
 
 from isaaclab.assets import ArticulationCfg
-from isaaclab.actuators import IdealPDActuatorCfg
+from isaaclab.actuators import ActuatorNetMLPCfg, IdealPDActuatorCfg
 import isaaclab.sim as sim_utils
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
@@ -48,9 +48,28 @@ _K1_USD_PATH = os.path.join(
     "../../../../../../assets_soccer/booster_robotics_robots/K1/K1_22dof.usd",
 )
 
+_LEG_NET_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "../../../../../../actuator_net_leg.pt",
+)
+
 ##
 # K1 robot asset configuration
 ##
+
+actuatornet_leg = ActuatorNetMLPCfg(
+    joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
+    effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+    velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+    saturation_effort=120.0,
+    armature={".*_Hip_Pitch": 0.0478125, ".*_Hip_Roll": 0.0339552, ".*_Hip_Yaw": 0.0282528, ".*_Knee_Pitch": 0.095625},
+    network_file=_LEG_NET_PATH,
+    pos_scale=1.0,
+    vel_scale=1.0,
+    torque_scale=1.0,
+    input_order="vel_pos",
+    input_idx=[2, 1, 0],
+)
 
 K1_LOCOMOTION_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
@@ -95,16 +114,17 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
     ),
     soft_joint_pos_limit_factor=0.9,
     actuators={
-        "legs": IdealPDActuatorCfg(
-            joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
-            effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
-            velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
-            # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
-            # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
-            stiffness={".*_Hip_.*": 200.0, ".*_Knee_Pitch": 200.0},
-            damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
-            armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
-        ),
+        "legs" : actuatornet_leg,
+        # "legs": IdealPDActuatorCfg(
+        #     joint_names_expr=[".*_Hip_Pitch", ".*_Hip_Roll", ".*_Hip_Yaw", ".*_Knee_Pitch"],
+        #     effort_limit={".*_Hip_Pitch": 68.0, ".*_Hip_Roll": 76.0, ".*_Hip_Yaw": 38.3, ".*_Knee_Pitch": 112.0},
+        #     velocity_limit={".*_Hip_Pitch": 14.66, ".*_Hip_Roll": 12.57, ".*_Hip_Yaw": 17.59, ".*_Knee_Pitch": 12.57},
+        #     # stiffness={".*_Hip_Pitch": 30.20098947, ".*_Hip_Roll": 21.44796105, ".*_Hip_Yaw": 17.84601339, ".*_Knee_Pitch": 60.40197893},
+        #     # damping={".*_Hip_Pitch": 90.6029684, ".*_Hip_Roll": 64.34388314, ".*_Hip_Yaw": 53.53804017, ".*_Knee_Pitch": 120.8039579},
+        #     stiffness={".*_Hip_.*": 200.0, ".*_Knee_Pitch": 200.0},
+        #     damping={".*_Hip_.*": 5.0 , ".*_Knee_Pitch": 5.0},
+        #     armature={".*_Hip_Pitch": 0.0478125,".*_Hip_Roll": 0.0339552 , ".*_Knee_Pitch": 0.095625, '.*_Hip_Yaw': 0.0282528},
+        # ),
         "feet": IdealPDActuatorCfg(
             joint_names_expr=[".*_Ankle_Pitch", ".*_Ankle_Roll"],
             effort_limit=38.3,
