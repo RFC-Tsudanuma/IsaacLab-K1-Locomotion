@@ -1,0 +1,7 @@
+{
+  "_comment": "★ 2026-08-30: 減速区間ゲート (stop_window_s) を切って従来挙動に戻す A/B 用。振動ペナルティが「指令ゼロ化直後の減速中」に本当に効くようになったかの検証にのみ使う。同一 seed の iteration 0 を比べれば、方策更新前なので差はゲートだけに由来する。",
+  "env": {
+    "rewards.standstill_jitter.params.stop_window_s": 0.0,
+    "rewards.body_jitter.params.stop_window_s": 0.0
+  }
+}

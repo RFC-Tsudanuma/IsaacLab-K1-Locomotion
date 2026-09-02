@@ -121,11 +121,21 @@ H. **位相を ``f = |v_cmd| / (2 L(θ))`` にする** (``_ADAPTIVE_PHASE_PARAMS
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 from isaaclab.utils import configclass
+import isaaclab.terrains as terrain_gen
+from isaaclab.terrains import TerrainGeneratorCfg
 
-from ..locomotion.mdp.events import randomize_joint_offset, reset_gait_phase
+from ..locomotion.mdp.events import (
+    randomize_joint_offset,
+    randomize_rigid_body_inertia,
+    reset_gait_phase,
+)
+from ..locomotion.mdp.obs_noise_models import SensorArtifactNoiseCfg
+from ..locomotion.mdp.rewards import base_ang_acc_l2
 from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1
+import isaaclab_tasks.manager_based.locomotion.velocity.mdp as _mdp
 
 from .goalkeeper_direct_env_cfg import K1GKDirectStage1EnvCfg
 from .mdp.events import reset_lateral_buffers
@@ -229,6 +239,72 @@ PHASE_FREQ_DR_RANGE: tuple[float, float] = (-0.25, 0.25)
 # 既存 DR (質量・COM・摩擦・PD ゲイン・遅延) に唯一欠けていた実機由来のばらつき。
 JOINT_OFFSET_RANGE: tuple[float, float] = (-0.02, 0.02)
 
+# ★★ 2026-08-25: `feat/inoue_walk_double_encoder` の DR を移植した。
+#   あちらは歩行タスクを実機まで持っていく過程で追加したもので、**実機由来の知見**が
+#   入っている。我々の DR は velocity_env_cfg の初期値のままで、いくつか実機の実態を
+#   カバーしていなかった。
+#
+#   ☠ 特に **摩擦は「実機の値が学習分布の外」** だった。GETUP_HANDOFF.md の記録:
+#       「MuJoCo/実フィールドの実効摩擦は μ≈0.7〜1.0 と高い (地面 0.7 + 足 1.0)。
+#         低摩擦説は誤り」
+#     旧設定は dynamic 0.2〜0.6 で、**実機の 0.7〜1.0 が丸ごと分布外**だった。
+#   ☠ さらに `make_consistent` が未指定 (既定 False) だと static/dynamic を独立に
+#     サンプルするので、**動摩擦 > 静摩擦という非物理な組み合わせ**が混ざっていた。
+FRICTION_RANGE: tuple[float, float] = (0.3, 1.0)
+
+# リンク物性のランダム化。DH (履歴 CNN) は「同定すべきばらつき」が分布に無ければ
+# 何も学習しない。旧設定は Trunk の質量 ±1.5kg だけで、脚のリンクの個体差はゼロだった。
+# ☠ 質量スケールは default 基準で書き直すため、Trunk だけの add_base_mass は
+#   上書きされて意味を失う。あちらと同じく add_base_mass は無効化する。
+LINK_MASS_RANGE: tuple[float, float] = (0.9, 1.1)
+LINK_INERTIA_RANGE: tuple[float, float] = (0.9, 1.1)
+
+# 観測側のセンサ遅延 [s]。通信・ドライバ由来の伝送遅延を per-env でランダム化する。
+# ☠ 我々にはアクション側の遅延 (DelayedPDActuator 2〜7 step) しか無く、**観測側の遅延が
+#   ゼロ**だった。実機の IMU・エンコーダには必ず遅延がある。
+#   上限 20ms = 制御周期 1 ステップ分。
+SENSOR_DELAY_RANGE: tuple[float, float] = (0.0, 0.020)
+
+# 地形の凹凸。☠ 旧設定は **完全平面** (flat_env_cfg と goalkeeper_direct_env_cfg の
+#   2 箇所で terrain_type="plane" に落としていた)。人工芝の凹凸は実在し、
+#   クリアランス下位10% (実測 50mm) を直接食う。後退はかかとの余裕が前進の 55% しか
+#   無いので、接地面の高さのばらつきに一番弱い方向でもある。
+USE_NOISY_TERRAIN: bool = True
+
+# 横移動タスク専用の地形 (2026-08-26)。
+#
+# ☠ 共有の `NOISY_FLAT_TERRAIN_CFG` (locomotion/flat_env_cfg.py) は **使わない**。
+#   あちらは凹凸 90% / 平面 10% / noise_range (0.01, 0.04) で、around_ball など他タスクも
+#   参照する想定になっている。ここで書き換えると他へ波及するので独立に定義する。
+#
+# ☠☠ **`noise_range` は「セルの高さの範囲」であって「段差」ではない。**
+#   `HfRandomUniformTerrainCfg` は各セルの高さを noise_range から一様サンプルして
+#   noise_step で量子化する。歩行で効くのは **隣接セルの高低差** なので、
+#       (0.01, 0.04) → 高さ {1,2,3,4}cm → 最大段差 **3cm**
+#       (0.03, 0.04) → 高さ {3,4}cm     → 最大段差 **1cm**  ← 絞ると易しくなる
+#       (0.00, 0.04) → 高さ {0..4}cm    → 最大段差 **4cm**  ← これを採用
+#   「3〜4cm の高低差が欲しい」なら **下限を 0 に広げる** のが正しい。
+LATERAL_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=5.0,
+    num_rows=5,
+    num_cols=5,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    curriculum=False,
+    sub_terrains={
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.8,                # 凹凸 80%
+            noise_range=(0.0, 0.04),       # 段差 最大 4cm
+            noise_step=0.01,
+            border_width=0.25,
+        ),
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.2),   # 平地 20%
+    },
+)
+
 _ADAPTIVE_PHASE_PARAMS = {
     "adaptive": LATERAL_ADAPTIVE_PHASE,
     "l_fwd": L_FWD,
@@ -273,6 +349,11 @@ _ADAPTIVE_PHASE_PARAMS = {
     "vel_lag_s": 0.3,
     "vel_noise_std": 0.0,
     "l_back": L_BACK,
+    # ★ 2026-08-25【検証用】右移動 (vy<0) のとき位相を π ずらす。既定 False = 従来どおり。
+    #   ☠ **キーとして明示しておくこと** (`--override_json` は存在しないキーを作らない)。
+    #   ☠ ここは observations の gait_phase にしか効かない (報酬側の feet_phase /
+    #     foot_clearance は同名引数を持たない)。学習で採用するならそちらにも足すこと。
+    "lateral_phase_flip": False,
 }
 
 # 直前の指令を符号反転させる確率 (2026-08-21 追加)。
@@ -281,6 +362,44 @@ _ADAPTIVE_PHASE_PARAMS = {
 # ☆ 追加の報酬は入れない。反転で転べば termination_penalty (-200) で十分強く罰される。
 #   足りなければ姿勢の項を足す、の順序にする (報酬を先に足すと何が効いたか分からない)。
 REVERSAL_PROB: float = 0.20
+
+# ★★ 2026-08-26: 実機で「**歩行から停止する瞬間に振動する**」と報告された件の対策3点。
+#
+# ① 「全開 → 停止」の遷移密度を上げる。``rel_standing_envs`` (0.10) は直前の指令と
+#    無関係な抽選なので、この最悪の遷移は偶然にしか出ない。``reversal_prob`` を入れた
+#    ときと同じ論理 (GK で実際に効く遷移の密度を上げる)。GK は飛んだあと必ず止まる。
+STOP_PROB: float = 0.15
+
+# ② 指令の再サンプル間隔。☠ 学習時の実測値は **(10.0, 10.0)** で、1 つの env が反転を
+#    経験するのは平均 50 秒に 1 回しかなかった。カリキュラム
+#    (`command_resampling_time_range`) が (0.5, 7.0) に縮める設定はあるが、発動が
+#    `num_steps = 14000 × 48` = 67 万ステップ後 = **28000 イテレーション相当**で、
+#    17300 イテレーションでは到達しない実質デッドコードだった。直接指定する。
+CMD_RESAMPLING_TIME_RANGE: tuple[float, float] = (1.5, 5.0)
+
+# ③ 振動ペナルティの速度ゲート。☠☠ **これが今回の主犯の可能性が高い。**
+#    `_stopped_boost` / `body_jitter(stop_only=True)` は
+#        is_stopped(指令ノルム<0.05) **かつ** lin < lin_vel_max(0.5)
+#    で発火する。「止まれ」が来た瞬間、機体はまだ 1.0〜1.5 m/s で減速中なので
+#    **0.5 を下回るまでの 0.3〜0.5 秒間、振動の罰が完全に切れている**。
+#    まさに実機で震えている区間が無罰だった。
+#    ☠☠ このガードは「push で突き飛ばされた復帰動作を罰しない」ためのもので、
+#      **本タスクでは push は実在する**。2026-08-26 に学習ログ 2026-08-23_18-05-55 の
+#      env.yaml で確認: push_robot は mode=interval / (7.0, 10.0) 秒 / ±0.5 m/s で有効。
+#      ☠ `goalkeeper_direct_env_cfg.py` 側は `push_robot = None` だが、本タスクは
+#        それを継承していない。直接版だけを見て「push は起きない」と判断すると誤る
+#        (一度そう判断して lin_vel_max を 10.0 に潰しかけた)。
+#    → **速度でガードするのをやめ、「指令がゼロになった直後か」で見分ける**。
+#      push はランダム時刻に起きるので指令のゼロ化と相関しない。実装は
+#      goalkeeper/mdp/rewards.py の `_stop_window` を参照。
+JITTER_GATE_LIN_VEL_MAX: float = 0.5    # 静止時のゲートは従来どおり (push 復帰を守る)
+JITTER_STOP_WINDOW_S: float = 0.8       # 指令ゼロ化から何秒を「減速中」として罰するか
+#   1.5 m/s から 0.5 m/s まで落ちるのに実測 0.3〜0.5 秒なので 0.8 秒で全域を覆う。
+
+# 胴体角加速度のペナルティ (feat/inoue_walk_double_encoder から移植)。
+# ☠ `body_jitter` は有界化 d/(d+w_ref) しているので大きい領域で飽和する。本項は生の
+#   二乗で飽和しないため、**減速中の大きなジッタ**にも勾配が残る。補完関係。
+BASE_ANG_ACC_WEIGHT: float = -1.0e-5
 
 # ☠ 経緯のメモ: 3 本目の前に位相を固定 3.5Hz へ上げようとして **取り下げた**。
 #   位相を守らせるなら 歩幅 = 速度 / (2×周波数) なので、**周波数を下げるほど要求される
@@ -368,6 +487,68 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         # 推論側の近似誤差・定数のずれに耐えるための保険。PHASE_FREQ_DR_RANGE 参照。
         self.events.randomize_phase_freq.params["offset_range"] = PHASE_FREQ_DR_RANGE
 
+        # ==================================================================
+        # feat/inoue_walk_double_encoder から移植した DR (2026-08-25)
+        # ==================================================================
+        # --- ① 地面摩擦: 実機の μ≈0.7〜1.0 を分布に入れる ---
+        # ☠ make_consistent=True で dynamic <= static を保証する。既定の False だと
+        #   独立サンプルになり「動摩擦 > 静摩擦」という非物理な env が生成される。
+        self.events.physics_material.params["static_friction_range"] = FRICTION_RANGE
+        self.events.physics_material.params["dynamic_friction_range"] = FRICTION_RANGE
+        self.events.physics_material.params["make_consistent"] = True
+
+        # --- ② 全リンクの質量・慣性 ---
+        # ☠ add_base_mass (Trunk のみ ±1.5kg) は無効化する。randomize_rigid_body_mass は
+        #   default 値基準で書き直すので、後から全リンクスケールを掛けると上書きされて
+        #   意味を失う。×0.9〜1.1 は ±1.5kg より広い DR なので実質の後退にはならない。
+        self.events.add_base_mass = None
+        self.events.randomize_link_mass = EventTerm(
+            func=_mdp.randomize_rigid_body_mass,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "mass_distribution_params": LINK_MASS_RANGE,
+                "operation": "scale",
+                "distribution": "uniform",
+                "recompute_inertia": True,
+            },
+        )
+        # 慣性を質量とは **独立に** 振る (IsaacLab 標準に無いので自作イベント)。
+        # 上の質量 DR の後に走り、最終慣性 = default × 質量比 × 本倍率 で合成される。
+        self.events.randomize_link_inertia = EventTerm(
+            func=randomize_rigid_body_inertia,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*"),
+                "inertia_distribution_params": LINK_INERTIA_RANGE,
+            },
+        )
+
+        # --- ③ 観測側のセンサ遅延 (0〜20ms) ---
+        # 白色ノイズの幅は K1PolicyCfg の Unoise と同値をそのまま内包させる。
+        # ☠ バイアス/EMA/ホールドは入れない。あちらの実測で「実機の後退転倒に効かず、
+        #   推測ベースのノイズは run 比較の交絡源になる」として既定無効にされている。
+        self.observations.policy.base_ang_vel.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.2, n_max=0.2), delay_range=SENSOR_DELAY_RANGE
+        )
+        self.observations.policy.projected_gravity.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.05, n_max=0.05), delay_range=SENSOR_DELAY_RANGE
+        )
+        self.observations.policy.joint_pos.noise = SensorArtifactNoiseCfg(
+            noise_cfg=Unoise(n_min=-0.03, n_max=0.03), delay_range=SENSOR_DELAY_RANGE
+        )
+
+        # --- ④ 地形の凹凸 (1〜4cm が 70% / 平面 30%) ---
+        # ☠ 親 (flat_env_cfg / goalkeeper_direct_env_cfg) が 2 箇所で平面に落としているので、
+        #   ここで戻す。高さスキャンは入れない (実機に無いセンサなので観測しない = 盲目で歩く)。
+        if USE_NOISY_TERRAIN:
+            self.scene.terrain.terrain_type = "generator"
+            self.scene.terrain.terrain_generator = LATERAL_TERRAIN_CFG
+            self.scene.terrain.max_init_terrain_level = None
+            self.scene.height_scanner = None
+            self.observations.policy.height_scan = None
+            self.curriculum.terrain_levels = None
+
         # --- 関節ゼロ点 (較正) オフセット DR (2026-08-23、脚 12 関節のみ) ---
         # ☠ mode="startup" 必須。default_joint_pos を書き換えるので reset だと累積して発散する。
         self.events.randomize_joint_offset = EventTerm(
@@ -410,6 +591,12 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         #   **反転の所要時間も反転時の転倒率も測る手段が無い**。学習と並行して
         #   eval に反転指標を足すこと (測っていない量は直らない)。
         self.commands.base_velocity.reversal_prob = REVERSAL_PROB
+        # ① 「全開 → 停止」の遷移を密にする (反転と排他。両方当たったら反転が優先)
+        self.commands.base_velocity.stop_prob = STOP_PROB
+        # ② 再サンプル間隔を実効的な値にする。カリキュラム側は到達しないので無効化する。
+        self.commands.base_velocity.resampling_time_range = CMD_RESAMPLING_TIME_RANGE
+        self.curriculum.command_resampling_time_range = None
+
 
         # ==================================================================
         # ★ I. 振動対策 (5 本目、2026-08-21)
@@ -485,6 +672,18 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         #   w_ref=0.15 は元々停止時のレンジ (0.02〜0.2) に合わせた値なので設計とも整合する。
         self.rewards.body_jitter = RewTerm(
             func=body_jitter, weight=-1.5, params={"w_ref": 0.15, "stop_only": True}
+        )
+        # ③ 振動ペナルティを **減速中にも効かせる** (定数のコメント参照)。
+        #   静止時の速度ゲートは残したまま、減速区間を追加で有効にする。
+        for _t in (self.rewards.standstill_jitter, self.rewards.body_jitter):
+            _t.params["lin_vel_max"] = JITTER_GATE_LIN_VEL_MAX
+            _t.params["stop_window_s"] = JITTER_STOP_WINDOW_S
+
+        # 胴体角加速度。body_jitter (有界) が飽和する領域を補う。
+        self.rewards.base_ang_acc_l2 = RewTerm(
+            func=base_ang_acc_l2,
+            weight=BASE_ANG_ACC_WEIGHT,
+            params={"asset_cfg": SceneEntityCfg("robot")},
         )
 
         # ==================================================================

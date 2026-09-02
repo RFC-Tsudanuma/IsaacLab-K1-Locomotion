@@ -56,7 +56,8 @@ class DiscreteVelocityCommand(UniformVelocityCommand):
         self.vel_command_b[env_ids, 1] = self._sample_axis(n, self.cfg.ranges.lin_vel_y, self.cfg.lin_vel_y_resolution)
         self.vel_command_b[env_ids, 2] = self._sample_axis(n, self.cfg.ranges.ang_vel_z, self.cfg.ang_vel_z_resolution)
         self._apply_pure_axis(env_ids, n)
-        self._apply_reversal(env_ids, n, prev)
+        _reversed = self._apply_reversal(env_ids, n, prev)
+        self._apply_stop(env_ids, n, prev, _reversed)
         if self.cfg.heading_command:
             self.heading_target[env_ids] = r.uniform_(*self.cfg.ranges.heading)
             self.is_heading_env[env_ids] = r.uniform_(0.0, 1.0) <= self.cfg.rel_heading_envs
@@ -91,7 +92,29 @@ class DiscreteVelocityCommand(UniformVelocityCommand):
         mask = (axis_idx == keep.unsqueeze(1)) | ~pure.unsqueeze(1)          # (n, 3)
         self.vel_command_b[env_ids] = self.vel_command_b[env_ids] * mask.float()
 
-    def _apply_reversal(self, env_ids: Sequence[int], n: int, prev: torch.Tensor) -> None:
+    def _apply_stop(self, env_ids: Sequence[int], n: int, prev: torch.Tensor,
+                    exclude: torch.Tensor) -> None:
+        """``stop_prob`` の確率で新しい指令を **ゼロ** に差し替える (歩行→停止の遷移)。
+
+        Args:
+            prev: 直前の指令 (n, 3)。再サンプル前に控えたもの。
+            exclude: 既に反転が当たった env のマスク (n,)。二重適用を避ける。
+        """
+        p = float(getattr(self.cfg, "stop_prob", 0.0) or 0.0)
+        if p <= 0.0:
+            return
+        min_speed = float(getattr(self.cfg, "stop_min_speed", 0.3))
+        prev_speed = torch.norm(prev[:, :2], dim=1)
+        do = (torch.rand(n, device=self.device) < p) & (prev_speed > min_speed) & ~exclude
+        if not bool(do.any()):
+            return
+        ids = torch.as_tensor(env_ids, device=self.device)[do]
+        self.vel_command_b[ids] = 0.0
+        # ☠ standing 抽選で上書きされないよう、この env は standing 扱いにする。
+        #   (is_standing_env は _update_command でゼロ埋めに使われる)
+        self.is_standing_env[ids] = True
+
+    def _apply_reversal(self, env_ids: Sequence[int], n: int, prev: torch.Tensor) -> torch.Tensor:
         """``reversal_prob`` の確率で新しい指令を **直前の指令の符号反転** に差し替える。
 
         ★ 2026-08-21 追加。既定 0.0 なので、指定しない限り従来の挙動と完全に同じ。
@@ -114,14 +137,15 @@ class DiscreteVelocityCommand(UniformVelocityCommand):
         """
         p = float(getattr(self.cfg, "reversal_prob", 0.0) or 0.0)
         if p <= 0.0:
-            return
+            return torch.zeros(n, dtype=torch.bool, device=self.device)
         min_speed = float(getattr(self.cfg, "reversal_min_speed", 0.3))
         prev_speed = torch.norm(prev[:, :2], dim=1)
         do = (torch.rand(n, device=self.device) < p) & (prev_speed > min_speed)
         if not bool(do.any()):
-            return
+            return do
         ids = torch.as_tensor(env_ids, device=self.device)[do]
         self.vel_command_b[ids] = -prev[do]
+        return do
 
 
 @configclass
@@ -129,6 +153,24 @@ class DiscreteVelocityCommandCfg(UniformVelocityCommandCfg):
     """離散速度コマンド（軸ごとの resolution で格子化）の設定クラス。"""
 
     class_type: type = DiscreteVelocityCommand
+
+    stop_prob: float = 0.0
+    """直前が全開でも **強制的にゼロ指令** にする確率 [0,1]。0 で従来どおり。
+
+    ★ 2026-08-26 追加。実機で「歩行から停止する瞬間に振動する」と報告されたため。
+
+    ☠ ``rel_standing_envs`` (既定 0.10) は **直前の指令と無関係な抽選** なので、
+      「全開 → 停止」という最悪の遷移が出るのは偶然でしかない。``reversal_prob`` を
+      入れたときと同じ論理 (GK で実際に効く遷移の密度を上げる) をそのまま適用する。
+      GK は飛んだあと必ず止まって構えるので、停止の遷移は反転と同じくらい頻出する。
+
+    ☠ ``reversal_prob`` と排他にすること (両方当たったら反転を優先)。同時に適用すると
+      「反転してから即ゼロ」になって、どちらの遷移も学習できない。
+    """
+
+    stop_min_speed: float = 0.3
+    """直前の指令がこれ未満の env は ``stop_prob`` の対象外 [m/s]。
+    ほぼ止まっていた env をさらに止めても「歩行→停止」の遷移にならないため。"""
 
     lin_vel_x_resolution: float | None = None
     lin_vel_y_resolution: float | None = None

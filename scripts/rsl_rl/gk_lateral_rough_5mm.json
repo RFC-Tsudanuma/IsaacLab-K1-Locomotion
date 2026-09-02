@@ -1,0 +1,9 @@
+{
+  "_comment": "★ 2026-09-02: 地面の凹凸の強さを 5mm に固定する掃引用の上書き。実機の停止時振動が「学習が平地のみ / 実機の床は人工芝で凹凸あり」で説明できるかを、用量反応で確かめる。全 env を凹凸にして希釈を避ける (平地の割合を 0 にする)。判定は diag_stop_transition の 静止中 が較正値 0.082 (停止時に振動する) を超えるか。",
+  "env": {
+    "scene.terrain.terrain_generator.sub_terrains.random_rough.noise_range": [0.0, 0.005],
+    "scene.terrain.terrain_generator.sub_terrains.random_rough.noise_step": 0.005,
+    "scene.terrain.terrain_generator.sub_terrains.random_rough.proportion": 1.0,
+    "scene.terrain.terrain_generator.sub_terrains.plane.proportion": 0.0
+  }
+}

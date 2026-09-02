@@ -7,8 +7,11 @@
 
 from __future__ import annotations
 
+import math
 import torch
 from typing import TYPE_CHECKING
+
+from isaaclab.managers import SceneEntityCfg
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedEnv
@@ -219,6 +222,7 @@ def get_gait_phase(
     env: "ManagerBasedEnv",
     phase_freq: float,
     adaptive: bool = False,
+    lateral_phase_flip: bool = False,
     **freq_kwargs,
 ) -> torch.Tensor:
     """左足の歩行位相 [rad] を返す (N,)。右足は ``+ pi``。
@@ -249,6 +253,23 @@ def get_gait_phase(
         # 分解能が落ちるのを防ぐ。20s エピソードで最大 4Hz なら 500 周する)
         ph.remainder_(2.0 * torch.pi)
         setattr(env, _GAIT_PHASE_STEP_ATTR, cur)
+
+    # ★ 2026-08-25【検証用】右移動 (vy<0) のとき位相の基準足を入れ替える (φ += π)。
+    #
+    #   ☠ 仮説: **リセット時の位相が左右非対称**。:func:`reset_gait_phase` は全 env を
+    #     φ=0 で始めるが、φ=0 は「左足が位相 0 / 右足が π」を意味し、**その鏡像は φ=π**。
+    #     つまり右移動の初期条件が左移動の鏡像になっていない。位相クロックは進行方向に
+    #     よらず回り続けるので、このずれは極限周期に残り続ける。
+    #     方策が対称 (実測 0.49%)・ロボットも対称 (URDF 実測: 脚の質量差 0.000000 kg) なのに
+    #     右移動だけヨー 5.26°/s・x ドリフト -0.545 が出る件の、最後に残った説明。
+    #
+    #   ☠ **アキュムレータ本体は書き換えない** (書き換えると指令が反転するたびに位相が
+    #     不連続に飛ぶ)。読み出し時にオフセットするだけにしてある。
+    #   ☠ 学習で採用するなら **推論側にも同じ規則が必要**。定数の二重管理が増えるので、
+    #     効果を確認してから採否を決めること。
+    if lateral_phase_flip:
+        cmd_y = env.command_manager.get_command("base_velocity")[:, 1]
+        return ph + torch.where(cmd_y < 0.0, torch.full_like(ph, math.pi), torch.zeros_like(ph))
     return ph
 
 
@@ -318,8 +339,6 @@ def randomize_joint_offset(
       作るので、そちらにもこのバイアスが乗る (意図どおり: 較正のずれた機体は
       ずれた姿勢で立ち上がる)。
     """
-    from isaaclab.managers import SceneEntityCfg
-
     if asset_cfg is None:
         asset_cfg = SceneEntityCfg("robot")
     asset = env.scene[asset_cfg.name]
@@ -341,3 +360,41 @@ def randomize_joint_offset(
         default[env_ids] += bias
     else:
         default[env_ids[:, None], torch.as_tensor(joint_ids, device=env.device)] += bias
+
+
+def randomize_rigid_body_inertia(
+    env: "ManagerBasedEnv",
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    inertia_distribution_params: tuple[float, float] = (0.7, 1.3),
+):
+    """各リンクの慣性テンソルをリンク毎の一様乱数倍でスケールする (startup 専用)。
+
+    ★ 2026-08-25: feat/inoue_walk_double_encoder から移植。あちらは質量とは独立に
+      慣性を振っている (IsaacLab 標準には質量非依存の慣性 DR が無いため自作)。
+
+    IsaacLab 標準には質量と独立な慣性ランダム化がないため自作。
+    「現在の」慣性値に倍率を掛けるので、``randomize_rigid_body_mass``
+    (recompute_inertia=True: 慣性 = default × 質量比) の **後** に実行すれば
+    質量ランダム化と合成される (最終慣性 = default × 質量比 × 本倍率)。
+    テンソル全成分に同一スカラを掛けるため正定値性は保たれる。
+
+    Note:
+        現在値に累積で掛かるため mode="startup" (1回のみ) でしか使わないこと。
+        reset モードで使うと呼ばれる度に縮小/拡大が複利で効いてしまう。
+    """
+    asset = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.scene.num_envs, device="cpu")
+    else:
+        env_ids = env_ids.cpu()
+    if asset_cfg.body_ids == slice(None):
+        body_ids = torch.arange(asset.num_bodies, dtype=torch.int, device="cpu")
+    else:
+        body_ids = torch.tensor(asset_cfg.body_ids, dtype=torch.int, device="cpu")
+
+    inertias = asset.root_physx_view.get_inertias()  # (E, B, 9), CPU
+    lo, hi = float(inertia_distribution_params[0]), float(inertia_distribution_params[1])
+    ratios = torch.empty((env_ids.numel(), body_ids.numel(), 1)).uniform_(lo, hi)
+    inertias[env_ids[:, None], body_ids] = inertias[env_ids[:, None], body_ids] * ratios
+    asset.root_physx_view.set_inertias(inertias, env_ids)

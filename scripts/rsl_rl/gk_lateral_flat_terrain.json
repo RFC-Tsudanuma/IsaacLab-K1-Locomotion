@@ -1,0 +1,7 @@
+{
+  "_comment": "★ 2026-09-02: 地形 DR を切って平地に戻す上書き。☠ 2026-08-23 学習のチェックポイントは **凹凸地形 DR を入れる前** に学習されている。共有 cfg に LATERAL_TERRAIN_CFG (最大4cm) を入れた結果、Play タスクもそれを継承するため、旧ポリシーを学習時より難しい地形で評価してしまう。旧ckptの計測にはこれを付けること。",
+  "env": {
+    "scene.terrain.terrain_type": "plane",
+    "scene.terrain.terrain_generator": null
+  }
+}

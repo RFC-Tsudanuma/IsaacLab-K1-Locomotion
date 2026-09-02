@@ -89,6 +89,7 @@ def feet_phase(
     cmd_gain: float = 1.0,
     vel_lag_s: float = 0.0,
     vel_noise_std: float = 0.0,
+    lateral_phase_flip: bool = False,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -128,6 +129,7 @@ def feet_phase(
         l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
         use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
         vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
+        lateral_phase_flip=lateral_phase_flip,
     ) % (2.0 * math.pi)   # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
@@ -375,6 +377,7 @@ def foot_clearance_ji(
     cmd_gain: float = 1.0,
     vel_lag_s: float = 0.0,
     vel_noise_std: float = 0.0,
+    lateral_phase_flip: bool = False,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -401,6 +404,7 @@ def foot_clearance_ji(
         l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
         use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
         vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
+        lateral_phase_flip=lateral_phase_flip,
     ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
@@ -436,6 +440,7 @@ def foot_clearance_ji_pen(
     cmd_gain: float = 1.0,
     vel_lag_s: float = 0.0,
     vel_noise_std: float = 0.0,
+    lateral_phase_flip: bool = False,
 ) -> torch.Tensor:
     """遊脚にのみ高さ追従報酬を与える関数
 
@@ -458,6 +463,7 @@ def foot_clearance_ji_pen(
         l_fwd=l_fwd, l_lat=l_lat, l_back=l_back, f_min=f_min, f_max=f_max, dr_base=dr_base,
         use_actual_speed=use_actual_speed, cmd_gain=cmd_gain,
         vel_lag_s=vel_lag_s, vel_noise_std=vel_noise_std,
+        lateral_phase_flip=lateral_phase_flip,
     ) % (2.0 * math.pi)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)
     stance_threshold = 2.0 * math.pi * stance_ratio
@@ -1428,3 +1434,36 @@ __all__ = [
     "compute_zmp_xy",
     "zmp_support_center",
 ]
+
+
+def base_ang_acc_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """base (Trunk) の角加速度の L2 二乗をペナルティとして返す (weight < 0 で使う)。
+
+    ★ 2026-08-26: feat/inoue_walk_double_encoder から移植。
+      ☠ 我々の ``goalkeeper/mdp/rewards.py::body_jitter`` は角速度の2階差分を
+        **有界化** (d/(d+w_ref)) しているので、大きい領域で飽和して勾配が消える。
+        本項は生の二乗なので飽和せず、**歩行→停止の減速中のような大きなジッタ**にも
+        勾配が残る。補完関係にあるので併用する。
+
+    頭部は Trunk に剛結合されているため、頭の振動 = Trunk の回転ジッタ × レバーアーム。
+    角速度ペナルティ (ang_vel_xy_l2) はゆっくりした揺れを抑えるが、高周波の
+    カタカタしたジッタは「速度は小さいが加速度が大きい」ため取りこぼす。
+    角加速度を直接罰することで頭部の振動を抑える。
+
+    物理エンジンの生の加速度はスパイクを含むため、角速度の有限差分で計算し、
+    リセット直後は無効化する (com_jerk_l2 と同じパターン)。
+    """
+    robot = env.scene[asset_cfg.name]
+    ang_vel = robot.data.root_ang_vel_b  # (N, 3)
+    if not hasattr(env, "_prev_root_ang_vel_b") or env._prev_root_ang_vel_b.shape != ang_vel.shape:
+        env._prev_root_ang_vel_b = ang_vel.clone()
+    prev = env._prev_root_ang_vel_b
+    dt = env.step_dt
+    ang_acc = (ang_vel - prev) / max(dt, 1e-6)
+    env._prev_root_ang_vel_b = ang_vel.clone()
+    penalty = torch.sum(torch.square(ang_acc), dim=1)
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)

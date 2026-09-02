@@ -1158,6 +1158,7 @@ def standstill_jitter(
     cmd_threshold: float = 0.05,
     d2_ref: float = 0.05,
     lin_vel_max: float = 0.5,
+    stop_window_s: float = 0.0,
 ) -> torch.Tensor:
     """**停止指令中の高周波の振れ幅**を有界に罰する (N,)。weight < 0 で使う。
 
@@ -1194,7 +1195,64 @@ def standstill_jitter(
     """
     _, d2 = _action_diffs(env)
     pen = d2 / (d2 + float(d2_ref))
-    return pen * _stop_mask(env, command_name, cmd_threshold, lin_vel_max)
+    return pen * _stop_mask(env, command_name, cmd_threshold, lin_vel_max, stop_window_s)
+
+
+_STOP_WINDOW_TIMER_ATTR = "_gk_stop_window_timer"   # (N,) 指令がゼロになってからの経過秒
+_STOP_WINDOW_STEP_ATTR = "_gk_stop_window_step"
+
+
+def _stop_window(
+    env: "ManagerBasedRLEnv",
+    is_stopped: torch.Tensor,
+    stop_window_s: float,
+) -> torch.Tensor:
+    """**指令がゼロになった直後の減速区間**なら True (N,)。
+
+    ★★ 2026-08-26: 実機フィードバック「**歩いているところから止まるときに振動する**」
+      への対応。それまでのゲートは ``is_stopped & (lin < lin_vel_max=0.5)`` だったが、
+      指令がゼロになった瞬間の機体はまだ 1.0〜1.5 m/s で走っている。
+      **0.5 m/s を下回るまでの 0.3〜0.5 秒間、振動ペナルティが完全にゼロ**になっていた。
+      **まさに実機で震えている区間だけ罰が切れていた**ことになる。
+
+    ☠☠ ではなぜ ``lin_vel_max`` を単純に外さないか。**push は実在するため** (2026-08-26
+      に学習ログ ``2026-08-23_18-05-55`` の env.yaml で確認):
+
+          push_robot: mode=interval, interval_range_s=(7.0, 10.0),
+                      velocity_range x/y = (-0.5, 0.5)
+
+      **7〜10 秒ごとに突き飛ばされている**。速度ゲートを外すと押され復帰まで罰する。
+      (``goalkeeper_direct_env_cfg.py`` 側は ``push_robot = None`` だが、横移動タスクは
+      これを継承していない。直接版だけを見て「push は起きない」と判断すると誤る。)
+
+    そこで **速度で押しを代用するのをやめ、指令の変化で見分ける**:
+
+        ============================  ======  ==================  ====
+        場面                          指令    ゼロ化からの経過    罰
+        ============================  ======  ==================  ====
+        減速して止まる (対象)         ≈0      **< stop_window_s** 効く
+        静止中に押される              ≈0      大きい              切れる
+        通常の静止                    ≈0      大きい              効く (速度側で通る)
+        ============================  ======  ==================  ====
+
+      push はランダムな時刻に起きるので指令のゼロ化と相関しない。この見分けは成立する。
+
+    Args:
+        stop_window_s: ゼロ化から何秒を「減速区間」とみなすか。1.5 m/s から 0.5 m/s まで
+            落ちるのに実測 0.3〜0.5 秒なので 0.8 秒あれば全域を覆う。
+    """
+    timer: torch.Tensor | None = getattr(env, _STOP_WINDOW_TIMER_ATTR, None)
+    if timer is None or timer.shape != is_stopped.shape:
+        # 初回は「ずっと前から停止している」扱い (静止から始まるので速度側のゲートが拾う)
+        timer = torch.full(is_stopped.shape, 1.0e3, device=is_stopped.device)
+        setattr(env, _STOP_WINDOW_TIMER_ATTR, timer)
+    cur = int(getattr(env, "common_step_counter", 0))
+    if getattr(env, _STOP_WINDOW_STEP_ATTR, -1) != cur:
+        # ☠ 複数の報酬項から呼ばれるので **1 step につき 1 回だけ** 進める。
+        timer.add_(float(env.step_dt))
+        timer[~is_stopped] = 0.0   # 動いている間は 0 = 次のゼロ化から数え直す
+        setattr(env, _STOP_WINDOW_STEP_ATTR, cur)
+    return timer <= float(stop_window_s)
 
 
 def _stop_mask(
@@ -1202,13 +1260,21 @@ def _stop_mask(
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.05,
     lin_vel_max: float = 0.5,
+    stop_window_s: float = 0.0,
 ) -> torch.Tensor:
-    """停止指令中なら 1.0、それ以外 0.0 (N,)。:func:`_stopped_boost` と同じ判定。"""
+    """停止指令中なら 1.0、それ以外 0.0 (N,)。:func:`_stopped_boost` と同じ判定。
+
+    ``stop_window_s > 0`` のとき、速度ゲートに加えて **指令ゼロ化直後の減速区間**でも
+    有効になる (:func:`_stop_window` を参照)。既定 0.0 は従来の挙動。
+    """
     cmd = env.command_manager.get_command(command_name)[:, :3]
     is_stopped = torch.norm(cmd, dim=1) < float(cmd_threshold)
     robot: Articulation = env.scene["robot"]
     lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
-    return (is_stopped & (lin < float(lin_vel_max))).float()
+    gate = is_stopped & (lin < float(lin_vel_max))
+    if float(stop_window_s) > 0.0:
+        gate = gate | (is_stopped & _stop_window(env, is_stopped, stop_window_s))
+    return gate.float()
 
 
 _BODY_JITTER_HIST_ATTR = "_gk_body_jitter_hist"    # (2, N, 3) [w_{t-1}, w_{t-2}]
@@ -1223,6 +1289,7 @@ def body_jitter(
     command_name: str = "base_velocity",
     cmd_threshold: float = 0.05,
     lin_vel_max: float = 0.5,
+    stop_window_s: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """**胴体角速度の2階差分**を有界に罰する (N,)。weight < 0 で使う。
@@ -1282,10 +1349,7 @@ def body_jitter(
     if stop_only:
         # _stopped_boost は scale 倍率を返すゲートなので、scale=1.0 で「停止中=1 / それ以外=0」
         # のマスクにはならない。ここは 0/1 のマスクが要るので直接組む。
-        cmd = env.command_manager.get_command(command_name)[:, :3]
-        is_stopped = torch.norm(cmd, dim=1) < float(cmd_threshold)
-        lin = torch.norm(robot.data.root_lin_vel_b[:, :2], dim=1)
         # ☠ push で突き飛ばされた直後は外す (復帰動作を罰しないため)。閾値の根拠は
-        #   _stopped_boost の docstring と同じ。
-        penalty = penalty * (is_stopped & (lin < float(lin_vel_max))).float()
+        #   _stopped_boost の docstring と同じ。減速区間の扱いは _stop_window を参照。
+        penalty = penalty * _stop_mask(env, command_name, cmd_threshold, lin_vel_max, stop_window_s)
     return penalty
