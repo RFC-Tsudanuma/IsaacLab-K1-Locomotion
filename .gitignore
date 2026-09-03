@@ -10,3 +10,7 @@ logs/
 
 # Isaac Sim
 _isaac_sim/
+data/
+
+#optuna
+runs/

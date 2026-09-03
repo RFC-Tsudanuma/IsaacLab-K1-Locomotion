@@ -5,6 +5,20 @@
 
 """Script to train RL agent with RSL-RL."""
 
+import os
+
+# PyTorch CUDA アロケータの断片化対策 (2026-08-05)。履歴観測 (100step × 49/81ch) の
+# 巨大ロールアウトストレージでメモリが逼迫した際、断片化による「合計は空いているのに
+# 連続領域不足で OOM」を防ぐ。計算・精度・乱数には一切影響しない (アロケータのみ)。
+# 既にユーザーが環境変数を設定している場合はそちらを優先する。
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# 2 GPU 分散学習の NCCL ハング対策 (2026-08-06)。この PC は GPU 間が PHB 接続 +
+# AMD IOMMU 有効のため、NCCL が PCIe P2P を使うと最初の broadcast で無限に固まる。
+# P2P を無効化しホストメモリ経由にする。同期対象は勾配 (~9MB) のみなので速度影響は
+# 誤差レベル。単一 GPU 学習には無影響。
+os.environ.setdefault("NCCL_P2P_DISABLE", "1")
+
 """Launch Isaac Sim Simulator first."""
 
 import argparse
@@ -32,7 +46,19 @@ parser.add_argument(
 )
 parser.add_argument("--export_io_descriptors", action="store_true", default=False, help="Export IO descriptors.")
 parser.add_argument(
+    "--reset_noise_std",
+    type=float,
+    default=None,
+    help="If set, clamp the policy action-noise std to this minimum after loading a checkpoint (resume only).",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
+)
+parser.add_argument(
+    "--override_json",
+    type=str,
+    default=None,
+    help="JSON file with dot-path overrides for env_cfg / agent_cfg (used by Optuna tuning).",
 )
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
@@ -121,6 +147,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
     )
 
+    # apply Optuna-style JSON overrides last so they win over Hydra/CLI defaults
+    if args_cli.override_json is not None:
+        from config_overrides import apply_overrides_from_file
+
+        apply_overrides_from_file(args_cli.override_json, env_cfg=env_cfg, agent_cfg=agent_cfg)
+
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
     env_cfg.seed = agent_cfg.seed
@@ -190,7 +222,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # --checkpoint に実在するファイルパスが渡された場合はそれを直接使う。
+        # これにより load_run を介さず、別 experiment / 任意の場所にある .pt からでも
+        # 追加学習を開始できる (追加学習で checkpoint パスだけ指定したいケース)。
+        # ファイルが見つからない場合は従来通り logs/rsl_rl/<experiment_name>/<load_run>/
+        # 配下を load_run・load_checkpoint の正規表現で解決する (後方互換)。
+        if agent_cfg.load_checkpoint and os.path.isfile(agent_cfg.load_checkpoint):
+            resume_path = os.path.abspath(agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -221,8 +261,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # load the checkpoint
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-        # load previously trained model
-        runner.load(resume_path)
+        # When resetting std, also drop the optimizer state. The saved Adam moments for the std
+        # parameter carry strong "push std down" momentum that immediately drives std negative on
+        # the first update, regardless of any post-load clamp.
+        load_optimizer = args_cli.reset_noise_std is None
+        runner.load(resume_path, load_optimizer=load_optimizer)
+        if not load_optimizer:
+            print("[INFO]: Skipped optimizer state load (--reset_noise_std set).")
+
+        policy = runner.alg.policy
+
+        # Force-load workaround: runner.load() can silently no-op for some checkpoints
+        # (see PLAY_LOAD_ISSUE.md). Detect and force-load if needed.
+        ckpt = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+        ckpt_msd = ckpt["model_state_dict"]
+        live_msd = policy.state_dict()
+        mismatched = [
+            k for k in ckpt_msd if k in live_msd and not torch.equal(live_msd[k].cpu(), ckpt_msd[k].cpu())
+        ]
+        if mismatched:
+            print(f"[WARN]: runner.load no-op detected; force-loading {len(mismatched)} mismatched keys.")
+            policy.load_state_dict(ckpt_msd, strict=False)
+
+        # re-inject action noise std if requested (recover from collapsed std after long training)
+        if args_cli.reset_noise_std is not None:
+            import math
+
+            with torch.no_grad():
+                if policy.noise_std_type == "scalar":
+                    before = policy.std.data.clone()
+                    policy.std.data.clamp_(min=args_cli.reset_noise_std)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std}\n"
+                        f"        before: {before.tolist()}\n"
+                        f"        after : {policy.std.data.tolist()}"
+                    )
+                elif policy.noise_std_type == "log":
+                    log_floor = math.log(args_cli.reset_noise_std)
+                    before = policy.log_std.data.exp().clone()
+                    policy.log_std.data.clamp_(min=log_floor)
+                    print(
+                        f"[INFO]: Clamped policy std to min={args_cli.reset_noise_std} (log_std clamp)\n"
+                        f"        before std: {before.tolist()}\n"
+                        f"        after  std: {policy.log_std.data.exp().tolist()}"
+                    )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
