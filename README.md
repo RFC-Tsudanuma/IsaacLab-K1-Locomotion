@@ -1,4 +1,3 @@
-# IsaacLab-K1-Dribbling
+# IsaacLab-K1-Locomotion
 
-K1の歩行の訓練をIsaacLabで行うためのリポジトリ  
-[https://github.com/HarukiOgawa1/IsaacLab-K1-Dribbling](https://github.com/HarukiOgawa1/IsaacLab-K1-Dribbling)をコピーして歩行に関する機能のみにした
+K1の歩行の訓練をIsaacLabで行うためのリポジトリ
