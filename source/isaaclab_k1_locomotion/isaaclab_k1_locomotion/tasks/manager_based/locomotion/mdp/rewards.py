@@ -1436,6 +1436,33 @@ __all__ = [
 ]
 
 
+def joint_power_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """関節の機械パワー ``torque × joint_vel`` の二乗和 (N,)。weight < 0 で使う。
+
+    ★ 2026-09-07: feat/inoue_walk_double_encoder から移植 (weight -3.0e-5 で使用中)。
+      あちらの歩容は実機の試合で使われていて「柔らかい」と評価されている一方、
+      我々の横移動は「ドスドスする」と報告された。着地衝撃の実測は **体重の 3.8〜5.0 倍**
+      (人間の歩行は 1.2〜1.5 倍) で、異常に硬い。
+
+    ☠ ``dof_torques_l2`` (トルクのみ) との違いは **速度が掛かる**こと。
+      静的に大きなトルクを出すこと自体は罰さず、**速く動かしながら大トルクを出す**
+      = 衝撃的な動きだけを選んで罰する。二乗和なのでピークを強く罰する
+      (:func:`joint_power_l1` より鋭い)。
+
+    Args:
+        asset_cfg: ``joint_ids`` を絞れば脚だけに限定できる。既定は全関節。
+    """
+    asset = env.scene[asset_cfg.name]
+    power = (
+        asset.data.applied_torque[:, asset_cfg.joint_ids]
+        * asset.data.joint_vel[:, asset_cfg.joint_ids]
+    )
+    return torch.sum(torch.square(power), dim=1)
+
+
 def base_ang_acc_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

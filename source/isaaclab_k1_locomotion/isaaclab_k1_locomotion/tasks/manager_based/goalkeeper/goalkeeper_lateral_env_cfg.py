@@ -118,6 +118,7 @@ H. **位相を ``f = |v_cmd| / (2 L(θ))`` にする** (``_ADAPTIVE_PHASE_PARAMS
 ベースライン記録: ``docs/baselines/gk_direct_stage1_2026-07-28.md``。
 """
 
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
@@ -132,7 +133,7 @@ from ..locomotion.mdp.events import (
     reset_gait_phase,
 )
 from ..locomotion.mdp.obs_noise_models import SensorArtifactNoiseCfg
-from ..locomotion.mdp.rewards import base_ang_acc_l2
+from ..locomotion.mdp.rewards import base_ang_acc_l2, joint_power_l2
 from ..locomotion.rough_env_cfg import _COMMAND_THRESHOLD
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as _mdp
@@ -147,6 +148,7 @@ from .mdp.rewards import (
     swing_ground_exposure,
     track_lin_vel_x_exp,
 )
+from ..locomotion.mdp.curriculums import modify_command_resampling_time_range
 
 # 「地面すれすれ」とみなす足裏クリアランスの上端 [m] (:func:`swing_ground_exposure`)。
 # 07-28 の足裏 p50 (13.3mm) のすぐ下 = 頂点を上げずに軌道を作り直すだけで届く水準。
@@ -168,7 +170,15 @@ TARGET_GROUND_EXPOSURE_H: float = 0.010
 #   実力の頭打ちは 1.75 m/s 前後で、1.5 のキャップが単に足を引っ張っていた。
 #   ☠ 過去に「±1.8 は物理的に届かず崩れた歩容を誘発する」として 1.5 にキャップした
 #     経緯があるが、**あれは前進の話**で、当時は DH も指令ベース位相も無かった。
-LATERAL_CMD_MAX: float = 1.8
+# ★★ 2026-09-07: **1.8 → 1.3 に下げた** (ユーザー判断)。1.8 への引き上げ根拠 (上記) は
+#   シムの実力 (頭打ち 1.75 m/s) に基づくが、**実機で出るとは限らない**:
+#   位相は f = 0.5·(0.92·v)/L_lat なので **1.8 では f_max 4.0 Hz に張り付く**。
+#   実測した足首の閉ループ帯域は **実機 4.74 Hz / シム 6.70 Hz** で、4.0 Hz は
+#   実機アクチュエータの追従限界のすぐ横 = **シムだけ出せる領域**。
+#   1.3 なら純横 3.23 Hz、最悪の斜め (後退+横) でも 3.97 Hz で f_max に触れない。
+#   ☠ デプロイ側 (rl_policy_slide_walk_node.cpp) の CMD_LIMIT_VY も 1.3 に合わせること。
+#     学習と推論で指令上限がずれると分布外の指令が入る。
+LATERAL_CMD_MAX: float = 1.3
 
 # 1 軸だけ残す指令の割合。実機はコントローラで純粋方向の指令を出すのに対し、
 # 3 軸独立サンプルでは「ほぼ純粋な後退」が全指令の約 1.5% しか出ていなかった。
@@ -211,7 +221,13 @@ LATERAL_ADAPTIVE_PHASE: bool = True
 #     なり、位相報酬 (feet_phase / foot_clearance) がまとめて無効化される。
 L_FWD: float = 0.31     # 前進の 1 歩あたりの進み幅 [m] (1.6Hz で 0.984 m/s。前進は据え置き)
 L_LAT: float = 0.185    # 横の 1 歩あたりの進み幅 [m] (1.6Hz で 0.582 m/s)
-PHASE_F_MIN: float = 1.2
+# ★★ 2026-09-07: **1.2 → 1.8**。feat/inoue_walk_double_encoder の低速プラトー
+#   (_PHASE_FREQ_LOW = 1.8 Hz、speed ≤ 1.0 m/s は 1.8 固定) に合わせる。
+#   我々の式では 前進 1.0 → 1.48 Hz なので、f_min 1.8 のクランプにより
+#   **前進の全域 (±1.0) が 1.8 Hz = inoue と完全一致**になる。
+#   横 0.72 m/s 以下も 1.8 Hz に張り付くので、そこも一致する。
+#   ☠ 試合で使う歩行と分布を揃えるのが目的 (2026-09-07 のユーザー方針)。
+PHASE_F_MIN: float = 1.8
 PHASE_F_MAX: float = 4.0  # 4.0Hz で名目スイング 0.125s
 #   ☠ 上限を上げるとスイング窓が短くなり、足を上げる時間が減る。5.0Hz の 0.100s は
 #     実測の実スイング 0.13〜0.14s より短いので、ここが新しい律速になる可能性がある。
@@ -226,14 +242,25 @@ PHASE_DR_BASE: float = 1.6  # randomize_phase_freq の base_phase_freq と揃え
 #   張り付くのを避ける」の妥協点 (後退 1.0 m/s で f = 1.0/0.40 = 2.5Hz)。
 #   ☠ 効果は転倒率では見えない (後退はシムで既に引きすり率 0.1%・転倒最少)。
 #     ZMP のかかと余裕で測ること。
-L_BACK: float = 0.20
+# ★★ 2026-09-07: **0.20 → 0.31 (= L_FWD)**。inoue は歩行周波数を速度の大きさだけで
+#   決めており **前後で変えない**。後退 1.0 m/s は inoue で 1.8 Hz、我々は l_back=0.20
+#   だと 2.30 Hz でずれる。0.31 にすると 1.48 → f_min クランプで 1.8 Hz となり一致する。
+#   ☠ 代償: 後退の歩幅が伸び、かかと側の ZMP 余裕が減る方向。ただし l_back=0.20 の
+#     効果は実機で確認できておらず、inoue は前後同一周波数で試合を戦えている。
+#     後退の姿勢は「前傾して重心をかかとから遠ざける」ほうで担保する
+#     (2026-09-04 の計測: 新方策は後退中ずっと +4.05° 前傾し、かかと余裕が正に転じた)。
+L_BACK: float = 0.31
 
 # 位相周波数 DR の幅 [Hz]。
 # ☠☠ 2026-08-23: 従来は ±0.05 Hz (base 1.6 に対し **±3%**) しか振っていなかった。
 #   実機の推論が固定 1.6Hz のままで学習が 3.2〜3.9Hz だったため **2.4 倍ずれ**、
 #   横移動で 10 歩に 1 歩足を引きずっていた (シム実測: 引きずり率 10.3% vs 2.0%)。
 #   ±0.25 Hz (±15%) まで広げ、推論側の近似誤差や定数のずれに耐える方策にする。
-PHASE_FREQ_DR_RANGE: tuple[float, float] = (-0.25, 0.25)
+# ★★ 2026-09-07: **±0.25 → ±0.05**。この値は base_phase_freq=1.6 に対する Hz オフセットで、
+#   実際には **倍率** として効く (events.adaptive_phase_freq: f = f * (pf / dr_base))。
+#   ±0.25 は倍率 ±16% = 4 Hz なら ±0.64 Hz と、**inoue の ±0.05 Hz の 13 倍**広かった。
+#   ±0.05 なら倍率 ±3.1%、f=1.8 で ±0.056 Hz と inoue とほぼ同じ幅になる。
+PHASE_FREQ_DR_RANGE: tuple[float, float] = (-0.05, 0.05)
 
 # 関節ゼロ点 (較正) オフセット DR の振れ幅 [rad]。±0.02 rad ≈ ±1.15°。
 # 既存 DR (質量・COM・摩擦・PD ゲイン・遅延) に唯一欠けていた実機由来のばらつき。
@@ -296,12 +323,19 @@ LATERAL_TERRAIN_CFG = TerrainGeneratorCfg(
     curriculum=False,
     sub_terrains={
         "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
-            proportion=0.8,                # 凹凸 80%
-            noise_range=(0.0, 0.04),       # 段差 最大 4cm
+            # ★★ 2026-09-07: **feat/inoue_walk_double_encoder の NOISY_FLAT_TERRAIN_CFG と
+            #   完全に同一の値にした**。あちらは同じ地形 DR を入れて実機の試合で通用する
+            #   柔らかい歩容を出しているので、**地形の設定自体は「正解」が既にある**。
+            #   独自にずらす理由が無く、ずらすと分布が inoue と食い違う。
+            #   ☠ 以前は 0.8 / (0.0, 0.04) / 平地 0.2 にしていた。下限を 0 にしたのは
+            #     「noise_step=0.01 刻みだと凹凸タイル内に完全な平坦セルが 1 つも無くなる」
+            #     という理由だったが、inoue は下限 0.01 のまま良好なので合わせる。
+            proportion=0.7,                # 凹凸 70% (inoue と同じ)
+            noise_range=(0.01, 0.04),      # 段差 1〜4cm (inoue と同じ)
             noise_step=0.01,
             border_width=0.25,
         ),
-        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.2),   # 平地 20%
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.3),   # 平地 30% (inoue と同じ)
     },
 )
 
@@ -370,12 +404,32 @@ REVERSAL_PROB: float = 0.20
 #    ときと同じ論理 (GK で実際に効く遷移の密度を上げる)。GK は飛んだあと必ず止まる。
 STOP_PROB: float = 0.15
 
-# ② 指令の再サンプル間隔。☠ 学習時の実測値は **(10.0, 10.0)** で、1 つの env が反転を
-#    経験するのは平均 50 秒に 1 回しかなかった。カリキュラム
-#    (`command_resampling_time_range`) が (0.5, 7.0) に縮める設定はあるが、発動が
-#    `num_steps = 14000 × 48` = 67 万ステップ後 = **28000 イテレーション相当**で、
-#    17300 イテレーションでは到達しない実質デッドコードだった。直接指定する。
-CMD_RESAMPLING_TIME_RANGE: tuple[float, float] = (1.5, 5.0)
+# ② 指令の再サンプル間隔。
+#
+# ☠☠ 2026-09-07: **(1.5, 5.0) を学習の最初から入れたのは誤りだった。(10.0, 10.0) に戻す。**
+#   2026-09-02 の学習でこれをやった結果、実機で「動かした瞬間から振動して使い物に
+#   ならない」となった。前進 1.0 m/s の 1 歩は 0.68 秒なので、最短 1.5 秒では
+#   **約 2 歩で指令が変わる** = まっすぐ歩き続ける経験をほぼ積んでいない。
+#   さらに位相速度の LPF (τ=0.3s、整定 ~0.9s) があるため、**学習時間の 28% が
+#   「位相が実速度と食い違ったままの過渡」**になる (10 秒なら 9%)。位相と実速度の
+#   不一致は実機の横移動引きずりバグの原因そのもので、それを常態化させていた。
+#
+# ☠ そもそも短縮した動機が誤り。「反転の経験が足りない」と判断したが、
+#   `reversal_prob = 0.2` と `rel_standing_envs = 0.1` が旧から既にあり、
+#   10 秒周期でも 20000 iter × 4096 env なら遷移のサンプル数は十分だった。
+#   **増やすべきは確率であって周期ではなく、その確率は既に入っていた。**
+#
+#   feat/inoue_walk_double_encoder は (10.0, 10.0) で始め、**学習の 70% を過ぎてから**
+#   カリキュラムで縮める。「まず定常歩行を覚え、あとから乱す」という順序。
+CMD_RESAMPLING_TIME_RANGE: tuple[float, float] = (10.0, 10.0)
+
+# カリキュラムで縮める先と、その発動イテレーション。
+# ☠☠ `num_steps` は **環境ステップ数**なので、イテレーション換算は `num_steps_per_env` に
+#   依存する。**我々の DH は 24、inoue は 48** で倍違う。継承値の `14000 × 48` は
+#   我々では 672000/24 = **28000 イテレーション相当**になり、20000 では発動しない
+#   デッドコードだった (これが「直接指定する」に走った原因)。24 で計算し直す。
+CMD_RESAMPLING_CURRICULUM_RANGE: tuple[float, float] = (1.5, 7.0)
+CMD_RESAMPLING_CURRICULUM_ITER: int = 14000   # inoue と同じ「学習の 70%」の位置
 
 # ③ 振動ペナルティの速度ゲート。☠☠ **これが今回の主犯の可能性が高い。**
 #    `_stopped_boost` / `body_jitter(stop_only=True)` は
@@ -399,6 +453,9 @@ JITTER_STOP_WINDOW_S: float = 0.8       # 指令ゼロ化から何秒を「減�
 # 胴体角加速度のペナルティ (feat/inoue_walk_double_encoder から移植)。
 # ☠ `body_jitter` は有界化 d/(d+w_ref) しているので大きい領域で飽和する。本項は生の
 #   二乗で飽和しないため、**減速中の大きなジッタ**にも勾配が残る。補完関係。
+# 関節パワーの罰 (feat/inoue_walk_double_encoder と同値)。着地の硬さ対策。
+JOINT_POWER_WEIGHT: float = -3.0e-5
+
 BASE_ANG_ACC_WEIGHT: float = -1.0e-5
 
 # ☠ 経緯のメモ: 3 本目の前に位相を固定 3.5Hz へ上げようとして **取り下げた**。
@@ -595,7 +652,16 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         self.commands.base_velocity.stop_prob = STOP_PROB
         # ② 再サンプル間隔を実効的な値にする。カリキュラム側は到達しないので無効化する。
         self.commands.base_velocity.resampling_time_range = CMD_RESAMPLING_TIME_RANGE
-        self.curriculum.command_resampling_time_range = None
+        # ☠ 無効化 (None) ではなく、**発動時期を我々の num_steps_per_env=24 で
+        #   計算し直して有効化する**。定数のコメント参照。
+        self.curriculum.command_resampling_time_range = CurrTerm(
+            func=modify_command_resampling_time_range,
+            params={
+                "command_name": "base_velocity",
+                "resampling_time_range": CMD_RESAMPLING_CURRICULUM_RANGE,
+                "num_steps": CMD_RESAMPLING_CURRICULUM_ITER * 24,
+            },
+        )
 
 
         # ==================================================================
@@ -686,6 +752,16 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
 
+        # ★ 2026-09-07: feat/inoue_walk_double_encoder と同じ weight で追加。
+        #   実機で「ドスドスする」と報告された着地の硬さへの対策。
+        #   torque × joint_vel の二乗和なので「速く動かしながら大トルク」= 衝撃的な
+        #   動きだけを選んで罰する (dof_torques_l2 は静的な大トルクも罰してしまう)。
+        self.rewards.joint_power_l2 = RewTerm(
+            func=joint_power_l2,
+            weight=JOINT_POWER_WEIGHT,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+
         # ==================================================================
         # E. 観測遅延 DR 【2 本目 (2026-08-21) で無効化した】
         # ==================================================================
@@ -773,18 +849,18 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         #   1.3 → 1.8 と一気に飛ばすと「達成不能な指令が急に来て exp 報酬の勾配が消え、
         #   諦めて足踏みに落ちる」罠を踏む (このリポジトリで一度踏んでいる)。
         self.curriculum.lin_vel_command.params["stages_y"] = [
-            (-0.6, 0.6), (-0.9, 0.9), (-1.1, 1.1), (-1.3, 1.3), (-1.5, 1.5),
+            (-0.6, 0.6), (-0.9, 0.9), (-1.1, 1.1),
             (-LATERAL_CMD_MAX, LATERAL_CMD_MAX),
-        ]
+        ]   # ★ 2026-09-07: 上限 1.3 に伴い 6 段 → **4 段**。刻みはそのまま残す
         # stages_x は段数を揃える (カリキュラムが同じ段番号を引くため)
         self.curriculum.lin_vel_command.params["stages_x"] = [
-            (-0.6, 0.6), (-0.8, 0.8), (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0), (-1.0, 1.0),
+            (-0.6, 0.6), (-0.8, 0.8), (-1.0, 1.0), (-1.0, 1.0),
         ]
         # ☠ error_threshold も **段数と同じ長さ**でないと起動時に ValueError で落ちる。
         #   最終段は指令が 1.5 まで伸びるぶん追従誤差も大きくなるので閾値も少し緩める
         #   (厳しいままだと最終段へ上がった直後に降格して往復する)。
-        # ☠ 段数と同じ長さでないと起動時に ValueError で落ちる (6 段なので 6 個)。
-        self.curriculum.lin_vel_command.params["error_threshold"] = [0.30, 0.35, 0.40, 0.43, 0.47, 0.52]
+        # ☠ 段数と同じ長さでないと起動時に ValueError で落ちる (4 段なので 4 個)。
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.30, 0.35, 0.40, 0.43]
         self.rewards.lateral_speed_bonus.params["v_ref"] = LATERAL_CMD_MAX
 
         # ★★ 2026-08-22: weight 2.0 → 4.0。**高速域で唯一勾配が生きている項**だから。
@@ -849,16 +925,32 @@ class K1GKLateralEnvCfg(K1GKDirectStage1EnvCfg):
         # ☠ edge_frac=0.3 (急峻ランプ) は必須。線形版は「一番低いところだけ少し上げる」
         #   に収束し、f(10mm) を 0.416 → 0.515 に **悪化** させた (2026-08-17 実測)。
         #   形状報酬のランプは、評価したい指標の指示関数に形を合わせること。
-        self.rewards.ground_exposure = RewTerm(
-            func=swing_ground_exposure,
-            weight=-1.5,
-            params={
-                "command_name": "base_velocity",
-                "h_target": TARGET_GROUND_EXPOSURE_H,
-                "edge_frac": 0.3,
-                "cmd_threshold": _COMMAND_THRESHOLD,
-            },
-        )
+        # ☠☠ 2026-09-07: **無効化した (weight -1.5 → None)**。
+        #
+        #   実機フィードバック: 我々の歩容は「**ドスドスする**」、
+        #   feat/inoue_walk_double_encoder は「**柔らかい**」。着地衝撃の実測は
+        #   **体重の 3.8〜5.0 倍** (人間の歩行 1.2〜1.5 倍) で異常に硬い。
+        #
+        #   本項は「遊脚が h_target (10mm) 以下に居る時間」を罰する。ところが
+        #   **静かに接地するには、足を地面の近くでゆっくり降ろす必要がある**。
+        #   つまり本項は **柔らかい着地そのものを罰している**。着地の硬さへの
+        #   因果が最も直接的な項なので、まずこれを外す。
+        #   inoue には本項も foot_clearance も無く、それで柔らかい歩容が出ている。
+        #
+        #   ☠☠ さらに 2026-09-07 に PHASE_F_MIN を 1.2 → 1.8 にしたため、前進の
+        #     遊脚時間が 0.338 → 0.278 秒 (**−18%**) に縮む。target_clearance 0.095 を
+        #     据え置いたまま時間だけ縮めると **足の鉛直速度が +22%** になり、着地は
+        #     いまより硬くなる。分布合わせの変更が症状を悪化させる向きなので、
+        #     何らかの補償が要る。その補償を本項の除去で行う。
+        #
+        #   ☠ リスク: 低クリアランス率 f(10mm) の悪化。ただし過去の実測が示すのは
+        #     「**foot_clearance を消した**」ケース (露出率のみ 0.498、両方 0.214、
+        #     07-28 は両方なしで 0.321) であって、**本構成 (クリアランスのみ) は未計測**。
+        #     足上げの主役は foot_clearance (振幅を作る側) なので残している。
+        #     判定は eval_swing_quality の f(10mm)。**0.30 を超えたら不合格**とし、
+        #     その場合は本項を戻すのではなく target_clearance をケイデンスに
+        #     合わせて下げる (0.095 → 0.078) 方向で調整すること。
+        self.rewards.ground_exposure = None
         # ☠☠ 親の foot_clearance (= foot_clearance_ji、weight 2.5、目標 0.095) を
         #   **消さないこと**。2026-08-17 に消して露出率だけにしたら f(10mm) が
         #   0.321 → 0.498 と 07-28 より悪化した。2 項は要求が違う:
