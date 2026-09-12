@@ -144,6 +144,33 @@ class K1FlatPosturePPORunnerCfg(K1FlatPPORunnerCfg):
 
 
 @configclass
+class K1FlatGoalkeeperPPORunnerCfg(K1FlatPPORunnerCfg):
+    """横移動特化 (Isaac-Velocity-Flat-Goalkeeper) 用。
+
+    学習済み Flat ポリシーからの warm-start を前提に既定 10000 イテレーション
+    (y カリキュラム拡張 + 5000 iter からの extreme 導入分)。resume の checkpoint
+    解決を簡単にするため experiment_name は "k1_flat" を共有する (Posture と同様)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10000
+
+
+@configclass
+class K1FlatFastPPORunnerCfg(K1FlatPPORunnerCfg):
+    """通常歩行の高速実験版 (Isaac-Velocity-Flat-Fast) 用。
+
+    学習済み Flat ポリシーからの warm-start を前提に既定 10000 イテレーション。
+    resume の checkpoint 解決のため experiment_name は "k1_flat" を共有する。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 10000
+
+
+@configclass
 class K1GetupPPORunnerCfg(K1RoughPPORunnerCfg):
     """起き上がり (get-up) 用の PPO 設定。
 

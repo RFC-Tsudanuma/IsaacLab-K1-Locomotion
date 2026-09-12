@@ -22,7 +22,7 @@ from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
-from .mdp.commands import ExtremeVelocityCommandCfg
+from .mdp.commands import ExtremeVelocityCommandCfg, LateralVelocityCommandCfg
 from .mdp.rewards import (
     feet_landing_impact,
     feet_landing_vel,
@@ -30,6 +30,9 @@ from .mdp.rewards import (
     com_jerk_l2,
     base_ang_acc_l2,
     joint_power_l2,
+    feet_stride_length,
+    feet_slide_deadband,
+    both_feet_not_in_contact,
 )
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
@@ -58,6 +61,30 @@ NOISY_FLAT_TERRAIN_CFG = TerrainGeneratorCfg(
             border_width=0.25,
         ),
         "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.3),
+    },
+)
+
+
+# 平面重視版 (2026-09-09): 実機デプロイは完全平面のみという運用実態に合わせ、
+# 平面 0.7 / 凹凸 0.3 に反転した地形。凹凸を少し残すのはロバスト性と足上げ高さの保険。
+PLANE_HEAVY_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0),
+    border_width=5.0,
+    num_rows=5,
+    num_cols=5,
+    horizontal_scale=0.1,
+    vertical_scale=0.005,
+    slope_threshold=0.75,
+    use_cache=True,
+    curriculum=False,
+    sub_terrains={
+        "random_rough": terrain_gen.HfRandomUniformTerrainCfg(
+            proportion=0.3,
+            noise_range=(0.01, 0.04),
+            noise_step=0.01,
+            border_width=0.25,
+        ),
+        "plane": terrain_gen.MeshPlaneTerrainCfg(proportion=0.7),
     },
 )
 
@@ -497,6 +524,558 @@ class K1FlatEnvCfg(K1RoughEnvCfg):
         )
 
 @configclass
+class K1FlatGoalkeeperCfg(K1FlatEnvCfg):
+    """横移動特化 (ゴールキーパー) 用の FlatEnv 派生設定 (2026-08-17)。
+
+    ゴール前の横っ飛びの代わりに「速いサイドステップ」で守るキーパー用ポリシーを
+    作る。観測レイアウトは K1FlatEnvCfg と完全に同一 (policy 入力の変更なし) なので、
+    既存の C++ デプロイスタックとモデル形状をそのまま使える。
+
+    通常 FlatEnv との違い:
+
+    * 速度カリキュラム: x は全ステージ ±0.7 固定、y を ±0.9 → ±1.2 → ±1.5 と拡張
+      (通常版と x/y の役割を反転)。学習済み Flat ポリシー (y ±0.9 習得済み) からの
+      warm-start を前提に stage0 を ±0.9 から始める。
+    * コマンドサンプリング: LateralVelocityCommand で確率 lateral_prob により
+      「|vy| 上端域 + vx 縮小域」の横重視コマンドを混ぜる。
+    * extreme corner カリキュラム: warm-start 前提で 5000 iter から導入 (通常版 10000)。
+    * Hip_Roll 偏差ペナルティ緩和: 横 1.5 m/s のサイドステップは股関節 roll の
+      大きな外転を要するため -0.10 → -0.02 に弱める (Hip_Yaw の -1.0 は据え置き、
+      足先はゴールライン正面向きを保つ)。
+
+    使い方 (既存 Flat ポリシーから warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Goalkeeper --headless --distributed \\
+            --num_envs 2048 --resume --load_run <既存run名> --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 速度カリキュラム: y 主体に置き換え ---
+        # 閾値は通常版の実測知見 (±0.9 到達誤差 ~0.30 / 拡張直後 +0.1 程度) を流用。
+        # 最終ステージの値は遷移判定に使われずログ表示専用。
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-0.7, 0.7),
+            (-0.7, 0.7),
+            (-0.7, 0.7),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-1.2, 1.2),
+            (-1.5, 1.5),
+        ]
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.30, 0.38, 0.45]
+
+        # --- コマンドを横重視サンプリング版に差し替え ---
+        # 4 割の resample で |vy| ∈ [0.6*max, max] + vx 縮小域を引く。残り 6 割は
+        # 通常の一様 (+学習後半は extreme corner) サンプリングで全域をカバーする。
+        prev = self.commands.base_velocity
+        self.commands.base_velocity = LateralVelocityCommandCfg(
+            asset_name=prev.asset_name,
+            resampling_time_range=prev.resampling_time_range,
+            rel_standing_envs=prev.rel_standing_envs,
+            rel_heading_envs=prev.rel_heading_envs,
+            heading_command=prev.heading_command,
+            heading_control_stiffness=prev.heading_control_stiffness,
+            debug_vis=prev.debug_vis,
+            ranges=LateralVelocityCommandCfg.Ranges(
+                lin_vel_x=prev.ranges.lin_vel_x,
+                lin_vel_y=prev.ranges.lin_vel_y,
+                ang_vel_z=prev.ranges.ang_vel_z,
+                heading=prev.ranges.heading,
+            ),
+            lateral_prob=0.4,
+            lateral_frac=0.6,
+            lateral_x_scale=0.4,
+        )
+        # warm-start なので最初から短めの再サンプリング周期でキーパー的な
+        # 反応 (コマンド急変) に晒す。段階短縮カリキュラムは不要なので無効化。
+        self.commands.base_velocity.resampling_time_range = (1.0, 7.0)
+        self.curriculum.command_resampling_time_range = None
+
+        # --- extreme corner: warm-start 前提で早めに導入 ---
+        # x±0.7 + y±1.5 同時上端のような corner はキーパーの主要動作なので
+        # 5000 iter から 2000 iter かけて導入する (num_steps/ramp_steps は iteration 基準)。
+        self.curriculum.extreme_commands.params["num_steps"] = 5000
+        self.curriculum.extreme_commands.params["ramp_steps"] = 2000
+
+        # --- Hip_Roll 偏差ペナルティ緩和 (横ステップの外転を許す) ---
+        self.rewards.joint_deviation_hip.weight = -0.02
+
+
+@configclass
+class K1FlatFastCfg(K1FlatEnvCfg):
+    """通常歩行の高速実験版: x ±1.8 m/s + 最大ケイデンス 2.5 Hz (2026-08-20)。
+
+    通常版 FlatEnv は「2.0 Hz ケイデンスでは ±1.8 m/s に脚長的に歩幅が届かず、
+    位相を無視した崩れた歩容になる」ため x を ±1.5 にキャップした経緯がある
+    (rough_env_cfg の lin_vel_command カリキュラム参照)。ゴールキーパー高速版
+    (K1FlatGoalkeeperFastCfg, y ±1.8 + 2.5 Hz) で「ケイデンスを上げて歩数で稼ぐ」
+    戦略が機能したので、同じ手法を前後方向に適用して ±1.8 m/s を再挑戦する。
+
+    K1FlatEnvCfg との違い:
+
+    * 位相周波数マッピング: 高速側を 2.0 → 2.5 Hz に引き上げ (1.0 m/s 以下 1.8 Hz は
+      共通、1.8 m/s で 2.5 Hz 到達、以降同傾きで外挿)。obs (policy/critic) と
+      feet_phase 報酬の 3 箇所を同時に上書きし、位相積分の整合を保つ。
+    * 速度カリキュラム: x ±1.5 → ±1.8 の 1 段拡張 (±1.5 習得済みポリシーからの
+      warm-start 前提)。y は ±0.9 固定のまま。
+    * extreme corner: 既存ポリシーが ±1.5 で頑健化済みの warm-start 前提で
+      3000 iter から導入。
+    * 再サンプリング周期は最初から (1.0, 7.0) の短周期 (段階短縮カリキュラム不要)。
+
+    使い方 (既存 Flat ポリシーから warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Fast --headless --distributed \\
+            --num_envs 2048 --resume --load_run <既存run名> --reset_noise_std 0.05
+
+    NOTE: デプロイ時は C++ 側 cmd_phase_freq() の高速側周波数も 2.5 Hz に
+    合わせること (k1_constants_isaaclab.hpp)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 位相周波数マッピング: 高速側 2.5 Hz ---
+        # 位相アキュムレータは obs/reward のどちらが先に呼ばれても同じ周波数で
+        # 積分されるよう、params を持つ全 3 項を同じ値で上書きする。
+        fast_phase_freq = {
+            "low_speed": 1.0,
+            "high_speed": 1.8,
+            "low_freq": 1.8,
+            "high_freq": 2.5,
+        }
+        self.observations.policy.gait_phase.params.update(fast_phase_freq)
+        self.observations.critic.gait_phase.params.update(fast_phase_freq)
+        self.rewards.feet_phase.params.update(fast_phase_freq)
+
+        # --- 速度カリキュラム: x ±1.5 開始 → ±1.8 (y は ±0.9 固定) ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-1.5, 1.5),
+            (-1.8, 1.8),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+        ]
+        # stage0 閾値は ±1.5 習得済み実測 (~0.43)。最終値はログ表示専用。
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.43, 0.55]
+
+        # --- extreme corner: warm-start 前提で前倒し ---
+        self.curriculum.extreme_commands.params["num_steps"] = 3000
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1500
+
+        # --- 再サンプリング周期: 最初から短周期 ---
+        self.commands.base_velocity.resampling_time_range = (1.0, 7.0)
+        self.curriculum.command_resampling_time_range = None
+
+
+@configclass
+class K1FlatFast2Cfg(K1FlatFastCfg):
+    """通常歩行のさらなる高速版: x ±2.0 m/s + 最大ケイデンス 2.8 Hz (2026-08-24)。
+
+    K1FlatFastCfg (±1.8 / 2.5 Hz, run 2026-08-20_08-58-47) で「ケイデンス引き上げで
+    歩数を稼ぐ」戦略が ±1.8 で機能した (err 1.00) ので、同じ手法をもう 1 段押し進める。
+
+    K1FlatFastCfg との違い:
+
+    * 位相周波数マッピング: 1.0 m/s 以下 1.8 Hz は共通、高速側アンカーを
+      1.8 m/s→2.5 Hz から 2.0 m/s→2.8 Hz へ変更 (中間 1.8 m/s では 2.6 Hz と
+      旧マッピングより +0.1 Hz、以降同傾き 1.0 Hz/(m/s) で外挿)。
+    * 速度カリキュラム: x ±1.8 開始 → ±2.0 の 1 段拡張 (±1.8 習得済みポリシー
+      2026-08-20_08-58-47/model_44994 からの warm-start 前提)。y は ±0.9 固定。
+
+    使い方 (±1.8 高速ポリシーから warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Fast2 --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-08-20_08-58-47 \\
+            --checkpoint model_44994.pt --reset_noise_std 0.05
+
+    NOTE: デプロイ時は C++ 側 cmd_phase_freq() の高速側アンカーも
+    (2.0 m/s, 2.8 Hz) に合わせること (k1_constants_isaaclab.hpp)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 位相周波数マッピング: 高速側 2.0 m/s で 2.8 Hz ---
+        fast2_phase_freq = {
+            "low_speed": 1.0,
+            "high_speed": 2.0,
+            "low_freq": 1.8,
+            "high_freq": 2.8,
+        }
+        self.observations.policy.gait_phase.params.update(fast2_phase_freq)
+        self.observations.critic.gait_phase.params.update(fast2_phase_freq)
+        self.rewards.feet_phase.params.update(fast2_phase_freq)
+
+        # --- 速度カリキュラム: x ±1.8 開始 → ±2.0 (y は ±0.9 固定) ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-1.8, 1.8),
+            (-2.0, 2.0),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+        ]
+        # stage0 閾値は ±1.8 習得済み実測 (~0.55)。最終値はログ表示専用。
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.55, 0.65]
+
+
+@configclass
+class K1FlatStrideCfg(K1FlatEnvCfg):
+    """歩幅誘導で高速化する通常歩行 (2026-08-25): 周期は通常 (最大 2.0 Hz) のまま x ±1.8 m/s。
+
+    2.5 Hz 以上のケイデンスは実機では無理があるため (ユーザー判断)、周波数マッピングは
+    K1FlatEnvCfg のまま変えず、歩幅を伸ばす方向で ±1.8 m/s を狙う。
+
+    K1FlatEnvCfg との違い:
+
+    * ``feet_stride_length`` 報酬 (mdp/rewards.py): コマンド速度と位相周波数から決まる
+      目標歩幅 L = |v|/(2f) に、コマンド方向の左右足距離を位相追従させる。
+      速度ゲート 0.6→1.0 m/s で低速歩容には影響させない。位相パラメータは
+      obs / feet_phase と同一 (_PHASE_FREQ_PARAMS 経由)。
+    * ``base_height_penalty`` の閾値 0.53 → 0.50: 歩幅が伸びると両脚支持期に CoM が
+      必ず沈むため、既定の床が歩幅拡張を直接罰してしまう。
+    * 速度カリキュラム x ±1.5 → ±1.8 (K1FlatFastCfg と同じ 1 段拡張、±1.5 習得済み
+      ポリシーからの warm-start 前提)、extreme 3000/1500、再サンプリング (1.0, 7.0)。
+    * Metrics/base_velocity/stride_touchdown (着地時実測歩幅) で効果を検証する。
+
+    使い方 (2.0 Hz 世代の Flat ポリシーから warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Stride --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-08-10_03-07-48 \\
+            --checkpoint model_34995.pt --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 歩幅誘導報酬 ---
+        # プローブ結果 (2026-08-25, model_34995 から 300-600it):
+        #   * σ=0.08 では現状歩幅 (0.17m) が目標 (0.39m@1.5m/s) から遠すぎて勾配ゼロ → σ=0.25。
+        #   * weight 0.6/2.0/4.0/8.0 単独では歩幅 +12%/600it の漸進のみ。
+        #   * 直接計測 (measure_stride.py) で、ベース方策は 1.8m/s 指令時に実速度の半分以上を
+        #     接地中の足の滑り (0.38m/s) で稼いでいると判明 → feet_slide を -0.5→-8.0 に
+        #     強化 (下記) してチートの旨味を消すと、600it で歩幅 +11%/滑り -31%/実速度 +5%。
+        self.rewards.feet_stride_length = RewTerm(
+            func=feet_stride_length,
+            weight=4.0,
+            params={
+                "command_name": "base_velocity",
+                "sigma": 0.25,
+                "gate_low_speed": 0.6,
+                "gate_high_speed": 1.0,
+                **{k: self.rewards.feet_phase.params[k] for k in ("low_speed", "high_speed", "low_freq", "high_freq")},
+            },
+        )
+
+        # --- 足の滑り (スケーティング) 抑制: デッドバンド版に置換 (2026-08-31) ---
+        # 経緯: 素の feet_slide -8.0 は extreme 導入前は最良 (滑り -48%) だが extreme 導入後
+        # に 1.8m/s 追従を放棄 (実速度 0.76)。-4.0 は追従維持で滑り -35% (2026-08-30)。
+        # ただし一律罰は着地・蹴り出しの自然な足の動きにも課金され「接地を短くする」圧に
+        # なり歩幅を妨げる (ユーザー観察: 大股歩行は接地時間が長い) ため、閾値 0.15 m/s
+        # 以下を無罰にするデッドバンド版へ置換。重みは本物のスケーティングに対して強め。
+        self.rewards.feet_slide = RewTerm(
+            func=feet_slide_deadband,
+            weight=-4.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "v_thresh": 0.15,
+            },
+        )
+
+        # --- 大歩幅時の CoM 沈み込みを許容 ---
+        self.rewards.base_height_penalty.params["min_height"] = 0.50
+
+        # --- 速度カリキュラム: x ±1.5 開始 → ±1.8 (y は ±0.9 固定) ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-1.5, 1.5),
+            (-1.8, 1.8),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+        ]
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.43, 0.55]
+
+        # --- extreme corner: warm-start 前提で前倒し ---
+        self.curriculum.extreme_commands.params["num_steps"] = 3000
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1500
+
+        # --- 再サンプリング周期: 最初から短周期 ---
+        self.commands.base_velocity.resampling_time_range = (1.0, 7.0)
+        self.curriculum.command_resampling_time_range = None
+
+
+@configclass
+class K1FlatStanceCfg(K1FlatEnvCfg):
+    """接地重視版 (2026-09-04): stance_ratio 拡大 + 両足空中の禁止で速度追従率を最大化する。
+
+    経緯: 歩幅誘導路線 (K1FlatStrideCfg) は歩幅 +17% を達成したが上体の揺れが増え、
+    ユーザー判断で放棄。odometry の関係で空中区間 (フライト期) は不要どころか有害。
+    直接計測ではベース方策も高速域で遊脚 0.32s/周期 0.5s の実質ランニングになっていた。
+
+    K1FlatEnvCfg との違い:
+
+    * ``feet_phase`` の stance_ratio 0.50 → 0.55: 位相スケジュール上、両足接地の
+      重なり (double support) が各歩に必ず入り、フライト期がスケジュールから消える。
+    * ``no_fly`` 報酬 (both_feet_not_in_contact): 両足同時空中を直接罰する。
+      NOTE: 関数が内部で -1 を返すので weight は正 (+1.0) がペナルティになる。
+    * extreme corner 3000/1500・再サンプリング (1.0, 7.0) は warm-start 前提の
+      最近の系譜と同じ。速度カリキュラムはベースのまま (±1.5、歩幅拡大は目的外)。
+
+    使い方 (ベース系譜 model_34995 から warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Stance --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-08-10_03-07-48 \\
+            --checkpoint model_34995.pt --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 接地時間の拡大: stance_ratio 0.50 → 0.60 ---
+        # 1000it プローブ (2026-09-04, 34995 起点・extreme 有効): 0.55/0.60 とも err 0.95 で
+        # 追従は同等、フライト削減は 0.60 が上 (fly% 9.4 vs 6.6 @1.5m/s) → 0.60 採用。
+        self.rewards.feet_phase.params["stance_ratio"] = 0.60
+
+        # --- 両足空中 (フライト期) の直接禁止 ---
+        # weight は追従とのトレードオフ (1000it プローブ, fly% は 1.5m/s 指令の実測):
+        #   w1: err 0.95 / fly 6.6%、w4: err 1.00 / fly 2.8%、w8: err 1.07 / fly 0.9%。
+        # 追従優先の方針 (ユーザー指示) で w4 を採用。長回しで fly はさらに漸減する傾向。
+        self.rewards.no_fly = RewTerm(
+            func=both_feet_not_in_contact,
+            weight=4.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link")},
+        )
+
+        # --- extreme corner: warm-start 前提で前倒し ---
+        self.curriculum.extreme_commands.params["num_steps"] = 3000
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1500
+
+        # --- 再サンプリング周期: 最初から短周期 ---
+        self.commands.base_velocity.resampling_time_range = (1.0, 7.0)
+        self.curriculum.command_resampling_time_range = None
+
+
+@configclass
+class K1FlatStanceFastCfg(K1FlatStanceCfg):
+    """接地重視版の x ±1.8 m/s 拡張 (2026-09-07)。
+
+    K1FlatStanceCfg (sr0.60 + no_fly4, 採用 2026-09-04_13-50-47/model_41000) の設定は
+    そのままに、速度カリキュラムだけ x ±1.5 → ±1.8 の 1 段拡張を足す。周期は通常
+    マッピング (最大 2.0 Hz) のまま。フライト禁止下では速度 ≈ 歩幅×ケイデンスに
+    上限があるため、±1.8 にどこまで届くかは実測で判断する。
+
+    使い方 (Stance 採用 ckpt から warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Stance-Fast --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-09-04_13-50-47 \\
+            --checkpoint model_41000.pt --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 速度カリキュラム: x ±1.5 開始 → ±1.8 (y は ±0.9 固定) ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-1.5, 1.5),
+            (-1.8, 1.8),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+        ]
+        # stage0 閾値は ±1.5 習得済み実測 (extreme 下 err ~0.95)。最終値はログ表示専用。
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.43, 0.55]
+
+
+@configclass
+class K1FlatStancePlaneCfg(K1FlatStanceCfg):
+    """接地重視版の平面特化・±2.0 m/s 挑戦 (2026-09-09, 案1+案2)。
+
+    実機デプロイは完全平面のみという運用実態に基づき、学習分布をデプロイに寄せて
+    保守性の分の余力を最高速度に回す。±1.5 学習の Stance 採用ポリシー (model_41000)
+    は実機/mujoco の平面では ~1.8 m/s まで追従できており、sim の過酷分布
+    (凹凸 0.7 + 摩擦 0.3〜) が上限を下げていた。
+
+    K1FlatStanceCfg との違い:
+
+    * 地形: 凹凸 0.7/平面 0.3 → **平面 0.7/凹凸 0.3** (凹凸は頑健性と足上げの保険)。
+    * 摩擦 DR: (0.3, 1.0) → **(0.6, 1.0)** (実機の乾いた平面相当に整合)。
+    * 速度カリキュラム: x ±1.5 → ±1.8 → ±2.0 の 2 段拡張。
+    * 高速域限定の保守ペナルティ緩和 (速度ゲート 1.5→1.8 m/s):
+      - base_height_penalty の床 0.53 → 高速時 0.48 (大股時の CoM 沈み許容)
+      - feet_parallel_to_ground を高速時 0.5 倍に減衰 (蹴り出しのつま先角度許容)
+    * クリアランス系は feet_air_time のみ (foot_clearance_ji は不採用: ユーザー方針)。
+
+    使い方 (Stance 採用 ckpt から warm-start)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Stance-Plane --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-09-04_13-50-47 \\
+            --checkpoint model_41000.pt --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 地形: 平面重視 ---
+        self.scene.terrain.terrain_generator = PLANE_HEAVY_TERRAIN_CFG
+
+        # --- 摩擦 DR: 実機の平面に整合 ---
+        self.events.physics_material.params["static_friction_range"] = (0.6, 1.0)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.6, 1.0)
+
+        # --- 速度カリキュラム: x ±1.5 → ±1.8 → ±2.0 (y は ±0.9 固定) ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-1.5, 1.5),
+            (-1.8, 1.8),
+            (-2.0, 2.0),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+            (-0.9, 0.9),
+        ]
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.43, 0.55, 0.65]
+
+        # --- 高速域限定の保守ペナルティ緩和 ---
+        self.rewards.base_height_penalty.params.update({
+            "min_height_high": 0.48,
+            "gate_low_speed": 1.5,
+            "gate_high_speed": 1.8,
+        })
+        self.rewards.feet_parallel_to_ground.params.update({
+            "gate_low_speed": 1.5,
+            "gate_high_speed": 1.8,
+            "gate_high_scale": 0.5,
+        })
+
+
+@configclass
+class K1FlatStancePlanePolishCfg(K1FlatStancePlaneCfg):
+    """Stance-Plane ポリシー (2026-09-09_18-32-40/model_50999) 用の省エネ・姿勢仕上げ (2026-09-11)。
+
+    K1FlatImprovePostureCfg の仕上げレシピを Stance-Plane 環境 (平面 0.7・摩擦 0.6-1.0・
+    stance_ratio 0.60・no_fly・±2.0) の上に移植したもの。旧 Posture タスクをそのまま使うと
+    接地スケジュール・地形分布・速度レンジが食い違い、方策の核を壊すため専用化する。
+
+    K1FlatStancePlaneCfg との違い:
+
+    * joint_power_l2 追加: ±1.5 調整値 -3e-5 はパワー∝速度² で ±1.8 実効約 2 倍だった
+      教訓 (2026-08-22) に従い、±2.0 では -1.5e-5 を既定とする (プローブで確認)。
+    * flat_orientation_l2 -20 → -30: 仕上げ resume での増量は安全実績あり (-40 は
+      ±1.8 高速版で追従を落とさなかったが効果も薄かったため中間の -30)。
+    * カリキュラムを学習終了時点の状態に固定 (resume で 0 から再進行させない):
+      lin_vel ±2.0/±0.9 固定、extreme 即時 α=1、push は stage1 相当の強状態。
+
+    使い方::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Stance-Plane-Polish --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-09-09_18-32-40 \\
+            --checkpoint model_50999.pt --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 機械パワー (torque * joint_vel)² の抑制 ---
+        self.rewards.joint_power_l2 = RewTerm(
+            func=joint_power_l2,
+            weight=-1.5e-5,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+
+        # --- 上体の傾き抑制 (仕上げ増量) ---
+        self.rewards.flat_orientation_l2.weight = -30.0
+
+        # --- カリキュラムを学習終了時点の状態に固定 ---
+        self.curriculum.lin_vel_command = None
+        self.commands.base_velocity.ranges.lin_vel_x = (-2.0, 2.0)
+        self.commands.base_velocity.ranges.lin_vel_y = (-0.9, 0.9)
+        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
+
+        self.curriculum.extreme_commands.params["num_steps"] = 0
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1
+        self.commands.base_velocity.resampling_time_range = (0.8, 8.0)
+
+        self.curriculum.push_robot_stage1 = None
+        self.events.push_robot.interval_range_s = (0.5, 8.0)
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-0.7, 0.7),
+            "y": (-0.7, 0.7),
+            "roll": (-0.06, 0.06),
+            "pitch": (-0.06, 0.06),
+        }
+
+
+@configclass
+class K1FlatGoalkeeperFastCfg(K1FlatGoalkeeperCfg):
+    """ゴールキーパーの高速実験版: y ±1.8 m/s + 最大ケイデンス 2.5 Hz (2026-08-18)。
+
+    通常版 FlatEnv では ±1.8 m/s は「2.0 Hz ケイデンスでは脚長的に位相通りに届かず
+    崩れた歩容になる」ため ±1.5 にキャップした経緯がある (rough_env_cfg 参照)。
+    本設定はケイデンス上限を 2.5 Hz に引き上げることで、歩幅ではなく歩数で
+    ±1.8 m/s の横移動に届くかを試す。
+
+    K1FlatGoalkeeperCfg との違い:
+
+    * 位相周波数マッピング: 高速側を 2.0 → 2.5 Hz に引き上げ (1.0 m/s 以下 1.8 Hz は
+      共通、1.8 m/s で 2.5 Hz、以降も同じ傾きで外挿)。obs (policy/critic) と
+      feet_phase 報酬の 3 箇所を同時に上書きし、位相積分の整合を保つ。
+    * y カリキュラム: ±1.5 → ±1.8 の 1 段拡張 (±1.5 習得済みポリシーからの
+      warm-start 前提)。x は ±0.7 固定のまま。
+    * extreme corner: ±1.5 版で頑健化済みの warm-start 前提で 3000 iter から導入。
+
+    NOTE: デプロイ時は C++ 側 cmd_phase_freq() の高速側周波数も 2.5 Hz に
+    合わせること (k1_constants_isaaclab.hpp)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 位相周波数マッピング: 高速側 2.5 Hz ---
+        # 位相アキュムレータは obs/reward のどちらが先に呼ばれても同じ周波数で
+        # 積分されるよう、params を持つ全 3 項を同じ値で上書きする。
+        gk_phase_freq = {
+            "low_speed": 1.0,
+            "high_speed": 1.8,
+            "low_freq": 1.8,
+            "high_freq": 2.5,
+        }
+        self.observations.policy.gait_phase.params.update(gk_phase_freq)
+        self.observations.critic.gait_phase.params.update(gk_phase_freq)
+        self.rewards.feet_phase.params.update(gk_phase_freq)
+
+        # --- y カリキュラム: ±1.5 開始 → ±1.8 ---
+        self.curriculum.lin_vel_command.params["stages_x"] = [
+            (-0.7, 0.7),
+            (-0.7, 0.7),
+        ]
+        self.curriculum.lin_vel_command.params["stages_y"] = [
+            (-1.5, 1.5),
+            (-1.8, 1.8),
+        ]
+        # stage0 閾値は ±1.5 習得済み実測 (~0.43)。最終値はログ表示専用。
+        self.curriculum.lin_vel_command.params["error_threshold"] = [0.43, 0.55]
+
+        # --- extreme corner: warm-start 前提でさらに前倒し ---
+        self.curriculum.extreme_commands.params["num_steps"] = 3000
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1500
+
+
+@configclass
 class K1FlatEnvLearnStandingCfg(K1FlatEnvCfg):
     """追加学習で立ち姿勢を覚えるための環境設定。これは予め普通のFlatで学習したポリシーに追加学習する用途"""
     def __post_init__(self):
@@ -659,6 +1238,47 @@ class K1FlatImprovePostureCfg(K1FlatEnvCfg):
             "roll": (-0.06, 0.06),
             "pitch": (-0.06, 0.06),
         }
+
+
+@configclass
+class K1FlatImprovePostureFastCfg(K1FlatImprovePostureCfg):
+    """高速歩行版 (K1FlatFastCfg: x ±1.8 + 最大 2.5 Hz) ポリシー用の姿勢仕上げ設定 (2026-08-21)。
+
+    K1FlatImprovePostureCfg は通常版 (x ±1.5 / 2.0 Hz) の学習終了時状態で
+    カリキュラムを固定するため、高速版ポリシーに直接使うと位相周波数マッピングが
+    学習条件と食い違い (2.0 vs 2.5 Hz)、コマンド範囲も ±1.5 に縮んでしまう。
+    本設定は姿勢仕上げの報酬構成 (flat_ori -40 / joint_power -3e-5 等) を
+    そのまま使い、位相と範囲だけ K1FlatFastCfg の学習終了時状態に合わせる。
+
+    使い方::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Posture-Fast --headless --distributed \\
+            --num_envs 2048 --resume --load_run <高速版run名> --reset_noise_std 0.05
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 位相周波数マッピング: K1FlatFastCfg と同一 (高速側 2.5 Hz) ---
+        fast_phase_freq = {
+            "low_speed": 1.0,
+            "high_speed": 1.8,
+            "low_freq": 1.8,
+            "high_freq": 2.5,
+        }
+        self.observations.policy.gait_phase.params.update(fast_phase_freq)
+        self.observations.critic.gait_phase.params.update(fast_phase_freq)
+        self.rewards.feet_phase.params.update(fast_phase_freq)
+
+        # --- コマンド範囲: 高速版の学習終了時状態 (x ±1.8) で固定 ---
+        self.commands.base_velocity.ranges.lin_vel_x = (-1.8, 1.8)
+
+        # --- joint_power は ±1.8 向けに半減 (2026-08-22) ---
+        # パワーは速度の 2 乗で増えるため、±1.5 で調整した -3e-5 は ±1.8 では実効的に
+        # 約 2 倍効き、err_vel_xy 1.18→1.83 の漸進崩壊を起こした (300it プローブで
+        # 主因を特定: flat_ori -40→-30 は効果なし、jp 半減で悪化がほぼ停止)。
+        self.rewards.joint_power_l2.weight = -1.5e-5
 
 
 @configclass

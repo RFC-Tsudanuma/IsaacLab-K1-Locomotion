@@ -92,6 +92,82 @@ class ExtremeVelocityCommand(UniformVelocityCommand):
 
     cfg: "ExtremeVelocityCommandCfg"
 
+    def __init__(self, cfg: "ExtremeVelocityCommandCfg", env: "ManagerBasedEnv"):
+        super().__init__(cfg, env)
+        # 着地時歩幅メトリクス (2026-08-25): 足が接地した瞬間の「着地足 − 支持足」の
+        # コマンド方向距離を記録し、エピソード内の着地平均を Metrics/.../stride_touchdown
+        # として出す。歩幅誘導報酬 (feet_stride_length) が実際に歩幅を伸ばしているかの
+        # 検証用で、報酬値ではなく実測歩幅そのものを見る。
+        self.metrics["stride_touchdown"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["stride_touchdown_fast"] = torch.zeros(self.num_envs, device=self.device)
+        self._stride_sum = torch.zeros(self.num_envs, device=self.device)
+        self._stride_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._stride_fast_sum = torch.zeros(self.num_envs, device=self.device)
+        self._stride_fast_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._stride_ids: tuple[list[int], list[int]] | None = None
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        if env_ids is None:
+            env_ids = slice(None)
+        # 着地サンプルが 1 つも無い env (停止・低速・早期転倒) を平均に含めると値が
+        # 希釈されるので、サンプルのある env だけで平均を取り直す
+        masked = {}
+        for name, s, c in (
+            ("stride_touchdown", self._stride_sum, self._stride_cnt),
+            ("stride_touchdown_fast", self._stride_fast_sum, self._stride_fast_cnt),
+        ):
+            cnt = c[env_ids]
+            has = cnt > 0
+            if has.any():
+                masked[name] = (s[env_ids][has] / cnt[has]).mean().item()
+        extras = super().reset(env_ids)
+        # サンプル無しの reset ではキーごと落とす (NaN を返すと logger 側の平均が NaN に汚染される)
+        for name in ("stride_touchdown", "stride_touchdown_fast"):
+            extras.pop(name, None)
+        extras.update(masked)
+        for buf in (self._stride_sum, self._stride_cnt, self._stride_fast_sum, self._stride_fast_cnt):
+            buf[env_ids] = 0.0
+        return extras
+
+    def _update_metrics(self):
+        super()._update_metrics()
+        sensor = self._env.scene.sensors.get("contact_forces")
+        if sensor is None:
+            return
+        if self._stride_ids is None:
+            sensor_ids, names = sensor.find_bodies(".*_foot_link")
+            robot_ids = [self.robot.find_bodies(n)[0][0] for n in names]
+            self._stride_ids = (sensor_ids, robot_ids)
+        sensor_ids, robot_ids = self._stride_ids
+        # 遊脚 0.1 s 以上の後の接地のみ「着地」とみなす (接地中のバウンド再接触を除外)
+        first = sensor.compute_first_contact(self._env.step_dt)[:, sensor_ids]  # [N, 2]
+        first = first & (sensor.data.last_air_time[:, sensor_ids] > 0.1)
+
+        speed = torch.norm(self.vel_command_b[:, :2], dim=1)
+        cmd_dir = self.vel_command_b[:, :2] / speed.clamp(min=1e-6).unsqueeze(1)
+        base_pos_w = self.robot.data.root_pos_w[:, :3]
+        quat_yaw = math_utils.yaw_quat(self.robot.data.root_quat_w)
+        rel = [
+            math_utils.quat_apply_inverse(quat_yaw, self.robot.data.body_pos_w[:, i, :3] - base_pos_w)[:, :2]
+            for i in robot_ids
+        ]
+        gap01 = ((rel[0] - rel[1]) * cmd_dir).sum(dim=1)
+        # 着地した足を先頭に取った「着地足 − 支持足」距離。両足同時着地は片側のみ数える。
+        stride = torch.where(first[:, 0], gap01, -gap01)
+        hit = (first[:, 0] | first[:, 1]) & (speed > 0.1)
+        self._stride_sum += torch.where(hit, stride, torch.zeros_like(stride))
+        self._stride_cnt += hit.float()
+        self.metrics["stride_touchdown"] = self._stride_sum / self._stride_cnt.clamp(min=1.0)
+        # 前後高速コマンド (|vx|>1.0, |vy|<0.3) 時のみの前後方向着地歩幅: 歩幅誘導の効果は
+        # ここに出る。横歩きは「踏み出し→引き寄せ」で引き寄せ側の歩幅が負になるため除外。
+        vx, vy = self.vel_command_b[:, 0], self.vel_command_b[:, 1]
+        gap_x = (rel[0][:, 0] - rel[1][:, 0]) * torch.sign(vx)
+        stride_x = torch.where(first[:, 0], gap_x, -gap_x)
+        hit_fast = hit & (vx.abs() > 1.0) & (vy.abs() < 0.3)
+        self._stride_fast_sum += torch.where(hit_fast, stride_x, torch.zeros_like(stride))
+        self._stride_fast_cnt += hit_fast.float()
+        self.metrics["stride_touchdown_fast"] = self._stride_fast_sum / self._stride_fast_cnt.clamp(min=1.0)
+
     def _resample_command(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
         prob = float(self.cfg.extreme_prob)
@@ -152,6 +228,75 @@ class ExtremeVelocityCommandCfg(UniformVelocityCommandCfg):
     extreme_heading_err_range: tuple[float, float] = (2.0, math.pi)
     """extreme モードで heading target を現在 yaw から離す角度 [rad] の範囲。
     stiffness 0.5・ang_vel_z 上限 1.0 の場合、誤差 2.0 rad 以上で yaw コマンドが飽和する。"""
+
+
+class LateralVelocityCommand(ExtremeVelocityCommand):
+    """横 (y) 方向の速度コマンドを重点的にサンプリングする速度コマンド (ゴールキーパー用)。
+
+    ``ExtremeVelocityCommand`` の一様 + extreme corner サンプリングに加えて、
+    確率 ``cfg.lateral_prob`` で resample を「lateral モード」にする:
+
+      - lin_vel_y を符号ランダムで ``|vy| ∈ [lateral_frac*max, max]`` から引く
+        (現在の ``cfg.ranges`` を参照するのでカリキュラムの y 範囲拡張に追従)
+      - lin_vel_x は範囲を ``lateral_x_scale`` 倍に縮めた範囲から引き直す
+        (横ステップ主体の状況を作る。0 にはしないので斜め移動も残る)
+      - lateral に選ばれた env は standing 抽選から除外する
+
+    extreme と lateral の両方に選ばれた env は lateral が後勝ちする (vy は上端域、
+    vx は縮小域)。``lateral_prob=0.0`` (既定) では ``ExtremeVelocityCommand`` と同一挙動。
+    """
+
+    cfg: "LateralVelocityCommandCfg"
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+        prob = float(self.cfg.lateral_prob)
+        if prob <= 0.0:
+            return
+        ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+        pick = torch.rand(ids.numel(), device=self.device) < prob
+        if not pick.any():
+            return
+        ids = ids[pick]
+        m = ids.numel()
+
+        # lin_vel_y: 符号ランダムで上端域 [frac*|bound|, |bound|] から引く
+        frac = float(self.cfg.lateral_frac)
+        lo, hi = float(self.cfg.ranges.lin_vel_y[0]), float(self.cfg.ranges.lin_vel_y[1])
+        pick_pos = torch.rand(m, device=self.device) < 0.5
+        bound = torch.where(
+            pick_pos,
+            torch.full((m,), hi, device=self.device),
+            torch.full((m,), lo, device=self.device),
+        )
+        u = torch.rand(m, device=self.device)
+        self.vel_command_b[ids, 1] = bound * (frac + (1.0 - frac) * u)
+
+        # lin_vel_x: 縮小レンジから引き直す
+        x_scale = float(self.cfg.lateral_x_scale)
+        x_lo, x_hi = float(self.cfg.ranges.lin_vel_x[0]), float(self.cfg.ranges.lin_vel_x[1])
+        self.vel_command_b[ids, 0] = torch.empty(m, device=self.device).uniform_(
+            x_lo * x_scale, x_hi * x_scale
+        )
+
+        # lateral env は立ち止まり抽選から除外 (コマンドが 0 に上書きされるのを防ぐ)
+        self.is_standing_env[ids] = False
+
+
+@configclass
+class LateralVelocityCommandCfg(ExtremeVelocityCommandCfg):
+    """`LateralVelocityCommand` の設定クラス。"""
+
+    class_type: type = LateralVelocityCommand
+
+    lateral_prob: float = 0.0
+    """resample を lateral (横重視) モードにする確率 [0,1]。0 で ExtremeVelocityCommand と同一。"""
+
+    lateral_frac: float = 0.6
+    """lateral モードで引く lin_vel_y の大きさの下限 (レンジ端に対する割合)。"""
+
+    lateral_x_scale: float = 0.4
+    """lateral モードで lin_vel_x の範囲に掛ける縮小倍率。"""
 
 
 class KickDirectionCommand(CommandTerm):

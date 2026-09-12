@@ -21,16 +21,26 @@ from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 from .data_logger import send_data_stream
 from .observations import ball_vel as get_ball_vel
-from .events import get_phase_freq, get_gait_phase
+from .events import get_phase_freq, get_gait_phase, compute_cmd_phase_freq
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-def minimum_height(env: ManagerBasedRLEnv, min_height: float = 0.47, 
+def minimum_height(env: ManagerBasedRLEnv, min_height: float = 0.47,
                     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
-                    sensor_cfg: SceneEntityCfg = None) -> torch.Tensor:
+                    sensor_cfg: SceneEntityCfg = None,
+                    min_height_high: float | None = None,
+                    gate_low_speed: float = 1.5,
+                    gate_high_speed: float = 1.8,
+                    command_name: str = "base_velocity") -> torch.Tensor:
     """
     minimum heightよりもロボットの高さが低い場合にペナルティを与える報酬関数
+
+    速度ゲート (2026-09-09): ``min_height_high`` を与えると、コマンド速度が
+    ``gate_low_speed`` 以下では ``min_height``、``gate_high_speed`` 以上では
+    ``min_height_high`` になるよう床を線形に下げる。高速域の大股歩行では両脚支持期に
+    CoM が幾何的に沈むため、床を一律に保つと歩幅拡張を直接罰してしまう。
+    ``min_height_high=None`` (既定) で従来と同一挙動。
     """
     asset = env.scene[asset_cfg.name]
     if sensor_cfg is not None:  # これはRaycasterである必要あり.roughの場合に使う
@@ -40,6 +50,11 @@ def minimum_height(env: ManagerBasedRLEnv, min_height: float = 0.47,
     else:
         # Use the provided target height directly for flat terrain
         adjusted_min_height = min_height
+    if min_height_high is not None:
+        cmd = env.command_manager.get_command(command_name)
+        speed = torch.norm(cmd[:, :2], dim=1)
+        frac = ((speed - gate_low_speed) / (gate_high_speed - gate_low_speed)).clamp(0.0, 1.0)
+        adjusted_min_height = adjusted_min_height - frac * (min_height - min_height_high)
     # Compute the L2 squared penalty
     # send_data_stream({"current_height": asset.data.root_pos_w[:, 2][0], "rewards": torch.square(asset.data.root_pos_w[:, 2][0] - adjusted_min_height)})
     return torch.where(asset.data.root_pos_w[:, 2] < adjusted_min_height, torch.square(asset.data.root_pos_w[:, 2] - adjusted_min_height), torch.zeros_like(asset.data.root_pos_w[:, 2]))
@@ -288,7 +303,11 @@ def feet_parallel_to_ground(env: ManagerBasedRLEnv,
                             sigma: float = 0.3,
                             enable_potential: bool = True,
                             discount_factor: float = 0.99,
-                            gate_behind_com: bool = True) -> torch.Tensor:
+                            gate_behind_com: bool = True,
+                            gate_low_speed: float | None = None,
+                            gate_high_speed: float = 1.8,
+                            gate_high_scale: float = 0.5,
+                            command_name: str = "base_velocity") -> torch.Tensor:
     """Reward feet being parallel to the ground.
 
     This function rewards the agent for keeping its feet parallel to the ground.
@@ -348,6 +367,15 @@ def feet_parallel_to_ground(env: ManagerBasedRLEnv,
     total_error = left_foot_error + right_foot_error
 
     current_potential = torch.exp(-total_error / sigma)
+
+    # 速度ゲート (2026-09-09): 高速コマンド域では水平化圧を減衰させ、大股の蹴り出し・
+    # 着地のつま先角度を許容する。gate_low_speed=None (既定) で従来と同一挙動。
+    # ポテンシャル自体をスケールするので shaping (下記) とも整合する。
+    if gate_low_speed is not None:
+        cmd = env.command_manager.get_command(command_name)
+        speed = torch.norm(cmd[:, :2], dim=1)
+        frac = ((speed - gate_low_speed) / (gate_high_speed - gate_low_speed)).clamp(0.0, 1.0)
+        current_potential = current_potential * (1.0 + (gate_high_scale - 1.0) * frac)
 
     if enable_potential:
         buffer_key = "feet_parallel_to_ground_potential_prev"
@@ -532,33 +560,65 @@ def feet_height_bezier(env: ManagerBasedRLEnv,
     total_error = error_left + error_right
     return torch.exp(-total_error / sigma)
 
+def feet_slide_deadband(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    v_thresh: float = 0.15,
+) -> torch.Tensor:
+    """接地中の足の xy 速度のうち ``v_thresh`` を超えた分だけを罰する feet_slide 変種 (2026-08-31)。
+
+    素の feet_slide は接地中の足速度を一律に罰するため、着地・蹴り出し・足裏ロールに
+    伴う自然な足の動きにも課金され、「足を素早く離す = 接地を短くする」圧になって
+    歩幅の伸びを妨げる (ユーザー観察: 他の K1 歩行は一歩が大きく接地時間が長い)。
+    閾値以下を無罰にすることで、長い接地の大股歩行を許しつつスケーティングのみを罰する。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] > 1.0
+    )
+    asset = env.scene[asset_cfg.name]
+    body_vel = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2]
+    excess = (body_vel.norm(dim=-1) - v_thresh).clamp(min=0.0)
+    return torch.sum(excess * contacts, dim=1)
+
+
 def feet_stride_length(
     env: ManagerBasedRLEnv,
     command_name: str,
-    phase_freq: float = 1.5,
-    stance_ratio: float = 0.55,
-    sigma: float = 0.04,
-    cmd_threshold: float = 0.1,
+    sigma: float = 0.08,
+    gate_low_speed: float = 0.6,
+    gate_high_speed: float = 1.0,
+    low_speed: float = 1.0,
+    high_speed: float = 1.8,
+    low_freq: float = 1.5,
+    high_freq: float = 2.0,
 ) -> torch.Tensor:
-    """コマンド速度に応じた目標歩幅に追従するほど高い報酬。
+    """コマンド速度と歩行周波数から決まる目標歩幅に追従するほど高い報酬 (2026-08-25 改修)。
 
-    目標歩幅
-        L = v_cmd_x * stance_ratio / phase_freq
-    （1サイクル中に遊脚が前進する距離 = 接地中に後退する距離）
-
-    左右足の前後方向距離 (x_L - x_R, base yaw frame) を位相に応じた目標値
+    周期 (ケイデンス) を固定したまま速度を上げるには歩幅を伸ばすしかないので、
+    1 歩あたりの目標歩幅を
+        L = ||v_cmd_xy|| / (2 f(cmd))
+    とする (半周期で 1 歩進む)。左右足の相対位置 (base yaw frame) をコマンド方向の
+    単位ベクトルに射影した ``gap`` を、位相に応じた目標値
         target_gap(φ_L) = L * cos(φ_L)
-    と比較し、 exp(-error² / σ²) で報酬化する。
-    （各足が ±L/2 の振幅で逆位相に振動する単純な正弦近似モデル。
-      接地/遊脚比は左右ともに対称で、x方向のオフセットは0近傍と仮定。）
+    と比較し exp(-error² / σ²) で報酬化する (φ_L=0 で左足着地=左が最前方、π で右足着地。
+    feet_phase の stance 規約と整合)。
+
+    位相と周波数は obs / feet_phase と同じ積分アキュムレータ
+    (``mdp.events.get_gait_phase`` / ``compute_cmd_phase_freq``) を使うので、
+    low_speed..high_freq の 4 パラメータは他 3 箇所と同じ値を渡すこと。
+
+    低速では目標歩幅が自然に満たされるため、コマンド速度 ``gate_low_speed`` 以下で 0、
+    ``gate_high_speed`` で 1 になる線形ゲートを掛け、低速歩容を荒らさないようにする
+    (停止時もゲート 0)。
 
     Args:
         env: 学習環境
         command_name: 速度コマンド名
-        phase_freq: 歩行周期の周波数 [Hz] (feet_phase と揃えること)
-        stance_ratio: 接地時間の割合 (feet_phase と揃えること)
         sigma: 指数報酬のスケール [m]
-        cmd_threshold: コマンドがこれ未満の時は目標歩幅を0にする
+        gate_low_speed / gate_high_speed: 速度ゲートの立ち上がり区間 [m/s]
+        low_speed / high_speed / low_freq / high_freq: コマンド速度→歩行周波数マッピング
     """
     asset = env.scene["robot"]
 
@@ -567,27 +627,27 @@ def feet_stride_length(
 
     base_pos_w = asset.data.root_pos_w[:, :3]
     base_quat_yaw = yaw_quat(asset.data.root_quat_w)
-
     foot_rel_left = quat_apply_inverse(
         base_quat_yaw, asset.data.body_pos_w[:, left_foot_idx, :3] - base_pos_w
     )
     foot_rel_right = quat_apply_inverse(
         base_quat_yaw, asset.data.body_pos_w[:, right_foot_idx, :3] - base_pos_w
     )
-    fwd_gap = foot_rel_left[:, 0] - foot_rel_right[:, 0]
-
-    t = env.episode_length_buf * env.step_dt
-    phase_left = (2.0 * math.pi * phase_freq * t) % (2.0 * math.pi)
 
     cmd = env.command_manager.get_command(command_name)
-    L = cmd[:, 0] * stance_ratio / phase_freq
+    cmd_xy = cmd[:, :2]
+    speed = torch.norm(cmd_xy, dim=1)
+    cmd_dir = cmd_xy / speed.clamp(min=1e-6).unsqueeze(1)
+    gap = ((foot_rel_left[:, :2] - foot_rel_right[:, :2]) * cmd_dir).sum(dim=1)
 
-    cmd_speed = torch.norm(cmd[:, :3], dim=1)
-    L = torch.where(cmd_speed < cmd_threshold, torch.zeros_like(L), L)
-
+    freq = compute_cmd_phase_freq(env, command_name, low_speed, high_speed, low_freq, high_freq)
+    L = speed / (2.0 * freq)
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)
     target_gap = L * torch.cos(phase_left)
-    error = torch.square(fwd_gap - target_gap)
-    return torch.exp(-error / (sigma ** 2))
+
+    reward = torch.exp(-torch.square(gap - target_gap) / (sigma ** 2))
+    gate = ((speed - gate_low_speed) / (gate_high_speed - gate_low_speed)).clamp(0.0, 1.0)
+    return reward * gate
 
 # ボールの速度方向がコマンド(目標位置)へ向く方向とどの程度一致するかを [0,1] で返す。
 # ボールが (ほぼ) 停止している間は 0 になるよう速度でゲートする。
