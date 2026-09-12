@@ -5,7 +5,6 @@
 
 from .observations import *
 from .rewards import *
-from .getup_rewards import *
 from .curriculums import *
 from .events import *
 from .commands import (
