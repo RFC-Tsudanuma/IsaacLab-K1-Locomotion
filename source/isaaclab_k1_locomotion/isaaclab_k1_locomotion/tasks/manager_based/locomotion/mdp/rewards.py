@@ -1514,8 +1514,131 @@ def zmp_support_center(
     any_contact = in_contact.any(1)
     return torch.where(any_contact, reward, torch.zeros_like(reward))
 
+# ---------------------------------------------------------------------------
+# その場高速回転タスク (K1FlatTurnCfg) 用の報酬
+# ---------------------------------------------------------------------------
+# NOTE (実行順序の罠): ``ManagerBasedRLEnv.step`` は
+#   reward → reset → command_manager.compute → obs
+# の順に走る。したがって報酬計算の時点で
+# ``env.command_manager.get_command("base_velocity")`` は **1 ステップ古い**。
+# 以下の報酬はコマンド項の ``heading_error`` プロパティ (毎回 robot.data.heading_w を
+# live 参照して wrap(ψ_target - ψ_current) を計算し直す) から読むことで常に最新値を使う。
+
+
+def _heading_error(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
+    """``TargetHeadingCommand`` から最新の残り角 Δψ [rad] を取り出す。"""
+    return env.command_manager.get_term(command_name).heading_error
+
+
+def track_heading_exp(
+    env: ManagerBasedRLEnv,
+    std: float,
+    command_name: str = "base_velocity",
+) -> torch.Tensor:
+    """目標ヘディングへの追従報酬 ``exp(-Δψ² / std²)``。
+
+    毎ステップ積算されるので「早く着くほどエピソード総報酬が大きい」という形で
+    「なるべく早く」が自動的に符号化される。別途の時間ペナルティは不要。
+
+    速度追従と同じく std の広い「粗い」項と狭い「鋭い」項を重ねて使う想定
+    (flat_env_cfg.py の track_lin_vel_xy_coarse のコメント参照):
+    粗い項が遠方で勾配を供給し、鋭い項が最終的な停止精度を出す。
+    """
+    err = _heading_error(env, command_name)
+    return torch.exp(-torch.square(err) / (std**2))
+
+
+def heading_progress(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    max_rate: float = 3.0,
+) -> torch.Tensor:
+    """残り角を「詰めた速さ」を [-1, 1] で返す shaping 項。
+
+    ``(|Δψ_{t-1}| - |Δψ_t|) / (max_rate * dt)`` を [-1, 1] に clamp したもの。
+    スクラッチ学習の初期では exp カーネルの勾配だけでは「とにかく回る」動機が
+    弱いので、角度を詰める行為そのものを直接報酬する。``max_rate`` [rad/s] は
+    正規化の基準となる想定最大 yaw レートで、これを超えて詰めても +1 で頭打ちになる。
+
+    コマンド再サンプリング直後は Δψ が不連続に飛ぶため、その 1 ステップは 0 にする。
+    """
+    err_abs = _heading_error(env, command_name).abs()
+
+    prev = getattr(env, "_heading_progress_prev", None)
+    if prev is None or prev.shape != err_abs.shape:
+        prev = err_abs.clone()
+        env._heading_progress_prev = prev
+
+    delta = prev - err_abs
+    env._heading_progress_prev = err_abs.clone()
+
+    scale = max(float(max_rate) * env.step_dt, 1e-6)
+    reward = torch.clamp(delta / scale, min=-1.0, max=1.0)
+
+    # 再サンプリング/リセット直後の飛びを除外する。
+    # - |delta| が 1 ステップで到達不能なほど大きい: コマンド再サンプリング
+    # - episode_length_buf <= 1: エピソード開始直後 (報酬計算は reset より前に走るので、
+    #   リセット後の最初の報酬計算では buf == 1 になる)
+    jumped = delta.abs() > (scale * 4.0)
+    invalid = jumped | (env.episode_length_buf <= 1)
+    return torch.where(invalid, torch.zeros_like(reward), reward)
+
+
+def feet_air_time_heading(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    threshold: float,
+    command_name: str = "base_velocity",
+    error_threshold: float = 0.087,
+) -> torch.Tensor:
+    """``feet_air_time_positive_biped`` の速度ゲートを「残り角ゲート」に置換したもの。
+
+    本家 (isaaclab_tasks ... velocity/mdp/rewards.py:49) は最後に
+    ``reward *= ||cmd[:, :2]|| > 0.1`` を掛けるが、その場回転タスクでは
+    ``cmd[:, :2]`` が恒等的に 0 なので**報酬が常に 0 になってしまう**。
+    そこで「まだ目標に着いていない (``|Δψ| > error_threshold``) ときだけ
+    片足支持の継続時間を報酬する」形に置き換える。
+
+    これにより、回転中は足を持ち上げた歩容 (すり足でなく) が促され、
+    目標に着いたら足踏みが報酬されなくなって静止に落ち着く。
+    """
+    contact_sensor = env.scene.sensors[sensor_cfg.name]
+    air_time = contact_sensor.data.current_air_time[:, sensor_cfg.body_ids]
+    contact_time = contact_sensor.data.current_contact_time[:, sensor_cfg.body_ids]
+    in_contact = contact_time > 0.0
+    in_mode_time = torch.where(in_contact, contact_time, air_time)
+    single_stance = torch.sum(in_contact.int(), dim=1) == 1
+    reward = torch.min(torch.where(single_stance.unsqueeze(-1), in_mode_time, 0.0), dim=1)[0]
+    reward = torch.clamp(reward, max=threshold)
+    # 目標に十分近い (= 止まるべき) ときは足踏みを報酬しない
+    reward = reward * (_heading_error(env, command_name).abs() > float(error_threshold))
+    return reward
+
+
+def base_xy_drift_l2(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """コマンド発行時の xy 位置からの変位² をペナルティとして返す (「その場」の担保)。
+
+    基準位置は ``TargetHeadingCommand.origin_pos_w`` (再サンプリングのたびに取り直す)。
+    速度そのものを罰する :func:`base_lin_vel_xy_l2` と違い、ゆっくりした一方向の
+    ドリフトが積み上がるのを直接罰せる。
+    """
+    asset = env.scene[asset_cfg.name]
+    origin = env.command_manager.get_term(command_name).origin_pos_w
+    return torch.sum(torch.square(asset.data.root_pos_w[:, :2] - origin), dim=1)
+
+
 __all__ = [
     "minimum_height",
+    "track_heading_exp",
+    "heading_progress",
+    "feet_air_time_heading",
+    "base_xy_drift_l2",
+    "base_lin_vel_xy_l2",
+    "feet_slide_deadband",
     "track_lin_vel_xy_discrete_exp",
     "track_ang_vel_z_discrete_exp",
     "feet_distance",

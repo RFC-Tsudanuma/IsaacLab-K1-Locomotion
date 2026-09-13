@@ -171,6 +171,34 @@ class K1FlatFastPPORunnerCfg(K1FlatPPORunnerCfg):
 
 
 @configclass
+class K1TurnPPORunnerCfg(K1FlatPPORunnerCfg):
+    """高速その場回転タスク (Isaac-Velocity-Flat-Turn) 用。
+
+    max_iterations は 8000 (K1FlatPPORunnerCfg の 20000 から削減)。歩行タスクの 20000 は
+    3 次元コマンド空間 (vx ±2.0 / vy ±0.9 / ωz ±1.0) + extreme corner サンプリング +
+    3 段速度カリキュラムを学ぶために必要だったが、本タスクのコマンドは Δψ の 1 次元で
+    探索すべき空間が大幅に狭い。スクラッチで二足バランス自体は学ぶ必要があるため、
+    その分の余裕を見て 8000 とする。
+
+    NOTE: ``schedule="adaptive"`` (KL 適応 LR) なので max_iterations は純粋な停止条件で、
+    LR スケジュールには一切影響しない。``save_interval=100`` で checkpoint が残るため、
+    収束したら途中で止めてもその checkpoint がそのまま成果物になる。
+    逆に足りなければ --max_iterations で伸ばすか --resume で継続すればよい。
+
+    `init_noise_std` は既定のまま (スクラッチ学習なので finetune 用に下げない)。
+    experiment_name だけ "k1_turn" に分けて、歩行タスクのログ・checkpoint と混ざらないようにする。
+
+    観測レイアウトは歩行タスクと完全に同一 (1 ステップ 49 次元) なので、
+    obs_groups / mirror loss / num_mini_batches は継承したままで正しく動く。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 8000
+        self.experiment_name = "k1_turn"
+
+
+@configclass
 class K1GetupPPORunnerCfg(K1RoughPPORunnerCfg):
     """起き上がり (get-up) 用の PPO 設定。
 
