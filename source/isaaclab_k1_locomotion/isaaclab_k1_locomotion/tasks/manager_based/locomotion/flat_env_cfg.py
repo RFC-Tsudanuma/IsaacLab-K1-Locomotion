@@ -1099,6 +1099,19 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
             debug_vis=True,
             turn_angle_range=(0.3, math.pi),
             success_threshold=math.radians(5.0),
+            # 到達後に必ず 2 秒は「目標角でその場静止」させる (2026-09-13)。
+            #
+            # MuJoCo 検証で、歩行ポリシーへの引き渡し自体は成立するものの、回転終了後に
+            # 安定させる動作の学習が不足していることが判明した。原因は上の間隔短縮
+            # ((3.0, 5.0) → (1.0, 3.0)) で静止練習の時間を削りすぎたこと。
+            #
+            # 間隔を戻すのではなくこちらで対処するのは、間隔が到達タイミングと無関係に
+            # 引かれるため「回転終了後 N 秒」を保証できないため。初到達を検出してから
+            # 2 秒を確保する方が、旋回の学習密度 (settle 0.43→0.34s に効いた) を
+            # 保ったまま静止練習だけを足せる。
+            # 1 サイクルは 旋回 ~0.35 s + 保持 >=2.0 s ≒ 2.4 s となり、
+            # 20 s エピソードあたり約 8 回の旋回を維持できる。
+            hold_after_settle_s=2.0,
             # ranges は _resample_command を完全に置き換えたため未使用 (MISSING 回避のダミー)
             ranges=TargetHeadingCommandCfg.Ranges(
                 lin_vel_x=(0.0, 0.0),
@@ -1280,7 +1293,25 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         # rough_env_cfg.py の __post_init__ が (1.0, 1.0) で潰しており、毎エピソード
         # 必ず同一の公称姿勢から始まっていた。実機では歩行中の任意の脚配置で
         # 回転指令が飛んでくるので、初期姿勢そのものの分布も広げる。
-        self.events.reset_robot_joints.params["position_range"] = (0.7, 1.3)
+        #
+        # 倍率ベース (reset_joints_by_scale) → オフセットベース (reset_joints_by_offset)
+        # に変更する (2026-09-13)。倍率はデフォルト角に掛けるため、**デフォルトが 0 の関節は
+        # 何倍しても 0 で全くランダム化されない**。K1 のデフォルト角は
+        #   Hip_Pitch -0.26 / Hip_Roll 0.0 / Hip_Yaw 0.0 /
+        #   Knee_Pitch 0.52 / Ankle_Pitch -0.26 / Ankle_Roll 0.0
+        # なので、倍率 (0.7, 1.3) では 12 関節中 6 関節 (Hip_Roll/Hip_Yaw/Ankle_Roll の左右) が
+        # 実効 ±0°、残りも Hip/Ankle_Pitch ±4.5°・Knee ±8.9° にしかなっていなかった。
+        # オフセットなら全関節に一律 ±30° がかかる。
+        # reset_joints_by_offset は soft_joint_pos_limits (soft_joint_pos_limit_factor=0.9)
+        # でクランプするので、関節可動域を超える初期姿勢にはならない。
+        self.events.reset_robot_joints = EventTerm(
+            func=mdp.reset_joints_by_offset,
+            mode="reset",
+            params={
+                "position_range": (-math.radians(30.0), math.radians(30.0)),
+                "velocity_range": (0.0, 0.0),
+            },
+        )
 
         # リセット時の初期線速度を段階的に広げる (±0.5 → ±1.4 m/s)。
         # 「静止した公称姿勢からしか動作を始められない」方策になるのを防ぐ。
@@ -1301,6 +1332,60 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
                 "axes": ("x", "y"),
             },
         )
+
+
+@configclass
+class K1FlatTurnFinetuneCfg(K1FlatTurnCfg):
+    """学習済み回転ポリシーからの warm-start (追加学習) 用 (2026-09-13)。
+
+    `K1FlatTurnCfg` で学習した方策 (例: 2026-09-13_04-31-39/model_4200.pt,
+    settle 0.344 s / success 0.981 / 転倒 0.027) に対して、
+    後から足した要件を追加学習させるための設定。スクラッチで撒き直すより速い。
+
+    追加要件 (どちらも K1FlatTurnCfg 側に実装済みで、本クラスは継承するだけ):
+
+    * ``hold_after_settle_s=2.0``: 到達後 2 秒の静止保持。MuJoCo 検証で
+      「歩行への引き渡しは成立するが、回転終了後に安定させる動作の学習が不足」
+      と判明したため。
+    * 初期関節角 ±30° のオフセットランダム化。
+
+    **本クラスの役割はカリキュラムを最終状態に固定することだけ。**
+    ``--resume`` では ``common_step_counter`` が 0 に戻るため、何もしないと
+    カリキュラムが最初から再進行し、±180°・±1.4 m/s を習得済みの方策が
+    ±45°・±0.5 m/s に引き戻されて能力を削ってしまう。
+    (``K1FlatStancePlanePolishCfg`` が lin_vel 側で同じ回避をしている)
+
+    NOTE: ``turn_angle_curriculum`` / ``reset_base_velocity_curriculum`` は
+    ``__init__`` や毎回の呼び出しで cfg を上書きするので、``None`` にするだけでなく
+    対応する cfg 値を明示的に書き戻す必要がある。
+
+    使い方 (LR 張り付き対策として --reset_noise_std を必ず付ける。
+    train.py はこの引数があるとオプティマイザ状態の読み込みもスキップする)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Turn-Finetune --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-09-13_04-31-39 \\
+            --checkpoint model_4200.pt --reset_noise_std 0.05 --max_iterations 2000
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 目標角レンジを最終段 (±180°) に固定 ---
+        self.curriculum.turn_angle = None
+        self.commands.base_velocity.turn_angle_range = (0.3, math.pi)
+
+        # --- 初期線速度を最終値 (±1.4 m/s) に固定 ---
+        # z / roll / pitch / yaw は K1FlatTurnCfg が継承している ±0.5 のまま。
+        self.curriculum.reset_base_velocity = None
+        self.events.reset_base.params["velocity_range"] = {
+            "x": (-1.4, 1.4),
+            "y": (-1.4, 1.4),
+            "z": (-0.5, 0.5),
+            "roll": (-0.5, 0.5),
+            "pitch": (-0.5, 0.5),
+            "yaw": (-0.5, 0.5),
+        }
 
 
 @configclass

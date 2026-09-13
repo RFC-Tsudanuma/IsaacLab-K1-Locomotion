@@ -450,6 +450,7 @@ class TargetHeadingCommand(UniformVelocityCommand):
         self.metrics["settle_time_s"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["time_in_target"] = torch.zeros(self.num_envs, device=self.device)
         self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["settled_speed"] = torch.zeros(self.num_envs, device=self.device)
 
         # 「その場」判定の基準位置 (コマンド発行時の xy)。base_xy_drift_l2 が参照する。
         self.origin_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
@@ -465,6 +466,7 @@ class TargetHeadingCommand(UniformVelocityCommand):
         self._settle_sum = torch.zeros(self.num_envs, device=self.device)
         self._settle_cnt = torch.zeros(self.num_envs, device=self.device)
         self._issued_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._settled_speed_sum = torch.zeros(self.num_envs, device=self.device)
 
     def __str__(self) -> str:
         msg = "TargetHeadingCommand:\n"
@@ -513,6 +515,7 @@ class TargetHeadingCommand(UniformVelocityCommand):
             self._settle_sum,
             self._settle_cnt,
             self._issued_cnt,
+            self._settled_speed_sum,
         ):
             buf[env_ids] = 0.0
 
@@ -537,11 +540,32 @@ class TargetHeadingCommand(UniformVelocityCommand):
         self._settle_sum += torch.where(newly_settled, self._elapsed, torch.zeros_like(self._elapsed))
         self._settle_cnt += newly_settled.float()
 
+        # 到達後の静止保持時間を保証する (2026-09-13)。
+        #
+        # 再サンプリング間隔は到達タイミングと無関係に引かれるので、間隔を長くしても
+        # 「回転終了後に静止する時間」は保証できない (到達が遅ければ残り時間が足りない)。
+        # 初到達を検出した時点で time_left の下限を hold_after_settle_s に引き上げ、
+        # 必ずその秒数だけ「目標角で立ち続ける」状況を作る。
+        #
+        # 実機では回転後すぐ歩行ポリシーへ引き渡すが、引き渡し可能な安定姿勢に
+        # 落ち着く動作自体は学習させる必要がある (MuJoCo 検証で判明)。
+        #
+        # NOTE: CommandTerm.compute() は _update_metrics → time_left -= dt →
+        #       再サンプル判定 の順なので、ここで書けば同ステップの減算前に反映される。
+        hold = float(getattr(self.cfg, "hold_after_settle_s", 0.0))
+        if hold > 0.0 and bool(newly_settled.any()):
+            self.time_left[newly_settled] = self.time_left[newly_settled].clamp(min=hold)
+
+        # 到達中の実速度。「目標に着いた後ちゃんと止まっているか」の直接指標。
+        settled_speed = torch.norm(self.robot.data.root_lin_vel_b[:, :2], dim=1)
+        self._settled_speed_sum += torch.where(in_target, settled_speed, torch.zeros_like(settled_speed))
+
         denom = self._step_cnt.clamp(min=1.0)
         self.metrics["heading_error_deg"] = self._err_sum / denom * (180.0 / math.pi)
         self.metrics["time_in_target"] = self._in_target_cnt / denom
         self.metrics["settle_time_s"] = self._settle_sum / self._settle_cnt.clamp(min=1.0)
         self.metrics["success_rate"] = self._settle_cnt / self._issued_cnt.clamp(min=1.0)
+        self.metrics["settled_speed"] = self._settled_speed_sum / self._in_target_cnt.clamp(min=1.0)
 
     def _resample_command(self, env_ids: Sequence[int]):
         # 継承元は cfg.ranges から (vx, vy, ωz) を引くが、本コマンドでは全て無視する。
@@ -629,4 +653,17 @@ class TargetHeadingCommandCfg(UniformVelocityCommandCfg):
     ``turn_angle_curriculum`` がこの上限を段階的に拡げる。"""
 
     success_threshold: float = 0.087
-    """「到達した」とみなす残り角 [rad] (既定 5°)。メトリクス集計にのみ使い、報酬には使わない。"""
+    """「到達した」とみなす残り角 [rad] (既定 5°)。メトリクス集計と
+    ``hold_after_settle_s`` の到達判定に使う。報酬には使わない。"""
+
+    hold_after_settle_s: float = 0.0
+    """初到達を検出してから、次の再サンプリングまで最低限確保する秒数。
+
+    ``> 0`` のとき、目標圏内 (``success_threshold``) に初めて入った時点で
+    ``time_left`` の下限をこの値に引き上げ、「回転終了後にその場で静止し続ける」
+    状況を必ずこの秒数だけ作る。
+
+    再サンプリング間隔 (``resampling_time_range``) を伸ばすだけでは、間隔が到達
+    タイミングと無関係に引かれるため到達後の保持時間を保証できない (到達が遅いと
+    残り時間が足りない)。0.0 で無効 (従来挙動)。
+    """
