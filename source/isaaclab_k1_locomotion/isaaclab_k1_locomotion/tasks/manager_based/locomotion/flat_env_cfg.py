@@ -997,6 +997,16 @@ class K1FlatStancePlanePolishCfg(K1FlatStancePlaneCfg):
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
 
+        # --- 関節初期角のランダム化: オフセット加算 ±30° (2026-09-13, ユーザー指示) ---
+        # 既定の reset_joints_by_scale は rough_env_cfg で (1.0, 1.0) に無効化されている上、
+        # スケール方式はデフォルト角 0 の関節 (roll/yaw 系) に効かない。オフセット加算方式
+        # に置き換え、全関節に ±30° の一様オフセットを入れる (ソフトリミットにクランプ)。
+        self.events.reset_robot_joints.func = mdp.reset_joints_by_offset
+        self.events.reset_robot_joints.params["position_range"] = (
+            -math.radians(30.0),
+            math.radians(30.0),
+        )
+
         # --- 上体の傾き抑制 (仕上げ増量) ---
         self.rewards.flat_orientation_l2.weight = -30.0
 
