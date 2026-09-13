@@ -22,7 +22,7 @@ from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
-from .mdp.commands import ExtremeVelocityCommandCfg, LateralVelocityCommandCfg
+from .mdp.commands import ExtremeVelocityCommandCfg, LateralVelocityCommandCfg, TargetHeadingCommandCfg
 from .mdp.rewards import (
     feet_landing_impact,
     feet_landing_vel,
@@ -33,12 +33,19 @@ from .mdp.rewards import (
     feet_stride_length,
     feet_slide_deadband,
     both_feet_not_in_contact,
+    track_heading_exp,
+    heading_progress,
+    feet_air_time_heading,
+    base_xy_drift_l2,
+    base_lin_vel_xy_l2,
 )
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
     lin_vel_command_curriculum,
     modify_push_robot,
     extreme_command_curriculum,
+    turn_angle_curriculum,
+    reset_base_velocity_curriculum,
 )
 
 
@@ -1027,6 +1034,367 @@ class K1FlatStancePlanePolishCfg(K1FlatStancePlaneCfg):
             "y": (-0.7, 0.7),
             "roll": (-0.06, 0.06),
             "pitch": (-0.06, 0.06),
+        }
+
+
+@configclass
+class K1FlatTurnCfg(K1FlatStancePlaneCfg):
+    """高速その場回転タスク (2026-09-12)。コマンド = 目標ヘディングまでの残り角 Δψ。
+
+    `K1FlatStancePlaneCfg` (平面 0.7・摩擦 0.6-1.0・stance_ratio 0.60・no_fly) の
+    土台をそのまま使い、**コマンドの意味だけを速度指令から残り角に差し替える**。
+    最重視するのは「なるべく早く」「なるべく正確に」目標角へ到達すること。
+
+    観測 (歩行コマンド枠以外) はベースタスクと完全に同一:
+    1 ステップ 49 次元というレイアウトは ``history_layout.py`` / ``mdp/symmetry.py`` /
+    ``agents/history_policy_exporter.py`` / C++ デプロイ側に共有ハードコードされているため、
+    ``velocity_commands`` の 3 次元枠の「中身」だけを ``[0, 0, Δψ/π]`` に差し替える。
+    この符号化なら symmetry の ``vel_cmd`` 符号 ``(+1, -1, -1)`` が
+    「左右反転で Δψ → -Δψ」とそのまま一致するので、symmetry / history_layout /
+    exporter は 1 行も変更不要 (詳細は ``TargetHeadingCommand`` の docstring)。
+
+    K1FlatStancePlaneCfg との主な違い:
+
+    * コマンド: ``ExtremeVelocityCommandCfg`` → ``TargetHeadingCommandCfg``。
+    * 速度追従報酬 3 種を削除し、ヘディング追従 (粗 + 鋭) と progress shaping に置換。
+    * ``feet_phase`` を削除: 固定ケイデンス 1.8 Hz の接地スケジュールは「急停止時の
+      踏み替え強制」になり、最速到達・高精度停止と直接競合する。観測側の
+      ``gait_phase`` は 49 次元維持のため残す (固定周波数の自由クロックになる)。
+    * 旋回と競合するペナルティを緩和: ``feet_slide`` → デッドバンド版 (支持脚ピボットで
+      足中心が ~0.3 m/s 並進するため)、``joint_deviation_hip_yaw`` -1.0 → -0.05
+      (Hip_Yaw はその場回転の主動力)。
+    * 「その場」の担保として並進速度・並進ドリフトのペナルティを追加。
+    * 速度系カリキュラムを全停止し、回転量カリキュラム (±45° → ±90° → ±180°) に置換。
+
+    NOTE (デプロイ側の契約): ONNX の入出力形状は歩行ポリシーと不変だが、
+    **コマンド 3 枠に書き込む値の意味が変わる**。C++ 側は ``(vx, vy, ωz)`` ではなく
+    ``[0, 0, Δψ/π]`` を毎制御周期書き込むこと。
+
+    使い方 (スクラッチ学習)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Turn --headless --distributed --num_envs 2048
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # ------------------------------------------------------------------
+        # コマンド: 速度指令 → 目標までの残り角
+        # ------------------------------------------------------------------
+        # 項名は "base_velocity" のまま据え置く。全報酬・観測が
+        # command_name="base_velocity" を参照しているため、名前を変えずに中身だけ
+        # 差し替えるのが最小差分になる。
+        prev = self.commands.base_velocity
+        self.commands.base_velocity = TargetHeadingCommandCfg(
+            asset_name=prev.asset_name,
+            # 1 回の回転に与える時間 (2026-09-13 に (3.0, 5.0) から短縮)。
+            #
+            # 実機の運用は「この方策で向きを変える → 直後に歩行ポリシーへ切り替えて
+            # 歩き出す」なので、目標角で長く立ち続ける能力には価値がない。
+            # 実測 settle_time は 0.40-0.47 s なので (3.0, 5.0) では時間の約 9 割が
+            # 「到達済みで静止」に費やされ、肝心の旋回動作の試行回数が稼げていなかった。
+            # 平均 4.0 s → 2.0 s で旋回の学習密度が約 2 倍になる。
+            #
+            # 下限 1.0 s は最大角 (±180°) の settle (<1 s) をぎりぎり許容する値。
+            # たまに到達前に再サンプルされるが、それは「旋回中に目標が変わる」状況の
+            # 学習になるので害はない。
+            # NOTE: 間隔短縮は turn_angle_curriculum が見る「全 env 平均 |Δψ|」を押し上げる
+            #       (再サンプル直後の大きい誤差を含む env の比率が上がるため)。
+            #       概算では stage0 で ~0.08、stage1 で ~0.13 と閾値 [0.20, 0.35] に対して
+            #       十分な余裕があるので、ステージ進行は阻害されない見込み。
+            resampling_time_range=(1.0, 3.0),
+            rel_standing_envs=0.0,
+            heading_command=False,
+            debug_vis=True,
+            turn_angle_range=(0.3, math.pi),
+            success_threshold=math.radians(5.0),
+            # 到達後に必ず 2 秒は「目標角でその場静止」させる (2026-09-13)。
+            #
+            # MuJoCo 検証で、歩行ポリシーへの引き渡し自体は成立するものの、回転終了後に
+            # 安定させる動作の学習が不足していることが判明した。原因は上の間隔短縮
+            # ((3.0, 5.0) → (1.0, 3.0)) で静止練習の時間を削りすぎたこと。
+            #
+            # 間隔を戻すのではなくこちらで対処するのは、間隔が到達タイミングと無関係に
+            # 引かれるため「回転終了後 N 秒」を保証できないため。初到達を検出してから
+            # 2 秒を確保する方が、旋回の学習密度 (settle 0.43→0.34s に効いた) を
+            # 保ったまま静止練習だけを足せる。
+            # 1 サイクルは 旋回 ~0.35 s + 保持 >=2.0 s ≒ 2.4 s となり、
+            # 20 s エピソードあたり約 8 回の旋回を維持できる。
+            hold_after_settle_s=2.0,
+            # ranges は _resample_command を完全に置き換えたため未使用 (MISSING 回避のダミー)
+            ranges=TargetHeadingCommandCfg.Ranges(
+                lin_vel_x=(0.0, 0.0),
+                lin_vel_y=(0.0, 0.0),
+                ang_vel_z=(-1.0, 1.0),
+                heading=None,
+            ),
+        )
+
+        # ------------------------------------------------------------------
+        # 報酬: 速度追従 → ヘディング追従
+        # ------------------------------------------------------------------
+        # コマンドの意味が変わったので、速度追従 3 種は「誤った目標」を追うことになる。
+        # 必ず全て削除する。
+        self.rewards.track_lin_vel_xy_exp = None
+        self.rewards.track_lin_vel_xy_coarse = None
+        self.rewards.track_ang_vel_z_exp = None
+
+        # 既存の「鋭い項 + 粗い項」構成 (flat_env_cfg.py:416-428 のコメント参照) を踏襲する。
+        # 粗い項が遠方 (Δψ ~ π) でも勾配を供給し、鋭い項が最終的な停止精度を出す。
+        # exp カーネルは毎ステップ積算されるので「早く着くほど総報酬が大きい」= 「なるべく早く」が
+        # 自動的に符号化される (別途の時間ペナルティは不要)。
+        # 合計 weight は旧速度追従 (1.5 + 2.4 + 4.8 = 8.7) と同オーダに合わせてある。
+        self.rewards.track_heading_coarse = RewTerm(
+            func=track_heading_exp,
+            weight=3.0,
+            params={"command_name": "base_velocity", "std": 1.0},
+        )
+        self.rewards.track_heading_sharp = RewTerm(
+            func=track_heading_exp,
+            weight=5.0,
+            params={"command_name": "base_velocity", "std": 0.15},
+        )
+        # スクラッチ学習の立ち上げ用 shaping: 「角度を詰めた速さ」を直接報酬する。
+        self.rewards.heading_progress = RewTerm(
+            func=heading_progress,
+            weight=2.0,
+            params={"command_name": "base_velocity", "max_rate": 3.0},
+        )
+
+        # ------------------------------------------------------------------
+        # 位相報酬の削除 (観測の gait_phase は 49 次元維持のため残す)
+        # ------------------------------------------------------------------
+        self.rewards.feet_phase = None
+        # ||cmd_xy|| が恒等的に 0 なので compute_cmd_phase_freq は常に low_freq を返す。
+        # low == high にして「速度依存の傾き」を明示的に殺し、固定 1.8 Hz のクロックにする。
+        for group in (self.observations.policy, self.observations.critic):
+            group.gait_phase.params.update({"low_freq": 1.8, "high_freq": 1.8})
+
+        # feet_air_time は本家実装が ||cmd[:, :2]|| > 0.1 でゲートするため、本タスクでは
+        # 恒等的に 0 になる。残り角ゲート版に差し替えて「回転中は片足支持を報酬、
+        # 目標到達後は足踏みを報酬しない」形にする (すり足対策)。
+        self.rewards.feet_air_time = None
+        self.rewards.feet_air_time_heading = RewTerm(
+            func=feet_air_time_heading,
+            weight=0.2,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "threshold": 0.4,
+                "command_name": "base_velocity",
+                "error_threshold": math.radians(5.0),
+            },
+        )
+
+        # ------------------------------------------------------------------
+        # 旋回と直接競合するペナルティの調整
+        # ------------------------------------------------------------------
+        # 支持脚のピボットでは足中心が ~0.3 m/s で並進する (足を 0.1 m 外に置いて 3 rad/s)。
+        # 素の feet_slide はこれを丸ごと罰してしまうので、デッドバンド版に差し替えて
+        # 「本当の滑り」だけを罰する。
+        self.rewards.feet_slide = None
+        self.rewards.feet_slide_deadband = RewTerm(
+            func=feet_slide_deadband,
+            weight=-0.5,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "v_thresh": 0.25,
+            },
+        )
+        # Hip_Yaw はその場回転の主動力。ガニ股対策の -1.0 (flat_env_cfg.py:499) は
+        # 本タスクではタスクそのものを罰するので、ほぼ無効化する。
+        self.rewards.joint_deviation_hip_yaw.weight = -0.05
+
+        # ------------------------------------------------------------------
+        # 「その場」の担保
+        # ------------------------------------------------------------------
+        self.rewards.base_lin_vel_xy = RewTerm(
+            func=base_lin_vel_xy_l2,
+            weight=-1.0,
+            params={"asset_cfg": SceneEntityCfg("robot")},
+        )
+        # 速度ペナルティだけだと、ゆっくりした一方向のドリフトが積み上がる。
+        # コマンド発行時の位置からの変位を直接罰する。
+        self.rewards.base_xy_drift = RewTerm(
+            func=base_xy_drift_l2,
+            weight=-2.0,
+            params={"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")},
+        )
+
+        # ------------------------------------------------------------------
+        # 速度ゲート付きペナルティを素の値に戻す
+        # ------------------------------------------------------------------
+        # ||cmd_xy|| = 0 なので Stance-Plane の高速域ゲート (1.5→1.8 m/s) は永久に
+        # 発火しない。誤解を招くので明示的に素の設定へ戻す。
+        self.rewards.base_height_penalty.params.update({
+            "min_height": 0.53,
+            "min_height_high": None,
+        })
+        self.rewards.feet_parallel_to_ground.params.update({"gate_high_scale": 1.0})
+
+        # ------------------------------------------------------------------
+        # カリキュラム: 速度系を全停止し、回転量カリキュラムに置換
+        # ------------------------------------------------------------------
+        # lin_vel_command は __init__ 内で ranges.lin_vel_x/y を書き換える
+        # (curriculums.py:248 の _apply_stage(0)) ので、必ず None にする。
+        self.curriculum.lin_vel_command = None
+        # extreme_commands は ExtremeVelocityCommand 専用 (cfg.extreme_prob を書く)。
+        self.curriculum.extreme_commands = None
+        self.curriculum.turn_angle = CurrTerm(
+            func=turn_angle_curriculum,
+            params={
+                "command_name": "base_velocity",
+                # |Δψ_0| の範囲 [rad]。下限は「ほぼ 0 の目標」を避けるため 0.3 で固定し、
+                # 上限だけを ±45° → ±90° → ±180° と拡げる。
+                "stages": [(0.3, math.pi / 4), (0.3, math.pi / 2), (0.3, math.pi)],
+                # 監視するのは全 env 平均の残り角 [rad]。再サンプリング直後の env も
+                # 含まれるので完璧でも 0 にはならない。実測に合わせて要調整
+                # (最終ステージの値は遷移判定に使われずログ表示専用)。
+                "error_threshold": [0.20, 0.35, 0.50],
+                "ema_alpha": 0.026,
+                "min_updates": 50,
+                "stage_cooldown_resamples": 1.5,
+                "post_switch_hold_steps": 500,
+                "post_switch_ema_scale": 2.0,
+            },
+        )
+
+        # ------------------------------------------------------------------
+        # 接触ダイナミクスの DR 拡大 (2026-09-13)
+        # ------------------------------------------------------------------
+        # 初回スクラッチ run (2026-09-12_23-07-01) は it550 で収束したが
+        # (成功率 0.976 / settle 0.40s / 転倒 2.9%)、``feet_air_time_heading`` が
+        # 0.0005 = 片足支持時間ほぼ 0 で、**両足接地のまま足裏を捻る/滑らせる
+        # ピボット旋回**を獲得していた。
+        #
+        # この戦略自体は人型の正当な旋回方法なので罰さない (ユーザー方針)。
+        # 代わりに接触ダイナミクスの分布を広げて、捻り滑りのまま sim2real で
+        # 成立するようにする。罰する路線 (feet_slide_deadband 増量) は獲得済みの
+        # 戦略を壊すだけなので採らない。
+        #
+        # 副次効果として狙っているのは「高摩擦では足裏が滑れないので、大角度は
+        # 踏み替えないと回れない」こと。μ 上限を 1.4 まで入れることで、罰する
+        # ことなく踏み替えもレパートリーに入る (= 摩擦に応じて戦略を切り替える
+        # 方策になる) ことを期待している。
+        #
+        # NOTE: 地形マテリアルは friction 1.0 × multiply 結合なので、ここで
+        #       ランダム化するロボット側の値がそのまま実効摩擦になる
+        #       (K1FlatEnvCfg.__post_init__ のコメント参照)。
+        #       make_consistent=True は K1FlatEnvCfg で設定済みのため dynamic <= static が保証される。
+
+        # 摩擦 DR: Stance-Plane の (0.6, 1.0) → (0.25, 1.4)。
+        # 下限 0.25 = 埃っぽい/滑る床、上限 1.4 = 新品ゴム底の高グリップ床。
+        self.events.physics_material.params["static_friction_range"] = (0.25, 1.4)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.25, 1.4)
+
+        # 地形: PLANE_HEAVY (平面 0.7/凹凸 0.3) → NOISY_FLAT (凹凸 0.7/平面 0.3)。
+        # 捻り滑りは足裏全面の接触状態に強く依存するので、凹凸を主にして
+        # 接触点の分布・接触ダイナミクスの違いに晒す。
+        # NOTE: Stance-Plane が平面重視にしたのは「実機デプロイは完全平面のみ」
+        #       という運用実態に合わせて最高速度に余力を回すためで、本タスクは
+        #       速度上限を追わないので凹凸側に振り直してよい。
+        self.scene.terrain.terrain_generator = NOISY_FLAT_TERRAIN_CFG
+
+        # ------------------------------------------------------------------
+        # 初期状態の DR 拡大 (2026-09-13)
+        # ------------------------------------------------------------------
+        # 関節角のランダム化を復活させる。ベース (velocity_env_cfg) は (0.5, 1.5) だが
+        # rough_env_cfg.py の __post_init__ が (1.0, 1.0) で潰しており、毎エピソード
+        # 必ず同一の公称姿勢から始まっていた。実機では歩行中の任意の脚配置で
+        # 回転指令が飛んでくるので、初期姿勢そのものの分布も広げる。
+        #
+        # 倍率ベース (reset_joints_by_scale) → オフセットベース (reset_joints_by_offset)
+        # に変更する (2026-09-13)。倍率はデフォルト角に掛けるため、**デフォルトが 0 の関節は
+        # 何倍しても 0 で全くランダム化されない**。K1 のデフォルト角は
+        #   Hip_Pitch -0.26 / Hip_Roll 0.0 / Hip_Yaw 0.0 /
+        #   Knee_Pitch 0.52 / Ankle_Pitch -0.26 / Ankle_Roll 0.0
+        # なので、倍率 (0.7, 1.3) では 12 関節中 6 関節 (Hip_Roll/Hip_Yaw/Ankle_Roll の左右) が
+        # 実効 ±0°、残りも Hip/Ankle_Pitch ±4.5°・Knee ±8.9° にしかなっていなかった。
+        # オフセットなら全関節に一律 ±30° がかかる。
+        # reset_joints_by_offset は soft_joint_pos_limits (soft_joint_pos_limit_factor=0.9)
+        # でクランプするので、関節可動域を超える初期姿勢にはならない。
+        self.events.reset_robot_joints = EventTerm(
+            func=mdp.reset_joints_by_offset,
+            mode="reset",
+            params={
+                "position_range": (-math.radians(30.0), math.radians(30.0)),
+                "velocity_range": (0.0, 0.0),
+            },
+        )
+
+        # リセット時の初期線速度を段階的に広げる (±0.5 → ±1.4 m/s)。
+        # 「静止した公称姿勢からしか動作を始められない」方策になるのを防ぐ。
+        # 最初から ±1.4 を与えるとスクラッチの「立つ」獲得と competing するので、
+        # 300 iter まで据え置き → 1700 iter かけてランプし、**2000 iter で最大**になる
+        # (ベースライン run の収束が ~550 iter なので、立てるようになった直後から
+        #  ゆっくり広がり、収束後に十分な時間をかけて最大レンジへ到達する)。
+        # 対象は水平の x/y のみ。z を含めると reset 時に鉛直射出/叩きつけになる。
+        # z / roll / pitch / yaw は cfg の値 (±0.5) のまま。
+        self.curriculum.reset_base_velocity = CurrTerm(
+            func=reset_base_velocity_curriculum,
+            params={
+                "term_name": "reset_base",
+                "start_speed": 0.5,
+                "end_speed": 1.4,
+                "num_steps": 300,
+                "ramp_steps": 1700,
+                "axes": ("x", "y"),
+            },
+        )
+
+
+@configclass
+class K1FlatTurnFinetuneCfg(K1FlatTurnCfg):
+    """学習済み回転ポリシーからの warm-start (追加学習) 用 (2026-09-13)。
+
+    `K1FlatTurnCfg` で学習した方策 (例: 2026-09-13_04-31-39/model_4200.pt,
+    settle 0.344 s / success 0.981 / 転倒 0.027) に対して、
+    後から足した要件を追加学習させるための設定。スクラッチで撒き直すより速い。
+
+    追加要件 (どちらも K1FlatTurnCfg 側に実装済みで、本クラスは継承するだけ):
+
+    * ``hold_after_settle_s=2.0``: 到達後 2 秒の静止保持。MuJoCo 検証で
+      「歩行への引き渡しは成立するが、回転終了後に安定させる動作の学習が不足」
+      と判明したため。
+    * 初期関節角 ±30° のオフセットランダム化。
+
+    **本クラスの役割はカリキュラムを最終状態に固定することだけ。**
+    ``--resume`` では ``common_step_counter`` が 0 に戻るため、何もしないと
+    カリキュラムが最初から再進行し、±180°・±1.4 m/s を習得済みの方策が
+    ±45°・±0.5 m/s に引き戻されて能力を削ってしまう。
+    (``K1FlatStancePlanePolishCfg`` が lin_vel 側で同じ回避をしている)
+
+    NOTE: ``turn_angle_curriculum`` / ``reset_base_velocity_curriculum`` は
+    ``__init__`` や毎回の呼び出しで cfg を上書きするので、``None`` にするだけでなく
+    対応する cfg 値を明示的に書き戻す必要がある。
+
+    使い方 (LR 張り付き対策として --reset_noise_std を必ず付ける。
+    train.py はこの引数があるとオプティマイザ状態の読み込みもスキップする)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Turn-Finetune --headless --distributed \\
+            --num_envs 2048 --resume --load_run 2026-09-13_04-31-39 \\
+            --checkpoint model_4200.pt --reset_noise_std 0.05 --max_iterations 2000
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 目標角レンジを最終段 (±180°) に固定 ---
+        self.curriculum.turn_angle = None
+        self.commands.base_velocity.turn_angle_range = (0.3, math.pi)
+
+        # --- 初期線速度を最終値 (±1.4 m/s) に固定 ---
+        # z / roll / pitch / yaw は K1FlatTurnCfg が継承している ±0.5 のまま。
+        self.curriculum.reset_base_velocity = None
+        self.events.reset_base.params["velocity_range"] = {
+            "x": (-1.4, 1.4),
+            "y": (-1.4, 1.4),
+            "z": (-0.5, 0.5),
+            "roll": (-0.5, 0.5),
+            "pitch": (-0.5, 0.5),
+            "yaw": (-0.5, 0.5),
         }
 
 

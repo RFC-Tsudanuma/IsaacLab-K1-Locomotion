@@ -68,6 +68,7 @@ simulation_app = app_launcher.app
 
 """Rest everything follows."""
 
+import math
 import os
 import time
 from pathlib import Path
@@ -161,8 +162,151 @@ def setup_viser(env, urdf_path: str, port: int):
 
     gui = {"vx": gui_vx, "vy": gui_vy, "wz": gui_wz}
 
-    print(f"[INFO] Viser visualization available at http://localhost:{port}")
+    # ------------------------------------------------------------------
+    # Turn task (Isaac-Velocity-Flat-Turn) specific GUI + scene handles.
+    # Only built when the active command term is a TargetHeadingCommand.
+    # ------------------------------------------------------------------
+    if _is_turn_task(env):
+        with server.gui.add_folder("Turn Task (target heading)"):
+            gui_free_run = server.gui.add_checkbox(
+                "free run (env resamples)",
+                initial_value=True,
+                hint="ON: the env picks new targets on its own timer (3-5 s) - this shows the"
+                " trained behaviour. OFF: hold the target at the slider below.",
+            )
+            gui_yaw = server.gui.add_slider(
+                "target_yaw [deg]", min=-180.0, max=180.0, step=5.0, initial_value=0.0,
+                hint="Absolute world yaw to hold. Only used when 'free run' is OFF.",
+            )
+            gui_new_target = server.gui.add_button(
+                "new random target", hint="Force an immediate resample (free run only)."
+            )
+            # Read-only readouts.
+            gui_err = server.gui.add_number("remaining dpsi [deg]", initial_value=0.0, disabled=True)
+            gui_tgt = server.gui.add_number("target psi [deg]", initial_value=0.0, disabled=True)
+            gui_cur = server.gui.add_number("current psi [deg]", initial_value=0.0, disabled=True)
+            gui_in_tgt = server.gui.add_checkbox("in target (<5 deg)", initial_value=False, disabled=True)
+            gui_elapsed = server.gui.add_number("time since target [s]", initial_value=0.0, disabled=True)
+
+        # Pending-resample flag, consumed by override_command_from_viser.
+        pending = {"resample": False}
+
+        @gui_new_target.on_click
+        def _(_):
+            pending["resample"] = True
+
+        # Persistent scene handles (positions/text updated every frame).
+        target_marker = server.scene.add_icosphere(
+            "/turn/target_marker", radius=0.07, color=(0, 220, 60), position=(0.0, 0.0, 0.06)
+        )
+        readout_label = server.scene.add_label("/turn/label", "dpsi = 0.0 deg", position=(0.0, 0.0, 1.1))
+
+        gui.update({
+            "turn": True,
+            "free_run": gui_free_run,
+            "target_yaw": gui_yaw,
+            "pending": pending,
+            "err": gui_err,
+            "tgt": gui_tgt,
+            "cur": gui_cur,
+            "in_tgt": gui_in_tgt,
+            "elapsed": gui_elapsed,
+            "target_marker": target_marker,
+            "readout_label": readout_label,
+        })
+        print("[INFO] Viser: turn-task visualization enabled (target/current heading rays + dpsi arc).")
+
+    # NOTE: viser falls back to the next free port when the requested one is taken
+    # (e.g. a previous play.py still holding it), so report the port the server
+    # actually bound rather than the requested one.
+    actual_port = server.get_port() if hasattr(server, "get_port") else port
+    if actual_port != port:
+        print(f"[WARNING] Viser: port {port} was busy; bound to {actual_port} instead.")
+    print(f"[INFO] Viser visualization available at http://localhost:{actual_port}")
     return server, base_frame, viser_urdf, joint_indices, gui
+
+
+def _is_turn_task(env) -> bool:
+    """True when the active ``base_velocity`` term is a ``TargetHeadingCommand``.
+
+    Detected structurally (``heading_target`` buffer + ``turn_angle_range`` cfg field)
+    rather than by task id, so it also covers derived configs.
+    """
+    try:
+        cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+    except Exception:
+        return False
+    return hasattr(cmd_term, "heading_target") and hasattr(cmd_term.cfg, "turn_angle_range")
+
+
+def _update_turn_viser(env, server, gui, env_idx: int = 0):
+    """Draw the target/current heading and the remaining angle for the turn task.
+
+    Scene contents:
+      * green ray  = target heading (psi_target)
+      * blue ray   = current heading (psi_current)
+      * orange arc = the remaining angle dpsi the robot still has to rotate
+      * green ball = tip of the target ray
+      * label      = signed dpsi in degrees
+    """
+    cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+    robot = env.unwrapped.scene["robot"]
+
+    psi_t = float(cmd_term.heading_target[env_idx])
+    psi_c = float(robot.data.heading_w[env_idx])
+    # Signed remaining angle, wrapped to (-pi, pi]. Reuse the command term's own
+    # property so the displayed value matches exactly what the policy observes.
+    d_psi = float(cmd_term.heading_error[env_idx])
+
+    base = robot.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    origin = np.array([base[0], base[1], 0.06], dtype=np.float32)
+
+    ray_len = 1.2
+    arc_r = 0.8
+
+    def ray(psi, length):
+        return origin + np.array([math.cos(psi) * length, math.sin(psi) * length, 0.0], dtype=np.float32)
+
+    # -- target / current heading rays (re-added by name each frame; viser replaces in place)
+    server.scene.add_line_segments(
+        "/turn/target_ray",
+        points=np.array([[origin, ray(psi_t, ray_len)]], dtype=np.float32),
+        colors=(0, 220, 60),
+        line_width=5.0,
+    )
+    server.scene.add_line_segments(
+        "/turn/current_ray",
+        points=np.array([[origin, ray(psi_c, ray_len)]], dtype=np.float32),
+        colors=(60, 130, 255),
+        line_width=5.0,
+    )
+
+    # -- arc sweeping from the current heading to the target, i.e. the work still to do
+    n_seg = 24
+    angles = psi_c + d_psi * np.linspace(0.0, 1.0, n_seg + 1)
+    arc_pts = origin + np.stack(
+        [np.cos(angles) * arc_r, np.sin(angles) * arc_r, np.zeros_like(angles)], axis=-1
+    ).astype(np.float32)
+    server.scene.add_line_segments(
+        "/turn/dpsi_arc",
+        points=np.stack([arc_pts[:-1], arc_pts[1:]], axis=1).astype(np.float32),
+        colors=(255, 160, 0),
+        line_width=3.0,
+    )
+
+    # -- marker + label
+    gui["target_marker"].position = ray(psi_t, ray_len)
+    gui["readout_label"].text = f"dpsi = {math.degrees(d_psi):+.1f} deg"
+    gui["readout_label"].position = np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32)
+
+    # -- GUI readouts
+    gui["err"].value = round(math.degrees(d_psi), 1)
+    gui["tgt"].value = round(math.degrees(psi_t), 1)
+    gui["cur"].value = round(math.degrees(psi_c), 1)
+    gui["in_tgt"].value = bool(abs(d_psi) < float(getattr(cmd_term.cfg, "success_threshold", 0.087)))
+    elapsed = getattr(cmd_term, "_elapsed", None)
+    if elapsed is not None:
+        gui["elapsed"].value = round(float(elapsed[env_idx]), 2)
 
 
 def override_command_from_viser(env, gui):
@@ -172,6 +316,32 @@ def override_command_from_viser(env, gui):
     zeroing so the GUI values survive the next ``_update_command`` call.
     """
     cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+
+    # TargetHeadingCommand (Isaac-Velocity-Flat-Turn): the command is the remaining
+    # angle Δψ, recomputed from ``heading_target`` every step. Writing vel_command_b
+    # here would just be overwritten by ``_update_command``, so drive
+    # ``heading_target`` instead.
+    if gui.get("turn"):
+        # "new random target" button: zeroing time_left makes the env resample on the
+        # next command_manager.compute(), which goes through the real _resample_command
+        # path and so also resets the per-command metric buffers (_elapsed/_settled).
+        if gui["pending"]["resample"]:
+            gui["pending"]["resample"] = False
+            if hasattr(cmd_term, "time_left"):
+                cmd_term.time_left[:] = 0.0
+            return
+
+        if bool(gui["free_run"].value):
+            # Let the env drive: targets resample on their own timer (3-5 s).
+            # This is what the trained policy actually sees, so it is the default.
+            return
+
+        # Hold mode: pin the target to the slider and freeze resampling.
+        cmd_term.heading_target[:] = math.radians(float(gui["target_yaw"].value))
+        if hasattr(cmd_term, "time_left"):
+            cmd_term.time_left[:] = 1.0e9
+        return
+
     ref = getattr(cmd_term, "vel_command_b", None)
     if ref is None:
         ref = getattr(cmd_term, "command", None)
@@ -194,8 +364,12 @@ def override_command_from_viser(env, gui):
         cmd_term.is_standing_env[:] = False
 
 
-def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
-    """Push the current robot state from Isaac Lab into the viser scene."""
+def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0, server=None, gui=None):
+    """Push the current robot state from Isaac Lab into the viser scene.
+
+    When ``server``/``gui`` are given and the active task is the turn task, also
+    updates the target-heading visualization (see :func:`_update_turn_viser`).
+    """
     robot = env.unwrapped.scene["robot"]
     root_state = robot.data.root_state_w[env_idx]
     pos = root_state[0:3].detach().cpu().numpy()
@@ -209,6 +383,9 @@ def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0):
     base_frame.position = pos.astype(np.float32)
     base_frame.wxyz = quat_wxyz.astype(np.float32)
     viser_urdf.update_cfg(cfg)
+
+    if server is not None and gui is not None and gui.get("turn"):
+        _update_turn_viser(env, server, gui, env_idx=env_idx)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -356,8 +533,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy_nn.reset(dones)
         if viser_state is not None:
             try:
-                _, base_frame, viser_urdf, joint_indices, _ = viser_state
-                update_viser(env, base_frame, viser_urdf, joint_indices, env_idx=args_cli.viser_env_idx)
+                server, base_frame, viser_urdf, joint_indices, gui = viser_state
+                update_viser(
+                    env, base_frame, viser_urdf, joint_indices,
+                    env_idx=args_cli.viser_env_idx, server=server, gui=gui,
+                )
             except Exception as e:
                 print(f"[WARNING] Viser update failed: {e}")
         if args_cli.video:

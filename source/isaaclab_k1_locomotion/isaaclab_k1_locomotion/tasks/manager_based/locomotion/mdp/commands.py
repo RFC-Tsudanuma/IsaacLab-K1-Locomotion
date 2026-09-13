@@ -409,3 +409,261 @@ class KickDirectionCommandCfg(CommandTermCfg):
     """キック方向を示す矢印マーカーの設定 (デフォルトは緑の矢印)。"""
 
     goal_dir_visualizer_cfg.markers["arrow"].scale = (0.5, 0.5, 0.5)
+
+
+class TargetHeadingCommand(UniformVelocityCommand):
+    """目標ヘディングまでの「残り角」をコマンドとして返す (その場高速回転タスク用)。
+
+    歩行タスクのコマンドは ``(vx, vy, ωz)`` の速度指令だが、本コマンドは::
+
+        command = [0, 0, wrap_to_pi(ψ_target - ψ_current) / π]     shape (num_envs, 3)
+
+    を返す。次元を 3 のままにしているのは意図的で、観測 1 ステップ 49 次元という
+    レイアウトが ``history_layout.py`` / ``mdp/symmetry.py`` /
+    ``agents/history_policy_exporter.py`` / C++ デプロイ側に共有ハードコードされている
+    ため、枠の「中身」だけを差し替えて既存資産をそのまま使う。
+
+    この符号化が持つ性質:
+
+    * **左右対称性がそのまま通る**: ``mdp/symmetry.py`` の ``vel_cmd`` 変換は符号
+      ``(+1, -1, -1)``。左右反転で Δψ → -Δψ なので slot2 (符号 -1) と完全一致し、
+      ゼロ 2 枠は符号不変。symmetry / history_layout の変更は不要。
+    * **目標到達で ``||cmd||`` が 0 に落ちる**: 既存の「停止指令」ゲートが自然に発火する。
+      ``phase_obs`` は ``||cmd[:, :3]|| < cmd_threshold`` で位相をゼロ化するので
+      |Δψ| < 9° (閾値 0.05 の場合) で位相クロックが切れ、``_stand_still_boost`` が
+      action 平滑ペナルティを強めて「目標で静かに止まる」ことを促す。
+    * ``||cmd[:, :2]|| = 0`` なので ``compute_cmd_phase_freq`` は常に ``low_freq`` を返す。
+
+    継承元の heading 制御則 (``ωz = clip(stiffness * Δψ)``) は**使わない**。
+    P 則で ωz 参照値を作ると「加速 → 減速 → 目標で停止」の減速プロファイルを
+    ポリシー側が設計できないため、残り角そのものを渡して任せる。
+    """
+
+    cfg: "TargetHeadingCommandCfg"
+
+    def __init__(self, cfg: "TargetHeadingCommandCfg", env: "ManagerBasedEnv"):
+        super().__init__(cfg, env)
+        # 速度追従メトリクスは意味を失うので取り除き、回転タスク用に差し替える。
+        self.metrics.pop("error_vel_xy", None)
+        self.metrics.pop("error_vel_yaw", None)
+        self.metrics["heading_error_deg"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["settle_time_s"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["time_in_target"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["success_rate"] = torch.zeros(self.num_envs, device=self.device)
+        self.metrics["settled_speed"] = torch.zeros(self.num_envs, device=self.device)
+
+        # 「その場」判定の基準位置 (コマンド発行時の xy)。base_xy_drift_l2 が参照する。
+        self.origin_pos_w = torch.zeros(self.num_envs, 2, device=self.device)
+
+        # --- 計測バッファ ---
+        # コマンド単位 (再サンプリングごとにリセット)
+        self._elapsed = torch.zeros(self.num_envs, device=self.device)
+        self._settled = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        # エピソード単位 (reset でのみクリア)
+        self._err_sum = torch.zeros(self.num_envs, device=self.device)
+        self._step_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._in_target_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._settle_sum = torch.zeros(self.num_envs, device=self.device)
+        self._settle_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._issued_cnt = torch.zeros(self.num_envs, device=self.device)
+        self._settled_speed_sum = torch.zeros(self.num_envs, device=self.device)
+
+    def __str__(self) -> str:
+        msg = "TargetHeadingCommand:\n"
+        msg += f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
+        msg += f"\tResampling time range: {self.cfg.resampling_time_range}\n"
+        msg += f"\tTurn angle range [rad]: {self.cfg.turn_angle_range}\n"
+        msg += f"\tSuccess threshold [rad]: {self.cfg.success_threshold}"
+        return msg
+
+    """
+    Properties
+    """
+
+    @property
+    def heading_error(self) -> torch.Tensor:
+        """``wrap_to_pi(ψ_target - ψ_current)`` [rad], shape ``(num_envs,)``。
+
+        毎回 ``robot.data.heading_w`` を live 参照して計算し直すので、常に最新値になる。
+        報酬側がこれを使うのは重要で、``ManagerBasedRLEnv.step`` は
+        reward → reset → ``command_manager.compute`` の順に走るため、報酬計算時点の
+        ``command_manager.get_command(...)`` は 1 ステップ古い値を返すため。
+        """
+        return math_utils.wrap_to_pi(self.heading_target - self.robot.data.heading_w)
+
+    """
+    Implementation specific functions.
+    """
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
+        if env_ids is None:
+            env_ids = slice(None)
+        # 一度も目標に到達しなかった env を平均に含めると settle_time が希釈されるので、
+        # 到達サンプルのある env だけで平均を取り直す (ExtremeVelocityCommand と同じ方針)。
+        masked: dict[str, float] = {}
+        cnt = self._settle_cnt[env_ids]
+        has = cnt > 0
+        if has.any():
+            masked["settle_time_s"] = (self._settle_sum[env_ids][has] / cnt[has]).mean().item()
+
+        # エピソード累積バッファはここでクリアする。この後 super().reset() 内の
+        # _resample が新しいコマンドを立てて _issued_cnt を 1 にするので、順序が重要。
+        for buf in (
+            self._err_sum,
+            self._step_cnt,
+            self._in_target_cnt,
+            self._settle_sum,
+            self._settle_cnt,
+            self._issued_cnt,
+            self._settled_speed_sum,
+        ):
+            buf[env_ids] = 0.0
+
+        extras = super().reset(env_ids)
+        # 到達サンプル無しの reset ではキーごと落とす (0 での希釈を防ぐ)
+        extras.pop("settle_time_s", None)
+        extras.update(masked)
+        return extras
+
+    def _update_metrics(self):
+        # super() は呼ばない (速度誤差メトリクスを積まないため)。
+        err = self.heading_error.abs()
+        self._elapsed += self._env.step_dt
+        self._err_sum += err
+        self._step_cnt += 1.0
+
+        in_target = err < float(self.cfg.success_threshold)
+        self._in_target_cnt += in_target.float()
+        # 「初めて目標圏内に入った時刻」= 到達時間。以降の出入りでは更新しない。
+        newly_settled = in_target & (~self._settled)
+        self._settled |= in_target
+        self._settle_sum += torch.where(newly_settled, self._elapsed, torch.zeros_like(self._elapsed))
+        self._settle_cnt += newly_settled.float()
+
+        # 到達後の静止保持時間を保証する (2026-09-13)。
+        #
+        # 再サンプリング間隔は到達タイミングと無関係に引かれるので、間隔を長くしても
+        # 「回転終了後に静止する時間」は保証できない (到達が遅ければ残り時間が足りない)。
+        # 初到達を検出した時点で time_left の下限を hold_after_settle_s に引き上げ、
+        # 必ずその秒数だけ「目標角で立ち続ける」状況を作る。
+        #
+        # 実機では回転後すぐ歩行ポリシーへ引き渡すが、引き渡し可能な安定姿勢に
+        # 落ち着く動作自体は学習させる必要がある (MuJoCo 検証で判明)。
+        #
+        # NOTE: CommandTerm.compute() は _update_metrics → time_left -= dt →
+        #       再サンプル判定 の順なので、ここで書けば同ステップの減算前に反映される。
+        hold = float(getattr(self.cfg, "hold_after_settle_s", 0.0))
+        if hold > 0.0 and bool(newly_settled.any()):
+            self.time_left[newly_settled] = self.time_left[newly_settled].clamp(min=hold)
+
+        # 到達中の実速度。「目標に着いた後ちゃんと止まっているか」の直接指標。
+        settled_speed = torch.norm(self.robot.data.root_lin_vel_b[:, :2], dim=1)
+        self._settled_speed_sum += torch.where(in_target, settled_speed, torch.zeros_like(settled_speed))
+
+        denom = self._step_cnt.clamp(min=1.0)
+        self.metrics["heading_error_deg"] = self._err_sum / denom * (180.0 / math.pi)
+        self.metrics["time_in_target"] = self._in_target_cnt / denom
+        self.metrics["settle_time_s"] = self._settle_sum / self._settle_cnt.clamp(min=1.0)
+        self.metrics["success_rate"] = self._settle_cnt / self._issued_cnt.clamp(min=1.0)
+        self.metrics["settled_speed"] = self._settled_speed_sum / self._in_target_cnt.clamp(min=1.0)
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        # 継承元は cfg.ranges から (vx, vy, ωz) を引くが、本コマンドでは全て無視する。
+        n = len(env_ids)
+        if n == 0:
+            return
+        lo, hi = self.cfg.turn_angle_range
+        # 回転量は「大きさ」を引いてから符号をランダムに付ける。こうすると
+        # turn_angle_range の下限で「ほぼ 0 の目標」が出にくくなり、カリキュラムで
+        # 上限だけを動かせば難易度が素直に上がる。
+        magnitude = torch.empty(n, device=self.device).uniform_(float(lo), float(hi))
+        sign = torch.where(
+            torch.rand(n, device=self.device) < 0.5,
+            torch.ones(n, device=self.device),
+            -torch.ones(n, device=self.device),
+        )
+        self.heading_target[env_ids] = math_utils.wrap_to_pi(
+            self.robot.data.heading_w[env_ids] + sign * magnitude
+        )
+        # 「その場」の基準位置を、このコマンドの発行時点で取り直す。
+        self.origin_pos_w[env_ids] = self.robot.data.root_pos_w[env_ids, :2]
+
+        # 継承元のフラグは参照しないが、play.py 等が触っても破綻しないよう整合させておく。
+        self.is_heading_env[env_ids] = True
+        self.is_standing_env[env_ids] = False
+
+        # コマンド単位の計測をリセットし、発行回数を数える。
+        self._elapsed[env_ids] = 0.0
+        self._settled[env_ids] = False
+        self._issued_cnt[env_ids] += 1.0
+
+    def _update_command(self):
+        # 継承元の P 則 (clip(stiffness * Δψ)) と standing ゼロ化は使わない。
+        self.vel_command_b[:, 0] = 0.0
+        self.vel_command_b[:, 1] = 0.0
+        self.vel_command_b[:, 2] = self.heading_error / math.pi
+
+    """
+    可視化: 継承元は command[:, :2] (= 常に 0) で矢印を描くため長さ 0 になる。
+    代わりに「目標ヘディング (緑)」と「現在ヘディング (青)」の向きを描く。
+    """
+
+    def _debug_vis_callback(self, event):
+        if not self.robot.is_initialized:
+            return
+        base_pos_w = self.robot.data.root_pos_w.clone()
+        base_pos_w[:, 2] += 0.5
+        goal_scale, goal_quat = self._resolve_heading_to_arrow(
+            self.heading_target, self.goal_vel_visualizer
+        )
+        cur_scale, cur_quat = self._resolve_heading_to_arrow(
+            self.robot.data.heading_w, self.current_vel_visualizer
+        )
+        self.goal_vel_visualizer.visualize(base_pos_w, goal_quat, goal_scale)
+        self.current_vel_visualizer.visualize(base_pos_w, cur_quat, cur_scale)
+
+    def _resolve_heading_to_arrow(
+        self, heading_w: torch.Tensor, visualizer: VisualizationMarkers
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """ワールド yaw 角 [rad] を矢印の (scale, quaternion) に変換する。"""
+        default_scale = visualizer.cfg.markers["arrow"].scale
+        arrow_scale = torch.tensor(default_scale, device=self.device).repeat(heading_w.shape[0], 1)
+        zeros = torch.zeros_like(heading_w)
+        arrow_quat = math_utils.quat_from_euler_xyz(zeros, zeros, heading_w)
+        return arrow_scale, arrow_quat
+
+
+@configclass
+class TargetHeadingCommandCfg(UniformVelocityCommandCfg):
+    """`TargetHeadingCommand` の設定クラス。
+
+    ``ranges`` の ``lin_vel_x`` / ``lin_vel_y`` / ``ang_vel_z`` は
+    ``_resample_command`` を完全に置き換えたため**未使用**。``configclass`` の
+    MISSING チェックを通すためだけにダミー値を入れておくこと。
+    ``heading_command`` は False 固定 (継承元の P 則を無効化する意思表示であり、
+    かつ ``ranges.heading=None`` でも ``__init__`` のバリデーションを通すため)。
+    """
+
+    class_type: type = TargetHeadingCommand
+
+    heading_command: bool = False
+
+    turn_angle_range: tuple[float, float] = (0.3, math.pi)
+    """1 コマンドあたりの回転量 |Δψ_0| [rad] のサンプル範囲。符号は別途ランダムに付く。
+    ``turn_angle_curriculum`` がこの上限を段階的に拡げる。"""
+
+    success_threshold: float = 0.087
+    """「到達した」とみなす残り角 [rad] (既定 5°)。メトリクス集計と
+    ``hold_after_settle_s`` の到達判定に使う。報酬には使わない。"""
+
+    hold_after_settle_s: float = 0.0
+    """初到達を検出してから、次の再サンプリングまで最低限確保する秒数。
+
+    ``> 0`` のとき、目標圏内 (``success_threshold``) に初めて入った時点で
+    ``time_left`` の下限をこの値に引き上げ、「回転終了後にその場で静止し続ける」
+    状況を必ずこの秒数だけ作る。
+
+    再サンプリング間隔 (``resampling_time_range``) を伸ばすだけでは、間隔が到達
+    タイミングと無関係に引かれるため到達後の保持時間を保証できない (到達が遅いと
+    残り時間が足りない)。0.0 で無効 (従来挙動)。
+    """

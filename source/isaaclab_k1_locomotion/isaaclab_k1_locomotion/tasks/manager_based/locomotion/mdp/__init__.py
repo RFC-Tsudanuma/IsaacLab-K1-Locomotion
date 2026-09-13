@@ -12,4 +12,6 @@ from .commands import (
     DiscreteVelocityCommandCfg,
     ExtremeVelocityCommand,
     ExtremeVelocityCommandCfg,
+    TargetHeadingCommand,
+    TargetHeadingCommandCfg,
 )
