@@ -684,7 +684,7 @@
     name="Left_Hip_Pitch"
     type="revolute">
     <origin
-      xyz="0 0.096 -0.077"
+      xyz="0 0.096 -0.062"
       rpy="0 0 0" />
     <parent
       link="Trunk" />
@@ -1026,7 +1026,7 @@
     name="Right_Hip_Pitch"
     type="revolute">
     <origin
-      xyz="0 -0.096 -0.077"
+      xyz="0 -0.096 -0.062"
       rpy="0 0 0" />
     <parent
       link="Trunk" />
