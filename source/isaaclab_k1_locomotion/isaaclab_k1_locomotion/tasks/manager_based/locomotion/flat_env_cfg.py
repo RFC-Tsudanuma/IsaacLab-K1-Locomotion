@@ -10,6 +10,7 @@ from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
+import isaaclab.sim as sim_utils
 import isaaclab.terrains as terrain_gen
 from isaaclab.terrains import TerrainGeneratorCfg
 
@@ -20,6 +21,14 @@ from .velocity_env_cfg import CurriculumCfg
 from .history_layout import HISTORY_LENGTH
 from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
+import os
+
+# make_k1_usd_torsional.py が生成する、足裏にトーショナル摩擦 (スピン抵抗) を
+# 書き込んだ K1 の USD。URDF を変更したらスクリプトを再実行して作り直すこと。
+_K1_TORSIONAL_USD_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "../../../../../../assets_soccer/booster_robotics_robots/K1/usd_torsional/K1_locomotion.usd",
+)
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
 from .mdp.commands import ExtremeVelocityCommandCfg, LateralVelocityCommandCfg, TargetHeadingCommandCfg
@@ -1277,6 +1286,53 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         # 下限 0.25 = 埃っぽい/滑る床、上限 1.4 = 新品ゴム底の高グリップ床。
         self.events.physics_material.params["static_friction_range"] = (0.25, 1.4)
         self.events.physics_material.params["dynamic_friction_range"] = (0.25, 1.4)
+
+        # --- 足裏のスピン抵抗: 物理側で再現する (2026-09-14) ---
+        #
+        # 実機・MuJoCo では足裏が地面をスピンする際にトーショナル摩擦が抵抗トルクを
+        # 生むが、IsaacLab の通常の設定経路では K1 に適用できなかった:
+        #   1. startup イベントで複製後の prim に modify_collision_properties
+        #      → 失敗。env は USD インスタンスとして複製されるため編集不可
+        #   2. spawn の collision_props に設定
+        #      → 失敗。URDF→USD 変換が collisions prim を既にインスタンス化済み
+        #   3. converter の make_instanceable=False
+        #      → 無効。urdf_converter.py はこのフラグを参照せず instanceable 固定
+        #
+        # そのため Isaac 内では足裏が実質無抵抗でスピンでき、その場回転タスクの方策は
+        # 「接地したまま捻る」戦略に居座った。摩擦 DR を平均 0.82→1.65 に上げても、
+        # 踏み替え報酬を 5 倍にしても片足支持時間は 0.0040→0.0037 と不変
+        # (捻りのコストが 0 なので当然)。sim2sim では Isaac 成功率 97.7% の
+        # 130-180° が MuJoCo でほとんど失敗していた。
+        #
+        # 解決策: make_k1_usd_torsional.py で URDF→USD 変換を行い、変換後の
+        # configuration/K1_locomotion_physics.usd (ここでは collision prim が
+        # インスタンス化されていない) に torsionalPatchRadius=0.04 を書き込んだ
+        # USD を生成して、それを UsdFileCfg で読む。
+        # 検証済み: 足 2 prim のみに値が入り、可動関節 12 個は JOINT_NAMES_K1 と完全一致。
+        #
+        # NOTE: この USD は URDF のスナップショット。**URDF を変更したら
+        #       make_k1_usd_torsional.py を再実行すること。**
+        # NOTE: 変換設定は K1_LOCOMOTION_CFG.spawn と同値に保つこと (スクリプト側に記載)。
+        # NOTE: K1_LOCOMOTION_CFG はモジュール共有なので、他タスク (歩行 / dribble /
+        #       kick) に影響しないよう本タスクのコピーに対してのみ差し替える。
+        self.scene.robot.spawn = sim_utils.UsdFileCfg(
+            usd_path=_K1_TORSIONAL_USD_PATH,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                retain_accelerations=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=1000.0,
+                max_depenetration_velocity=1.0,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=False,
+                solver_position_iteration_count=8,
+                solver_velocity_iteration_count=4,
+            ),
+        )
 
         # 地形: PLANE_HEAVY (平面 0.7/凹凸 0.3) → NOISY_FLAT (凹凸 0.7/平面 0.3)。
         # 捻り滑りは足裏全面の接触状態に強く依存するので、凹凸を主にして
