@@ -1584,6 +1584,89 @@ def heading_progress(
     return torch.where(invalid, torch.zeros_like(reward), reward)
 
 
+def foot_spin_in_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    contact_threshold: float = 1.0,
+    deadband: float = 0.0,
+) -> torch.Tensor:
+    """接地中の足の鉛直軸まわり角速度 (スピン) を罰する。
+
+    **これはシミュレータのモデル補正であり、有効な戦略への罰ではない。**
+
+    実機・MuJoCo では足裏が地面をスピンする際にトーショナル摩擦が抵抗トルクを生むが、
+    IsaacLab ではこれを K1 に適用できない:
+
+      * 摩擦係数 (``RigidBodyMaterialCfg``) は並進の滑りにしか効かない
+      * スピン抵抗を決める ``CollisionPropertiesCfg.torsional_patch_radius`` は、
+        URDF→USD 変換が collision prim をインスタンス化するため適用できない
+        (URDF 変換器は ``make_instanceable`` を参照せず instanceable 固定)
+
+    結果として Isaac 内では足裏が実質無抵抗でスピンでき、方策は「接地したまま捻る」
+    戦略に居座った。摩擦 DR を平均 0.82→1.65 に上げても、踏み替え報酬を 5 倍にしても
+    片足支持時間は 0.0040→0.0037 と不変だった (捻りのコストが 0 なので当然)。
+
+    その帰結が sim2sim ギャップで、Isaac では 130-180° の成功率 97.7% なのに MuJoCo
+    ではほとんど失敗する。破綻率は必要スピン量に比例して増えていた
+    (0-50°: 0.3% / 50-90°: 0.4% / 90-130°: 0.9% / 130-180°: 2.0%)。
+
+    本項はその欠落コストを報酬側で代行する。Coulomb 摩擦の散逸は |ω| に比例するので
+    **L1 (絶対値)** を使う。二乗だと低速域で勾配が消え、狙った「スピンを避ける」圧が
+    かからない (settle_stillness で同じ罠を踏んだ)。
+
+    Args:
+        sensor_cfg: 足の接触センサ (``.*_foot_link``)。
+        asset_cfg: 足の body (``.*_foot_link``)。
+        contact_threshold: 接地とみなす接触力 [N]。
+        deadband: この角速度 [rad/s] までは無罰。着地時の微小な回転を許す場合に使う。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    contacts = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0]
+        > contact_threshold
+    )
+    asset = env.scene[asset_cfg.name]
+    spin = asset.data.body_ang_vel_w[:, asset_cfg.body_ids, 2].abs()
+    if deadband > 0.0:
+        spin = (spin - float(deadband)).clamp(min=0.0)
+    return torch.sum(spin * contacts, dim=1)
+
+
+def settle_stillness(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    std: float = 0.12,
+    error_threshold: float = 0.087,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """目標角に到達している間だけ、機体が静止しているほど高い報酬 ``exp(-‖v_xy‖²/std²)``。
+
+    実測 (2026-09-13, warm-start run) で ``settled_speed`` が 0.17-0.22 m/s から
+    570 iter にわたって下がらず停滞した。原因は到達中の報酬収支:
+
+      track_heading_sharp  +5.0 × ~1.0 = +5.0
+      track_heading_coarse             = +3.0
+      base_lin_vel_xy (v=0.20)  -1.0 × 0.04   = -0.04
+      base_lin_vel_xy (v=0.05)  -1.0 × 0.0025 = -0.0025
+
+    静止圧が合計の 0.5% しかなく、さらに **二乗ペナルティは低速域で勾配が消える**ため
+    0.2 → 0.05 m/s に下げる動機がほとんど無かった。``_stand_still_boost`` による
+    ×3 倍率は action の平滑性にしか効かず、機体の並進速度は見ていない。
+
+    そこで低速域で強い勾配を持つ exp カーネルを、到達中のみゲートして加える。
+    std=0.12 のとき v=0.05 → 0.84、v=0.20 → 0.06 と、狙った帯域で差が大きい。
+
+    NOTE: 角速度は含めない。目標角からのずれは ``track_heading_exp`` (sharp は
+    std=0.15 rad) が既に強く罰しており、二重掛けになるため。
+    """
+    err = _heading_error(env, command_name).abs()
+    asset = env.scene[asset_cfg.name]
+    speed_sq = torch.sum(torch.square(asset.data.root_lin_vel_b[:, :2]), dim=1)
+    reward = torch.exp(-speed_sq / (std**2))
+    return reward * (err < float(error_threshold))
+
+
 def feet_air_time_heading(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -1636,6 +1719,8 @@ __all__ = [
     "track_heading_exp",
     "heading_progress",
     "feet_air_time_heading",
+    "settle_stillness",
+    "foot_spin_in_contact",
     "base_xy_drift_l2",
     "base_lin_vel_xy_l2",
     "feet_slide_deadband",

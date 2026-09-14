@@ -45,6 +45,8 @@ from .mdp.rewards import (
     track_heading_exp,
     heading_progress,
     feet_air_time_heading,
+    settle_stillness,
+    foot_spin_in_contact,
     base_xy_drift_l2,
     base_lin_vel_xy_l2,
 )
@@ -1106,7 +1108,11 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
             rel_standing_envs=0.0,
             heading_command=False,
             debug_vis=True,
-            turn_angle_range=(0.3, math.pi),
+            # 下限 0.3 → 0.0 (2026-09-14)。0.3 rad = 17.2° なので、**17° 未満の指令が
+            # 学習分布に一度も出ていなかった**。sim2sim で 0-50° が「角度は出るが静止できず
+            # 後ろに倒れる」となったのは、この帯域の一部が分布外だったため。
+            # 0 付近は「その場に留まれ」という指令になり、静止練習も兼ねる。
+            turn_angle_range=(0.0, math.pi),
             success_threshold=math.radians(5.0),
             # 到達後に必ず 2 秒は「目標角でその場静止」させる (2026-09-13)。
             #
@@ -1174,9 +1180,15 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         # 恒等的に 0 になる。残り角ゲート版に差し替えて「回転中は片足支持を報酬、
         # 目標到達後は足踏みを報酬しない」形にする (すり足対策)。
         self.rewards.feet_air_time = None
+        # weight 0.2 → 1.0 (2026-09-14)。sim2sim で 130-180° の大角度がほぼ失敗し、
+        # 「足踏みして回りすぎる」「足を開いたところで固まる」の 2 パターンが出た。
+        # どちらも「滑れないので踏み替えに切り替えようとして失敗する」で説明でき、
+        # 実測でも片足支持時間はほぼ 0 (0.0008) のままだった。
+        # 滑りを罰する代わりに**代替手段である踏み替えを積極的に報酬**して、
+        # 高摩擦下での大角度旋回に使える歩容を獲得させる。
         self.rewards.feet_air_time_heading = RewTerm(
             func=feet_air_time_heading,
-            weight=0.2,
+            weight=1.0,
             params={
                 "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
                 "threshold": 0.4,
@@ -1213,6 +1225,22 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
             weight=-1.0,
             params={"asset_cfg": SceneEntityCfg("robot")},
         )
+        # 到達後の静止 (2026-09-13)。
+        # 上の base_lin_vel_xy (二乗ペナルティ) は低速域で勾配が消えるうえ、到達中の
+        # 報酬収支でも全体の 0.5% しかなく (v=0.2 で -0.04 vs track_heading 計 +8.0)、
+        # warm-start run では settled_speed が 0.17-0.22 m/s で 570 iter 停滞していた。
+        # 到達中のみゲートした exp カーネルで 0-0.3 m/s の帯域に強い勾配を与える。
+        # weight は track_heading_sharp (5.0) と同オーダにしないと効かない。
+        self.rewards.settle_stillness = RewTerm(
+            func=settle_stillness,
+            weight=3.0,
+            params={
+                "command_name": "base_velocity",
+                "std": 0.12,
+                "error_threshold": math.radians(5.0),
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
         # 速度ペナルティだけだと、ゆっくりした一方向のドリフトが積み上がる。
         # コマンド発行時の位置からの変位を直接罰する。
         self.rewards.base_xy_drift = RewTerm(
@@ -1246,7 +1274,7 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
                 "command_name": "base_velocity",
                 # |Δψ_0| の範囲 [rad]。下限は「ほぼ 0 の目標」を避けるため 0.3 で固定し、
                 # 上限だけを ±45° → ±90° → ±180° と拡げる。
-                "stages": [(0.3, math.pi / 4), (0.3, math.pi / 2), (0.3, math.pi)],
+                "stages": [(0.0, math.pi / 4), (0.0, math.pi / 2), (0.0, math.pi)],
                 # 監視するのは全 env 平均の残り角 [rad]。再サンプリング直後の env も
                 # 含まれるので完璧でも 0 にはならない。実測に合わせて要調整
                 # (最終ステージの値は遷移判定に使われずログ表示専用)。
@@ -1282,10 +1310,26 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         #       (K1FlatEnvCfg.__post_init__ のコメント参照)。
         #       make_consistent=True は K1FlatEnvCfg で設定済みのため dynamic <= static が保証される。
 
-        # 摩擦 DR: Stance-Plane の (0.6, 1.0) → (0.25, 1.4)。
-        # 下限 0.25 = 埃っぽい/滑る床、上限 1.4 = 新品ゴム底の高グリップ床。
-        self.events.physics_material.params["static_friction_range"] = (0.25, 1.4)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.25, 1.4)
+        # 摩擦 DR: (0.25, 1.4) → (0.7, 1.5) に引き上げ (2026-09-14, MuJoCo sim2sim 検証後)。
+        #
+        # MuJoCo (K1_22dof.xml) の実効接触摩擦は **μ = 1.0**。地面 geom は
+        # friction="0.4 ..." だが、足の接触 geom (box) に friction 属性が無く MuJoCo の
+        # デフォルト (1, 0.005, 0.0001) が使われ、MuJoCo は接触摩擦を 2 geom の
+        # 要素ごと最大値で決めるため max(0.4, 1.0) = 1.0 になる。
+        #
+        # 旧 DR U(0.25, 1.4) は平均 0.825 で、**学習サンプルの 65% が μ<1.0**。
+        # つまり学習時間の大半を MuJoCo/実機より滑りやすい床で過ごしており、
+        # 足裏が滑る前提のピボット旋回に最適化されていた。sim2sim で
+        # 130-180° がほぼ失敗したのはこのため (滑れず、代替の踏み替えも未学習)。
+        #
+        # 上限は 2.8 まで広げる (RMA 論文が最大 4.5 の摩擦 DR を使っている前例に倣う)。
+        # 高摩擦側を厚くすることで「足裏が滑らない」状況が学習に十分含まれ、
+        # 大角度旋回では踏み替えの獲得が物理的に強制される。
+        # 下限 0.5 は埃っぽい/やや滑る床を想定。上限だけ上げると分布の中心が検証環境
+        # (MuJoCo μ=1.0) より大きく上に寄るため、低摩擦側も残して両側に頑健にする。
+        # U(0.5, 2.8): 平均 1.65、μ<1.0 が 22%。
+        self.events.physics_material.params["static_friction_range"] = (0.5, 2.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.5, 2.8)
 
         # --- 足裏のスピン抵抗: 物理側で再現する (2026-09-14) ---
         #
@@ -1298,11 +1342,10 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         #   3. converter の make_instanceable=False
         #      → 無効。urdf_converter.py はこのフラグを参照せず instanceable 固定
         #
-        # そのため Isaac 内では足裏が実質無抵抗でスピンでき、その場回転タスクの方策は
-        # 「接地したまま捻る」戦略に居座った。摩擦 DR を平均 0.82→1.65 に上げても、
-        # 踏み替え報酬を 5 倍にしても片足支持時間は 0.0040→0.0037 と不変
-        # (捻りのコストが 0 なので当然)。sim2sim では Isaac 成功率 97.7% の
-        # 130-180° が MuJoCo でほとんど失敗していた。
+        # そのため Isaac 内では足裏が実質無抵抗でスピンでき、方策は「接地したまま
+        # 捻る」戦略に居座った。摩擦 DR を平均 0.82→1.65 に上げても、踏み替え報酬を
+        # 5 倍にしても片足支持時間は 0.0040→0.0037 と不変 (捻りのコストが 0 なので当然)。
+        # sim2sim では Isaac 成功率 97.7% の 130-180° が MuJoCo でほとんど失敗していた。
         #
         # 解決策: make_k1_usd_torsional.py で URDF→USD 変換を行い、変換後の
         # configuration/K1_locomotion_physics.usd (ここでは collision prim が
@@ -1313,8 +1356,6 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         # NOTE: この USD は URDF のスナップショット。**URDF を変更したら
         #       make_k1_usd_torsional.py を再実行すること。**
         # NOTE: 変換設定は K1_LOCOMOTION_CFG.spawn と同値に保つこと (スクリプト側に記載)。
-        # NOTE: K1_LOCOMOTION_CFG はモジュール共有なので、他タスク (歩行 / dribble /
-        #       kick) に影響しないよう本タスクのコピーに対してのみ差し替える。
         self.scene.robot.spawn = sim_utils.UsdFileCfg(
             usd_path=_K1_TORSIONAL_USD_PATH,
             activate_contact_sensors=True,
@@ -1332,6 +1373,20 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
                 solver_position_iteration_count=8,
                 solver_velocity_iteration_count=4,
             ),
+        )
+
+        # 物理でスピン抵抗が入ったので、報酬による代行 (foot_spin_in_contact) は
+        # 既定では使わない。物理だけで踏み替えが出ない場合の補助として weight を
+        # 上げて使う余地は残すが、モデル補正の二重掛けになるので既定は 0。
+        self.rewards.foot_spin_in_contact = RewTerm(
+            func=foot_spin_in_contact,
+            weight=0.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "contact_threshold": 1.0,
+                "deadband": 0.3,
+            },
         )
 
         # 地形: PLANE_HEAVY (平面 0.7/凹凸 0.3) → NOISY_FLAT (凹凸 0.7/平面 0.3)。
@@ -1429,7 +1484,7 @@ class K1FlatTurnFinetuneCfg(K1FlatTurnCfg):
 
         # --- 目標角レンジを最終段 (±180°) に固定 ---
         self.curriculum.turn_angle = None
-        self.commands.base_velocity.turn_angle_range = (0.3, math.pi)
+        self.commands.base_velocity.turn_angle_range = (0.0, math.pi)
 
         # --- 初期線速度を最終値 (±1.4 m/s) に固定 ---
         # z / roll / pitch / yaw は K1FlatTurnCfg が継承している ±0.5 のまま。
