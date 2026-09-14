@@ -22,7 +22,15 @@ from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 import math
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
-from .mdp.commands import ExtremeVelocityCommandCfg, LateralVelocityCommandCfg, TargetHeadingCommandCfg
+from .mdp.commands import (
+    MODE_TURN,
+    MODE_WALK,
+    ExtremeVelocityCommandCfg,
+    LateralVelocityCommandCfg,
+    TargetHeadingCommandCfg,
+    TransitionCommandCfg,
+)
+from .mdp.observations import transition_mode
 from .mdp.rewards import (
     feet_landing_impact,
     feet_landing_vel,
@@ -38,6 +46,7 @@ from .mdp.rewards import (
     feet_air_time_heading,
     base_xy_drift_l2,
     base_lin_vel_xy_l2,
+    mode_gated,
 )
 from .mdp.curriculums import (
     modify_command_resampling_time_range,
@@ -1669,3 +1678,225 @@ class K1FlatEnvCfg_PLAY(K1FlatEnvCfg):
         self.observations.policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+##
+# 歩行 ⇄ 回転の遷移学習 (2026-09-14)
+##
+
+
+@configclass
+class K1TransitionModeCfg(ObsGroup):
+    """補助観測: `TransitionCommand` の現在モード (0=walk / 1=turn, 1 次元, 履歴なし)。
+
+    方策の入力ではない (rsl_rl の obs_groups に含めない)。``MultiExpertPPO`` が
+    env ごとに「どの expert がアクションを出すか」を決めるために読む。
+    """
+
+    mode = ObsTerm(func=transition_mode, params={"command_name": "base_velocity"})
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class K1FlatTransitionObservationsCfg(K1FlatObservationsCfg):
+    """K1 Flat の観測 (command + policy/critic 履歴) に補助グループ ``expert_mode`` を足したもの。"""
+
+    expert_mode: K1TransitionModeCfg = K1TransitionModeCfg()
+
+
+def _gate(term: RewTerm, mode: int, weight: float | None = None) -> RewTerm:
+    """既存の報酬項を `mode_gated` で包み、指定モードのときだけ有効にする。"""
+    return RewTerm(
+        func=mode_gated,
+        weight=term.weight if weight is None else weight,
+        params={"mode": mode, "func": term.func, "params": dict(term.params)},
+    )
+
+
+@configclass
+class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
+    """歩行 expert ⇄ 回転 expert の遷移学習環境 (2026-09-14)。
+
+    目的: 単体では完成している歩行 expert (`K1FlatStancePlaneCfg` 系) と回転 expert
+    (`K1FlatTurnCfg`) に、「実行途中で相手から制御を引き継ぐ / 相手へ引き渡す」状況を
+    追加学習させる。RPG (Robust Policy Gating) の policy-transition randomization を
+    コマンド追従設定に移植したもので、ゲーティング網は使わない (ハード切替)。
+
+    構成:
+
+    * コマンド ``base_velocity`` を `TransitionCommandCfg` に差し替える。内部に歩行生成器
+      (``ExtremeVelocityCommandCfg``、Stance-Plane の最終カリキュラム状態で固定) と回転生成器
+      (``TargetHeadingCommandCfg``、±180°) を持ち、env ごとのモードで中身を切り替える。
+      モード遷移 (walk 区間長・到達後保持・割り込み) は `TransitionCommand` の docstring 参照。
+    * 切替の瞬間、観測履歴 (policy / critic) のコマンド枠を全ステップ 0 にする
+      (履歴バッファは両 expert で 1 本共有。デプロイ側も同じ処理をすること)。
+    * 補助観測グループ ``expert_mode`` を追加 (方策入力ではない)。
+    * 報酬: 歩行専用項は walk モード、回転専用項は turn モードのときだけ有効
+      (``mode_gated``)。共通の姿勢・平滑・接触ペナルティは常時。各 expert が単体学習で
+      見ていた重みをそのまま使う。
+    * 学習は `MultiExpertPPO` (``Isaac-Velocity-Flat-Transition-Walk`` / ``-Turn``) で行い、
+      一方を学習・他方を凍結 checkpoint から実行する。
+
+    環境の物理分布は両 expert の学習分布の共通部分に合わせる: 地形 PLANE_HEAVY・摩擦
+    (0.6, 1.0) (Stance-Plane そのまま。回転 expert の (0.25, 1.4) はこれを含む)。
+    Stance-Plane-Polish で歩行 expert が受けていた ``joint_power_l2`` は walk モード限定で
+    残す (回転側の目的を変えないため)。
+
+    使い方 (歩行 expert を学習、回転 expert を凍結)::
+
+        torchrun --standalone --nproc_per_node=2 train.py \
+            --task Isaac-Velocity-Flat-Transition-Walk --headless --distributed --num_envs 2048 \
+            --resume --checkpoint /abs/path/k1_flat/<run>/model_51500.pt --reset_noise_std 0.05 \
+            --frozen_ckpt turn=/abs/path/k1_turn/<run>/model_XXXX.pt --max_iterations 2000
+
+    回転 expert を学習する場合は ``--task Isaac-Velocity-Flat-Transition-Turn`` と
+    ``--frozen_ckpt walk=...`` にする。
+    """
+
+    observations: K1FlatTransitionObservationsCfg = K1FlatTransitionObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # ------------------------------------------------------------------
+        # カリキュラムを学習終了時点の状態に固定 (Stance-Plane-Polish と同じ回避)
+        # ------------------------------------------------------------------
+        # 複合コマンドの cfg は ExtremeVelocityCommandCfg ではないので、これらの
+        # カリキュラム (term.cfg.ranges / extreme_prob を書く) は必ず外す。
+        self.curriculum.lin_vel_command = None
+        self.curriculum.extreme_commands = None
+        self.curriculum.command_resampling_time_range = None
+        self.curriculum.push_robot_stage1 = None
+        # push は stage1 相当 (両 expert とも経験している範囲) で固定
+        self.events.push_robot.interval_range_s = (4.0, 8.0)
+        self.events.push_robot.params["velocity_range"] = {
+            "x": (-0.5, 0.5),
+            "y": (-0.5, 0.5),
+            "roll": (-0.02, 0.02),
+            "pitch": (-0.02, 0.02),
+        }
+
+        # ------------------------------------------------------------------
+        # コマンド: 歩行生成器 (最終状態で固定) + 回転生成器 → 複合コマンド
+        # ------------------------------------------------------------------
+        walk_cfg: ExtremeVelocityCommandCfg = self.commands.base_velocity
+        walk_cfg.ranges.lin_vel_x = (-2.0, 2.0)
+        walk_cfg.ranges.lin_vel_y = (-0.9, 0.9)
+        walk_cfg.ranges.ang_vel_z = (-1.0, 1.0)
+        walk_cfg.extreme_prob = 0.35
+        walk_cfg.extreme_frac = 0.7
+        walk_cfg.resampling_time_range = (0.8, 8.0)
+
+        turn_cfg = TargetHeadingCommandCfg(
+            asset_name=walk_cfg.asset_name,
+            resampling_time_range=(1.0, 3.0),  # 未使用 (モード遷移が代替)
+            rel_standing_envs=0.0,
+            heading_command=False,
+            debug_vis=False,
+            turn_angle_range=(0.3, math.pi),
+            success_threshold=math.radians(5.0),
+            hold_after_settle_s=0.0,  # 未使用 (turn_hold_range が代替)
+            ranges=TargetHeadingCommandCfg.Ranges(
+                lin_vel_x=(0.0, 0.0),
+                lin_vel_y=(0.0, 0.0),
+                ang_vel_z=(-1.0, 1.0),
+                heading=None,
+            ),
+        )
+        self.commands.base_velocity = TransitionCommandCfg(
+            asset_name=walk_cfg.asset_name,
+            debug_vis=walk_cfg.debug_vis,
+            walk_cfg=walk_cfg,
+            turn_cfg=turn_cfg,
+            initial_turn_prob=0.3,
+            walk_duration_range=(2.0, 6.0),
+            turn_hold_range=(0.2, 1.0),
+            turn_interrupt_prob=0.15,
+            turn_interrupt_time_range=(0.15, 0.8),
+            turn_max_duration=4.0,
+            zero_command_history_on_switch=True,
+        )
+
+        # ------------------------------------------------------------------
+        # 報酬: 歩行専用項を walk モードにゲート
+        # ------------------------------------------------------------------
+        # 逆モード中は muxed コマンドが「相手の意味」になるので、速度追従系は誤った
+        # 目標を追う。位相報酬はピボット中に 1.8 Hz の踏み替えを強制してしまう。
+        # feet_slide は回転側でデッドバンド版に差し替わる。Hip_Yaw 偏差は回転の主動力
+        # なので重みを分ける。
+        # NOTE: feet_air_time (本家) は ||cmd_xy|| > 0.1 で内部ゲートされ、turn モードでは
+        #       cmd_xy = 0 なので自動的に 0 になる (ゲート不要)。
+        for name in (
+            "track_lin_vel_xy_exp",
+            "track_lin_vel_xy_coarse",
+            "track_ang_vel_z_exp",
+            "feet_phase",
+            "feet_slide",
+            "joint_deviation_hip_yaw",
+        ):
+            setattr(self.rewards, name, _gate(getattr(self.rewards, name), MODE_WALK))
+
+        # Stance-Plane-Polish の省エネ項 (歩行 expert の学習目的を保つ。回転側には課さない)
+        self.rewards.joint_power_l2 = RewTerm(
+            func=mode_gated,
+            weight=-1.5e-5,
+            params={"mode": MODE_WALK, "func": joint_power_l2, "params": {"asset_cfg": SceneEntityCfg("robot")}},
+        )
+
+        # ------------------------------------------------------------------
+        # 報酬: 回転専用項を turn モードにゲートして追加 (K1FlatTurnCfg と同じ重み)
+        # ------------------------------------------------------------------
+        def turn_term(func, weight: float, params: dict) -> RewTerm:
+            return RewTerm(func=mode_gated, weight=weight, params={"mode": MODE_TURN, "func": func, "params": params})
+
+        self.rewards.track_heading_coarse = turn_term(
+            track_heading_exp, 3.0, {"command_name": "base_velocity", "std": 1.0}
+        )
+        self.rewards.track_heading_sharp = turn_term(
+            track_heading_exp, 5.0, {"command_name": "base_velocity", "std": 0.15}
+        )
+        self.rewards.heading_progress = turn_term(
+            heading_progress, 2.0, {"command_name": "base_velocity", "max_rate": 3.0}
+        )
+        self.rewards.feet_air_time_heading = turn_term(
+            feet_air_time_heading,
+            0.2,
+            {
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "threshold": 0.4,
+                "command_name": "base_velocity",
+                "error_threshold": math.radians(5.0),
+            },
+        )
+        self.rewards.feet_slide_deadband = turn_term(
+            feet_slide_deadband,
+            -0.5,
+            {
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "v_thresh": 0.25,
+            },
+        )
+        self.rewards.joint_deviation_hip_yaw_turn = turn_term(
+            mdp.joint_deviation_l1, -0.05, {"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw"])}
+        )
+        self.rewards.base_lin_vel_xy = turn_term(base_lin_vel_xy_l2, -1.0, {"asset_cfg": SceneEntityCfg("robot")})
+        self.rewards.base_xy_drift = turn_term(
+            base_xy_drift_l2, -2.0, {"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")}
+        )
+
+
+@configclass
+class K1FlatTransitionCfg_PLAY(K1FlatTransitionCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 0.1
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.commands.base_velocity.debug_vis = True
