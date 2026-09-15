@@ -100,3 +100,12 @@ def kick_direction_b(
     kick_dir_w = torch.cat([kick_dir_w_xy, z], dim=1)
     kick_dir_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), kick_dir_w)
     return kick_dir_b[:, :2]
+
+
+def transition_mode(env: ManagerBasedRLEnv, command_name: str = "base_velocity") -> torch.Tensor:
+    """`TransitionCommand` の現在モード (0=walk / 1=turn) を (num_envs, 1) の float で返す。
+
+    方策の入力には使わない (obs_groups に含めない) 補助観測。``MultiExpertPPO`` が
+    「この env のアクションをどの expert が出すか」を決めるために読む。
+    """
+    return env.command_manager.get_term(command_name).mode.to(torch.float32).unsqueeze(1)

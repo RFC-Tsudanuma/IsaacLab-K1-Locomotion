@@ -14,4 +14,9 @@ from .commands import (
     ExtremeVelocityCommandCfg,
     TargetHeadingCommand,
     TargetHeadingCommandCfg,
+    TransitionCommand,
+    TransitionCommandCfg,
+    MODE_WALK,
+    MODE_TURN,
+    MODE_NAMES,
 )

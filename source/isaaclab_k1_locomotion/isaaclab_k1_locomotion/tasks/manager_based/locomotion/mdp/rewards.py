@@ -11,12 +11,14 @@ specify the reward function and its parameters.
 
 from __future__ import annotations
 
+import copy
+import inspect
 import math
 import torch
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
 from isaaclab.sensors import ContactSensor
 from isaaclab.utils.math import  yaw_quat, euler_xyz_from_quat, wrap_to_pi
 from isaaclab.utils.math import quat_apply_inverse, yaw_quat
@@ -1791,7 +1793,72 @@ def base_xy_drift_l2(
     return torch.sum(torch.square(asset.data.root_pos_w[:, :2] - origin), dim=1)
 
 
+
+##
+# 歩行 ⇄ 回転の遷移学習用: モードゲート
+##
+
+
+class mode_gated(ManagerTermBase):
+    """内側の報酬項を `TransitionCommand` のモードでゲートする (逆モード中は 0)。
+
+    歩行専用の報酬 (速度追従・位相・Hip_Yaw 偏差など) と回転専用の報酬 (ヘディング追従・
+    その場保持など) は、逆のモードでは「誤った目標」を追うことになる。両方を 1 つの
+    RewardsCfg に並べるために、各項をこのクラスで包んでモード一致時のみ値を通す。
+
+    使い方 (cfg 側)::
+
+        RewTerm(func=mode_gated, weight=w, params={
+            "mode": MODE_WALK,             # この報酬が有効なモード
+            "func": mdp.track_lin_vel_xy_yaw_frame_exp,   # 内側の報酬 (関数 or ManagerTermBase 派生クラス)
+            "params": {"command_name": "base_velocity", "std": 0.5},   # 内側の params
+        })
+
+    内側の ``params`` に含まれる ``SceneEntityCfg`` は RewardManager が解決しない
+    (トップレベルの params しか見ない) ので、ここで ``resolve`` する。内側がクラス項
+    (状態を持つ報酬) の場合はここで生成し、``reset`` も委譲する。
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        inner = cfg.params["func"]
+        inner_params = dict(cfg.params.get("params") or {})
+        for value in inner_params.values():
+            if isinstance(value, SceneEntityCfg):
+                value.resolve(env.scene)
+        if inspect.isclass(inner):
+            if not issubclass(inner, ManagerTermBase):
+                raise TypeError(f"mode_gated: 内側のクラス項は ManagerTermBase 派生であること (received {inner}).")
+            inner_cfg = copy.copy(cfg)
+            inner_cfg.func = inner
+            inner_cfg.params = inner_params
+            self._inner = inner(cfg=inner_cfg, env=env)
+            self._inner_params: dict = {}
+        else:
+            self._inner = inner
+            self._inner_params = inner_params
+        self._mode = int(cfg.params["mode"])
+        self._command_name = str(cfg.params.get("command_name", "base_velocity"))
+
+    def reset(self, env_ids: Sequence[int] | None = None):
+        if isinstance(self._inner, ManagerTermBase):
+            self._inner.reset(env_ids=env_ids)
+
+    def __call__(
+        self,
+        env: "ManagerBasedRLEnv",
+        mode: int,
+        func,
+        params: dict | None = None,
+        command_name: str = "base_velocity",
+    ) -> torch.Tensor:
+        value = self._inner(env, **self._inner_params)
+        active = env.command_manager.get_term(self._command_name).mode == self._mode
+        return value * active.to(value.dtype)
+
+
 __all__ = [
+    "mode_gated",
     "minimum_height",
     "track_heading_exp",
     "heading_progress",

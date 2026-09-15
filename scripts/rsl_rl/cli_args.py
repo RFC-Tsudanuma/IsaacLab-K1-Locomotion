@@ -37,6 +37,24 @@ def add_rsl_rl_args(parser: argparse.ArgumentParser):
     arg_group.add_argument(
         "--log_project_name", type=str, default=None, help="Name of the logging project when using wandb or neptune."
     )
+    # -- multi-expert (歩行 ⇄ 回転の遷移学習) arguments
+    arg_group.add_argument(
+        "--frozen_ckpt",
+        action="append",
+        default=None,
+        metavar="MODE=PATH",
+        help=(
+            "Frozen expert checkpoint for MultiExpertPPO, e.g. 'turn=/abs/path/model.pt'. "
+            "Repeatable. MODE is 'walk' or 'turn'."
+        ),
+    )
+    arg_group.add_argument(
+        "--learner_mode",
+        type=str,
+        default=None,
+        choices=["walk", "turn"],
+        help="Which expert the MultiExpertPPO trains (overrides the runner cfg).",
+    )
 
 
 def parse_rsl_rl_cfg(task_name: str, args_cli: argparse.Namespace) -> RslRlBaseRunnerCfg:
@@ -77,6 +95,8 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
         agent_cfg.resume = args_cli.resume
     if args_cli.load_run is not None:
         agent_cfg.load_run = args_cli.load_run
+    # multi-expert (MultiExpertPPO) overrides: only meaningful for RslRlMultiExpertPpoAlgorithmCfg
+    apply_multi_expert_args(agent_cfg, args_cli)
     if args_cli.checkpoint is not None:
         agent_cfg.load_checkpoint = args_cli.checkpoint
     if args_cli.experiment_name is not None:
@@ -91,3 +111,36 @@ def update_rsl_rl_cfg(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespac
         agent_cfg.neptune_project = args_cli.log_project_name
 
     return agent_cfg
+
+
+def apply_multi_expert_args(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Namespace) -> None:
+    """``--frozen_ckpt MODE=PATH`` / ``--learner_mode`` を `RslRlMultiExpertPpoAlgorithmCfg` に反映する。
+
+    アルゴリズム cfg が ``frozen_checkpoints`` を持たない (通常の PPO) 場合は、引数が
+    指定されていればエラーにする (黙って無視すると凍結 expert 無しで走ってしまう)。
+    """
+    import os
+
+    frozen = getattr(args_cli, "frozen_ckpt", None)
+    learner_mode = getattr(args_cli, "learner_mode", None)
+    algorithm = getattr(agent_cfg, "algorithm", None)
+    supports = algorithm is not None and hasattr(algorithm, "frozen_checkpoints")
+    if not supports:
+        if frozen or learner_mode:
+            raise ValueError(
+                "--frozen_ckpt / --learner_mode はマルチ expert タスク (Isaac-Velocity-Flat-Transition-*) 専用です。"
+            )
+        return
+    if learner_mode is not None:
+        algorithm.learner_mode = learner_mode
+    if frozen:
+        checkpoints = dict(algorithm.frozen_checkpoints or {})
+        for item in frozen:
+            if "=" not in item:
+                raise ValueError(f"--frozen_ckpt は 'MODE=PATH' 形式で指定してください: {item!r}")
+            mode, path = item.split("=", 1)
+            mode = mode.strip().lower()
+            if mode not in ("walk", "turn"):
+                raise ValueError(f"--frozen_ckpt の MODE は walk / turn のいずれか: {mode!r}")
+            checkpoints[mode] = os.path.abspath(os.path.expanduser(path.strip()))
+        algorithm.frozen_checkpoints = checkpoints

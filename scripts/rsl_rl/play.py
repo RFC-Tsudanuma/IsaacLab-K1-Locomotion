@@ -472,6 +472,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # obtain the trained policy for inference
     policy = runner.get_inference_policy(device=env.unwrapped.device)
+    # マルチ expert (歩行 ⇄ 回転の遷移学習) の場合は、学習方策と凍結 expert を env の
+    # モードで振り分けた実行アクションを使う (--frozen_ckpt で凍結側を渡すこと)。
+    if hasattr(runner.alg, "frozen"):
+        if not runner.alg.frozen:
+            print("[WARNING] MultiExpertPPO without frozen experts: the loaded policy drives every mode.")
+        else:
+            for expert in runner.alg.frozen.values():
+                expert.to(env.unwrapped.device)
+            policy = runner.alg.act_inference
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.

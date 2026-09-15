@@ -3,6 +3,8 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
+import dataclasses
+
 from isaaclab.utils import configclass
 
 from isaaclab_rl.rsl_rl import (
@@ -16,6 +18,7 @@ from isaaclab_rl.rsl_rl import (
 from ..mdp.symmetry import compute_symmetric_states
 from ..rough_env_cfg import _USE_RECURRENT_POLICY
 from .history_actor_critic import RslRlHistoryActorCriticCfg
+from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
 
 
 @configclass
@@ -196,3 +199,38 @@ class K1TurnPPORunnerCfg(K1FlatPPORunnerCfg):
         super().__post_init__()
         self.max_iterations = 8000
         self.experiment_name = "k1_turn"
+
+
+def _multi_expert_algorithm(base: RslRlPpoAlgorithmCfg, learner_mode: str) -> RslRlMultiExpertPpoAlgorithmCfg:
+    """既存の PPO 設定値を引き継いだ `RslRlMultiExpertPpoAlgorithmCfg` を作る (浅いコピー)。"""
+    values = {f.name: getattr(base, f.name) for f in dataclasses.fields(base) if f.name != "class_name"}
+    return RslRlMultiExpertPpoAlgorithmCfg(**values, learner_mode=learner_mode)
+
+
+@configclass
+class K1TransitionWalkPPORunnerCfg(K1FlatPPORunnerCfg):
+    """歩行 ⇄ 回転の遷移学習 (Isaac-Velocity-Flat-Transition-Walk): 歩行 expert を学習、回転 expert を凍結。
+
+    PPO を `MultiExpertPPO` に差し替える以外は K1FlatPPORunnerCfg (HistoryActorCritic /
+    mirror loss / num_mini_batches=8) と同一。凍結 expert の checkpoint は
+    ``--frozen_ckpt turn=/path/model.pt`` で与える (cfg 既定は空)。
+
+    experiment_name は "k1_transition" に分ける。学習元の歩行 checkpoint は
+    ``--resume --checkpoint /abs/path/model.pt`` (絶対パス) で読み込むこと。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 2000
+        self.experiment_name = "k1_transition"
+        self.algorithm = _multi_expert_algorithm(self.algorithm, learner_mode="walk")
+
+
+@configclass
+class K1TransitionTurnPPORunnerCfg(K1TransitionWalkPPORunnerCfg):
+    """遷移学習 (Isaac-Velocity-Flat-Transition-Turn): 回転 expert を学習、歩行 expert を凍結
+    (``--frozen_ckpt walk=/path/model.pt``)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.learner_mode = "turn"
