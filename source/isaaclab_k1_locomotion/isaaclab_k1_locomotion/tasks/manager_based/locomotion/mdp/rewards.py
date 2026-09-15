@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 import torch
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
@@ -1584,6 +1585,82 @@ def heading_progress(
     return torch.where(invalid, torch.zeros_like(reward), reward)
 
 
+def settle_ang_stillness(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    std: float = 0.15,
+    error_threshold: float = 0.087,
+    axis_ids: Sequence[int] = (2,),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """目標角に到達している間だけ、上体の角速度が小さいほど高い報酬。
+
+    実機 (MuJoCo) 検証で「その場回転して停止した後、上体を揺らしながら待機する」挙動が
+    観測された。**揺れは yaw 方向の振動** (目標角のまわりで首を振る) で、自己位置推定・
+    認識に悪影響があるため必ず消す必要がある (ユーザー要件)。
+
+    既定の ``axis_ids=(2,)`` は yaw のみを見る。``track_heading_exp`` が「位置」
+    (残り角) を、本項が「速度」(yaw レート) を抑えるので、両者は微分項の関係にあり
+    リミットサイクル的な振動を止めるのに効く。
+
+    既存の抑制項では止まらない:
+      ``ang_vel_xy_l2`` は **roll/pitch しか見ておらず yaw は対象外**。加えて二乗
+      ペナルティなので低振幅域で勾配が消える (±5° @1Hz で総報酬の 0.7% 相当)。
+    そこで到達中のみゲートした exp カーネルで低振幅域に強い勾配を与える
+    (:func:`settle_stillness` の角速度版)。
+
+    Args:
+        axis_ids: ``root_ang_vel_b`` のどの軸を見るか。既定は yaw のみ ``(2,)``。
+            roll/pitch も含めたい場合は ``(0, 1, 2)``。
+
+    NOTE: 揺れが「足裏を接地したまま微小回転して最後の数度を詰める」機構になっている
+          可能性がある。抑えると最終到達精度が落ちるおそれがあるので、導入後は
+          eval_turn_accuracy.py で誤差分布を必ず再測定すること。
+    """
+    err = _heading_error(env, command_name).abs()
+    asset = env.scene[asset_cfg.name]
+    ids = list(axis_ids)
+    ang_sq = torch.sum(torch.square(asset.data.root_ang_vel_b[:, ids]), dim=1)
+    reward = torch.exp(-ang_sq / (std**2))
+    return reward * (err < float(error_threshold))
+
+
+def settle_ang_vel_l1(
+    env: ManagerBasedRLEnv,
+    command_name: str = "base_velocity",
+    error_threshold: float = 0.087,
+    deadband: float = 0.0,
+    axis_ids: Sequence[int] = (2,),
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """到達中の上体角速度 (既定 yaw) の L1 ペナルティ (揺れの上限なし抑制)。
+
+    :func:`settle_ang_stillness` (exp 報酬) とペアで使う:
+
+      * exp 報酬はゼロ近傍に強い勾配を持つが **上限が weight で頭打ち**になるため、
+        揺れることで他の項 (track_heading_sharp 最大 +5.0 など) の利得が上回ると
+        競り負けうる。
+      * 本項は振幅に比例して際限なく増えるので、大きな揺れは必ず純損になる。
+
+    自己位置推定・認識の都合で上体の揺れは**必ず消す必要がある** (ユーザー要件) ため、
+    「勾配を作る exp」と「上限を作らない L1」の二段構えにしている。
+
+    L1 (絶対値) を使うのは、二乗だと低振幅域で勾配が消えるため
+    (既存の ang_vel_xy_l2 は **roll/pitch しか見ていない** うえ二乗なので、
+     ±5° のスウェイに対し総報酬の 0.7% しか圧を持てなかった)。
+
+    Args:
+        axis_ids: ``root_ang_vel_b`` のどの軸を見るか。既定は yaw のみ ``(2,)``。
+    """
+    err = _heading_error(env, command_name).abs()
+    asset = env.scene[asset_cfg.name]
+    ids = list(axis_ids)
+    ang = asset.data.root_ang_vel_b[:, ids].abs().sum(dim=1)
+    if deadband > 0.0:
+        ang = (ang - float(deadband)).clamp(min=0.0)
+    return ang * (err < float(error_threshold))
+
+
 def foot_spin_in_contact(
     env: ManagerBasedRLEnv,
     sensor_cfg: SceneEntityCfg,
@@ -1720,6 +1797,8 @@ __all__ = [
     "heading_progress",
     "feet_air_time_heading",
     "settle_stillness",
+    "settle_ang_stillness",
+    "settle_ang_vel_l1",
     "foot_spin_in_contact",
     "base_xy_drift_l2",
     "base_lin_vel_xy_l2",

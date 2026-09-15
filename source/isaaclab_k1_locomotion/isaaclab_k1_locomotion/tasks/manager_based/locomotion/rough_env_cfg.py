@@ -175,7 +175,12 @@ K1_LOCOMOTION_CFG = ArticulationCfg(
             # damping=53.53804017,
             stiffness=50.0,
             damping=2.5,
-            armature=0.0282528,
+            # 0.0282528 (= Hip_Yaw の値) が入っていたのを 0.0565 に修正 (2026-09-15)。
+            # MuJoCo の実モデル (booster_k1_locomotion/assets/rfc_assets/booster/K1/
+            # K1_22dof_soccer_field.xml) は Ankle_Pitch / Ankle_Roll とも armature="0.0565"。
+            # 他の 5 関節 (Hip x3 / Knee) は Isaac と MuJoCo で完全一致しており、
+            # 足首だけ Hip_Yaw の値になっていたので転記ミスと判断した。
+            armature=0.0565,
             min_delay=2,
             max_delay=7,
         ),

@@ -46,6 +46,8 @@ from .mdp.rewards import (
     heading_progress,
     feet_air_time_heading,
     settle_stillness,
+    settle_ang_stillness,
+    settle_ang_vel_l1,
     foot_spin_in_contact,
     base_xy_drift_l2,
     base_lin_vel_xy_l2,
@@ -1251,6 +1253,46 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
                 "asset_cfg": SceneEntityCfg("robot"),
             },
         )
+        # 到達後の上体の揺れ (**yaw 方向の振動**) の抑制 (2026-09-14, MuJoCo 検証)。
+        #
+        # 「回転して停止した後、目標角のまわりで首を振り続ける」挙動が出ていた。
+        # 自己位置推定・認識に悪影響があるため**必ず消す必要がある** (ユーザー要件)。
+        #
+        # 既存項では止まらない理由:
+        #   * ang_vel_xy_l2 は **roll/pitch しか見ておらず yaw は対象外**
+        #   * 加えて二乗ペナルティなので低振幅域で勾配が消える
+        #     (±5° @1Hz でも時間平均 -0.075/step = 総報酬の 0.7% 相当)
+        #
+        # track_heading_exp が「位置」(残り角) を、本項が「速度」(yaw レート) を抑えるので
+        # 両者は微分項の関係にあり、リミットサイクル的な振動を止めるのに効く。
+        #
+        # exp (勾配を作る) と L1 (上限を作らない) の二段構え:
+        #   exp 報酬だけだと利得が weight で頭打ちになり、揺れることで
+        #   track_heading_sharp (最大 +5.0) の微調整が効くなら競り負けうる。
+        #   L1 は振幅に比例して際限なく増えるので、大きな揺れは必ず純損になる。
+        self.rewards.settle_ang_stillness = RewTerm(
+            func=settle_ang_stillness,
+            weight=3.0,
+            params={
+                "command_name": "base_velocity",
+                "std": 0.15,
+                "error_threshold": math.radians(5.0),
+                "axis_ids": (2,),  # yaw のみ
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
+        self.rewards.settle_ang_vel_l1 = RewTerm(
+            func=settle_ang_vel_l1,
+            weight=-1.5,
+            params={
+                "command_name": "base_velocity",
+                "error_threshold": math.radians(5.0),
+                # 制御の微小な揺らぎまで罰すると硬直するので少しだけ許す。
+                "deadband": 0.05,
+                "axis_ids": (2,),  # yaw のみ
+                "asset_cfg": SceneEntityCfg("robot"),
+            },
+        )
         # 速度ペナルティだけだと、ゆっくりした一方向のドリフトが積み上がる。
         # コマンド発行時の位置からの変位を直接罰する。
         self.rewards.base_xy_drift = RewTerm(
@@ -1335,11 +1377,21 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         # 上限は 2.8 まで広げる (RMA 論文が最大 4.5 の摩擦 DR を使っている前例に倣う)。
         # 高摩擦側を厚くすることで「足裏が滑らない」状況が学習に十分含まれ、
         # 大角度旋回では踏み替えの獲得が物理的に強制される。
-        # 下限 0.5 は埃っぽい/やや滑る床を想定。上限だけ上げると分布の中心が検証環境
-        # (MuJoCo μ=1.0) より大きく上に寄るため、低摩擦側も残して両側に頑健にする。
-        # U(0.5, 2.8): 平均 1.65、μ<1.0 が 22%。
-        self.events.physics_material.params["static_friction_range"] = (0.5, 2.8)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.5, 2.8)
+        # 下限は 0.3。μ は並進の滑りだけでなく、**スピン抵抗 τ = μ·N·r の DR 幅も
+        # 一手に引き受けている** (r は USD に焼き込まれ per-env 変更できないため)。
+        # 実機データが無い以上、r は物理的な当たり (0.051) を置いて、不確かさは
+        # μ の幅でカバーする方針。
+        #
+        #   学習でカバーされる τ (N=125 と仮定): r=0.051, μ=U(0.3, 2.8) -> 1.9 - 17.8 Nm
+        #   実機で想定される τ (床 μ~0.6-1.0、実効半径 0.05-0.097): 3.8 - 12.1 Nm
+        #   -> 実機想定は学習範囲の 12% - 64% に位置し、両側に余裕がある。
+        #
+        # 下限 0.3 は「滑りやすい床でも回りすぎない」ための余裕。上限 2.8 は
+        # RMA 論文 (最大 4.5) の前例に倣った高摩擦側の余裕。
+        #
+        # NOTE: r を変えたら μ の範囲も必ず見直すこと (τ が連動して動くため)。
+        self.events.physics_material.params["static_friction_range"] = (0.3, 2.8)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.3, 2.8)
 
         # --- 足裏のスピン抵抗: 物理側で再現する (2026-09-14) ---
         #
@@ -1359,13 +1411,33 @@ class K1FlatTurnCfg(K1FlatStancePlaneCfg):
         #
         # 解決策: make_k1_usd_torsional.py で URDF→USD 変換を行い、変換後の
         # configuration/K1_locomotion_physics.usd (ここでは collision prim が
-        # インスタンス化されていない) に torsionalPatchRadius=0.04 を書き込んだ
+        # インスタンス化されていない) に torsionalPatchRadius を書き込んだ
         # USD を生成して、それを UsdFileCfg で読む。
-        # 検証済み: 足 2 prim のみに値が入り、可動関節 12 個は JOINT_NAMES_K1 と完全一致。
         #
-        # NOTE: この USD は URDF のスナップショット。**URDF を変更したら
-        #       make_k1_usd_torsional.py を再実行すること。**
-        # NOTE: 変換設定は K1_LOCOMOTION_CFG.spawn と同値に保つこと (スクリプト側に記載)。
+        # 半径は **0.051 m** = 足裏 0.18 x 0.07 m に一様圧力を仮定したときの
+        # 重心からの平均距離 (数値積分値)。τ ≈ μ·N·r の実効レバー長に対応する。
+        #
+        # **MuJoCo に合わせてはいけない。** 一時 0.097 (MuJoCo の box-plane が角 4 点で
+        # 接触することから逆算した値) にしたが、これは誤り。MuJoCo は検証ツールであって
+        # 真値ではなく、角 4 点接触は MuJoCo の衝突判定の離散化の都合にすぎない。
+        # 実機の足裏は連続面で、実効半径は実際の圧力分布で決まる。代理指標への
+        # 過剰適合になるので、物理的に根拠のある値を使い不確かさは DR で吸収する。
+        #
+        # 誤りの方向としても 0.097 は危険側だった:
+        #   学習 r が実機より低い -> 実機で抵抗が想定より大きい -> 回り足りない
+        #                            -> Δψ フィードバックで補正可能 (安全)
+        #   学習 r が実機より高い -> 実機で抵抗が想定より小さい -> **回りすぎ**
+        #                            -> オーバーシュート・不安定 (危険)
+        # 0.097 は実機の上限相当 (端荷重時) なので、回りすぎを誘発しやすい。
+        #
+        # 値の変遷: 0.04 (根拠なしの目分量) -> 0.064 (近似式、検算せず過大) ->
+        #           0.097 (MuJoCo 整合、方針として誤り) -> 0.051 (物理的推定値)。
+        #
+        # NOTE: r は USD に焼き込まれ DR 化できない (インスタンス化により per-env 変更不可)。
+        #       スピン抵抗 τ = μ·N·r の不確かさは **μ の DR 幅が一手に引き受ける**。
+        #       r を変えたら μ の範囲も必ず見直すこと。
+        # NOTE: 実機で動かした結果が出たら、それを基に r を調整すること。
+        #       現状は実機データが無いための物理的な当たりをつけた値にすぎない。
         self.scene.robot.spawn = sim_utils.UsdFileCfg(
             usd_path=_K1_TORSIONAL_USD_PATH,
             activate_contact_sensors=True,

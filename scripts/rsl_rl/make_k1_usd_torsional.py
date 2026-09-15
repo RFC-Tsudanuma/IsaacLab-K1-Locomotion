@@ -62,8 +62,8 @@ parser.add_argument(
 parser.add_argument(
     "--torsional_patch_radius",
     type=float,
-    default=0.04,
-    help="Contact patch radius for torsional friction [m]. MuJoCo の足 box (0.18 x 0.07 m) 相当は 0.035-0.05。",
+    default=0.051,
+    help="Contact patch radius for torsional friction [m]. 既定 0.051 は足裏 0.18 x 0.07 m に一様圧力を仮定したときの重心からの平均距離 (数値積分値)。τ≈μ·N·r の実効レバー長に対応する物理的な推定値。",
 )
 parser.add_argument(
     "--min_torsional_patch_radius", type=float, default=0.0, help="Minimum torsional patch radius [m]."
