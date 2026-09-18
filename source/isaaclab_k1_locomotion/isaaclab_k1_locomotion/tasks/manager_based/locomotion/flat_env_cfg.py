@@ -20,6 +20,7 @@ from .rough_env_cfg import K1RoughEnvCfg, K1PolicyCfg, K1CriticCfg, _COMMAND_THR
 from .velocity_env_cfg import CurriculumCfg
 from .history_layout import HISTORY_LENGTH
 from .mdp.obs_noise_models import SensorArtifactNoiseCfg
+import copy
 import math
 import os
 
@@ -1892,49 +1893,101 @@ class K1FlatTransitionObservationsCfg(K1FlatObservationsCfg):
     expert_mode: K1TransitionModeCfg = K1TransitionModeCfg()
 
 
-def _gate(term: RewTerm, mode: int, weight: float | None = None) -> RewTerm:
+def _gate(term: RewTerm, mode: int) -> RewTerm:
     """既存の報酬項を `mode_gated` で包み、指定モードのときだけ有効にする。"""
     return RewTerm(
         func=mode_gated,
-        weight=term.weight if weight is None else weight,
+        weight=term.weight,
         params={"mode": mode, "func": term.func, "params": dict(term.params)},
     )
 
 
+def _reward_terms(rewards_cfg) -> dict[str, RewTerm]:
+    """RewardsCfg インスタンスの有効な報酬項を名前→RewTerm で返す。
+
+    ``__post_init__`` で setattr された項も拾うため ``vars()`` を走査する
+    (dataclasses.fields では取れない)。None と weight 0.0 の項は「無し」扱い。
+    """
+    out: dict[str, RewTerm] = {}
+    for name, term in vars(rewards_cfg).items():
+        if isinstance(term, RewTerm) and term.weight != 0.0:
+            out[name] = term
+    return out
+
+
+def _same_reward(a: RewTerm, b: RewTerm) -> bool:
+    return a.func is b.func and a.weight == b.weight and a.params == b.params
+
+
+def merge_expert_rewards(rewards_cfg, walk_rewards, turn_rewards) -> None:
+    """歩行 expert と回転 expert の報酬設定を 1 つの RewardsCfg にマージする (in-place)。
+
+    * 両者で完全に同一の項 → そのまま (常時有効)。
+    * 片方にしか無い / 中身が異なる項 → それぞれ ``mode_gated`` で自モードのみ有効にする。
+      両方に (異なる形で) ある場合、歩行側は元の名前、回転側は ``<name>_turn`` で登録する。
+
+    これにより各 expert は「自分が単体学習で見ていた報酬と厳密に同じもの」を自モードで
+    受け取り、回転側 cfg (K1FlatTurnCfg) や歩行側 cfg を変更しても遷移環境が自動で追従する。
+    """
+    walk = _reward_terms(walk_rewards)
+    turn = _reward_terms(turn_rewards)
+    # 既存の項を全て消してから組み立て直す (StancePlane 由来の項が残らないように)
+    for name in list(vars(rewards_cfg)):
+        if isinstance(getattr(rewards_cfg, name), RewTerm) or getattr(rewards_cfg, name) is None:
+            setattr(rewards_cfg, name, None)
+    for name in sorted(set(walk) | set(turn)):
+        w, t = walk.get(name), turn.get(name)
+        if w is not None and t is not None and _same_reward(w, t):
+            setattr(rewards_cfg, name, w)
+        else:
+            if w is not None:
+                setattr(rewards_cfg, name, _gate(w, MODE_WALK))
+            if t is not None:
+                setattr(rewards_cfg, name if w is None else f"{name}_turn", _gate(t, MODE_TURN))
+
+
 @configclass
 class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
-    """歩行 expert ⇄ 回転 expert の遷移学習環境 (2026-09-14)。
+    """歩行 expert ⇄ 回転 expert の遷移学習環境 (2026-09-14, 2026-09-16 自動同期化)。
 
-    目的: 単体では完成している歩行 expert (`K1FlatStancePlaneCfg` 系) と回転 expert
+    目的: 単体では完成している歩行 expert (`K1FlatStancePlanePolishCfg` 系) と回転 expert
     (`K1FlatTurnCfg`) に、「実行途中で相手から制御を引き継ぐ / 相手へ引き渡す」状況を
     追加学習させる。RPG (Robust Policy Gating) の policy-transition randomization を
     コマンド追従設定に移植したもので、ゲーティング網は使わない (ハード切替)。
 
+    **各 expert の学習設定を参照 cfg から取り込む** (手コピーはしない):
+
+    * 歩行側の参照 = `K1FlatStancePlanePolishCfg` (歩行 expert 51500 系の最終学習設定)、
+      回転側の参照 = `K1FlatTurnFinetuneCfg` (カリキュラム最終状態で固定された回転設定)。
+    * 報酬は `merge_expert_rewards` で両者をマージ: 同一の項は常時、片方だけ / 異なる項は
+      ``mode_gated`` で自モードのみ有効。回転 cfg の報酬を変えればここも自動で変わる。
+    * コマンド生成器の cfg (歩行の速度レンジ・extreme、回転の目標角レンジ・到達判定) も
+      参照 cfg から deepcopy する。
+
     構成:
 
-    * コマンド ``base_velocity`` を `TransitionCommandCfg` に差し替える。内部に歩行生成器
-      (``ExtremeVelocityCommandCfg``、Stance-Plane の最終カリキュラム状態で固定) と回転生成器
-      (``TargetHeadingCommandCfg``、±180°) を持ち、env ごとのモードで中身を切り替える。
-      モード遷移 (walk 区間長・到達後保持・割り込み) は `TransitionCommand` の docstring 参照。
+    * コマンド ``base_velocity`` = `TransitionCommandCfg`。env ごとのモードで歩行 / 回転の
+      中身を切り替える。モード遷移 (walk 区間長・到達後保持・割り込み) は
+      `TransitionCommand` の docstring 参照。
     * 切替の瞬間、観測履歴 (policy / critic) のコマンド枠を全ステップ 0 にする
       (履歴バッファは両 expert で 1 本共有。デプロイ側も同じ処理をすること)。
     * 補助観測グループ ``expert_mode`` を追加 (方策入力ではない)。
-    * 報酬: 歩行専用項は walk モード、回転専用項は turn モードのときだけ有効
-      (``mode_gated``)。共通の姿勢・平滑・接触ペナルティは常時。各 expert が単体学習で
-      見ていた重みをそのまま使う。
+    * 物理: ロボット USD は回転側と同じ**足裏トーショナル摩擦入り** (ピボット戦略はスピン
+      抵抗の存在が前提。歩行 expert にとっては新しい物理だが、足首 armature 修正と合わせて
+      歩行側の遷移学習で吸収させる方針、2026-09-16 ユーザー決定)。地形は PLANE_HEAVY・
+      摩擦 DR (0.6, 1.0) = 両 expert の学習分布の共通部分。初期関節 ±30° オフセットは
+      両 expert が経験しているので採用。
     * 学習は `MultiExpertPPO` (``Isaac-Velocity-Flat-Transition-Walk`` / ``-Turn``) で行い、
       一方を学習・他方を凍結 checkpoint から実行する。
 
-    環境の物理分布は両 expert の学習分布の共通部分に合わせる: 地形 PLANE_HEAVY・摩擦
-    (0.6, 1.0) (Stance-Plane そのまま。回転 expert の (0.25, 1.4) はこれを含む)。
-    Stance-Plane-Polish で歩行 expert が受けていた ``joint_power_l2`` は walk モード限定で
-    残す (回転側の目的を変えないため)。
+    NOTE: 歩行 expert を凍結して回転側を先に学習すると、凍結歩行 expert は未適応の物理
+    (トーショナル USD + armature 修正) で動く。歩行側を先に学習する方が安全。
 
     使い方 (歩行 expert を学習、回転 expert を凍結)::
 
-        torchrun --standalone --nproc_per_node=2 train.py \
-            --task Isaac-Velocity-Flat-Transition-Walk --headless --distributed --num_envs 2048 \
-            --resume --checkpoint /abs/path/k1_flat/<run>/model_51500.pt --reset_noise_std 0.05 \
+        torchrun --standalone --nproc_per_node=2 train.py \\
+            --task Isaac-Velocity-Flat-Transition-Walk --headless --distributed --num_envs 2048 \\
+            --resume --checkpoint /abs/path/k1_flat/<run>/model_51500.pt --reset_noise_std 0.05 \\
             --frozen_ckpt turn=/abs/path/k1_turn/<run>/model_XXXX.pt --max_iterations 2000
 
     回転 expert を学習する場合は ``--task Isaac-Velocity-Flat-Transition-Turn`` と
@@ -1946,8 +1999,12 @@ class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
     def __post_init__(self):
         super().__post_init__()
 
+        # 参照 cfg (各 expert の最終学習設定)。純粋な Python 設定なので実体化は軽い。
+        walk_ref = K1FlatStancePlanePolishCfg()
+        turn_ref = K1FlatTurnFinetuneCfg()
+
         # ------------------------------------------------------------------
-        # カリキュラムを学習終了時点の状態に固定 (Stance-Plane-Polish と同じ回避)
+        # カリキュラムを学習終了時点の状態に固定 (両参照 cfg と同じ回避)
         # ------------------------------------------------------------------
         # 複合コマンドの cfg は ExtremeVelocityCommandCfg ではないので、これらの
         # カリキュラム (term.cfg.ranges / extreme_prob を書く) は必ず外す。
@@ -1963,34 +2020,27 @@ class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
             "roll": (-0.02, 0.02),
             "pitch": (-0.02, 0.02),
         }
+        # 初期関節角 ±30° オフセット (歩行 Polish / 回転 とも採用済み)
+        self.events.reset_robot_joints = copy.deepcopy(turn_ref.events.reset_robot_joints)
 
         # ------------------------------------------------------------------
-        # コマンド: 歩行生成器 (最終状態で固定) + 回転生成器 → 複合コマンド
+        # 物理: 回転 expert と同じトーショナル摩擦入り USD
         # ------------------------------------------------------------------
-        walk_cfg: ExtremeVelocityCommandCfg = self.commands.base_velocity
-        walk_cfg.ranges.lin_vel_x = (-2.0, 2.0)
-        walk_cfg.ranges.lin_vel_y = (-0.9, 0.9)
-        walk_cfg.ranges.ang_vel_z = (-1.0, 1.0)
+        self.scene.robot.spawn = copy.deepcopy(turn_ref.scene.robot.spawn)
+
+        # ------------------------------------------------------------------
+        # コマンド: 歩行生成器 (Polish の最終状態) + 回転生成器 (Finetune の最終状態) → 複合
+        # ------------------------------------------------------------------
+        walk_cfg: ExtremeVelocityCommandCfg = copy.deepcopy(walk_ref.commands.base_velocity)
+        # Polish は extreme を「カリキュラム即時 α=1」で入れており cfg 値自体は 0.0 のまま
+        # なので、カリキュラム無しの本環境では明示的に最終値を書く。
         walk_cfg.extreme_prob = 0.35
         walk_cfg.extreme_frac = 0.7
-        walk_cfg.resampling_time_range = (0.8, 8.0)
 
-        turn_cfg = TargetHeadingCommandCfg(
-            asset_name=walk_cfg.asset_name,
-            resampling_time_range=(1.0, 3.0),  # 未使用 (モード遷移が代替)
-            rel_standing_envs=0.0,
-            heading_command=False,
-            debug_vis=False,
-            turn_angle_range=(0.3, math.pi),
-            success_threshold=math.radians(5.0),
-            hold_after_settle_s=0.0,  # 未使用 (turn_hold_range が代替)
-            ranges=TargetHeadingCommandCfg.Ranges(
-                lin_vel_x=(0.0, 0.0),
-                lin_vel_y=(0.0, 0.0),
-                ang_vel_z=(-1.0, 1.0),
-                heading=None,
-            ),
-        )
+        turn_cfg: TargetHeadingCommandCfg = copy.deepcopy(turn_ref.commands.base_velocity)
+        turn_cfg.debug_vis = False
+        turn_cfg.hold_after_settle_s = 0.0  # 未使用 (turn_hold_range が代替)
+
         self.commands.base_velocity = TransitionCommandCfg(
             asset_name=walk_cfg.asset_name,
             debug_vis=walk_cfg.debug_vis,
@@ -2006,72 +2056,11 @@ class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
         )
 
         # ------------------------------------------------------------------
-        # 報酬: 歩行専用項を walk モードにゲート
+        # 報酬: 両 expert の報酬をマージ (同一 → 常時、差分 → 自モードのみ)
         # ------------------------------------------------------------------
-        # 逆モード中は muxed コマンドが「相手の意味」になるので、速度追従系は誤った
-        # 目標を追う。位相報酬はピボット中に 1.8 Hz の踏み替えを強制してしまう。
-        # feet_slide は回転側でデッドバンド版に差し替わる。Hip_Yaw 偏差は回転の主動力
-        # なので重みを分ける。
-        # NOTE: feet_air_time (本家) は ||cmd_xy|| > 0.1 で内部ゲートされ、turn モードでは
-        #       cmd_xy = 0 なので自動的に 0 になる (ゲート不要)。
-        for name in (
-            "track_lin_vel_xy_exp",
-            "track_lin_vel_xy_coarse",
-            "track_ang_vel_z_exp",
-            "feet_phase",
-            "feet_slide",
-            "joint_deviation_hip_yaw",
-        ):
-            setattr(self.rewards, name, _gate(getattr(self.rewards, name), MODE_WALK))
-
-        # Stance-Plane-Polish の省エネ項 (歩行 expert の学習目的を保つ。回転側には課さない)
-        self.rewards.joint_power_l2 = RewTerm(
-            func=mode_gated,
-            weight=-1.5e-5,
-            params={"mode": MODE_WALK, "func": joint_power_l2, "params": {"asset_cfg": SceneEntityCfg("robot")}},
-        )
-
-        # ------------------------------------------------------------------
-        # 報酬: 回転専用項を turn モードにゲートして追加 (K1FlatTurnCfg と同じ重み)
-        # ------------------------------------------------------------------
-        def turn_term(func, weight: float, params: dict) -> RewTerm:
-            return RewTerm(func=mode_gated, weight=weight, params={"mode": MODE_TURN, "func": func, "params": params})
-
-        self.rewards.track_heading_coarse = turn_term(
-            track_heading_exp, 3.0, {"command_name": "base_velocity", "std": 1.0}
-        )
-        self.rewards.track_heading_sharp = turn_term(
-            track_heading_exp, 5.0, {"command_name": "base_velocity", "std": 0.15}
-        )
-        self.rewards.heading_progress = turn_term(
-            heading_progress, 2.0, {"command_name": "base_velocity", "max_rate": 3.0}
-        )
-        self.rewards.feet_air_time_heading = turn_term(
-            feet_air_time_heading,
-            0.2,
-            {
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-                "threshold": 0.4,
-                "command_name": "base_velocity",
-                "error_threshold": math.radians(5.0),
-            },
-        )
-        self.rewards.feet_slide_deadband = turn_term(
-            feet_slide_deadband,
-            -0.5,
-            {
-                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
-                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
-                "v_thresh": 0.25,
-            },
-        )
-        self.rewards.joint_deviation_hip_yaw_turn = turn_term(
-            mdp.joint_deviation_l1, -0.05, {"asset_cfg": SceneEntityCfg("robot", joint_names=[".*_Hip_Yaw"])}
-        )
-        self.rewards.base_lin_vel_xy = turn_term(base_lin_vel_xy_l2, -1.0, {"asset_cfg": SceneEntityCfg("robot")})
-        self.rewards.base_xy_drift = turn_term(
-            base_xy_drift_l2, -2.0, {"command_name": "base_velocity", "asset_cfg": SceneEntityCfg("robot")}
-        )
+        # NOTE: 本家 feet_air_time は ||cmd_xy|| > 0.1 で内部ゲートされ turn モードでは
+        #       自動的に 0 になるが、回転側に無い項なので walk ゲートが付く (無害)。
+        merge_expert_rewards(self.rewards, walk_ref.rewards, turn_ref.rewards)
 
 
 @configclass
