@@ -1799,6 +1799,51 @@ def base_xy_drift_l2(
 ##
 
 
+def _is_private_reward_state(name: str) -> bool:
+    """報酬関数が env に置く「前ステップの値」バッファか (コピーごとに分離すべき属性か)。
+
+    対象: ``_custom_buffers`` (potential 系) と名前に ``prev`` を含む属性
+    (``_prev_root_ang_vel_b`` / ``_high_action_prev`` / ``_heading_progress_prev`` 等)。
+    歩行位相アキュムレータ (``get_gait_phase`` の ``_k1_gait_phase*``) や event が置く
+    ``_phase_freq_offset`` は**分離してはいけない**: 位相はステップカウンタで
+    「1 step に 1 回だけ積分」するよう設計されており、複数回呼ばれても安全な代わりに、
+    状態を分けると呼び出し元ごとに積分が走って観測の位相が 2 倍速になる
+    (実例: 歩行 expert が追従誤差 1.0・転倒 100 倍)。
+    """
+    return name == "_custom_buffers" or "prev" in name
+
+
+class _IsolatedEnvState:
+    """報酬関数に渡す env の薄いプロキシ。前ステップ値バッファだけをコピーごとに分離する。
+
+    potential ベースの報酬 (feet_parallel_to_ground 等) は ``env._custom_buffers`` や
+    ``env._prev_xxx`` に「前ステップの値」を固定キーで保存する。同じ関数を歩行版・回転版の
+    2 コピー (params が異なる) で持つと、毎ステップ 2 回呼ばれて互いの prev を上書きし、
+    差分報酬が壊れる (feet_parallel が -0.16 → -10.6/step になった実例あり)。
+    コピーごとにこのプロキシを渡し、`_is_private_reward_state` に該当する属性だけを
+    自前に持つ。それ以外 (scene / command_manager / reset_buf / 位相アキュムレータ ...) は
+    env にそのまま委譲する (読み書きとも)。
+    """
+
+    def __init__(self, env):
+        object.__setattr__(self, "_env", env)
+        object.__setattr__(self, "_state", {})
+
+    def __getattr__(self, name):
+        if _is_private_reward_state(name):
+            state = object.__getattribute__(self, "_state")
+            if name in state:
+                return state[name]
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_env"), name)
+
+    def __setattr__(self, name, value):
+        if _is_private_reward_state(name):
+            object.__getattribute__(self, "_state")[name] = value
+        else:
+            setattr(object.__getattribute__(self, "_env"), name, value)
+
+
 class mode_gated(ManagerTermBase):
     """内側の報酬項を `TransitionCommand` のモードでゲートする (逆モード中は 0)。
 
@@ -1826,13 +1871,15 @@ class mode_gated(ManagerTermBase):
         for value in inner_params.values():
             if isinstance(value, SceneEntityCfg):
                 value.resolve(env.scene)
+        # 内側関数が env に置く「前ステップ状態」をコピーごとに分離するプロキシ
+        self._env_view = _IsolatedEnvState(env)
         if inspect.isclass(inner):
             if not issubclass(inner, ManagerTermBase):
                 raise TypeError(f"mode_gated: 内側のクラス項は ManagerTermBase 派生であること (received {inner}).")
             inner_cfg = copy.copy(cfg)
             inner_cfg.func = inner
             inner_cfg.params = inner_params
-            self._inner = inner(cfg=inner_cfg, env=env)
+            self._inner = inner(cfg=inner_cfg, env=self._env_view)
             self._inner_params: dict = {}
         else:
             self._inner = inner
@@ -1852,7 +1899,7 @@ class mode_gated(ManagerTermBase):
         params: dict | None = None,
         command_name: str = "base_velocity",
     ) -> torch.Tensor:
-        value = self._inner(env, **self._inner_params)
+        value = self._inner(self._env_view, **self._inner_params)
         active = env.command_manager.get_term(self._command_name).mode == self._mode
         return value * active.to(value.dtype)
 

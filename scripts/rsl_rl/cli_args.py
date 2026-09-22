@@ -124,17 +124,25 @@ def apply_multi_expert_args(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Na
     frozen = getattr(args_cli, "frozen_ckpt", None)
     learner_mode = getattr(args_cli, "learner_mode", None)
     algorithm = getattr(agent_cfg, "algorithm", None)
-    supports = algorithm is not None and hasattr(algorithm, "frozen_checkpoints")
-    if not supports:
+    policy = getattr(agent_cfg, "policy", None)
+    # MultiExpertPPO: algorithm.frozen_checkpoints / GatingActorCritic: policy.expert_checkpoints
+    if algorithm is not None and hasattr(algorithm, "frozen_checkpoints"):
+        holder, attr = algorithm, "frozen_checkpoints"
+    elif policy is not None and hasattr(policy, "expert_checkpoints"):
+        holder, attr = policy, "expert_checkpoints"
+        if learner_mode is not None:
+            raise ValueError("--learner_mode はゲート学習 (Isaac-Velocity-Flat-Gating) では使えません (両 expert 凍結)。")
+    else:
         if frozen or learner_mode:
             raise ValueError(
-                "--frozen_ckpt / --learner_mode はマルチ expert タスク (Isaac-Velocity-Flat-Transition-*) 専用です。"
+                "--frozen_ckpt / --learner_mode はマルチ expert タスク"
+                " (Isaac-Velocity-Flat-Transition-* / Isaac-Velocity-Flat-Gating) 専用です。"
             )
         return
     if learner_mode is not None:
         algorithm.learner_mode = learner_mode
     if frozen:
-        checkpoints = dict(algorithm.frozen_checkpoints or {})
+        checkpoints = dict(getattr(holder, attr) or {})
         for item in frozen:
             if "=" not in item:
                 raise ValueError(f"--frozen_ckpt は 'MODE=PATH' 形式で指定してください: {item!r}")
@@ -143,4 +151,4 @@ def apply_multi_expert_args(agent_cfg: RslRlBaseRunnerCfg, args_cli: argparse.Na
             if mode not in ("walk", "turn"):
                 raise ValueError(f"--frozen_ckpt の MODE は walk / turn のいずれか: {mode!r}")
             checkpoints[mode] = os.path.abspath(os.path.expanduser(path.strip()))
-        algorithm.frozen_checkpoints = checkpoints
+        setattr(holder, attr, checkpoints)

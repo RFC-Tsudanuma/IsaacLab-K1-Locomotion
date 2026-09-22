@@ -19,6 +19,7 @@ from ..mdp.symmetry import compute_symmetric_states
 from ..rough_env_cfg import _USE_RECURRENT_POLICY
 from .history_actor_critic import RslRlHistoryActorCriticCfg
 from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
+from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
 
 
 @configclass
@@ -234,3 +235,31 @@ class K1TransitionTurnPPORunnerCfg(K1TransitionWalkPPORunnerCfg):
     def __post_init__(self):
         super().__post_init__()
         self.algorithm.learner_mode = "turn"
+
+
+@configclass
+class K1GatingPPORunnerCfg(K1FlatPPORunnerCfg):
+    """凍結 expert (歩行 / 回転) を混合するゲート網の学習 (Isaac-Velocity-Flat-Gating)。
+
+    環境は K1FlatTransitionCfg をそのまま使う。方策は GatingActorCritic (小 MLP、出力 =
+    回転 expert の重み logit)、アルゴリズムは GatingPPO (ゲートの平滑化・モード整合を
+    内発報酬として加算)。両 expert の checkpoint 既定は frozen_policies/best_walk / best_turn
+    (``--frozen_ckpt walk=... turn=...`` で上書き可)。
+
+    mirror loss は無効: ゲート出力はスカラーで左右反転に不変であり、rsl_rl の symmetry は
+    12 次元関節アクションの反転を前提にしているため次元が合わない。
+    スクラッチ学習 (resume 不要)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.max_iterations = 3000
+        self.save_interval = 100
+        self.experiment_name = "k1_gating"
+        self.policy = RslRlGatingActorCriticCfg()
+        values = {
+            f.name: getattr(self.algorithm, f.name)
+            for f in dataclasses.fields(self.algorithm)
+            if f.name not in ("class_name", "symmetry_cfg")
+        }
+        self.algorithm = RslRlGatingPpoAlgorithmCfg(**values, symmetry_cfg=None)

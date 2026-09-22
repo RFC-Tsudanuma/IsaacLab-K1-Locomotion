@@ -2064,6 +2064,41 @@ class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
 
 
 @configclass
+class K1FlatGatingCfg(K1FlatTransitionCfg):
+    """凍結 expert を混合するゲート網の学習用 (2026-09-23)。K1FlatTransitionCfg との差分のみ。
+
+    ゲートの目的は優先順に (1) 転倒しない、(2) 滑らかに遷移する、(3) 後続タスクの性能を保つ。
+    (3) は各 expert 自身の報酬 (モードゲート済み) がそのまま担う。(2) は GatingPPO の
+    内発報酬 ((Δw)^2 平滑化 + 猶予後のモード整合) と共通の action_rate / dof_acc。
+    (1) を最優先にするため転倒の終了ペナルティを 2 倍にする (-200 → -400)。
+
+    両 expert は凍結なので、遷移の練習密度を上げるためにモード切替を Transition より
+    頻繁にする (walk 1.5-4 s、到達後保持 0.2-0.8 s、開始時 turn 50%)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.rewards.termination_penalty.weight = -400.0
+        cmd = self.commands.base_velocity
+        cmd.initial_turn_prob = 0.5
+        cmd.walk_duration_range = (1.5, 4.0)
+        cmd.turn_hold_range = (0.2, 0.8)
+
+
+@configclass
+class K1FlatGatingCfg_PLAY(K1FlatGatingCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 50
+        self.scene.env_spacing = 0.1
+        self.observations.policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+        self.commands.base_velocity.debug_vis = True
+
+
+@configclass
 class K1FlatTransitionCfg_PLAY(K1FlatTransitionCfg):
     def __post_init__(self) -> None:
         super().__post_init__()

@@ -474,13 +474,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     policy = runner.get_inference_policy(device=env.unwrapped.device)
     # マルチ expert (歩行 ⇄ 回転の遷移学習) の場合は、学習方策と凍結 expert を env の
     # モードで振り分けた実行アクションを使う (--frozen_ckpt で凍結側を渡すこと)。
-    if hasattr(runner.alg, "frozen"):
-        if not runner.alg.frozen:
-            print("[WARNING] MultiExpertPPO without frozen experts: the loaded policy drives every mode.")
-        else:
-            for expert in runner.alg.frozen.values():
+    # ゲート方策 (GatingPPO) も同じフックで、凍結 expert を混合した 12 次元アクションを返す。
+    if hasattr(runner.alg, "act_inference"):
+        frozen = getattr(runner.alg, "frozen", None)
+        if frozen is not None:
+            for expert in frozen.values():
                 expert.to(env.unwrapped.device)
-            policy = runner.alg.act_inference
+        policy = runner.alg.act_inference
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
@@ -501,7 +501,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    if is_history_policy(policy_nn):
+    if getattr(policy_nn, "is_gating", False):
+        # ゲート方策 (凍結 expert 2 本 + ゲート MLP) の ONNX 化は未対応。
+        print("[INFO] Gating policy: skipping JIT/ONNX export (not supported yet).")
+    elif is_history_policy(policy_nn):
         # 履歴 + CNN 構成 (K1 Flat): 入力は command(N,3) + obs_history(N,H,C)。
         # 詳細は agents/history_policy_exporter.py の docstring を参照。
         export_history_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
