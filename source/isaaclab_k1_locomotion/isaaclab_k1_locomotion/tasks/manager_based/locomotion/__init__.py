@@ -113,6 +113,26 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Standup-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.getup_env_cfg:K1GetupEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StandupPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Standup-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.getup_env_cfg:K1GetupEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StandupPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Dribble-K1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

@@ -6,6 +6,7 @@
 from .observations import *
 from .rewards import *
 from .getup_rewards import *
+from .getup_terminations import *
 from .curriculums import *
 from .events import *
 from .commands import (

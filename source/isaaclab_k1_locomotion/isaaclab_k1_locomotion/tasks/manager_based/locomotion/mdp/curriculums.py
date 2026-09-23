@@ -717,6 +717,74 @@ def log_mean_body_z(env: "ManagerBasedRLEnv", env_ids: Sequence[int], body_name:
     return torch.mean(z[env_ids])
 
 
+def log_min_body_z(env: "ManagerBasedRLEnv", env_ids: Sequence[int], body_name: str) -> torch.Tensor:
+    """[ロギング専用] 指定body群のenvごとの最低world z [m]を平均して記録する。"""
+    robot: Articulation = env.scene["robot"]
+    ids, _ = robot.find_bodies(body_name)
+    min_z = robot.data.body_link_pos_w[:, ids, 2].min(dim=1).values
+    return torch.mean(min_z[env_ids])
+
+
+def log_max_body_z(env: "ManagerBasedRLEnv", env_ids: Sequence[int], body_name: str) -> torch.Tensor:
+    """[ロギング専用] 指定body群のenvごとの最高world z [m]を平均して記録する。"""
+    robot: Articulation = env.scene["robot"]
+    ids, _ = robot.find_bodies(body_name)
+    max_z = robot.data.body_link_pos_w[:, ids, 2].max(dim=1).values
+    return torch.mean(max_z[env_ids])
+
+
+def log_foot_minus_head_height(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] 最も高い足と頭の高さ差 [m]。正値なら足が頭より高い。"""
+    robot: Articulation = env.scene["robot"]
+    foot_ids, _ = robot.find_bodies(".*_foot_link")
+    head_ids, _ = robot.find_bodies("Head.*")
+    highest_foot = robot.data.body_link_pos_w[:, foot_ids, 2].max(dim=1).values
+    highest_head = robot.data.body_link_pos_w[:, head_ids, 2].max(dim=1).values
+    return torch.mean((highest_foot - highest_head)[env_ids])
+
+
+def log_hip_minus_foot_height(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] 最低Hipと最高footの高さ差 [m]。負値ならHipが足より低い。"""
+    robot: Articulation = env.scene["robot"]
+    hip_ids, _ = robot.find_bodies(".*_Hip_Pitch")
+    foot_ids, _ = robot.find_bodies(".*_foot_link")
+    lowest_hip = robot.data.body_link_pos_w[:, hip_ids, 2].min(dim=1).values
+    highest_foot = robot.data.body_link_pos_w[:, foot_ids, 2].max(dim=1).values
+    return torch.mean((lowest_hip - highest_foot)[env_ids])
+
+
+def log_head_minus_hip_height(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
+    """[ロギング専用] 最高Headと最高Hipの高さ差 [m]。0付近なら上体が水平。"""
+    robot: Articulation = env.scene["robot"]
+    head_ids, _ = robot.find_bodies("Head.*")
+    hip_ids, _ = robot.find_bodies(".*_Hip_Pitch")
+    highest_head = robot.data.body_link_pos_w[:, head_ids, 2].max(dim=1).values
+    highest_hip = robot.data.body_link_pos_w[:, hip_ids, 2].max(dim=1).values
+    return torch.mean((highest_head - highest_hip)[env_ids])
+
+
+def log_mean_joint_abs_deviation(
+    env: "ManagerBasedRLEnv", env_ids: Sequence[int], joint_name: str
+) -> torch.Tensor:
+    """[ロギング専用] 指定関節群のdefault角からの平均絶対偏差 [rad]。"""
+    robot: Articulation = env.scene["robot"]
+    joint_ids, _ = robot.find_joints(joint_name)
+    deviation = torch.abs(
+        robot.data.joint_pos[:, joint_ids] - robot.data.default_joint_pos[:, joint_ids]
+    ).mean(dim=1)
+    return torch.mean(deviation[env_ids])
+
+
+def log_mean_joint_position(
+    env: "ManagerBasedRLEnv", env_ids: Sequence[int], joint_name: str
+) -> torch.Tensor:
+    """[ロギング専用] 指定関節群の平均角度 [rad]。"""
+    robot: Articulation = env.scene["robot"]
+    joint_ids, _ = robot.find_joints(joint_name)
+    joint_position = robot.data.joint_pos[:, joint_ids].mean(dim=1)
+    return torch.mean(joint_position[env_ids])
+
+
 def log_trunk_tilt_deg(env: "ManagerBasedRLEnv", env_ids: Sequence[int]) -> torch.Tensor:
     """[ロギング専用] Trunk の鉛直からの傾き [deg] を平均で記録。直立=0°、横倒れ=90°。"""
     robot: Articulation = env.scene["robot"]

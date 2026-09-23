@@ -120,3 +120,12 @@ class K1GetupPPORunnerCfg(K1RoughPPORunnerCfg):
         self.max_iterations = 10000
         self.experiment_name = "k1_getup"
         self.save_interval = 200
+
+
+@configclass
+class K1StandupPPORunnerCfg(K1GetupPPORunnerCfg):
+    """Stand-up task alias with a separate experiment directory."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.experiment_name = "k1_standup"
