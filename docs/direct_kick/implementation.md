@@ -48,12 +48,18 @@ checkpoint は500 iterationsごとと終了時に保存する。学習終了時�
 | VisionFilter | ローカル `futbol_main/main` の `32ece6ee0676b1008d5bc58c3533d45613440568` を固定。stationary / rolling / high_speed / bounce の4仮説、MAP選択、bounce再初期化、confirmed/tentative 2観測取得を移植 |
 | NIS・欠測・再捕捉 | 元 DirectKick の単一KFを使わず、VisionFilterの NIS 9.21、strict `>3 s` timeout、再捕捉処理を使用 |
 | LSTM入力 | 2026-09-25の明示要求により、13時刻それぞれの位置・速度と4×4共分散全成分を入力。Actorのボール速度をMLPへ直接渡す経路を廃止。Critic特権の真値速度は維持 |
-| ボール初期方向 | PowerPointの「接近ボールへのキック」に合わせ、実効設定の `incoming_probability` を1.0に変更。接近・離反50%ずつの元YAMLは出典として保持し、`load_config()`で接近方向のみへ上書き。速さ0〜1 m/s、初期距離1.5〜3 m、横ずれ±0.25 mは維持 |
+| ボール初期条件 | 静止10%、移動90%。移動時は0〜6 m/s・最頻値3 m/sの対称三角分布で、接近方向のみ（`incoming_probability=1.0`）。軌道の符号付き最接近距離は±0.75 mの一様分布 |
+| 生成距離 | 移動時は最接近時間Tを1.0〜1.4秒で一様抽選し、速度v・通過ずれbから `d=max(1.5, sqrt((v*T)^2+b^2))` mで決定。静止時は1.5〜3 mの一様分布 |
+| 視認距離 | 高速時の最大生成距離約8.43 mに対応し、視認上限を6 mから9 mに拡大 |
 | rolling friction | ボールへの係数適用を省略。代替の転がり減速度や抵抗力は追加しない |
 | compliance | 足shapeへの係数適用を省略。新APIのspring stiffness/dampingへの換算は行わない |
 | 通常の摩擦・反発 | 地面、足、ボールの元のランダム化範囲を適用 |
 
 認識のQ/Rは最新VisionFilterの固定値を使う。旧DirectKickのQ/R倍率サンプルとrolling frictionによるQ補正は使用しない。実際のカメラ測定値に加える距離依存ノイズ、カメラ周期、遅延、FOV、dropout、外れ値、ego-motion noise は移植元を維持する。
+
+ボール生成の変更も元YAMLを出典として保持したまま `load_config()` で実効設定へ反映する。接近ボールの旧 `incoming_spawn_distance_range_m` は、速度と時間から距離を求める設定へ置き換えた。速度分布は独立な一様乱数2個の平均による対称三角分布で、静止を選んだ環境は並進・回転速度を0にする。10%は各リセットでの抽選確率であり、各バッチの正確な比率ではない。
+
+最接近時間は、ロボットが静止し、ボールが初期速度で直進した場合の基準。距離下限1.5 mが働く低速時は1.4秒を超えることがある。静止ボールに到達時間は設定しない。移動ボールの約2/3は初期直線軌道が中心から0.25 m以上ずれるが、身体形状・ロボットの動作を含む非衝突率を保証する値ではない。実際の衝突率・キック成功率はGPUシミュレーションでの確認が必要。
 
 ## 公開状態から Actor 325 への接続
 
@@ -112,7 +118,7 @@ Gym固有のCPU thread/subscene数・buffer倍率はLabの公開設定にその�
 
 ## 検証
 
-2026-09-25の全状態・共分散入力への変更後、**32 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
+2026-09-25のボール生成条件の変更後、**34 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
@@ -122,7 +128,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
 - 固定元VisionFilter C++から生成したoracle：stationary共分散、MAP／bounce、取得・欠測・再捕捉、3秒境界、複数環境を比較。rollingとhigh_speedは同じ運動モデルのため、状態・共分散が一致する数値的同率だけ選択ラベル差を許容。
 - tensor backend：Actor325／特権20、報酬・終端、phase、action delay、reset、実perception処理と13 horizonの共分散を確認。
 - 独立な有限差分ヤコビアンで4×4共分散変換を照合。全16成分の左右反射、13時刻の位置・速度・共分散の実入力とD P Dᵀ正規化、LSTM以外へのボール入力経路がないことを確認。
-- ボールreset：128環境×2回、異なるロボット位置・yawで初期の位置差と速度の内積が負（接近方向）になることを確認。
+- ボールreset：128環境×2回、異なるロボット位置・yawで静止／接近方向、通過ずれ、最接近時間を確認。8192回の生成結果から静止約10%・三角分布の累積確率・通過ずれの分布を確認。0 / 0.1 / 1 / 3 / 6 m/sの境界例で距離下限・速度連動・最大距離・回転速度も検証。
 - fake環境でのrollout→PPO→checkpoint再開→13出力TorchScript保存・再loadを確認。
 - Labの実書き込み処理をASTで実行し、10 physics writes中の外力適用が1回であること、COMまわりのモーメント保存、環境原点とquaternionの変換を確認。
 

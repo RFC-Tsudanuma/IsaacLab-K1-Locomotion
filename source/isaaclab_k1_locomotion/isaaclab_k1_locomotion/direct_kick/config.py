@@ -1,4 +1,4 @@
-"""Pinned source parameters plus the approved perception and observation changes."""
+"""Pinned source parameters plus the approved DirectKick changes."""
 from pathlib import Path
 import yaml
 from .direct_kicking_observation import expected_direct_kicking_observation_size
@@ -26,8 +26,20 @@ def load_config():
         'nis_threshold': 9.21,
         'max_missing_time_s': 3.0,
     }
-    # The experiment targets kicks of approaching balls, not outgoing balls.
-    cfg['direct_kicking']['ball_motion_randomization']['incoming_probability'] = 1.0
+    # Moving balls approach the robot; stationary cases train the approach itself.
+    motion = cfg['direct_kicking']['ball_motion_randomization']
+    motion.update({
+        'speed_range_mps': [0., 6.],  # Symmetric triangular distribution, mode 3 m/s.
+        'incoming_probability': 1.0,
+        'stationary_probability': 0.1,
+        'stationary_spawn_distance_range_m': [1.5, 3.],
+        'incoming_time_to_closest_range_s': [1., 1.4],
+        'minimum_spawn_distance_m': 1.5,
+        'closest_approach_offset_range_m': [-0.75, 0.75],
+    })
+    # Incoming distance now follows speed and time, not an independent range.
+    motion.pop('incoming_spawn_distance_range_m')
+    cfg['vision']['max_distance'] = 9.0
     cfg['migration'] = {
         'source_revision': SOURCE_REVISION,
         'vision_filter_revision': VISION_REVISION,

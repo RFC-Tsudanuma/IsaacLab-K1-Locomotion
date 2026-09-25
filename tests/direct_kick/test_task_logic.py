@@ -6,6 +6,7 @@ observation assembly, reward/outcome, reset, and physics-substep delay logic.
 
 import math
 import unittest
+from unittest import mock
 import xml.etree.ElementTree as ET
 
 import torch
@@ -227,7 +228,7 @@ class TaskLogicTest(unittest.TestCase):
         env._update_post_kick_phase_target()
         self.assertTrue(env.post_kick_phase_target_buf.all())
 
-    def test_ball_resets_only_approach_robot_for_different_positions_and_yaws(self):
+    def test_ball_resets_stationary_or_approaching_for_different_positions_and_yaws(self):
         env = TensorBackend(count=128)
         ids = torch.arange(env.num_envs)
         yaw = torch.linspace(-math.pi, math.pi, env.num_envs)
@@ -241,11 +242,93 @@ class TaskLogicTest(unittest.TestCase):
             env._reset_ball_at_robot_front(ids)
             offset = env.root_states[:, 1, :2] - env.root_states[:, 0, :2]
             velocity = env.root_states[:, 1, 7:9]
-            # Distance initially decreases, regardless of world position/yaw.
-            self.assertTrue(((offset * velocity).sum(dim=-1) < 0).all())
+            speed = velocity.norm(dim=-1)
+            moving = speed > 0
+            self.assertTrue(moving.any() and (~moving).any())
+            # Moving balls approach regardless of world position/yaw.
+            radial_motion = (offset * velocity).sum(dim=-1)
+            self.assertTrue((radial_motion[moving] < 0).all())
+            self.assert_close(env.root_states[~moving, 1, 7:13],
+                              torch.zeros_like(env.root_states[~moving, 1, 7:13]))
             distance = offset.norm(dim=-1)
-            self.assertTrue(((distance >= 1.5) & (distance <= 3.)).all())
-            self.assertTrue((velocity.norm(dim=-1) <= 1.).all())
+            self.assertTrue((distance >= 1.5 - 1e-5).all())
+            self.assertTrue((distance < env.task_cfg["vision"]["max_distance"]).all())
+            self.assertTrue((distance[~moving] <= 3.0 + 1e-5).all())
+            self.assertTrue((speed <= 6.0 + 1e-5).all())
+            # Recover trajectory geometry from the world-state outputs.
+            closest = (offset[:, 0] * velocity[:, 1] - offset[:, 1] * velocity[:, 0])[moving] / speed[moving]
+            self.assertTrue((closest.abs() <= 0.75 + 1e-5).all())
+            time_to_closest = -radial_motion[moving] / speed[moving].square()
+            self.assertTrue((time_to_closest >= 1.0 - 1e-5).all())
+            above_floor = distance[moving] > 1.5 + 1e-5
+            self.assertTrue((time_to_closest[above_floor] <= 1.4 + 1e-5).all())
+
+    def test_ball_reset_speed_mixture_and_off_center_distribution(self):
+        env = TensorBackend(count=256)
+        ids = torch.arange(env.num_envs)
+        speeds, distances, offsets = [], [], []
+        for _ in range(32):
+            env._reset_ball_at_robot_front(ids)
+            position = env.root_states[:, 1, :2] - env.root_states[:, 0, :2]
+            velocity = env.root_states[:, 1, 7:9]
+            speed = velocity.norm(dim=-1)
+            moving = speed > 0
+            speeds.append(speed)
+            distances.append(position.norm(dim=-1))
+            offsets.append((position[moving, 0] * velocity[moving, 1]
+                            - position[moving, 1] * velocity[moving, 0]) / speed[moving])
+        speed = torch.cat(speeds)
+        distance = torch.cat(distances)
+        offset = torch.cat(offsets)
+        stationary = speed == 0
+        self.assertAlmostEqual(stationary.float().mean().item(), 0.1, delta=0.02)
+        self.assertTrue(((distance[stationary] >= 1.5 - 1e-5)
+                         & (distance[stationary] <= 3.0 + 1e-5)).all())
+        self.assertAlmostEqual(distance[stationary].mean().item(), 2.25, delta=0.07)
+        moving_speed = speed[~stationary]
+        self.assertTrue((moving_speed <= 6.0 + 1e-5).all())
+        self.assertAlmostEqual(moving_speed.mean().item(), 3.0, delta=0.07)
+        # Analytic triangular CDF: distinguishes this distribution from uniform.
+        for threshold, probability in ((1.5, 0.125), (3.0, 0.5), (4.5, 0.875)):
+            self.assertAlmostEqual((moving_speed < threshold).float().mean().item(),
+                                   probability, delta=0.025)
+        self.assertTrue((offset.abs() <= 0.75 + 1e-5).all())
+        self.assertAlmostEqual(offset.mean().item(), 0.0, delta=0.04)
+        self.assertAlmostEqual((offset.abs() > 0.25).float().mean().item(),
+                               2.0 / 3.0, delta=0.03)
+
+    def test_ball_reset_distance_floor_zero_speed_and_maximum_speed(self):
+        env = TensorBackend(count=5)
+        ids = torch.arange(env.num_envs)
+        env.stationary_probability = 0.0
+        env.incoming_time_to_closest_range = (1.4, 1.4)
+        env.closest_approach_offset_range = (0.75, 0.75)
+        speeds = torch.tensor([0.0, 0.1, 1.0, 3.0, 6.0])
+        with mock.patch.object(env, "_sample_ball_speed", return_value=speeds):
+            env._reset_ball_at_robot_front(ids)
+        position = env.root_states[:, 1, :2] - env.root_states[:, 0, :2]
+        velocity = env.root_states[:, 1, 7:9]
+        distance = position.norm(dim=-1)
+        self.assertTrue(torch.isfinite(env.root_states).all())
+        self.assert_close(velocity.norm(dim=-1), speeds)
+        self.assert_close(distance[:2], [1.5, 1.5])
+        self.assertTrue((distance[2:] > distance[1:-1]).all())
+        self.assertAlmostEqual(distance[-1].item(), 8.433415677, places=5)
+        self.assertLess(distance[-1].item(), env.task_cfg["vision"]["max_distance"])
+        time_to_closest = -(position[1:] * velocity[1:]).sum(dim=-1) / speeds[1:].square()
+        self.assertGreater(time_to_closest[0].item(), 1.4)
+        self.assert_close(time_to_closest[1:], [1.4, 1.4, 1.4])
+        closest = (position[1:, 0] * velocity[1:, 1]
+                   - position[1:, 1] * velocity[1:, 0]) / speeds[1:]
+        self.assert_close(closest, [0.75] * 4)
+        self.assert_close(env.root_states[:, 1, 10], -velocity[:, 1] / env.ball_radius)
+        self.assert_close(env.root_states[:, 1, 11], velocity[:, 0] / env.ball_radius)
+        # The stationary branch must override both sampled translation and spin.
+        env.stationary_probability = 1.0
+        env._reset_ball_at_robot_front(ids)
+        distance = (env.root_states[:, 1, :2] - env.root_states[:, 0, :2]).norm(dim=-1)
+        self.assertTrue(((distance >= 1.5 - 1e-5) & (distance <= 3.0 + 1e-5)).all())
+        self.assert_close(env.root_states[:, 1, 7:13], torch.zeros(5, 6))
 
     def test_physics_substep_delay_and_selected_environment_reset(self):
         env = TensorBackend()
@@ -267,8 +350,10 @@ class TaskLogicTest(unittest.TestCase):
         env.post_kick_phase_target_buf.fill_(True)
         env.common_step_counter = 1000
         saved = env.action_target_history[0].clone()
+        saved_ball_state = env.root_states[[0, 2], 1].clone()
         env._reset_idx(torch.tensor([1, 3]))
         self.assert_close(env.action_target_history[0], saved)
+        self.assert_close(env.root_states[[0, 2], 1], saved_ball_state)
         self.assert_close(env.action_target_history[1], env.dof_pos[1].repeat(4, 1))
         self.assertEqual(env.post_kick_phase_target_buf.tolist(), [True, False, True, False])
         self.assertEqual(env.episode_length_buf.tolist(), [10, 0, 10, 0])
@@ -280,9 +365,10 @@ class TaskLogicTest(unittest.TestCase):
         self.assertEqual(env.kick_detection_block_until_step[[1, 3]].tolist(), [5, 5])
         ball_state = env.root_states[[1, 3], 1]
         spawn_distance = (ball_state[:, :2] - env.base_pos[[1, 3], :2]).norm(dim=-1)
-        self.assertTrue(((spawn_distance >= 1.5) & (spawn_distance <= 3.0)).all())
+        self.assertTrue(((spawn_distance >= 1.5 - 1e-5)
+                         & (spawn_distance < env.task_cfg["vision"]["max_distance"])).all())
         self.assert_close(ball_state[:, 2], [0.075, 0.075])
-        self.assertTrue((ball_state[:, 7:9].norm(dim=-1) <= 1.0).all())
+        self.assertTrue((ball_state[:, 7:9].norm(dim=-1) <= 6.0 + 1e-5).all())
         self.assert_close(ball_state[:, 10], -ball_state[:, 8] / env.ball_radius)
         self.assert_close(ball_state[:, 11], ball_state[:, 7] / env.ball_radius)
         self.assertTrue(((env.sampled_ball_restitution[[1, 3]] >= 0)

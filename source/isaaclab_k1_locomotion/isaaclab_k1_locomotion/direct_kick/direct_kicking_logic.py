@@ -69,9 +69,17 @@ class DirectKickingLogic(KickingLogic):
             "speed_range_mps",
             non_negative=True,
         )
-        self.incoming_spawn_distance_range = self._validated_range(
-            motion_cfg["incoming_spawn_distance_range_m"],
-            "incoming_spawn_distance_range_m",
+        self.incoming_time_to_closest_range = self._validated_range(
+            motion_cfg["incoming_time_to_closest_range_s"],
+            "incoming_time_to_closest_range_s",
+            positive=True,
+        )
+        self.minimum_spawn_distance = float(motion_cfg["minimum_spawn_distance_m"])
+        if self.minimum_spawn_distance <= 0.0:
+            raise ValueError("minimum_spawn_distance_m must be positive")
+        self.stationary_spawn_distance_range = self._validated_range(
+            motion_cfg["stationary_spawn_distance_range_m"],
+            "stationary_spawn_distance_range_m",
             positive=True,
         )
         self.outgoing_spawn_distance_range = self._validated_range(
@@ -88,13 +96,17 @@ class DirectKickingLogic(KickingLogic):
             "spawn_bearing_range_rad",
         )
         self.incoming_probability = float(motion_cfg["incoming_probability"])
+        self.stationary_probability = float(motion_cfg["stationary_probability"])
 
         if not 0.0 <= self.incoming_probability <= 1.0:
             raise ValueError("incoming_probability must be in [0, 1]")
+        if not 0.0 <= self.stationary_probability <= 1.0:
+            raise ValueError("stationary_probability must be in [0, 1]")
 
         minimum_spawn_distance = min(
-            self.incoming_spawn_distance_range[0],
+            self.minimum_spawn_distance,
             self.outgoing_spawn_distance_range[0],
+            self.stationary_spawn_distance_range[0],
         )
         maximum_offset = max(abs(value) for value in self.closest_approach_offset_range)
         if maximum_offset >= minimum_spawn_distance:
@@ -111,8 +123,13 @@ class DirectKickingLogic(KickingLogic):
         ):
             raise ValueError("spawn_bearing_range_rad must stay inside vision fov_yaw")
         maximum_spawn_distance = max(
-            self.incoming_spawn_distance_range[1],
+            self.minimum_spawn_distance,
+            math.hypot(
+                self.ball_speed_range[1] * self.incoming_time_to_closest_range[1],
+                maximum_offset,
+            ),
             self.outgoing_spawn_distance_range[1],
+            self.stationary_spawn_distance_range[1],
         )
         minimum_visible_distance = float(vision_cfg["min_distance"])
         maximum_visible_distance = float(vision_cfg["max_distance"])
@@ -976,10 +993,20 @@ class DirectKickingLogic(KickingLogic):
         incoming = (
             torch.rand(count, device=self.device) < self.incoming_probability
         )
-        incoming_distance = self._sample_uniform(
-            self.incoming_spawn_distance_range,
+        stationary = torch.rand(count, device=self.device) < self.stationary_probability
+        base_speed = self._sample_ball_speed(count)
+        base_speed = torch.where(stationary, 0.0, base_speed)
+        spawn_bearing = self._sample_uniform(self.spawn_bearing_range, count)
+        closest_approach_offset = self._sample_uniform(
+            self.closest_approach_offset_range,
             count,
         )
+        time_to_closest = self._sample_uniform(self.incoming_time_to_closest_range, count)
+        # For a stationary robot and a constant-speed ball, the path to closest
+        # approach has length v*T. Low speeds keep the approved distance floor.
+        incoming_distance = torch.hypot(
+            base_speed * time_to_closest, closest_approach_offset,
+        ).clamp_min(self.minimum_spawn_distance)
         outgoing_distance = self._sample_uniform(
             self.outgoing_spawn_distance_range,
             count,
@@ -989,12 +1016,8 @@ class DirectKickingLogic(KickingLogic):
             incoming_distance,
             outgoing_distance,
         )
-        spawn_bearing = self._sample_uniform(self.spawn_bearing_range, count)
-        closest_approach_offset = self._sample_uniform(
-            self.closest_approach_offset_range,
-            count,
-        )
-        base_speed = self._sample_uniform(self.ball_speed_range, count)
+        stationary_distance = self._sample_uniform(self.stationary_spawn_distance_range, count)
+        spawn_distance = torch.where(stationary, stationary_distance, spawn_distance)
         local_spawn_xy, local_velocity_xy = build_ball_trajectory(
             spawn_distance,
             spawn_bearing,
@@ -2080,6 +2103,13 @@ class DirectKickingLogic(KickingLogic):
         if non_negative and lower < 0.0:
             raise ValueError("{} must be non-negative".format(name))
         return lower, upper
+
+    def _sample_ball_speed(self, count):
+        """Symmetric triangular speed, with its mode at the range midpoint."""
+        return 0.5 * (
+            self._sample_uniform(self.ball_speed_range, count)
+            + self._sample_uniform(self.ball_speed_range, count)
+        )
 
     def _sample_uniform(self, value_range, count):
         lower, upper = value_range
