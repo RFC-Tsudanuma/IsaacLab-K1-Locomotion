@@ -227,6 +227,26 @@ class TaskLogicTest(unittest.TestCase):
         env._update_post_kick_phase_target()
         self.assertTrue(env.post_kick_phase_target_buf.all())
 
+    def test_ball_resets_only_approach_robot_for_different_positions_and_yaws(self):
+        env = TensorBackend(count=128)
+        ids = torch.arange(env.num_envs)
+        yaw = torch.linspace(-math.pi, math.pi, env.num_envs)
+        env.root_states[:, 0, 0] = torch.linspace(-10., 10., env.num_envs)
+        env.root_states[:, 0, 1] = torch.linspace(5., -5., env.num_envs)
+        env.root_states[:, 0, 3:7] = torch.stack(
+            (torch.zeros_like(yaw), torch.zeros_like(yaw), torch.sin(yaw/2), torch.cos(yaw/2)), dim=-1
+        )
+        env.root_states[:, 0, 7:13].zero_()
+        for _ in range(2):
+            env._reset_ball_at_robot_front(ids)
+            offset = env.root_states[:, 1, :2] - env.root_states[:, 0, :2]
+            velocity = env.root_states[:, 1, 7:9]
+            # Distance initially decreases, regardless of world position/yaw.
+            self.assertTrue(((offset * velocity).sum(dim=-1) < 0).all())
+            distance = offset.norm(dim=-1)
+            self.assertTrue(((distance >= 1.5) & (distance <= 3.)).all())
+            self.assertTrue((velocity.norm(dim=-1) <= 1.).all())
+
     def test_physics_substep_delay_and_selected_environment_reset(self):
         env = TensorBackend()
         self.assertEqual(env.action_delay_step_range, (1, 25))

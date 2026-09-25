@@ -48,6 +48,7 @@ checkpoint は500 iterationsごとと終了時に保存する。学習終了時�
 | VisionFilter | ローカル `futbol_main/main` の `32ece6ee0676b1008d5bc58c3533d45613440568` を固定。stationary / rolling / high_speed / bounce の4仮説、MAP選択、bounce再初期化、confirmed/tentative 2観測取得を移植 |
 | NIS・欠測・再捕捉 | 元 DirectKick の単一KFを使わず、VisionFilterの NIS 9.21、strict `>3 s` timeout、再捕捉処理を使用 |
 | LSTM入力 | 2026-09-25の明示要求により、13時刻それぞれの位置・速度と4×4共分散全成分を入力。Actorのボール速度をMLPへ直接渡す経路を廃止。Critic特権の真値速度は維持 |
+| ボール初期方向 | PowerPointの「接近ボールへのキック」に合わせ、実効設定の `incoming_probability` を1.0に変更。接近・離反50%ずつの元YAMLは出典として保持し、`load_config()`で接近方向のみへ上書き。速さ0〜1 m/s、初期距離1.5〜3 m、横ずれ±0.25 mは維持 |
 | rolling friction | ボールへの係数適用を省略。代替の転がり減速度や抵抗力は追加しない |
 | compliance | 足shapeへの係数適用を省略。新APIのspring stiffness/dampingへの換算は行わない |
 | 通常の摩擦・反発 | 地面、足、ボールの元のランダム化範囲を適用 |
@@ -111,7 +112,7 @@ Gym固有のCPU thread/subscene数・buffer倍率はLabの公開設定にその�
 
 ## 検証
 
-2026-09-25の全状態・共分散入力への変更後、**31 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
+2026-09-25の全状態・共分散入力への変更後、**32 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
@@ -121,6 +122,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
 - 固定元VisionFilter C++から生成したoracle：stationary共分散、MAP／bounce、取得・欠測・再捕捉、3秒境界、複数環境を比較。rollingとhigh_speedは同じ運動モデルのため、状態・共分散が一致する数値的同率だけ選択ラベル差を許容。
 - tensor backend：Actor325／特権20、報酬・終端、phase、action delay、reset、実perception処理と13 horizonの共分散を確認。
 - 独立な有限差分ヤコビアンで4×4共分散変換を照合。全16成分の左右反射、13時刻の位置・速度・共分散の実入力とD P Dᵀ正規化、LSTM以外へのボール入力経路がないことを確認。
+- ボールreset：128環境×2回、異なるロボット位置・yawで初期の位置差と速度の内積が負（接近方向）になることを確認。
 - fake環境でのrollout→PPO→checkpoint再開→13出力TorchScript保存・再loadを確認。
 - Labの実書き込み処理をASTで実行し、10 physics writes中の外力適用が1回であること、COMまわりのモーメント保存、環境原点とquaternionの変換を確認。
 

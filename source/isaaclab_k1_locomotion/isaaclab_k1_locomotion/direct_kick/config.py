@@ -26,6 +26,8 @@ def load_config():
         'nis_threshold': 9.21,
         'max_missing_time_s': 3.0,
     }
+    # The experiment targets kicks of approaching balls, not outgoing balls.
+    cfg['direct_kicking']['ball_motion_randomization']['incoming_probability'] = 1.0
     cfg['migration'] = {
         'source_revision': SOURCE_REVISION,
         'vision_filter_revision': VISION_REVISION,
