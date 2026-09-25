@@ -37,7 +37,6 @@ class DirectKickEnv(DirectKickingLogic, DirectRLEnv):
         self._prepare_reward_function()
         self._init_csv_logging()
         self.env_resets = self.env_successes = self.env_falling = 0
-        self.ball_velocities = []
         self._refresh_state()
 
     def _setup_scene(self):
@@ -271,6 +270,7 @@ class DirectKickEnv(DirectKickingLogic, DirectRLEnv):
         return self.rew_buf
 
     def _reset_idx(self, env_ids):
+        self._record_completed_episodes(env_ids)
         DirectRLEnv._reset_idx(self, env_ids)
         DirectKickingLogic._reset_idx(self, env_ids)
         self.reset_ball_buf[env_ids] = False

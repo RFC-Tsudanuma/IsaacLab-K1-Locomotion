@@ -19,6 +19,7 @@ import gymnasium as gym
 import isaaclab_k1_locomotion.tasks  # noqa: F401
 from isaaclab_k1_locomotion.tasks.direct.direct_kick.env_cfg import DirectKickEnvCfg
 from isaaclab_k1_locomotion.direct_kick.runner import DirectKickRunner
+from isaaclab_k1_locomotion.direct_kick.episode_metrics import write_episode_metrics
 
 
 def main():
@@ -40,6 +41,12 @@ def main():
                     break
                 output = runner.model.actor(obs['policy'])
                 obs, _, _, _, _ = env.step(output[:, :12])
+        summary = env.unwrapped.episode_metrics.summary()
+        metrics_path = runner.log_dir / 'episode_metrics.csv'
+        write_episode_metrics(metrics_path, summary, append=False)
+        completed = summary['all']
+        print(f"Completed episodes: {completed['episodes']}; kick rate: {completed['kick_rate']}")
+        print(f'Episode metrics: {metrics_path}')
     finally:
         env.close()
 

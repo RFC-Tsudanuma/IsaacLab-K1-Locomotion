@@ -60,7 +60,6 @@ class TensorBackend(DirectKickingLogic):
         self.ball_restitution_range = tuple(self.direct_cfg["physics_randomization"]["ball_restitution_range"])
         self.sampled_ball_restitution = torch.zeros(count)
         self.env_resets = self.env_successes = self.env_falling = 0
-        self.ball_velocities = []
         self.writes = []
         self._configure_ball_motion(self.task_cfg)
         self._configure_action_delay(self.task_cfg)
@@ -111,6 +110,11 @@ class TensorBackend(DirectKickingLogic):
         self.writes.append(("root", env_ids.clone(), robot, ball))
         if ball:
             self.body_states[env_ids, -1] = self.root_states[env_ids, 1]
+
+    def _reset_idx(self, env_ids):
+        # Match the native backend's completion snapshot before reset writes.
+        self._record_completed_episodes(env_ids)
+        super()._reset_idx(env_ids)
 
     def _write_dof_state(self, env_ids):
         self.writes.append(("dof", env_ids.clone()))
@@ -209,6 +213,44 @@ class TaskLogicTest(unittest.TestCase):
         self.assertEqual(env.time_out_buf.tolist(), [False, False, False, True])
         self.assertEqual(env.post_kick_terminal_buf.tolist(), [False, True, False, False])
         self.assertEqual(env.fall_buf.tolist(), [False, False, True, False])
+
+    def test_completed_episode_metrics_capture_kick_before_two_second_reset(self):
+        env = TensorBackend()
+        ids = torch.arange(env.num_envs)
+        env._reset_ball_at_robot_front(ids)
+        # Env 0 reaches post-kick recovery; env 1 falls after a kick;
+        # env 2 times out without kicking; env 3 remains in flight.
+        env.valid_kick_buf[:] = torch.tensor([True, True, False, False])
+        env.first_valid_kick_step[:] = torch.tensor([10, 10, -1, -1])
+        env.episode_length_buf[:] = torch.tensor([110, 110, 851, 50])
+        env.min_ball_vel_buf[:2] = 100  # Old strict >100 counter missed these kicks.
+        env.base_pos[1, 2] = 0.40
+        env._check_termination()
+        self.assertEqual(env.reset_buf.tolist(), [True, True, True, False])
+        env._reset_idx(torch.tensor([0, 1, 2]))
+        summary = env.episode_metrics.summary()["all"]
+        self.assertEqual(summary["episodes"], 3)
+        self.assertEqual(summary["kicks"], 2)
+        self.assertEqual(summary["falls"], 1)
+        self.assertEqual(summary["timeouts"], 1)
+        self.assertEqual(summary["post_kick_completions"], 1)
+        self.assertEqual(env.env_successes, 2)
+        self.assertFalse(env.valid_kick_buf.any())
+        # Resetting a zero-length episode must not count it again.
+        env._reset_idx(torch.tensor([0]))
+        self.assertEqual(env.episode_metrics.summary()["all"]["episodes"], 3)
+        self.assertFalse(hasattr(env, "ball_velocities"))
+
+    def test_unfinished_manual_resets_do_not_count_or_accumulate_velocity_history(self):
+        env = TensorBackend()
+        ids = torch.arange(env.num_envs)
+        for _ in range(5):
+            env.root_states[:, 1, 7] = 3.0
+            env.episode_length_buf.fill_(10)
+            env.reset_buf.zero_()
+            env._reset_idx(ids)
+        self.assertEqual(env.episode_metrics.summary()["all"]["episodes"], 0)
+        self.assertFalse(hasattr(env, "ball_velocities"))
 
     def test_phase_waits_for_selected_foot_landing(self):
         env = TensorBackend()

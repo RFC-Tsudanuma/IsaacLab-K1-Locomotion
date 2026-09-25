@@ -14,6 +14,7 @@ from test_source_parity import load_port
 
 
 Runner = load_port("runner").DirectKickRunner
+KickEpisodeMetrics = load_port("episode_metrics").KickEpisodeMetrics
 
 
 def small_config():
@@ -33,6 +34,11 @@ class ReusedTensorEnv:
         self.extras = {"post_kick_phase_target": torch.zeros(2)}
         self.seen_actions = []
         self.tick = 0
+        self.episode_metrics = KickEpisodeMetrics(self.num_envs, "cpu")
+
+    def start_episodes(self, ids):
+        self.episode_metrics.start(ids, torch.tensor([0., 3.])[ids],
+                                   torch.tensor([True, False])[ids], torch.tensor([0., 0.4])[ids])
 
     def write_observations(self):
         self.observations["policy"][0].fill_(self.tick * 0.1)
@@ -45,6 +51,7 @@ class ReusedTensorEnv:
     def reset(self):
         self.tick = 0
         self.seen_actions.clear()
+        self.start_episodes(torch.arange(self.num_envs))
         self.write_observations()
         self.extras["post_kick_phase_target"].copy_(torch.tensor([0.0, 1.0]))
         return self.observations, self.extras
@@ -67,6 +74,10 @@ class ReusedTensorEnv:
             labels = [0.0, 1.0]
         else:
             labels = [1.0, 1.0]
+        finished = (terminated | truncated).nonzero(as_tuple=False).flatten()
+        self.episode_metrics.finish(finished, terminated[finished], torch.zeros_like(terminated[finished]),
+                                    truncated[finished], terminated[finished])
+        self.start_episodes(finished)
         self.extras["post_kick_phase_target"].copy_(torch.tensor(labels))
         rewards = torch.tensor([0.2 * self.tick, -0.1 * self.tick])
         return self.observations, rewards, terminated, truncated, self.extras
@@ -127,6 +138,15 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(rows[0]["total_steps"], "6")
         self.assertTrue(all(math.isfinite(float(rows[0][key])) for key in ("value_loss", "phase_loss", "kl")))
 
+        with (runner.log_dir / "episode_metrics.csv").open() as stream:
+            episodes = {row["group"]: row for row in csv.DictReader(stream)}
+        self.assertEqual(episodes["all"]["episodes"], "2")
+        self.assertEqual(episodes["all"]["kick_rate"], "0.5")
+        self.assertEqual(episodes["stationary"]["kick_rate"], "0.0")
+        self.assertEqual(episodes["moving"]["kick_rate"], "1.0")
+        self.assertEqual(episodes["speed_5_6_mps"]["kick_rate"], "")
+        self.assertEqual(runner.env.episode_metrics.summary()["all"]["episodes"], 0)
+
         resumed = Runner(ReusedTensorEnv(), small_config(), self.log_dir / "resume", "cpu")
         checkpoint = resumed.load(path)
         self.assertEqual(resumed.iteration, 1)
@@ -146,6 +166,8 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(weights_only.iteration, 0)
         self.assertEqual(weights_only.total_steps, 0)
         self.assertFalse(weights_only.ppo.optimizer.state)
+        self.assertEqual(weights_only.ppo.learning_rate, small_config()["algorithm"]["learning_rate"])
+        self.assertEqual(weights_only.ppo.optimizer.param_groups[0]["lr"], weights_only.ppo.learning_rate)
         for key, value in runner.model.state_dict().items():
             self.assert_close(weights_only.model.state_dict()[key], value)
 
@@ -161,6 +183,32 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assert_close(actual[:, :12], runner.model.act(observations).loc)
         self.assertTrue(((actual[:, 12] >= 0) & (actual[:, 12] <= 1)).all())
         self.assertEqual(json.loads(export_path.with_suffix(".json").read_text()), runner.metadata)
+
+    def test_resume_matches_uninterrupted_adaptive_lr_and_two_further_updates(self):
+        cfg = small_config()
+        cfg["algorithm"].update(learning_rate=1e-4, desired_kl=1e6)
+        original = Runner(ReusedTensorEnv(), cfg, self.log_dir / "original", "cpu")
+        path = original.train(max_iterations=1)
+        self.assertNotEqual(original.ppo.learning_rate, cfg["algorithm"]["learning_rate"])
+        restored = Runner(ReusedTensorEnv(), copy.deepcopy(cfg), self.log_dir / "restored", "cpu")
+        restored.load(path)
+        self.assertEqual(restored.ppo.learning_rate, original.ppo.learning_rate)
+        observations, extras = original.env.reset()
+        for _ in range(2):
+            rollout, observations, extras = original.collect(observations, extras)
+            for runner in (original, restored):
+                # update() replaces timeout rewards in place.
+                runner.ppo.update(copy.deepcopy(rollout), observations["policy"].clone(),
+                                  observations["critic"].clone())
+            self.assertEqual(restored.ppo.learning_rate, original.ppo.learning_rate)
+            for key, value in original.model.state_dict().items():
+                self.assert_close(restored.model.state_dict()[key], value)
+            expected = original.ppo.optimizer.state_dict()
+            actual = restored.ppo.optimizer.state_dict()
+            self.assertEqual(actual["param_groups"], expected["param_groups"])
+            for parameter, state in expected["state"].items():
+                for key, value in state.items():
+                    self.assert_close(actual["state"][parameter][key], value)
 
     def test_port_metadata_gate_rejects_missing_and_changed_perception_before_load(self):
         source = Runner(ReusedTensorEnv(), small_config(), self.log_dir / "source", "cpu")

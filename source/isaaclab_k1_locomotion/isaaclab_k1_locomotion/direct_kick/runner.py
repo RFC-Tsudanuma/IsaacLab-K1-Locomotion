@@ -9,6 +9,7 @@ import yaml
 
 from .learning import DirectKickPPO
 from .model import DirectKickingActorCritic
+from .episode_metrics import episode_metric_scalars, write_episode_metrics
 
 
 class DirectKickRunner:
@@ -33,6 +34,7 @@ class DirectKickRunner:
         self.model.load_state_dict(checkpoint['model'], strict=True)
         if resume:
             self.ppo.optimizer.load_state_dict(checkpoint['optimizer'])
+            self.ppo.learning_rate = float(self.ppo.optimizer.param_groups[0]['lr'])
             self.iteration = int(checkpoint['iteration'])
             self.total_steps = int(checkpoint['total_steps'])
         return checkpoint
@@ -95,8 +97,14 @@ class DirectKickRunner:
                     writer.writerow(metrics)
                     stream.flush()
                     print(f"iteration={self.iteration} reward={reward:.5f} value_loss={metrics['value_loss']:.5f} kl={metrics['kl']:.6f}", flush=True)
+                    episode_summary = self.env.unwrapped.episode_metrics.summary(reset=True)
+                    write_episode_metrics(self.log_dir / 'episode_metrics.csv', episode_summary, self.iteration)
+                    completed = episode_summary['all']
+                    if completed['episodes']:
+                        print(f"episodes={completed['episodes']} kick_rate={completed['kick_rate']:.3f} "
+                              f"fall_rate={completed['fall_rate']:.3f}", flush=True)
                     if wandb_run is not None:
-                        wandb_run.log(metrics, step=self.iteration)
+                        wandb_run.log({**metrics, **episode_metric_scalars(episode_summary)}, step=self.iteration)
                     if self.iteration % self.cfg['runner']['save_interval'] == 0:
                         self.save()
                 return self.save()

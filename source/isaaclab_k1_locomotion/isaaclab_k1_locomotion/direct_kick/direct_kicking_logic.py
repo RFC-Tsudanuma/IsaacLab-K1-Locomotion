@@ -10,6 +10,7 @@ from .kicking_logic import KickingLogic
 from .action_smoothness import action_second_difference_l2
 from .ball_trajectory import build_ball_trajectory
 from .vision_filter import VisionFilter
+from .episode_metrics import KickEpisodeMetrics
 from .sensor_noise import distance_scaled_measurement_std
 from .ball_visibility import horizontal_fov_mask
 from .direct_kicking_observation import (
@@ -239,6 +240,7 @@ class DirectKickingLogic(KickingLogic):
         self._init_edge_only_support()
         self._init_direct_perception_buffers()
         self._init_direct_outcome_buffers()
+        self.episode_metrics = KickEpisodeMetrics(self.num_envs, self.device)
 
     def _init_edge_only_support(self):
         edge_positions = torch.as_tensor(
@@ -1051,12 +1053,24 @@ class DirectKickingLogic(KickingLogic):
         self.root_states[env_ids, 1, 10] = -world_velocity_xy[:, 1] / self.ball_radius
         self.root_states[env_ids, 1, 11] = world_velocity_xy[:, 0] / self.ball_radius
 
+        self.episode_metrics.start(env_ids, base_speed, stationary, closest_approach_offset)
         self._write_root_states(env_ids, ball=True)
         if hasattr(self, "ball_filter"):
             self.kick_detection_block_until_step[env_ids] = (
                 self.episode_length_buf[env_ids] + self._kick_warmup_steps()
             )
             self._reset_direct_perception(env_ids)
+
+    def _record_completed_episodes(self, env_ids):
+        """Called before the backend clears episode length or task reset flags."""
+        finished = env_ids[self.reset_buf[env_ids] & (self.episode_length_buf[env_ids] > 0)]
+        self.env_successes += int(self.episode_metrics.finish(
+            finished,
+            self.valid_kick_buf[finished],
+            self.fall_buf[finished],
+            self.time_out_buf[finished],
+            self.post_kick_terminal_buf[finished],
+        ).item())
 
     def _reset_idx(self, env_ids):
         super()._reset_idx(env_ids)

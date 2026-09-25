@@ -23,7 +23,7 @@
   --headless --device cuda:0 --num_envs 8192 --no_wandb
 ```
 
-`--no_wandb` を外すと W&B に記録する。環境0の報酬・状態 CSV は既定で有効、無効化は `--no_csv`。学習損失は `learning.csv`、実効設定は `config.yaml`、モデル／認識契約は `policy_contract.json` に保存する。
+`--no_wandb` を外すと W&B に記録する。環境0の報酬・状態 CSV は既定で有効、無効化は `--no_csv`。学習損失は `learning.csv`、全環境の完了エピソード集計は `episode_metrics.csv`、実効設定は `config.yaml`、モデル／認識契約は `policy_contract.json` に保存する。
 
 ```bash
 # 同じ移植実装の checkpoint から再開。max_iterations は通算の到達値。
@@ -40,6 +40,22 @@
 checkpoint は500 iterationsごとと終了時に保存する。学習終了時には `policy.pt` も出力する。TorchScript Actor の入力は `[N,325]`、出力は **12 action + phase確率の13要素**。環境に渡すのは先頭12要素。phaseは関節指令ではない。LSTM の hidden state は呼出間で持ち越さない。
 
 位置だけを符号化する旧132次元の移植checkpointと旧Gym checkpointは、観測形状・意味が異なるため再開には使えない。新しい入力契約で学習し直す。`port_metadata` でモデル契約と認識 revision を照合する。既存歩行タスクの checkpoint も対象外。
+
+## 再開と成績の集計
+
+checkpoint再開ではAdamを読み込んだ直後、その学習率をPPOの適応学習率にも復元する。従来形式のcheckpointに保存済みのoptimizer情報を使い、形式は変更しない。`resume=False` の重み読込ではoptimizerと学習率は初期設定のまま。同一rolloutによる2回の追加更新で、中断なしの場合と再開後の全重み・Adam状態・学習率が一致することをテストする。
+
+`episode_metrics.csv` は全環境を対象とし、学習時はiteration内に**完了したエピソード**を集計する。再生時は終了時に、その実行で完了したエピソード全体をcheckpointディレクトリ配下の `evaluation/episode_metrics.csv` に出力する（再生を再実行すると置換）。初期reset、途中での手動reset、再生終了時に未完了のエピソードは分母に含めない。学習再開後の集計は新しい実行での完了分から始める。
+
+- `all`、`stationary`、`moving`：全体／静止／移動。区分は生成時の抽選結果に固定する。
+- `speed_0_1_mps` ～ `speed_5_6_mps`：移動ボールの初速を1 m/s幅で区分。下限を含み上限を含まないが、最後の区分は6 m/sを含む。
+- `offset_0_0p25_m`、`offset_0p25_0p50_m`、`offset_0p50_0p75_m`：移動ボールの生成時の最接近ずれの絶対値で区分。同じく下限を含み、最後のみ上限0.75 mを含む。静止ボールは軌道の最接近ずれを持たないため除外する。
+- `episodes` と `kicks`、`kick_rate`：完了数、そのうち既存の `valid_kick` が成立した数・割合。**方向の正しいパス成功率ではない**。キック後に転倒した場合もキック成立には含め、転倒も別に記録する。従来の `env_successes` も、この完了エピソード内のキック成立数へ統一する。
+- `falls`、`timeouts`、`post_kick_completions`、`other_terminations` と各rate：終了理由。重複時は転倒→時間切れ→キック後の所定時間完了→その他の順に分類する。報酬や終了判定には使用しない。
+
+完了例がない区分のrateはCSVでは空欄、W&Bには送信しない。0%と未評価を区別し、件数も併記する。W&Bでは `episodes/<group>/<metric>` に記録する。終了状態をreset前に読み、二重計上を防ぐ。記録は環境ごとの固定サイズの区分マスクと件数カウンタのみで、未使用だった無制限のボール速度リストは削除した。
+
+後方へ通過した場合の終了条件・報酬はユーザー指示により維持する。現在の待機ペナルティは未キック中、2秒まで二次的に増加し、その後は毎step同じ額を加算する（係数−0.5、dt=0.02なので2秒以降は−0.01/step）。これは報酬の一項であり、総報酬や実際の見送り頻度への影響は学習結果で評価する。
 
 ## 承認された変更
 
@@ -118,7 +134,7 @@ Gym固有のCPU thread/subscene数・buffer倍率はLabの公開設定にその�
 
 ## 検証
 
-2026-09-25のボール生成条件の変更後、**34 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
+2026-09-25の学習再開・成績集計の修正後、**40 tests / 258 subtests 成功**。初回移植時には学習CLIの引数読込、元YAML・2 URDF・24 STLのバイト一致も確認した。出典ハッシュは [implementation_provenance.json](implementation_provenance.json) に記録している。
 
 ```bash
 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
@@ -129,7 +145,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
 - tensor backend：Actor325／特権20、報酬・終端、phase、action delay、reset、実perception処理と13 horizonの共分散を確認。
 - 独立な有限差分ヤコビアンで4×4共分散変換を照合。全16成分の左右反射、13時刻の位置・速度・共分散の実入力とD P Dᵀ正規化、LSTM以外へのボール入力経路がないことを確認。
 - ボールreset：128環境×2回、異なるロボット位置・yawで静止／接近方向、通過ずれ、最接近時間を確認。8192回の生成結果から静止約10%・三角分布の累積確率・通過ずれの分布を確認。0 / 0.1 / 1 / 3 / 6 m/sの境界例で距離下限・速度連動・最大距離・回転速度も検証。
-- fake環境でのrollout→PPO→checkpoint再開→13出力TorchScript保存・再loadを確認。
+- fake環境でのrollout→PPO→checkpoint再開→13出力TorchScript保存・再loadを確認。適応学習率が変わったcheckpointから同一rolloutを2回更新し、中断なしの場合との全重み・Adam・学習率の一致を確認。
+- 完了エピソードの集計：生成条件の保持、カテゴリ境界、空欄と0%の区別、集計後も継続するエピソード、初期／手動reset除外、二重計上防止、キック後2秒終了時の成立数、CSV出力を確認。native backendの実resetメソッドを使い、Labがepisode lengthをクリアする前に集計されることも確認。
 - Labの実書き込み処理をASTで実行し、10 physics writes中の外力適用が1回であること、COMまわりのモーメント保存、環境原点とquaternionの変換を確認。
 
 これらはGPU物理のテストを代替しない。再現用C++driverと固定入力は `tests/direct_kick/fixtures/vision_filter`、元PPOのfixtureは `tests/direct_kick/reference` に保存している。

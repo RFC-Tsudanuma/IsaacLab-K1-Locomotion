@@ -138,6 +138,31 @@ class BackendBoundaryTest(unittest.TestCase):
         torch.testing.assert_close(emitted[0]["force_data"], buffer.calls[0][0].reshape(-1, 3))
         torch.testing.assert_close(emitted[0]["torque_data"], buffer.calls[0][1].reshape(-1, 3))
 
+    def test_native_reset_records_outcome_before_lab_clears_episode_length(self):
+        from test_task_logic import DirectKickingLogic, TensorBackend
+
+        env = TensorBackend()
+        ids = torch.tensor([1])
+        env._reset_ball_at_robot_front(torch.arange(env.num_envs))
+        env.episode_length_buf[1] = 110
+        env.valid_kick_buf[1] = True
+        env.first_valid_kick_step[1] = 10
+        env._check_termination()
+        self.assertTrue(env.post_kick_terminal_buf[1])
+        reset = extract_method(ENV_PATH, "DirectKickEnv", "_reset_idx")
+
+        def lab_reset(instance, selected):
+            instance.episode_length_buf[selected] = 0
+
+        reset.__globals__.update(DirectRLEnv=SimpleNamespace(_reset_idx=lab_reset),
+                                DirectKickingLogic=DirectKickingLogic)
+        reset(env, ids)
+        self.assertEqual(env.episode_metrics.summary()["all"]["episodes"], 1)
+        self.assertEqual(env.episode_metrics.summary()["all"]["kicks"], 1)
+        self.assertEqual(env.env_successes, 1)
+        self.assertFalse(env.valid_kick_buf[1])
+        self.assertEqual(env.episode_length_buf[1].item(), 0)
+
     def test_root_write_adds_scene_origin_and_reorders_quaternion_without_mutating_task(self):
         state = torch.arange(52, dtype=torch.float32).reshape(2, 2, 13)
         state[:, :, 3:7] = torch.tensor([0.1, 0.2, 0.3, 0.4])

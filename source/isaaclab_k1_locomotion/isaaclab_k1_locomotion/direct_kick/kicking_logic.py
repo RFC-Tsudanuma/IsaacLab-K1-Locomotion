@@ -405,15 +405,6 @@ class KickingLogic:
         ):
             self.csv_episode_id += 1
 
-        velocity_before_reset = torch.norm(self.root_states[env_ids, 1, 7:10], dim=1)
-        
-        # only get velocities that are greater than 0.1
-        velocity_before_reset = velocity_before_reset[velocity_before_reset > 0.1]
-        if len(velocity_before_reset) > 0:
-            # append velocities sepeate
-            for velocity in velocity_before_reset:
-                self.ball_velocities.append(velocity.item())
-
         # Reset robot
         self._reset_dofs(env_ids)
         self._reset_root_states(env_ids)
@@ -639,8 +630,6 @@ class KickingLogic:
             max_ball_moving_time = self._reward_value("max_ball_moving_time_s", 4.0)
             self.reset_buf |= self.time_since_ball_is_moving_buf > max_ball_moving_time
 
-            # count a success if ball is moving for too long
-            self.env_successes += torch.sum(self.min_ball_vel_buf > np.ceil(self._reward_value("min_ball_vel_s") / self.dt))
         self.env_falling += int(torch.sum(self.fall_buf).item())
 
     def _compute_reward(self):
