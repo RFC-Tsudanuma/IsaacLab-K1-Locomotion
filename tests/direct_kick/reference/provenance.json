@@ -1,0 +1,31 @@
+{
+  "repository": "rl_humanoid_htwk",
+  "commit": "3af2acc97f1081b4cbfd9556efd39408dea92cc6",
+  "purpose": "Independent CPU parity oracle; original runner is parsed, never imported.",
+  "files": {
+    "runner.py": {
+      "source": "utils/runner.py",
+      "sha256": "c89f7895b2a5d158773c2b3cb388af9780dc07146138c08571e12005131bed11"
+    },
+    "DirectKickingAC.py": {
+      "source": "utils/models/DirectKickingAC.py",
+      "sha256": "af36e28cbc19a464ea5371bdac1eb75fd77dad1486cb1b2dbcaba2f90e93546a"
+    },
+    "direct_kicking_observation.py": {
+      "source": "utils/direct_kicking_observation.py",
+      "sha256": "673aed70ac9553c47fa3adfacbb9df005b0fe86c94fe027623b0a6ac44dadd2f"
+    },
+    "direct_kicking_symmetry.py": {
+      "source": "utils/direct_kicking_symmetry.py",
+      "sha256": "1c45f7cbae2c6909def8b14547faa1434b030240d97761ec92f8ddac5b1e7ae2"
+    },
+    "post_kick_phase.py": {
+      "source": "utils/post_kick_phase.py",
+      "sha256": "34482e7ddf37f2c60ee094d5dafed40f17d539592463dc2643b4aeaf283bf1d7"
+    },
+    "utils.py": {
+      "source": "utils/utils.py",
+      "sha256": "ec5ace1b5c33453036ad618c8b79d8bb01cdb15479b2fdf7b3332f4837058cfb"
+    }
+  }
+}

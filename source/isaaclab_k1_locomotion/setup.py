@@ -8,7 +8,7 @@
 import os
 
 import toml
-from setuptools import setup
+from setuptools import find_packages, setup
 
 # Obtain the extension data from the extension.toml file
 EXTENSION_PATH = os.path.dirname(os.path.realpath(__file__))
@@ -20,12 +20,17 @@ INSTALL_REQUIRES = [
     # NOTE: Add dependencies
     "psutil",
     "rsl-rl-lib==3.0.1",
+    "PyYAML",
+    "wandb",
 ]
 
 # Installation operation
 setup(
     name="isaaclab_k1_locomotion",
-    packages=["isaaclab_k1_locomotion"],
+    packages=find_packages(),
+    package_data={"isaaclab_k1_locomotion.direct_kick": [
+        "source_config.yaml", "assets/*.urdf", "assets/K1/*.urdf",
+    ]},
     author=EXTENSION_TOML_DATA["package"]["author"],
     maintainer=EXTENSION_TOML_DATA["package"]["maintainer"],
     url=EXTENSION_TOML_DATA["package"]["repository"],

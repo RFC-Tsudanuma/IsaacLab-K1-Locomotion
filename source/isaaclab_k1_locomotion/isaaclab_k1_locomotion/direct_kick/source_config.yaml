@@ -1,0 +1,562 @@
+basic:
+  model: "DirectKickingActorCritic"
+  headless: false
+  max_iterations: 200000 # set the maximum number of learning iterations to train for
+  sim_device: "cpu" # device for physics simulation
+  rl_device: "cpu" # device for the RL algorithm
+  seed: 42 # seed - set to -1 to choose random seed
+  description: ""
+  task: "K1/DirectKicking"
+  enable_csv_logging: true
+  env_status_print_interval: 0 # set to a positive env-step interval for verbose reset/fall prints
+
+env:
+  num_envs: 1
+  num_observations: 132
+  num_privileged_obs: 20
+  num_actions: 12
+  env_spacing: 5.  # not used with plane terrain
+
+runner:
+  horizon_length: 24
+  mini_epochs: 20
+  # Preserve full-batch PPO gradients while limiting LSTM activation memory.
+  optimization_chunk_size: 16384
+  save_interval: 500
+  use_wandb: true
+  log_video_interval: 500
+
+viewer:
+  pos: [3., -3., 2.]  # [m]
+  lookat: [15., 0., 0.]  # [m]
+  record_video: true  # only in play
+  record_interval: 5.  # [s]
+  record_env_idx: 0
+
+algorithm:
+  learning_rate: 1.e-5
+  gamma: 0.995
+  lam: 0.95
+  bound_coef: 1.0
+  entropy_coef: -0.01
+  # Applied only when the configured model exposes the DirectKicking hook.
+  symmetric_coef: 10.
+  post_kick_phase_auxiliary:
+    enabled: true
+    coefficient: 0.1
+    premature_weight: 3.0
+    delayed_weight: 1.0
+  desired_kl: 0.01
+  min_entropy: null
+  max_entropy: null
+
+sim:
+  dt: 0.002
+  substeps: 1
+  up_axis: "z"
+  gravity: [0.0, 0.0, -9.81]
+  physics_engine: "physx" # "physx" or "flex"
+  physx:
+    num_threads: 4 # Number of worker threads per scene used by PhysX - for CPU PhysX only.
+    solver_type: 1 # 0: pgs, 1: tgs
+    num_position_iterations: 8  # from IsaacLab K1 config
+    num_velocity_iterations: 4  # from IsaacLab K1 config
+    contact_offset: 0.02
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1.0  # from IsaacLab K1 config
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 8388608 # 8*1024*1024
+    num_subscenes: 4 # Splits the simulation into N physics scenes and runs each one in a separate thread
+    contact_collection: 1 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (broken - do not use!)
+
+asset:
+  file: "resources/K1/K1_locomotion.urdf"
+  mujoco_file: "resources/K1/K1_locomotion.xml"
+  name: "K1"
+  base_name: "Trunk"
+  foot_names: ["left_foot_link", "right_foot_link"]
+  disable_gravity: false
+  default_dof_drive_mode: 3 # see GymDofDriveModeFlags (0 is none, 1 is pos tgt, 2 is vel tgt, 3 effort)
+  collapse_fixed_joints: true # bug: if collapse_fixed_joints = false, foot doesn't collide with ground
+  fix_base_link: false # fix the base of the robot
+  self_collisions: 0 # 1 to disable, 0 to enable...bitwise filter
+  replace_cylinder_with_capsule: false # replace collision cylinders with capsules, leads to faster/more stable simulation
+  flip_visual_attachments: false # Some .obj meshes must be flipped from y-up to z-up
+  density: 0.001
+  angular_damping: 0.
+  linear_damping: 0.
+  max_angular_velocity: 1000.
+  max_linear_velocity: 1000.
+  armature: 0.
+  thickness: 0.01
+  feet_edge_pos: [[ 0.11,  0.04, -0.02],
+                  [ 0.11, -0.04, -0.02],
+                  [-0.07,  0.04, -0.02],
+                  [-0.07, -0.04, -0.02]] # x,y,z [m]
+
+ball:
+  file: "resources/T1/ball.urdf"
+  name: "ball"
+  radius: 0.075 # Must match resources/T1/ball.urdf
+  init_pos: [0.3, 0.0, 0.075]  # Initial position of the ball
+  init_rot: [0.0, 0.0, 0.0, 1.0]  # Initial rotation (quaternion)
+  init_lin_vel: [0.0, 0.0, 0.0]  # Initial linear velocity
+  init_ang_vel: [0.0, 0.0, 0.0]  # Initial angular velocity
+  restitution: 0.0  # Bounciness
+  friction: 1  # Friction coefficient
+  rolling_friction: 1  # Rolling friction coefficient
+  contact_offset: 0.005
+  density: 0.001
+  thickness: 0.01
+
+init_state:
+  # Fallback height when contact_aware_spawn is disabled.
+  pos: [0.0, 0.0, 0.545] # x,y,z [m]
+  rot: [0.0, 0.0, 0.0, 1.0] # x,y,z,w [quat]
+  lin_vel: [0.0, 0.0, 0.0]  # x,y,z [m/s]
+  ang_vel: [0.0, 0.0, 0.0]  # x,y,z [rad/s]
+  ball_pos: [0.5, 0.0, 0.075]  # x,y,z [m]
+  # Match booster_k1_locomotion's deployed IsaacLab walking policy so both
+  # episode initialization and zero-action targets are handoff-compatible.
+  default_joint_angles: {"Hip_Pitch": -0.26, "Knee_Pitch": 0.52, "Ankle_Pitch": -0.26, "default": 0.}
+
+control:
+  # Match the deployed policy_180843_19999 walking controller so switching
+  # policies does not also introduce a PD-gain transition.
+  stiffness: {"Hip": 200., "Knee": 200., "Ankle": 50., "Default": 10} # [N*m/rad]
+  damping: {"Hip": 5., "Knee": 5., "Ankle": 1.5, "Default": 1} # [N*m*s/rad]
+  armature: {"Hip_Pitch": 0.0478125, "Hip_Roll": 0.0339552, "Hip_Yaw": 0.0282528, "Knee": 0.095625, "Ankle": 0.0565056} # from IsaacLab K1 config
+  effort_limit: {"Hip_Pitch": 30., "Hip_Roll": 35., "Hip_Yaw": 20., "Knee": 40., "Ankle": 20.} # [N*m] - from IsaacLab K1 config
+  velocity_limit: {"Hip_Pitch": 8., "Hip_Roll": 12.9, "Hip_Yaw": 18., "Knee": 12.5, "Ankle": 18.} # [rad/s] - from IsaacLab K1 config
+  action_scale: 1.
+  decimation: 10
+
+terrain:
+  type: "plane" # "plane" or "trimesh"
+  static_friction: 1.0  # [-]
+  dynamic_friction: 1.0  # [-]
+  restitution: 0.        # [-]
+  # trimesh only:
+  terrain_length: 10.
+  terrain_width: 10.
+  border_size: 5.
+  num_terrains: 8
+  terrain_proportions: [0.0, 0.0, 0.5, 0.5] # terrain types: [plane, slope, random, discrete]
+  slope: 0.1
+  random_height: 0.1
+  discrete_height: 0.02
+  horizontal_scale: 0.1
+  vertical_scale: 0.005
+  slope_threshold: 2.0
+
+commands:
+  num_commands: 3 # lin_vel_x, lin_vel_y, ang_vel_yaw
+  still_proportion: 1.0
+  resampling_time_s: [2.0, 4.0]
+  lin_vel_x: [0.0, 0.0]
+  lin_vel_y: [0.0, 0.0]
+  ang_vel_yaw: [0.0, 0.0]
+  gait_frequency: [0.0, 0.0]
+  target_yaw: [-1.04, 1.04]
+  # Parent task requires a target point, but DirectKicking observes and
+  # rewards only its unit direction; this distance does not affect learning.
+  target_distance: [3.0, 5.0]
+  lin_vel_x_resolution: 0.2 # [m/s]
+  lin_vel_y_resolution: 0.1 # [m/s]
+  ang_vel_resolution: 0.2 # [rad/s]
+  episode_length_toler: 0.1
+  lin_vel_x_toler: 0.4 # [m/s]
+  lin_vel_y_toler: 0.2 # [m/s]
+  ang_vel_yaw_toler: 0.2 # [rad/s]
+  # KickingK1 allocates these buffers even though curriculum is disabled.
+  curriculum: false
+  update_rate: 0.1
+  lin_vel_levels: 10
+  ang_vel_levels: 10
+
+direct_kicking:
+  contact_aware_spawn:
+    enabled: true
+    ground_clearance_m: 0.003
+    # Conservative lower corners of the K1 foot collision meshes.
+    foot_contact_points:
+      [[ 0.119493,  0.041048, -0.038234],
+       [ 0.119493, -0.041048, -0.038234],
+       [-0.065899,  0.041048, -0.038234],
+       [-0.065899, -0.041048, -0.038234]]
+
+  walking_policy_initial_state:
+    enabled: true
+    # Always initialize from the deployed walking policy's nominal leg pose.
+    probability: 1.0
+    pose_blend_range: [1.0, 1.0]
+    joint_angles: {"Hip_Pitch": -0.26, "Knee_Pitch": 0.52,
+                   "Ankle_Pitch": -0.26, "default": 0.}
+
+  mirror_consistency:
+    enabled: true
+    # J_left/right is the minimum forecast distance to these mirrored ball
+    # strike points. x approximates toe extent + ball radius; abs(y) follows
+    # the K1 hip/foot lateral offset. body_approach_ball uses the same points
+    # as its target body-relative ball positions.
+    nominal_strike_point_m: [0.185, 0.096]
+    # Leave nearly equal-cost (central/ambiguous) states unconstrained and
+    # smoothly reach full weight as one foot becomes clearly more feasible.
+    ambiguity_cost_gap_m: [0.02, 0.10]
+
+  ego_motion_noise:
+    # Additional episode bias and slowly varying random walk for odometry/IMU.
+    velocity_bias_std_mps: 0.03
+    velocity_drift_std_mps_per_sqrt_s: 0.01
+    yaw_rate_bias_std_rps: 0.05
+    yaw_rate_drift_std_rps_per_sqrt_s: 0.02
+    position_noise_std_m: 0.000
+    position_bias_std_m: 0.00
+    yaw_noise_std_rad: 0.000
+    yaw_bias_std_rad: 0.00
+
+  observation:
+    # Per-horizon token: [relative_x, relative_y, log_std_x, log_std_y,
+    #                     rho_xy, normalized_horizon].
+    prediction_horizons_s: [0.0, 0.05, 0.10, 0.15, 0.20, 0.30, 0.50,
+                            0.75, 1.00, 1.50, 2.00, 2.50, 3.00]
+    # Stateless LSTMs encode only the future-horizon axis on each policy call.
+    lstm_hidden_size: 64
+    lstm_num_layers: 1
+    std_reference_m: 0.01
+    log_std_clip: [-4.0, 4.0]
+    measurement_age_normalizer_s: 0.5
+
+  outcome:
+    # Reward the resulting ball direction once at the first physical kick, then
+    # keep the episode briefly for observation before terminating it. Distance
+    # is ignored; kick-induced velocity change supplies a saturating scale.
+    post_kick_termination_s: 2.0
+    max_kick_direction_reward: 10.0
+    direction_reward_sharpness: 4.0
+    # Smoothly scale the one-shot direction reward by the kick-induced XY
+    # velocity change. The scale is 0.5 at the configured center.
+    velocity_change_reward_center_mps: 0.5
+    velocity_change_reward_sharpness: 10.0
+    # After the first physical kick, smoothly reward returning to the deployed
+    # walking policy pose. At this RMS joint error the reward is exp(-1).
+    walking_pose_reward_error_scale_rad: 0.25
+    # A kick attempt is a large, fast single-support forward swing while the
+    # base remains nearly stationary. Wait briefly for the physical kick gate
+    # before treating it as a failed attempt.
+    kick_attempt_minimum_forward_position_m: 0.12
+    kick_attempt_minimum_forward_speed_mps: 1.0
+    kick_attempt_maximum_base_speed_mps: 0.35
+    kick_attempt_outcome_window_s: 0.30
+
+  filter:
+    # Values use SI units. Q/R are randomized per environment and episode.
+    process_acceleration_std_mps2: 0.8
+    initial_velocity_std_mps: 0.5
+    process_noise_scale_range: [0.8, 1.2]
+    measurement_noise_scale_range: [0.8, 1.2]
+    nis_threshold: 13.82
+    max_missing_time_s: 0.5
+
+  perception_randomization:
+    # Baseline position-noise standard deviation at and below the reference
+    # distance. Above it, standard deviation grows linearly up to max_scale.
+    measurement_noise_std_range_m: [0.005, 0.015]
+    measurement_noise_reference_distance_m: 1.0
+    measurement_noise_max_scale: 8.0
+    camera_fps_range: [25.0, 30.0]
+    camera_fps_jitter: 0.15
+    # A fixed lag is sampled per environment/episode to preserve KF covariance consistency.
+    latency_range_s: [0.0, 0.06]
+    dropout_burst_probability: 0.05
+    dropout_burst_frames: [1, 3]
+    outlier_probability: 0.02
+    outlier_distance_range_m: [0.10, 0.30]
+
+  ball_motion_randomization:
+    # Shared initial XY speed range for incoming and outgoing balls.
+    speed_range_mps: [0.0, 1.0]
+    incoming_probability: 0.5
+    incoming_spawn_distance_range_m: [1.5, 3.0]
+    # Outgoing balls use the same spawn area as incoming balls.
+    outgoing_spawn_distance_range_m: [1.5, 3.0]
+    closest_approach_offset_range_m: [-0.25, 0.25]
+    # Keep spawns in the central +/-50 degrees of the +/-100 degree vision field.
+    spawn_bearing_range_rad: [-0.87266463, 0.87266463]
+    kick_detection_warmup_s: 0.1
+
+  physics_randomization:
+    enabled: true
+    # Plane friction is sampled once per run; ball friction is sampled per environment.
+    # Ball restitution is resampled whenever the ball is reset.
+    ground_friction_scale_range: [0.3, 0.9]
+    # Preserve the low-friction side and extend only toward harder-to-roll balls.
+    ball_friction_scale_range: [0.9, 1.3]
+    ball_rolling_friction_scale_range: [0.85, 1.4]
+    # Match the sim-to-sim/sim-to-real range used by Walk-loop-shoot.
+    ball_restitution_range: [0.0, 0.7]
+
+normalization:
+  gravity: 1.0
+  lin_vel: 1.0
+  ang_vel: 1.0
+  dof_pos: 1.0
+  dof_vel: 0.1
+  filter_weight: 0.1
+  push_force: 0.1
+  push_torque: 0.5
+  clip_actions: 1.
+  ball_pos: 1.0
+  ball_vel: 1.0
+  uncertainty_log_std: 0.25
+
+vision:
+  enabled: true
+  fov_yaw: 3.49065850 # 200-degree total horizontal field of view [rad]
+  min_distance: 0.05
+  max_distance: 6.0
+
+noise:
+  gravity:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  lin_vel:
+    range: [0., 0.10]
+    operation: "additive"
+    distribution: "gaussian"
+  ang_vel:
+    range: [0., 0.15]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_pos:
+    range: [0., 0.01]
+    operation: "additive"
+    distribution: "gaussian"
+  dof_vel:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+
+  height:
+    range: [0., 0.02]
+    operation: "additive"
+    distribution: "gaussian"
+  ball_pos:
+    range: [0., 0.]
+    operation: "additive"
+    distribution: "gaussian"
+
+randomization:
+  # Fixed per environment and episode. Applied at the 2 ms physics-step level.
+  action_delay_range_s: [0.002, 0.05]
+
+  init_dof_pos:
+    range: [0., 0.03]
+    operation: "additive"
+    distribution: "gaussian"
+  init_dof_vel:
+    range: [0., 0.15]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_pos_xy:
+    range: [-1., 1.]
+    operation: "additive"
+    distribution: "uniform"
+  init_base_lin_vel_xy:
+    range: [0., 0.1]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_ang_vel:
+    range: [0., 0.15]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_roll_pitch:
+    range: [0., 0.04]
+    operation: "additive"
+    distribution: "gaussian"
+  init_base_ang:
+    range: [-0.1, 0.1]
+    operation: "additive"
+    distribution: "uniform"
+
+  # Instantaneous world-frame XY velocity disturbance. Each environment
+  # independently resamples both its interval and per-axis velocity delta.
+  velocity_push_interval_s: [4.0, 7.0]
+  velocity_push_xy:
+    range: [-0.3, 0.3]
+    operation: "additive"
+    distribution: "uniform"
+
+  # Continuous local-frame force/torque disturbance. The next interval is
+  # independently resampled for each environment after every push.
+  push_interval_s: [3.0, 5.0]
+  push_duration_s: 0.2
+  push_force:
+    range: [0., 5.]
+    operation: "additive"
+    distribution: "gaussian"
+  push_torque:
+    range: [0., 0.5]
+    operation: "additive"
+    distribution: "gaussian"
+
+  dof_stiffness:
+    # Match the startup gain randomization used by IsaacLab K1 Kick.
+    range: [0.8, 1.2]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_damping:
+    range: [0.8, 1.2]
+    operation: "scaling"
+    distribution: "uniform"
+  dof_friction:
+    range: [0.0, 2.0]
+    operation: "additive"
+    distribution: "uniform"
+
+  friction:
+    range: [0.9, 1.1]
+    operation: "additive"
+    distribution: "uniform"
+  compliance:
+    range: [0.5, 1.5]
+    operation: "additive"
+    distribution: "uniform"
+  restitution:
+    range: [0.1, 0.9]
+    operation: "additive"
+    distribution: "uniform"
+
+  base_com:
+    range: [-0.1, 0.1]
+    operation: "additive"
+    distribution: "uniform"
+  base_mass:
+    range: [0.8, 1.2]
+    operation: "scaling"
+    distribution: "uniform"
+  other_com:
+    range: [-0.005, 0.005]
+    operation: "additive"
+    distribution: "uniform"
+  other_mass:
+    range: [0.98, 1.02]
+    operation: "scaling"
+    distribution: "uniform"
+
+rewards:
+  scales:
+    survival: 0.3
+    fall: -1000. # one-shot effective penalty is -20 at dt=0.02 s
+    # DirectKicking has zero velocity commands; do not reward maintaining
+    # zero linear/angular velocity while approaching the ball.
+    tracking_lin_vel_x: 0
+    tracking_lin_vel_y: 0
+    tracking_ang_vel: 0
+    base_height: -200.
+    orientation: -20
+    torques: -2.e-4
+    ankle_torques: -1.e-3
+    torque_tiredness: -1.e-2
+    power: -2.e-3
+    lin_vel_z: -2.0
+    ang_vel_xy: -0.1
+    dof_vel: -0.05
+    dof_acc: -1.e-7
+    root_acc: -1.e-4
+    action_rate: -1.5
+    # Match IsaacLab Flat's action_smoothness_l2 second-difference coefficient.
+    action_second_difference: -0.80
+    dof_pos_limits: -1
+    feet_slip: -1
+    feet_airborne: -4.5 # discourage jumping before a valid kick
+    edge_only_support: -4.0 # strongly reject persistent loaded heel-only/toe-only support
+    feet_yaw_diff: -1.
+    feet_yaw_mean: -3.
+    feet_roll: -3.
+    swing_feet_pitch: -1. # weakly keep feet ahead of the CoM near-level during approach
+    feet_distance: -1.
+    parallel_step: -2.0 # discourage lateral/cross-over motion while stepping forward
+    ball_velocity_target_direction: 0 # one-shot direction/sigmoid reward replaces it
+    body_approach_ball: 15
+    kicking_foot_approach_ball_stationary: 5
+    body_heading_to_ball: -1.0 # discourage approaching while facing sideways/backward
+    body_alignment_for_kick: 1
+    body_angle: 0.1
+    ball_acceleration: 0 # do not mix kick power into the direction objective
+    kicking_foot_height: -2.0
+    failed_kick_attempt: -10.0 # one-shot effective penalty is -0.2 at dt=0.02 s
+    post_kick_walking_pose: 1.0
+    waiting: -0.5
+
+  episode_length_s: 17.0
+  terminate_height: 0.45
+  terminate_vel: 50.
+  terminate_contacts_on: []
+  penalize_contacts_on: ["Trunk", "H1", "H2", "AL", "AR", "Waist", "Hip", "Shank", "Ankle"]
+  only_positive_rewards: false # if true negative total rewards are clipped at zero (avoids early termination problems)
+  tracking_sigma: 0.25 # tracking reward = exp(-error^2/sigma)
+  base_height_target: 0.54
+  soft_dof_pos_limit: 1. # percentage of urdf limits, values above this limit are penalized
+  soft_dof_vel_limit: 1.
+  soft_torque_limit: 1.
+  swing_period: 0.2
+  feet_distance_ref: 0.192
+  feet_distance_ref_x: 0.05
+  feet_distance_ref_y: 0
+  swing_feet_pitch_deadband_rad: 0.17453293 # 10 deg; allow natural foot rotation
+  edge_only_support_grace_s: 0.08 # allow brief natural heel strike and toe-off
+  edge_only_support_load_fraction: 0.10 # ignore an edge that carries less than 10% body weight
+  edge_only_support_contact_clearance_m: 0.01 # match the existing foot-contact proxy
+  # Allow small balance corrections, then normalize excess swing-foot lateral
+  # velocity so 0.30 m/s produces a raw parallel_step penalty of 1.0.
+  parallel_step_lateral_velocity_tolerance_mps: 0.05
+  parallel_step_lateral_velocity_scale_mps: 0.25
+  min_ball_vel_s: 2
+  max_ball_vel_x: 3
+  
+  # Legacy parent reward parameters. The speed/distance rewards are inactive in
+  # DirectKicking's direction-primary objective.
+  ball_target_position: [5.0, 0.0] # legacy target position; current target is sampled from commands.target_distance
+  ball_travel_distance_sigma: 0.5 # Sigma for matching traveled distance to sampled target distance
+  max_ball_travel_distance_reward: 1.0 # Max reward for matching target kick distance
+  max_ball_vel_target_reward: 10.0      # Max reward for ball velocity toward target
+  ball_vel_target_direction_sigma: 1.0 # Sigma for ball velocity toward target reward
+  ball_velocity_decay_time: 0.1 # Time constant in seconds for ball velocity decay
+
+  kicking_foot_height_limit: 0.18      # [m] maximum height for either potential kicking foot before contact
+  kicking_foot_height_excess_scale: 0.10 # [m] normalizes height above the limit before squaring
+  use_valid_kick_gating: true          # Keep kick penalties active until a valid kick is detected
+  kick_detection_foot_distance_threshold: 0.23 # [m] contact-like foot-to-ball distance at detection
+  kick_detection_min_foot_speed_towards_ball: 0.2 # [m/s] require either foot to drive the kick
+  # kick_velocity_threshold: 0.2         # Min change in ball speed (m/s) to be a kick event
+  # foot_kick_proximity_sigma: 0.1       # Sigma for proximity reward in foot_ball_proximity_and_kick_timing
+  # max_kick_timing_reward: 2.0          # Max reward for foot_ball_proximity_and_kick_timing
+
+  # Parameters for foot/body approach progress rewards
+  ball_stationary_speed_threshold: 0.1 # Max ball speed (m/s) to be considered stationary
+  kicking_foot_approach_mode: "progress" # Reward closing distance, not remaining beside the ball
+  kicking_foot_approach_distance_scale: 0.05 # [m] normalizes signed foot-to-ball distance progress
+  body_approach_distance_scale: 0.05 # [m] normalizes progress toward either nominal mirrored strike position
+
+  kick_target_pos_world: [5.0, 0.0, 0.075] # Target position for body alignment (world frame, z should be ball radius)
+  alignment_to_ball_sigma: 0.5         # Sigma for robot-to-ball alignment
+  alignment_to_target_sigma: 0.5       # Sigma for robot-to-target alignment
+  max_alignment_reward: 1.0            # Max reward for body_alignment_for_kick
+  
+  # Parameters for "ball comes to rest after kick" reset condition
+  kick_detection_velocity_change_threshold: 0.5 # [m/s] physical kick event gate, independent of target direction
+  ball_rest_speed_threshold_after_kick: 0.02   # Max ball speed (m/s) to be considered at rest after a kick
+  min_steps_travel_after_kick: 10              # Min sim steps ball must travel after kick before rest check applies
+
+  # Parameters for "ball is still for too long" reset condition
+  max_ball_still_time_s: 2
+
+  # Parameters for "ball is moving for too long" reset condition
+  max_ball_moving_time_s: 5
+
+  # Parameters for ball acceleration reward
+  ball_acceleration_scale: 80.0        # Scaling factor for acceleration towards target
+  max_ball_acceleration_reward: 80.0    # Maximum reward for ball acceleration towards target

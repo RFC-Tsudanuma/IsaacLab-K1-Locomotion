@@ -1,0 +1,49 @@
+{
+  "source_revision": "3af2acc97f1081b4cbfd9556efd39408dea92cc6",
+  "vision_revision": "32ece6ee0676b1008d5bc58c3533d45613440568",
+  "vision_sources": {
+    "src/ros2_ws/src/vision_filter/src/ball_prediction/cvkf.cpp": "53227ec7f9834b86860a2fd2f7e36a84183712221815c94ce947dfee3ef20eeb",
+    "src/ros2_ws/src/vision_filter/src/ball_prediction/select_best_prediction.cpp": "5a30a7e5bcabaf243f000a869591da0fd34e1baa909753a300c4dc6591d1334a",
+    "src/ros2_ws/src/vision_filter/src/vision_filter_node.cpp": "060ba978d6d3df9e326d1b2c54b237ac50eba5497922a190791e62cea3fd08a5",
+    "src/ros2_ws/src/vision_filter/config/vision_filter.yaml": "dc906d9f541b3c43b67bcacf8c65339b3795bb2b8dce6c2a7f3a52fb21269691",
+    "src/ros2_ws/src/vision_filter_interface/msg/FilteredBallState.msg": "b429e43a65e28fbf642e95c8080b76d039e7a0a9759822402f0d42ed80939630",
+    "src/ros2_ws/src/strategy/config/strategy_shared_config.yaml": "abd521d4bc05a61375dabcb4a87320337230d493416de0109957c8d5f790b5b3"
+  },
+  "runtime_assets": {
+    "assets/K1/K1_locomotion.urdf": "6ef4f429542076622e220307f5d04d34b9ee376a046f6ace570e518dd177deb9",
+    "assets/K1/meshes/Head_1.STL": "9ab00ca2c2ae9b27cdd54cdbbe7d9e50b1873f5815163aef5d719beceb445c96",
+    "assets/K1/meshes/Head_2.STL": "ae8f81b864fd0f16efaab6b0ee697a0fd80e54c2bd38f48526a326bc03085020",
+    "assets/K1/meshes/K1logo.STL": "93aab425a2e953fdd1c704ce9d9a4fb8d8431da9cc0cc4d2648838b11c47b487",
+    "assets/K1/meshes/Left_Ankle_Cross.STL": "1798cb3b9721d82c913ce4b0080da9c0eaa69749445bc4a8d6f13dc6a69da232",
+    "assets/K1/meshes/Left_Arm_1.STL": "e1a6de4b34f17260daa09b81aa3bc115d450787b808190aca286073b45540775",
+    "assets/K1/meshes/Left_Arm_2.STL": "b5861bc9f6119baf50f131bbc4f6420867e63c7c1de31792d1e788cac70ad8ae",
+    "assets/K1/meshes/Left_Arm_3.STL": "5424bdfedad4e70edc2dab6587bf0062c44489768c6e53ba4c2e58d700267f78",
+    "assets/K1/meshes/Left_Arm_4.STL": "e7de1dc79b85b23792eaf8d49688891876f46b4eab7234f2513ae9e241a72b14",
+    "assets/K1/meshes/Left_Foot.STL": "1a391f4b3b87a27726e09f15f6d2ce7795c702c13c0d76307d4756d8aeaadde3",
+    "assets/K1/meshes/Left_Hip_Pitch.STL": "ca604e643aaf41ec4d05c8a13ff66ce39587f9d80be7268376c2a6368decd55f",
+    "assets/K1/meshes/Left_Hip_Roll.STL": "aa278205ca751295c3d073ca3ddf682762a66218e6e5f239a22109b1d8f5ecf9",
+    "assets/K1/meshes/Left_Hip_Yaw.STL": "2d8ed37c3a7c954937d5e3b462869f93292e4c4b76047fd4667380fedd3d66d2",
+    "assets/K1/meshes/Left_Shank.STL": "0e99f5850ba752492a7d5fa0fb066efae03823cb4020e7e57a38e652a34be85c",
+    "assets/K1/meshes/Right_Ankle_Cross.STL": "fd59798e9b4b55661372b601db3dbec9ef5567256b631c3d679a2e3446638256",
+    "assets/K1/meshes/Right_Arm_1.STL": "1dc1518437d0b2de09d7c559d13f620ee4910b985ca0b70cb387f29fad67a7d6",
+    "assets/K1/meshes/Right_Arm_2.STL": "2f7f4bf14aac5fdb06974c2336be24b5f5577b069a6e0a36e98a443779bb15cc",
+    "assets/K1/meshes/Right_Arm_3.STL": "e3ae9cbd20736f4c3b29b2a455b07d8a59e6c093258d467fc20ecd4dc4b7486d",
+    "assets/K1/meshes/Right_Arm_4.STL": "4a70e0006cc89bfeacb9b825821cdf715113b9cf7d267de6fe4b64ad3e5b9aad",
+    "assets/K1/meshes/Right_Foot.STL": "059b969922a9a31eb40828206070731d3612453f3aa3c2559702c566abb4b0fd",
+    "assets/K1/meshes/Right_Hip_Pitch.STL": "ab6052ca8f6a2ddf75ad536e3daf51024cbd8f6b9fa5ca36a8ac966347d850ac",
+    "assets/K1/meshes/Right_Hip_Roll.STL": "9655e49b0ae12366eb8dba28dcc9593d63d6ec7a8431d90dc692041c8bb74765",
+    "assets/K1/meshes/Right_Hip_Yaw.STL": "dd54f3cd1cdbaead210692a4cd4e131a1b696ceefd9715ab1eb6a8e9f44d88aa",
+    "assets/K1/meshes/Right_Shank.STL": "6a7e831055148894ba623bf8d2eca27f2cef32e324819566c39e33cb12c0b4f9",
+    "assets/K1/meshes/Trunk.STL": "6c2fc1adb1d3d23c081b6cebab1a4d1da57adbd726d6e72c143281ba696ddd5d",
+    "assets/ball.urdf": "336c609bdfeec4003971ed5f3944dd523b1d5ac4835942d361a68c1e5737c522"
+  },
+  "original_config_sha256": "b80812d5ab2fdc72552ca52e660bc4a77b96fb3e71fc8696475908dddbd1717f",
+  "mesh_reuse": {
+    "mode": "relative_symlink",
+    "link": "source/isaaclab_k1_locomotion/isaaclab_k1_locomotion/direct_kick/assets/K1/meshes",
+    "target": "../../../../../../assets_soccer/booster_robotics_robots/K1/meshes",
+    "source": "assets_soccer/booster_robotics_robots/K1/meshes",
+    "referenced_meshes": 24,
+    "all_equal_to_source_revision": true
+  }
+}

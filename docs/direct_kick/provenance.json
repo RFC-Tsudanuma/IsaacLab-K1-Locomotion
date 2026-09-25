@@ -1,0 +1,276 @@
+{
+  "source_repository": "/home/akage/futbol_local/rl_humanoid_htwk",
+  "source_branch": "direct_kick/safety",
+  "source_commit": "3af2acc97f1081b4cbfd9556efd39408dea92cc6",
+  "scope": "Specification and configuration snapshot only; no IsaacLab task implementation.",
+  "files": [
+    {
+      "path": "envs/K1/direct_kicking.py",
+      "sha256": "6f7868d06169ed39fce947577e92999058cd6e1ba887a318709b8d90ce10a87f",
+      "bytes": 96630
+    },
+    {
+      "path": "envs/K1/kicking_k1.py",
+      "sha256": "07cfe6ebd680a9352ba2e24074c12a707696aa639ffe09c3b833fe4e93efe4b9",
+      "bytes": 90194
+    },
+    {
+      "path": "envs/base_task.py",
+      "sha256": "fbda6334e5d381ade6412c80e3ff68c2e8b2f0cb31b39311b31a15e1348f5faf",
+      "bytes": 6782
+    },
+    {
+      "path": "train_direct_kicking_k1.sh",
+      "sha256": "edfc0fa2cc6fdfbc7b777293ae4d166637154340bff08101a0558d0accae567c",
+      "bytes": 1473
+    },
+    {
+      "path": "train.py",
+      "sha256": "f2d7abec29129f015e335ebf2cf629fb0f6536cea77eac83d48ff167a38ecd41",
+      "bytes": 334
+    },
+    {
+      "path": "utils/action_delay.py",
+      "sha256": "48d11acc0c07b74058233ecbe6accc24f7b4957185cdbdc9d09c6233033374e9",
+      "bytes": 2930
+    },
+    {
+      "path": "utils/action_smoothness.py",
+      "sha256": "ed97d15d7dd81dd48c63b74389ee9f2792e794dee6d91e94ee512fb692478436",
+      "bytes": 761
+    },
+    {
+      "path": "utils/ball_kalman_filter.py",
+      "sha256": "20bc976f22e146e302c2833b06ecb8f71fc0bb33eb0c8a272f099b9bf03cce60",
+      "bytes": 15863
+    },
+    {
+      "path": "utils/ball_trajectory.py",
+      "sha256": "271adc71d032a642a4c7f9fb0666347363c0066e68ecf3f6a27021753ca8a324",
+      "bytes": 1386
+    },
+    {
+      "path": "utils/ball_visibility.py",
+      "sha256": "35eb7b78de11a88da23faacb3c7ded9052f529f71950682a74d3833a0481677e",
+      "bytes": 458
+    },
+    {
+      "path": "utils/direct_kicking_observation.py",
+      "sha256": "673aed70ac9553c47fa3adfacbb9df005b0fe86c94fe027623b0a6ac44dadd2f",
+      "bytes": 3090
+    },
+    {
+      "path": "utils/direct_kicking_outcome.py",
+      "sha256": "300b3ea91997b389eda12b899fdd63c25fa68d93ac2e6ac43bd6f05e05e089c0",
+      "bytes": 8408
+    },
+    {
+      "path": "utils/direct_kicking_symmetry.py",
+      "sha256": "1c45f7cbae2c6909def8b14547faa1434b030240d97761ec92f8ddac5b1e7ae2",
+      "bytes": 7472
+    },
+    {
+      "path": "utils/disturbance_schedule.py",
+      "sha256": "7dff3f2415c43cc897542cb0323759c03b8022be10515e351952bfe6f16eb5d9",
+      "bytes": 1041
+    },
+    {
+      "path": "utils/ego_motion.py",
+      "sha256": "6f8a7ac3d5b6bd77ee0db0cba55b4a1b9b8823ee63b424c6ceb26de8605fda78",
+      "bytes": 6330
+    },
+    {
+      "path": "utils/k1_foot_kinematics.py",
+      "sha256": "f7b47d21057f357f059097fe7045c60d1a7673583314ab58578602651e2759f9",
+      "bytes": 3812
+    },
+    {
+      "path": "utils/kick_foot_symmetry.py",
+      "sha256": "8945b4fac9f88e720c6e61d82753ad1cef873c992cf2b69a34bc520eb023c350",
+      "bytes": 10849
+    },
+    {
+      "path": "utils/post_kick_phase.py",
+      "sha256": "34482e7ddf37f2c60ee094d5dafed40f17d539592463dc2643b4aeaf283bf1d7",
+      "bytes": 2112
+    },
+    {
+      "path": "utils/utils.py",
+      "sha256": "ec5ace1b5c33453036ad618c8b79d8bb01cdb15479b2fdf7b3332f4837058cfb",
+      "bytes": 2005
+    },
+    {
+      "path": "utils/terrain.py",
+      "sha256": "03253fb9e4089cd3f0074b00d9c65cd2319434abb82d0cda4081faacf06feea4",
+      "bytes": 5511
+    },
+    {
+      "path": "utils/runner.py",
+      "sha256": "c89f7895b2a5d158773c2b3cb388af9780dc07146138c08571e12005131bed11",
+      "bytes": 82678
+    },
+    {
+      "path": "utils/buffer.py",
+      "sha256": "826ac3beb93b3c445b5e1c5f57d79f16354fd1ed53acdbd2cbc40fbe61f0046c",
+      "bytes": 701
+    },
+    {
+      "path": "utils/model_factory.py",
+      "sha256": "0a36b2373588d3d7d321145eb283fb5803458457af4cfdd0b4eb17685c8f8c91",
+      "bytes": 3350
+    },
+    {
+      "path": "utils/models/DirectKickingAC.py",
+      "sha256": "af36e28cbc19a464ea5371bdac1eb75fd77dad1486cb1b2dbcaba2f90e93546a",
+      "bytes": 16405
+    },
+    {
+      "path": "utils/models/BaseAC.py",
+      "sha256": "427ea98f94a7daa65d7dde60a8b792ac5ddb4e86d9ed73b426b2bb8800c316f0",
+      "bytes": 1268
+    },
+    {
+      "path": "envs/K1/DirectKicking.yaml",
+      "sha256": "b80812d5ab2fdc72552ca52e660bc4a77b96fb3e71fc8696475908dddbd1717f",
+      "bytes": 21171,
+      "copied_to": "source/DirectKicking.yaml"
+    },
+    {
+      "path": "resources/K1/K1_locomotion.urdf",
+      "sha256": "6ef4f429542076622e220307f5d04d34b9ee376a046f6ace570e518dd177deb9",
+      "bytes": 27978,
+      "copied_to": "source/K1_locomotion.urdf"
+    },
+    {
+      "path": "resources/T1/ball.urdf",
+      "sha256": "336c609bdfeec4003971ed5f3944dd523b1d5ac4835942d361a68c1e5737c522",
+      "bytes": 501,
+      "copied_to": "source/ball.urdf"
+    },
+    {
+      "path": "resources/K1/meshes/Head_1.STL",
+      "sha256": "9ab00ca2c2ae9b27cdd54cdbbe7d9e50b1873f5815163aef5d719beceb445c96",
+      "bytes": 509184
+    },
+    {
+      "path": "resources/K1/meshes/Head_2.STL",
+      "sha256": "ae8f81b864fd0f16efaab6b0ee697a0fd80e54c2bd38f48526a326bc03085020",
+      "bytes": 1502334
+    },
+    {
+      "path": "resources/K1/meshes/K1logo.STL",
+      "sha256": "93aab425a2e953fdd1c704ce9d9a4fb8d8431da9cc0cc4d2648838b11c47b487",
+      "bytes": 150584
+    },
+    {
+      "path": "resources/K1/meshes/Left_Ankle_Cross.STL",
+      "sha256": "1798cb3b9721d82c913ce4b0080da9c0eaa69749445bc4a8d6f13dc6a69da232",
+      "bytes": 105984
+    },
+    {
+      "path": "resources/K1/meshes/Left_Arm_1.STL",
+      "sha256": "e1a6de4b34f17260daa09b81aa3bc115d450787b808190aca286073b45540775",
+      "bytes": 142584
+    },
+    {
+      "path": "resources/K1/meshes/Left_Arm_2.STL",
+      "sha256": "b5861bc9f6119baf50f131bbc4f6420867e63c7c1de31792d1e788cac70ad8ae",
+      "bytes": 1258184
+    },
+    {
+      "path": "resources/K1/meshes/Left_Arm_3.STL",
+      "sha256": "5424bdfedad4e70edc2dab6587bf0062c44489768c6e53ba4c2e58d700267f78",
+      "bytes": 147484
+    },
+    {
+      "path": "resources/K1/meshes/Left_Arm_4.STL",
+      "sha256": "e7de1dc79b85b23792eaf8d49688891876f46b4eab7234f2513ae9e241a72b14",
+      "bytes": 117584
+    },
+    {
+      "path": "resources/K1/meshes/Left_Foot.STL",
+      "sha256": "1a391f4b3b87a27726e09f15f6d2ce7795c702c13c0d76307d4756d8aeaadde3",
+      "bytes": 2244834
+    },
+    {
+      "path": "resources/K1/meshes/Left_Hip_Pitch.STL",
+      "sha256": "ca604e643aaf41ec4d05c8a13ff66ce39587f9d80be7268376c2a6368decd55f",
+      "bytes": 132784
+    },
+    {
+      "path": "resources/K1/meshes/Left_Hip_Roll.STL",
+      "sha256": "aa278205ca751295c3d073ca3ddf682762a66218e6e5f239a22109b1d8f5ecf9",
+      "bytes": 37584
+    },
+    {
+      "path": "resources/K1/meshes/Left_Hip_Yaw.STL",
+      "sha256": "2d8ed37c3a7c954937d5e3b462869f93292e4c4b76047fd4667380fedd3d66d2",
+      "bytes": 211384
+    },
+    {
+      "path": "resources/K1/meshes/Left_Shank.STL",
+      "sha256": "0e99f5850ba752492a7d5fa0fb066efae03823cb4020e7e57a38e652a34be85c",
+      "bytes": 314184
+    },
+    {
+      "path": "resources/K1/meshes/Right_Ankle_Cross.STL",
+      "sha256": "fd59798e9b4b55661372b601db3dbec9ef5567256b631c3d679a2e3446638256",
+      "bytes": 105984
+    },
+    {
+      "path": "resources/K1/meshes/Right_Arm_1.STL",
+      "sha256": "1dc1518437d0b2de09d7c559d13f620ee4910b985ca0b70cb387f29fad67a7d6",
+      "bytes": 142084
+    },
+    {
+      "path": "resources/K1/meshes/Right_Arm_2.STL",
+      "sha256": "2f7f4bf14aac5fdb06974c2336be24b5f5577b069a6e0a36e98a443779bb15cc",
+      "bytes": 1222784
+    },
+    {
+      "path": "resources/K1/meshes/Right_Arm_3.STL",
+      "sha256": "e3ae9cbd20736f4c3b29b2a455b07d8a59e6c093258d467fc20ecd4dc4b7486d",
+      "bytes": 216234
+    },
+    {
+      "path": "resources/K1/meshes/Right_Arm_4.STL",
+      "sha256": "4a70e0006cc89bfeacb9b825821cdf715113b9cf7d267de6fe4b64ad3e5b9aad",
+      "bytes": 117884
+    },
+    {
+      "path": "resources/K1/meshes/Right_Foot.STL",
+      "sha256": "059b969922a9a31eb40828206070731d3612453f3aa3c2559702c566abb4b0fd",
+      "bytes": 2245984
+    },
+    {
+      "path": "resources/K1/meshes/Right_Hip_Pitch.STL",
+      "sha256": "ab6052ca8f6a2ddf75ad536e3daf51024cbd8f6b9fa5ca36a8ac966347d850ac",
+      "bytes": 132784
+    },
+    {
+      "path": "resources/K1/meshes/Right_Hip_Roll.STL",
+      "sha256": "9655e49b0ae12366eb8dba28dcc9593d63d6ec7a8431d90dc692041c8bb74765",
+      "bytes": 37584
+    },
+    {
+      "path": "resources/K1/meshes/Right_Hip_Yaw.STL",
+      "sha256": "dd54f3cd1cdbaead210692a4cd4e131a1b696ceefd9715ab1eb6a8e9f44d88aa",
+      "bytes": 211284
+    },
+    {
+      "path": "resources/K1/meshes/Right_Shank.STL",
+      "sha256": "6a7e831055148894ba623bf8d2eca27f2cef32e324819566c39e33cb12c0b4f9",
+      "bytes": 314284
+    },
+    {
+      "path": "resources/K1/meshes/Trunk.STL",
+      "sha256": "6c2fc1adb1d3d23c081b6cebab1a4d1da57adbd726d6e72c143281ba696ddd5d",
+      "bytes": 356484
+    },
+    {
+      "path": "export_model.py",
+      "sha256": "e214ef228da928c348295f3b62e7a56717c3ddd1473ecc7085bb3b23606dc2ce",
+      "bytes": 2969
+    }
+  ]
+}
