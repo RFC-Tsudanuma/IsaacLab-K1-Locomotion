@@ -1,6 +1,8 @@
 """CPU rollout, checkpoint and export integration using a mutating fake env."""
 
 import copy
+from contextlib import redirect_stdout
+import io
 import csv
 import json
 import math
@@ -31,7 +33,8 @@ class ReusedTensorEnv:
         self.unwrapped = self
         self.num_envs = 2
         self.observations = {"policy": torch.zeros(2, 325), "critic": torch.zeros(2, 20)}
-        self.extras = {"post_kick_phase_target": torch.zeros(2)}
+        self.extras = {"post_kick_phase_target": torch.zeros(2),
+                       "rew_terms": {"approach": torch.zeros(2), "waiting": torch.zeros(2)}}
         self.seen_actions = []
         self.tick = 0
         self.episode_metrics = KickEpisodeMetrics(self.num_envs, "cpu")
@@ -80,6 +83,8 @@ class ReusedTensorEnv:
         self.start_episodes(finished)
         self.extras["post_kick_phase_target"].copy_(torch.tensor(labels))
         rewards = torch.tensor([0.2 * self.tick, -0.1 * self.tick])
+        self.extras["rew_terms"]["approach"].copy_(torch.tensor([0.4, 0.2]) * self.tick)
+        self.extras["rew_terms"]["waiting"].copy_(rewards - self.extras["rew_terms"]["approach"])
         return self.observations, rewards, terminated, truncated, self.extras
 
 
@@ -209,6 +214,38 @@ class RunnerIntegrationTest(unittest.TestCase):
             for parameter, state in expected["state"].items():
                 for key, value in state.items():
                     self.assert_close(actual["state"][parameter][key], value)
+
+    def test_terminal_reports_completed_raw_returns_and_reward_terms(self):
+        runner = Runner(ReusedTensorEnv(), small_config(), self.log_dir, "cpu")
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runner.train(max_iterations=1)
+        rows = dict(line.strip().split(":", 1) for line in output.getvalue().splitlines() if ":" in line)
+        # Done returns are -0.1 (one step) and 0.6 (two steps), before PPO
+        # replaces the timeout reward with a bootstrap value.
+        self.assertEqual(float(rows["Mean reward"]), 0.25)
+        self.assertEqual(float(rows["Mean episode length"]), 1.5)
+        self.assertAlmostEqual(float(rows["Episode_Reward/approach"]), 0.7 / 17.0, places=4)
+        self.assertAlmostEqual(float(rows["Episode_Reward/waiting"]), -0.45 / 17.0, places=4)
+        self.assertEqual(int(rows["Completed episodes"]), 2)
+        self.assertEqual(float(rows["Kick rate"]), 0.5)
+        self.assertEqual(int(rows["Total timesteps"]), 6)
+        self.assertEqual(rows["ETA"].strip(), "00:00:00")
+
+    def test_resumed_eta_uses_only_iterations_in_current_run(self):
+        runner = Runner(ReusedTensorEnv(), small_config(), self.log_dir, "cpu")
+        runner.iteration = 1001
+        metrics = {name: 0.0 for name in ("value_loss", "actor_loss", "bound_loss",
+                   "symmetry_loss", "phase_loss", "entropy", "kl", "learning_rate")}
+        output = io.StringIO()
+        with redirect_stdout(output):
+            runner._print_progress(1100, metrics, runner.env.episode_metrics.summary(),
+                                   collection_time=6.0, learning_time=4.0,
+                                   elapsed_time=10.0, completed_iterations=1)
+        rows = dict(line.strip().split(":", 1) for line in output.getvalue().splitlines() if ":" in line)
+        self.assertEqual(rows["ETA"].strip(), "00:16:30")  # 99 remaining * 10 seconds
+        self.assertNotIn("Mean reward", rows)  # No completed episode is not a zero return.
+        self.assertNotIn("Fall rate", rows)
 
     def test_port_metadata_gate_rejects_missing_and_changed_perception_before_load(self):
         source = Runner(ReusedTensorEnv(), small_config(), self.log_dir / "source", "cpu")

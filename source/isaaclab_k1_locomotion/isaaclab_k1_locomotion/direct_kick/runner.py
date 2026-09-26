@@ -10,6 +10,7 @@ import yaml
 from .learning import DirectKickPPO
 from .model import DirectKickingActorCritic
 from .episode_metrics import episode_metric_scalars, write_episode_metrics
+from .terminal import EpisodeStatistics, format_duration
 
 
 class DirectKickRunner:
@@ -23,6 +24,8 @@ class DirectKickRunner:
         self.ppo = DirectKickPPO(self.model, cfg, self.device)
         self.iteration = 0
         self.total_steps = 0
+        self.terminal_statistics = EpisodeStatistics(
+            env.unwrapped.num_envs, self.device, cfg['rewards']['episode_length_s'])
         self.metadata = {'model': self.model.checkpoint_metadata(), 'migration': cfg['migration']}
         (self.log_dir / 'config.yaml').write_text(yaml.safe_dump(cfg, sort_keys=False))
         (self.log_dir / 'policy_contract.json').write_text(json.dumps(self.metadata, indent=2) + '\n')
@@ -69,10 +72,15 @@ class DirectKickRunner:
                 rollout['rewards'][t] = rewards.to(self.device)
                 rollout['dones'][t] = (terminated | truncated).to(self.device)
                 rollout['time_outs'][t] = truncated.to(self.device)
+                # Snapshot raw environment rewards before PPO timeout bootstrapping.
+                self.terminal_statistics.record(
+                    rollout['rewards'][t], rollout['dones'][t], extras.get('rew_terms', {}))
         return rollout, observations, extras
 
     def train(self, max_iterations):
         observations, extras = self.env.reset()
+        self.terminal_statistics.reset()
+        start_iteration = self.iteration
         wandb_run = None
         if self.cfg['runner']['use_wandb']:
             import wandb
@@ -83,9 +91,12 @@ class DirectKickRunner:
             with csv_path.open('a', newline='') as stream:
                 writer = None
                 while self.iteration < max_iterations:
+                    iteration_start = time.monotonic()
                     rollout, observations, extras = self.collect(observations, extras)
+                    collection_end = time.monotonic()
                     reward = rollout['rewards'].mean().item()
                     metrics = self.ppo.update(rollout, observations['policy'].to(self.device), observations['critic'].to(self.device))
+                    learning_end = time.monotonic()
                     self.iteration += 1
                     self.total_steps += rollout['rewards'].numel()
                     metrics.update(iteration=self.iteration, total_steps=self.total_steps, reward=reward,
@@ -96,13 +107,12 @@ class DirectKickRunner:
                             writer.writeheader()
                     writer.writerow(metrics)
                     stream.flush()
-                    print(f"iteration={self.iteration} reward={reward:.5f} value_loss={metrics['value_loss']:.5f} kl={metrics['kl']:.6f}", flush=True)
                     episode_summary = self.env.unwrapped.episode_metrics.summary(reset=True)
                     write_episode_metrics(self.log_dir / 'episode_metrics.csv', episode_summary, self.iteration)
-                    completed = episode_summary['all']
-                    if completed['episodes']:
-                        print(f"episodes={completed['episodes']} kick_rate={completed['kick_rate']:.3f} "
-                              f"fall_rate={completed['fall_rate']:.3f}", flush=True)
+                    self._print_progress(
+                        max_iterations, metrics, episode_summary,
+                        collection_end - iteration_start, learning_end - collection_end,
+                        time.monotonic() - start, self.iteration - start_iteration)
                     if wandb_run is not None:
                         wandb_run.log({**metrics, **episode_metric_scalars(episode_summary)}, step=self.iteration)
                     if self.iteration % self.cfg['runner']['save_interval'] == 0:
@@ -111,6 +121,46 @@ class DirectKickRunner:
         finally:
             if wandb_run is not None:
                 wandb_run.finish()
+
+    def _print_progress(self, max_iterations, metrics, episode_summary,
+                        collection_time, learning_time, elapsed_time, completed_iterations):
+        """Use the former IsaacLab/RSL-RL console layout with this task's values."""
+        width, pad = 80, 35
+        iteration_time = collection_time + learning_time
+        batch_steps = self.cfg['runner']['horizon_length'] * self.env.unwrapped.num_envs
+        fps = int(batch_steps / iteration_time) if iteration_time > 0 else 0
+        episodes = self.terminal_statistics.finish_iteration()
+        title = f' \033[1m Learning iteration {self.iteration}/{max_iterations} \033[0m '
+        lines = ['#' * width, title.center(width), '']
+
+        def row(label, value):
+            lines.append(f'{label + ":":>{pad}} {value}')
+
+        row('Computation', f'{fps} steps/s (collection: {collection_time:.3f}s, learning {learning_time:.3f}s)')
+        row('Mean action noise std', f'{self.model.logstd.detach().exp().mean().item():.2f}')
+        for key, label in (('value_loss', 'value_function'), ('actor_loss', 'surrogate'),
+                           ('bound_loss', 'bound'), ('symmetry_loss', 'symmetry'), ('phase_loss', 'phase')):
+            row(f'Mean {label} loss', f'{metrics[key]:.4f}')
+        row('Mean entropy', f'{metrics["entropy"]:.4f}')
+        row('KL divergence', f'{metrics["kl"]:.6f}')
+        row('Learning rate', f'{metrics["learning_rate"]:.6f}')
+        if episodes["reward"] is not None:
+            row('Mean reward', f'{episodes["reward"]:.2f}')
+            row('Mean episode length', f'{episodes["episode_length"]:.2f}')
+        for name, value in episodes['reward_terms'].items():
+            row(f'Episode_Reward/{name}', f'{value:.4f}')
+        completed = episode_summary['all']
+        row('Completed episodes', completed['episodes'])
+        if completed['episodes']:
+            row('Kick rate', f'{completed["kick_rate"]:.3f}')
+            row('Fall rate', f'{completed["fall_rate"]:.3f}')
+        lines.append('-' * width)
+        row('Total timesteps', self.total_steps)
+        row('Iteration time', f'{iteration_time:.2f}s')
+        row('Time elapsed', format_duration(elapsed_time))
+        remaining = max_iterations - self.iteration
+        row('ETA', format_duration(elapsed_time / completed_iterations * remaining))
+        print('\n'.join(lines) + '\n', flush=True)
 
     def export(self, path):
         """Stateless future-horizon LSTM; output = 12 actions + phase probability."""

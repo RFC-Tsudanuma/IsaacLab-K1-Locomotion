@@ -41,6 +41,19 @@ checkpoint は500 iterationsごとと終了時に保存する。学習終了時�
 
 位置だけを符号化する旧132次元の移植checkpointと旧Gym checkpointは、観測形状・意味が異なるため再開には使えない。新しい入力契約で学習し直す。`port_metadata` でモデル契約と認識 revision を照合する。既存歩行タスクの checkpoint も対象外。
 
+## ターミナルの学習表示
+
+2026-09-26から、移植前のIsaacLab／RSL-RLに合わせた複数行表示を各iterationで出力する。`Learning iteration`、学習速度（steps/s、収集・更新時間）、action noise、各損失、entropy・KL・学習率、報酬内訳、完了数・キック成立率・転倒率、総step数、経過時間・ETAを表示する。
+
+- `Mean reward` / `Mean episode length`：直近100件の完了エピソードの報酬合計／step数の平均。未完了エピソードは含めず、1件も完了していない間は表示しない。
+- `Episode_Reward/<name>`：当iterationで完了した各エピソードの重み適用済み報酬合計を平均し、エピソード上限時間（17秒）で割った値。IsaacLabの正規化単位に合わせる。完了エピソードを同じ重みで扱い、当iterationに完了例がない場合は内訳を表示しない。リセットが同時に起きた群ごとの平均や前iterationの値の再表示にはしない。
+- 報酬はPPOによるtimeout bootstrap用の書換前に集計する。途中のエピソードの累積はiterationをまたいで保持する。学習開始・再開時の環境resetで表示用の集計を初期化する。
+- ETAは今回の実行で消化したiterationの平均所要時間から算出する。checkpointに保存済みのiteration数を経過時間の分母に使わない。
+
+表示用の集計はPPO・環境へ値を戻さない。既存の`learning.csv`、`episode_metrics.csv`、W&B記録とcheckpoint形式は維持する。`learning.csv`の`reward`は従来どおりrolloutのstep平均なので、ターミナルの`Mean reward`とは集計単位が異なる。
+
+表示修正後のCPU検証：47 tests / 258 subtests 成功。報酬の完了時点・反復間の保持・直近100件・入力テンソルの非変更・学習ループの表示値・再開後ETAを確認した。
+
 ## 再開と成績の集計
 
 checkpoint再開ではAdamを読み込んだ直後、その学習率をPPOの適応学習率にも復元する。従来形式のcheckpointに保存済みのoptimizer情報を使い、形式は変更しない。`resume=False` の重み読込ではoptimizerと学習率は初期設定のまま。同一rolloutによる2回の追加更新で、中断なしの場合と再開後の全重み・Adam状態・学習率が一致することをテストする。
