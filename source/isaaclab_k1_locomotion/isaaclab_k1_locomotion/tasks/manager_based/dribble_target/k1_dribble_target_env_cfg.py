@@ -49,15 +49,13 @@ from .flat_env_cfg import (
     _COMMAND_THRESHOLD,
     K1FlatCommandCfg,
     K1FlatCriticHistoryCfg,
-    K1FlatEnvCfg,
     K1FlatPolicyHistoryCfg,
+    K1FlatStancePlaneCfg,
 )
 from .history_layout import DRIBBLE_TARGET_POLICY_EXTRA_TERMS
 from .velocity_env_cfg import MySceneCfg
 from .mdp.curriculums import (
     dribble_target_range_curriculum,
-    extreme_command_curriculum,
-    lin_vel_command_curriculum,
     log_ball_front_ratio,
     modify_gait_phase_cmd_threshold_linear,
     modify_reward_weight_linear,
@@ -163,8 +161,28 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # noise_range で掛ける。ObsTerm の noise は関数の戻り値の後に掛かるため、ホールドした値や
     # 「速度が推定できず厳密に 0」の値にもノイズが乗り、実機 vision_filter (同じ値の繰り返し /
     # ちょうど 0) と食い違うため (mdp/observations.py の _BallVisionTerm 参照)。
-    ball_pos_rel = ObsTerm(func=ball_pos_rel_vision, params={"near_hold_prob": 0.05, "noise_range": 0.05})
-    ball_vel = ObsTerm(func=ball_vel_rel_vision, params={"near_invalid_prob": 0.02, "noise_range": 0.1})
+    # NOTE (2026-10-18 再構築): 10-11-d の診断用の平坦化 (近距離も遠距離と同じ 0.05 / 0.02) は
+    # 「確認が終わったら戻す」ものだったので外し、仕様 (最新ラン) の値に合わせる:
+    #   ホールド確率   近距離 0.6  → 遠距離 0.05
+    #   速度欠損確率   近距離 0.4  → 遠距離 0.02
+    # 距離に応じて near_distance〜far_distance の間を線形補間する。値は env.yaml で追えるよう全て明示する。
+    ball_pos_rel = ObsTerm(
+        func=ball_pos_rel_vision,
+        params={
+            "near_distance": 0.35, "far_distance": 2.0,
+            "near_hold_prob": 0.6, "far_hold_prob": 0.05,
+            "noise_range": 0.05,
+        },
+    )
+    ball_vel = ObsTerm(
+        func=ball_vel_rel_vision,
+        params={
+            "near_distance": 0.35, "far_distance": 2.0,
+            "near_hold_prob": 0.6, "far_hold_prob": 0.05,
+            "near_invalid_prob": 0.4, "far_invalid_prob": 0.02,
+            "noise_range": 0.1,
+        },
+    )
     # 2026-10-06: obstacle_pos_rel は Policy から削除した (Critic専用に戻す)。
     # 実機に障害物検出センサが無く、最初のデプロイ版では Policy の入力に含めない方針
     # (docs/dribble_deploy_handoff.md §6-1、history_layout.py 参照)。
@@ -271,8 +289,16 @@ class K1DribbleTargetSceneCfg(MySceneCfg):
 # ---------------------------------------------------------------------------
 # Stage 2: フルタスク (ボールあり、ドリブル報酬フェードイン)
 # ---------------------------------------------------------------------------
+# 歩行の親 cfg。2026-10-18: K1FlatEnvCfg → K1FlatStancePlaneCfg に切り替えた。
+# 59 次元に広げた best_walk (model_52500) を推論だけで動かした比較 (512 env × 600 step × 2 seed) で、
+# StancePlane 系の方が追従誤差 (並進 0.25 vs 0.31 m/s、旋回 0.19 vs 0.24 rad/s) と両足空中率
+# (0.3% vs 1.4%) が小さく、転倒率は同等 (2.7% vs 2.7〜3.3%) だったため。best_walk はこの系で
+# 学習されている (frozen_policies/best_walk/README.md も StancePlane 系からの派生を指示)。
+_WALK_BASE_CFG = K1FlatStancePlaneCfg
+
+
 @configclass
-class K1DribbleTargetEnvCfg(K1FlatEnvCfg):
+class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
     scene: K1DribbleTargetSceneCfg = K1DribbleTargetSceneCfg(num_envs=4096, env_spacing=2.5)
     observations: K1DribbleTargetObservationsCfg = K1DribbleTargetObservationsCfg()
 
@@ -1010,36 +1036,16 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         # K1FlatEnvCfg 相当の初期値 (velocity_env_cfg.py の基本レンジ) を直接書く。
         # lin_vel_x/lin_vel_y はどのみち lin_vel_command カリキュラムが stage0 で
         # 即座に上書きする。
-        self.commands.base_velocity.ranges.lin_vel_x = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.lin_vel_y = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.ang_vel_z = (-1.0, 1.0)
-        self.commands.base_velocity.ranges.heading = (-math.pi, math.pi)
-        self.curriculum.lin_vel_command = CurrTerm(
-            func=lin_vel_command_curriculum,
-            params={
-                "command_name": "base_velocity",
-                "stages_x": [(-0.6, 0.6), (-1.2, 1.2), (-1.5, 1.5)],
-                "stages_y": [(-0.5, 0.5), (-0.7, 0.7), (-0.9, 0.9)],
-                "error_threshold": [0.30, 0.39, 0.43],
-                "asset_name": "robot",
-                "ema_alpha": 0.026,
-                "min_updates": 50,
-                "stage_cooldown_resamples": 1.5,
-                "post_switch_hold_steps": 500,
-                "post_switch_ema_scale": 2.0,
-            },
-        )
-        self.curriculum.extreme_commands = CurrTerm(
-            func=extreme_command_curriculum,
-            params={
-                "command_name": "base_velocity",
-                "num_steps": 10000,
-                "ramp_steps": 2000,
-                "extreme_prob": 0.35,
-                "extreme_frac": 0.7,
-                "resampling_time_range": (0.8, 8.0),
-            },
-        )
+        # NOTE (2026-10-18 再構築): 歩行の親を K1FlatStancePlaneCfg に切り替えたので、ここで戻す
+        # 「元の設定」も K1FlatEnvCfg の直書きの値ではなく、親 (_WALK_BASE_CFG) の値をそのまま
+        # 引き継ぐ (best_walk はこの分布で学習されている: x ±1.5→1.8→2.0、extreme 3000/1500、
+        # 再サンプリング 1〜7 秒)。親の __post_init__ で作られる値を、親の cfg を 1 つ作って取り出す。
+        _walk = _WALK_BASE_CFG()
+        self.commands.base_velocity.ranges = _walk.commands.base_velocity.ranges
+        self.commands.base_velocity.resampling_time_range = _walk.commands.base_velocity.resampling_time_range
+        self.curriculum.lin_vel_command = _walk.curriculum.lin_vel_command
+        self.curriculum.extreme_commands = _walk.curriculum.extreme_commands
+        self.curriculum.command_resampling_time_range = _walk.curriculum.command_resampling_time_range
         self.curriculum.gait_phase_cmd_threshold = None
         self.observations.policy.gait_phase.params = {
             **self.observations.policy.gait_phase.params, "cmd_threshold": _COMMAND_THRESHOLD,

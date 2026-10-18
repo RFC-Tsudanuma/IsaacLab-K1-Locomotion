@@ -80,6 +80,13 @@ parser.add_argument(
     "fade-ins start from 0). Used to start dribble Stage2 from the Stage1 checkpoint.",
 )
 parser.add_argument(
+    "--critic_warmup_iters",
+    type=int,
+    default=0,
+    help="Freeze the actor and action-noise std for the first N PPO updates and train only the critic "
+    "(§9-1, for Stage2 after --reset_critic). 0 (default) disables it.",
+)
+parser.add_argument(
     "--reestimate_obs_norm_terms",
     type=str,
     default=None,
@@ -178,37 +185,6 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
-
-
-def _filter_unsupported_alg_args(train_cfg: dict) -> dict:
-    """インストール済みの rsl-rl の PPO が受け付けない algorithm 設定を取り除く。
-
-    新しい isaaclab_rl の RslRlPpoAlgorithmCfg には rsl-rl >= 4 向けの項目 (share_cnn_encoders など)
-    があり、handle_deprecated_rsl_rl_cfg は rsl-rl 3.x 向けにそれを取り除かない。既定値のままの
-    項目だけを捨て、既定値以外が指定されていたら (意図した設定が黙って無視されないよう) エラーにする。
-    """
-    import inspect
-
-    alg_cfg = train_cfg.get("algorithm", {})
-    class_name = alg_cfg.get("class_name", "PPO")
-    import rsl_rl.algorithms as _algs
-
-    alg_class = getattr(_algs, class_name, None)
-    if alg_class is None:
-        return train_cfg
-    params = inspect.signature(alg_class.__init__).parameters
-    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-        return train_cfg
-    defaults = {"share_cnn_encoders": False, "optimizer": "adam", "normalize_advantage_per_mini_batch": False}
-    for key in list(alg_cfg):
-        if key == "class_name" or key in params:
-            continue
-        if key in defaults and alg_cfg[key] == defaults[key]:
-            print(f"[INFO]: algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} に無いので外します。")
-            del alg_cfg[key]
-        else:
-            raise ValueError(f"algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} では使えません。")
-    return train_cfg
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -331,7 +307,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, _filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, stage_transition_utils.filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
@@ -560,6 +536,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         stage_transition_utils.reestimate_obs_normalizer(
             env, runner.alg.policy, terms, args_cli.reestimate_obs_norm_steps
         )
+
+    # critic のウォームアップ (§9-1): 最初の N 回の更新は actor / std を固定する (既定は無効)
+    stage_transition_utils.enable_critic_warmup(runner, args_cli.critic_warmup_iters)
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

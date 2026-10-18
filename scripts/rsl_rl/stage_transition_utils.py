@@ -154,3 +154,78 @@ def load_curriculum_state(env, model_path: str) -> None:
         if name in state:
             term.load_state_dict(state[name])
             print(f"[INFO]: カリキュラム '{name}' の状態を復元しました: {state[name]}")
+
+
+def filter_unsupported_alg_args(train_cfg: dict) -> dict:
+    """インストール済みの rsl-rl の PPO が受け付けない algorithm 設定を取り除く。
+
+    新しい isaaclab_rl の RslRlPpoAlgorithmCfg には rsl-rl >= 4 向けの項目 (share_cnn_encoders など)
+    があり、handle_deprecated_rsl_rl_cfg は rsl-rl 3.x 向けにそれを取り除かない。既定値のままの
+    項目だけを捨て、既定値以外が指定されていたら (意図した設定が黙って無視されないよう) エラーにする。
+    """
+    import inspect
+
+    alg_cfg = train_cfg.get("algorithm", {})
+    class_name = alg_cfg.get("class_name", "PPO")
+    import rsl_rl.algorithms as _algs
+
+    alg_class = getattr(_algs, class_name, None)
+    if alg_class is None:
+        return train_cfg
+    params = inspect.signature(alg_class.__init__).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return train_cfg
+    defaults = {"share_cnn_encoders": False, "optimizer": "adam", "normalize_advantage_per_mini_batch": False}
+    for key in list(alg_cfg):
+        if key == "class_name" or key in params:
+            continue
+        if key in defaults and alg_cfg[key] == defaults[key]:
+            print(f"[INFO]: algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} に無いので外します。")
+            del alg_cfg[key]
+        else:
+            raise ValueError(f"algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} では使えません。")
+    return train_cfg
+
+
+def enable_critic_warmup(runner, num_iterations: int) -> None:
+    """最初の ``num_iterations`` 回の PPO 更新では actor と行動ノイズ (std) を固定し、critic だけを学習する。
+
+    Stage2 の開始直後、作り直したばかりの critic の価値推定が出鱈目なまま actor を更新すると
+    歩き方が崩れる (開始直後に転倒率が 0.31 → 0.98 に上がる現象の対策候補、§9-1)。
+
+    * actor / std の requires_grad を切る (勾配が None の引数は Adam が更新しない)。
+      Adam のモーメントもこの間は積まれないので、解除後に古い勢いが残ることもない。
+    * 学習率はこの間固定する (actor を固定すると KL が 0 になり、adaptive スケジュールが
+      学習率を動かす前提が崩れるため。rsl-rl 3.0.1 は KL=0 では動かさないが念のため)。
+    * actor の観測正規化器は通常どおり更新される (統計を集め続けるだけで、重みは固定)。
+    """
+    if num_iterations <= 0:
+        return
+    alg = runner.alg
+    policy = alg.policy
+    frozen = [p for name, p in policy.named_parameters() if not name.startswith("critic.") and p.requires_grad]
+    for p in frozen:
+        p.requires_grad_(False)
+    fixed_lr = alg.learning_rate
+    original_update = alg.update
+    state = {"done": 0}
+
+    def update(*args, **kwargs):
+        result = original_update(*args, **kwargs)
+        state["done"] += 1
+        if state["done"] < num_iterations:
+            alg.learning_rate = fixed_lr
+            for group in alg.optimizer.param_groups:
+                group["lr"] = fixed_lr
+        else:
+            for p in frozen:
+                p.requires_grad_(True)
+            alg.update = original_update
+            print(f"[INFO]: --critic_warmup_iters: {num_iterations} 回の更新が終わったので actor / std の固定を解除しました。")
+        return result
+
+    alg.update = update
+    print(
+        f"[INFO]: --critic_warmup_iters: 最初の {num_iterations} 回の更新は actor / std "
+        f"({len(frozen)} テンソル) を固定し critic だけを学習します (学習率 {fixed_lr:.2e} で固定)。"
+    )

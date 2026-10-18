@@ -1125,7 +1125,15 @@ class WaypointPose2dCommand(CommandTerm):
 
     サンプリング時の始点 S は「ボールの現在位置」(ボールが無ければロボット)。最終目標 G は
     ``S + (pos_x, pos_y)`` (ワールド軸。リセット直後のロボットは +x を向いている)。
-    heading は使わない。経路形状 ``cfg.path_shape`` (カリキュラムのレベルが指定):
+    heading は使わない。
+
+    実機では戦略がフィールド座標の目標点を直接指定するので、ボールの後方や遠い目標も混ぜる
+    (2026-10-18):
+
+    * 確率 ``omni_prob``: 方位を (-π, π] で一様にし、距離は ``|(pos_x, pos_y)|`` と同じ分布
+      (ボールの後方・横の目標)
+    * 確率 ``far_prob``: 前方の目標のまま、距離をそのレベルの上限の 1〜``far_scale`` 倍にする
+    * 残り: 従来どおり ``S + (pos_x, pos_y)``経路形状 ``cfg.path_shape`` (カリキュラムのレベルが指定):
 
     * ``straight``: [G]
     * ``curve``:    [S→G の中点を横に curve_offset_frac×|SG| ずらした点, G]
@@ -1197,9 +1205,23 @@ class WaypointPose2dCommand(CommandTerm):
         n = len(env_ids)
         r = torch.empty(n, device=self.device)
         start = self._tracked_xy()[env_ids].clone()
-        goal = start.clone()
-        goal[:, 0] += r.uniform_(*self.cfg.ranges.pos_x)
-        goal[:, 1] += r.uniform_(*self.cfg.ranges.pos_y)
+        offset = torch.stack(
+            [r.uniform_(*self.cfg.ranges.pos_x).clone(), torch.empty(n, device=self.device).uniform_(*self.cfg.ranges.pos_y)],
+            dim=1,
+        )
+        dist = torch.norm(offset, dim=1, keepdim=True).clamp(min=1e-6)
+        mode = torch.rand(n, device=self.device)
+        # 全方位 (ボールの後方・横を含む): 距離はそのままで方位だけ一様に回す
+        omni = (mode < self.cfg.omni_prob).unsqueeze(1)
+        bearing = torch.empty(n, device=self.device).uniform_(-math.pi, math.pi)
+        omni_offset = dist * torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=1)
+        # 遠方: 前方の向きのまま、距離をそのレベルの上限の 1〜far_scale 倍にする
+        far = ((mode >= self.cfg.omni_prob) & (mode < self.cfg.omni_prob + self.cfg.far_prob)).unsqueeze(1)
+        max_dist = math.hypot(max(abs(v) for v in self.cfg.ranges.pos_x), max(abs(v) for v in self.cfg.ranges.pos_y))
+        far_dist = torch.empty(n, 1, device=self.device).uniform_(max_dist, max_dist * self.cfg.far_scale)
+        far_offset = offset / dist * far_dist
+        offset = torch.where(omni, omni_offset, torch.where(far, far_offset, offset))
+        goal = start + offset
 
         seg = goal - start
         length = torch.norm(seg, dim=1, keepdim=True).clamp(min=1e-6)
@@ -1283,6 +1305,14 @@ class WaypointPose2dCommandCfg(CommandTermCfg):
 
     path_shape: str = "straight"
     """経路形状 (straight / curve / l_shape / z_shape)。dribble_target_range_curriculum が書き換える。"""
+
+    omni_prob: float = 0.25
+    """目標の方位を (-π, π] で一様にする割合 (ボールの後方・横の目標)。"""
+
+    far_prob: float = 0.1
+    """目標の距離をそのレベルの上限の 1〜far_scale 倍にする割合。"""
+
+    far_scale: float = 2.0
 
     waypoint_reach_radius: float = 0.3
     """ボールがこの距離 [m] 以内に入ったら次のウェイポイントへ進む。"""
