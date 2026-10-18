@@ -166,6 +166,8 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     #   ホールド確率   近距離 0.6  → 遠距離 0.05
     #   速度欠損確率   近距離 0.4  → 遠距離 0.02
     # 距離に応じて near_distance〜far_distance の間を線形補間する。値は env.yaml で追えるよう全て明示する。
+    # TODO: near_distance=0.35m / far_distance=2.0m は仮の値 (元の値が失われたため 2026-10-18 に確定扱い)。
+    #       実機 vision_filter のログ (ボール距離ごとの mask / vel_valid の割合) が取れたら合わせ込むこと。
     ball_pos_rel = ObsTerm(
         func=ball_pos_rel_vision,
         params={

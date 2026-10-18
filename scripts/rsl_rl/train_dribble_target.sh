@@ -15,13 +15,25 @@
 #            --reestimate_obs_norm_terms: Stage 1 で常に 0 だったドリブル用 5 項の actor 正規化統計を、
 #              Stage 2 の環境で集めた統計で上書きする (§9-2)。
 #
-# 既知の現象: Stage 2 の開始直後、転倒率が 0.31 → 0.98 に上がり、約 800 iteration (約 1.4 時間) で
-# 回復する (2026-10-10 のラン: 20499 → 0.70、20999 → 0.31、21499 → 0.04、21998 → 0.035)。
-# iteration 21000 より前に「回復しない」と判断して止めないこと。
+# 既知の現象: Stage 2 の開始直後、転倒率 (Episode_Termination/base_height) が 0.31 → 0.98 に上がり、
+# 4096 env では約 800 iteration (= 約 1.57 億サンプル) で回復した
+# (2026-10-10 のラン: Stage2 開始から +500 → 0.70、+1000 → 0.31、+1500 → 0.04、+2000 → 0.035)。
+# 2048 env (既定) ではサンプル数で揃えて約 1600 iteration が目安。それより前に「回復しない」と
+# 判断して止めないこと。比べるときは iteration ではなく累計サンプル数で比べる:
+#   python scripts/rsl_rl/stage2_progress.py logs/rsl_rl/k1_dribble_target/<run>
+#
+# env 数とミニバッチ数の既定値 (NUM_ENVS=2048, MINI_BATCHES=16) について (2026-10-18):
+#   このマシン (RTX 4070 SUPER 12GB) では 4096 env が動かない。観測が履歴 100 ステップ × (actor 59 +
+#   critic 66 次元) と大きく、rsl_rl の rollout storage だけで 48 step × 4096 env × 12509 × 4B ≈ 9.8GB に
+#   なるため。2048 env でも PPO 更新 (mirror loss) で数百 MB 足りなかったので、ミニバッチ数を
+#   8 → 16 にして 1 回の更新のメモリを半分にした (1 iteration のサンプル数は 2048 × 48)。
+#   GPU メモリに余裕のあるマシンで過去のラン (4096 env / 8 ミニバッチ) と揃えたいときは
+#   NUM_ENVS=4096 MINI_BATCHES=8 で上書きする。
 #
 # 使い方:
 #   ./scripts/rsl_rl/train_dribble_target.sh                     # 通しで実行
-#   NUM_ENVS=2048 ./scripts/rsl_rl/train_dribble_target.sh       # env 数を変える
+#   NUM_ENVS=4096 MINI_BATCHES=8 ./scripts/rsl_rl/train_dribble_target.sh
+#                                                                # 大きい GPU で過去のランと同じ設定にする
 #   ITER=50 ./scripts/rsl_rl/train_dribble_target.sh             # 短く試す (各 stage 50 iteration)
 #   STAGE=2 WALK_CKPT=logs/rsl_rl/k1_dribble_target_walk_phase/<run>/model_19999.pt \
 #       ./scripts/rsl_rl/train_dribble_target.sh                 # Stage 2 だけ再実行
@@ -93,7 +105,8 @@ EOF
 fi
 echo "[INFO] python: $LAB_PY"
 
-NUM_ENVS=${NUM_ENVS:-4096}
+NUM_ENVS=${NUM_ENVS:-2048}
+MINI_BATCHES=${MINI_BATCHES:-16}
 ITER=${ITER:-20000}
 STAGE=${STAGE:-all}
 
@@ -142,6 +155,7 @@ if [[ "$STAGE" == "all" || "$STAGE" == "1" ]]; then
         --task "$WALK_TASK" \
         --headless \
         --num_envs "$NUM_ENVS" \
+        agent.algorithm.num_mini_batches="$MINI_BATCHES" \
         --max_iterations "$ITER" \
         --resume --checkpoint "$(realpath "$WIDENED_CKPT")" \
         --reset_noise_std 0.05 \
@@ -159,6 +173,7 @@ if [[ "$STAGE" == "all" || "$STAGE" == "2" ]]; then
         --task "$DRIBBLE_TASK" \
         --headless \
         --num_envs "$NUM_ENVS" \
+        agent.algorithm.num_mini_batches="$MINI_BATCHES" \
         --max_iterations "$ITER" \
         --resume --checkpoint "$(realpath "$WALK_CKPT")" \
         --reset_critic \
