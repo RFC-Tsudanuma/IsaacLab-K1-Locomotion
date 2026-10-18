@@ -1,0 +1,15 @@
+# このリポジトリの学習 (rsl_rl / HistoryActorCritic) に必要な追加パッケージ。
+# Isaac Sim (kit python) に入れて使う。torch などは kit 同梱のものをそのまま使うので --no-deps で入れること:
+#
+#   /isaac-sim/python.sh -m pip install --no-deps -r requirements-k1.txt
+#   /isaac-sim/python.sh -m pip install --no-deps -e source/isaaclab_k1_locomotion
+#
+# rsl-rl-lib は 3.x の API (rsl_rl.modules.ActorCritic / rsl_rl.networks.MLP) が必要。
+# IsaacLab 側 (isaaclab_rl) が既定で入れる rsl-rl-lib 5.x では動かない。
+# tensordict は torch 2.7 で import できる版に固定する (0.15.x は torch 2.7 で import エラーになる)。
+rsl-rl-lib==3.0.1
+tensordict==0.9.1
+
+# 動作確認した環境 (2026-10-18、参考。kit 同梱なのでここでは入れない):
+#   Isaac Sim 5.1 / IsaacLab 2.3.2 (isaaclab 0.54.4, isaaclab_rl 0.5.2)
+#   torch==2.7.0+cu128, gymnasium==1.2.1, onnx==1.23.2, GitPython==3.2.1

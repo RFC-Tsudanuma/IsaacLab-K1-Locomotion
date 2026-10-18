@@ -14,6 +14,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+import stage_transition_utils  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -71,6 +72,27 @@ parser.add_argument(
     "(--resume or --load_pretrained).",
 )
 parser.add_argument(
+    "--reset_critic",
+    action="store_true",
+    default=False,
+    help="With --resume: re-initialise the critic network and critic obs normaliser, skip the optimizer "
+    "state, and do NOT sync common_step_counter to the checkpoint iteration (the new stage's reward "
+    "fade-ins start from 0). Used to start dribble Stage2 from the Stage1 checkpoint.",
+)
+parser.add_argument(
+    "--reestimate_obs_norm_terms",
+    type=str,
+    default=None,
+    help="Comma-separated observation term names whose actor normaliser stats are overwritten with stats "
+    "collected in the current env before training (e.g. the dribble terms that were always 0 in Stage1).",
+)
+parser.add_argument(
+    "--reestimate_obs_norm_steps",
+    type=int,
+    default=200,
+    help="Number of env steps used by --reestimate_obs_norm_terms.",
+)
+parser.add_argument(
     "--ray-proc-id", "-rid", type=int, default=None, help="Automatically configured by Ray integration, otherwise None."
 )
 parser.add_argument(
@@ -84,6 +106,8 @@ cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
+if args_cli.reset_critic and not args_cli.resume:
+    parser.error("--reset_critic は --resume (前ステージの checkpoint から始める) と一緒に使うこと。")
 
 # always enable cameras to record video
 if args_cli.video:
@@ -156,11 +180,51 @@ torch.backends.cudnn.deterministic = False
 torch.backends.cudnn.benchmark = False
 
 
+def _filter_unsupported_alg_args(train_cfg: dict) -> dict:
+    """インストール済みの rsl-rl の PPO が受け付けない algorithm 設定を取り除く。
+
+    新しい isaaclab_rl の RslRlPpoAlgorithmCfg には rsl-rl >= 4 向けの項目 (share_cnn_encoders など)
+    があり、handle_deprecated_rsl_rl_cfg は rsl-rl 3.x 向けにそれを取り除かない。既定値のままの
+    項目だけを捨て、既定値以外が指定されていたら (意図した設定が黙って無視されないよう) エラーにする。
+    """
+    import inspect
+
+    alg_cfg = train_cfg.get("algorithm", {})
+    class_name = alg_cfg.get("class_name", "PPO")
+    import rsl_rl.algorithms as _algs
+
+    alg_class = getattr(_algs, class_name, None)
+    if alg_class is None:
+        return train_cfg
+    params = inspect.signature(alg_class.__init__).parameters
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return train_cfg
+    defaults = {"share_cnn_encoders": False, "optimizer": "adam", "normalize_advantage_per_mini_batch": False}
+    for key in list(alg_cfg):
+        if key == "class_name" or key in params:
+            continue
+        if key in defaults and alg_cfg[key] == defaults[key]:
+            print(f"[INFO]: algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} に無いので外します。")
+            del alg_cfg[key]
+        else:
+            raise ValueError(f"algorithm.{key}={alg_cfg[key]!r} はインストール済みの rsl-rl の {class_name} では使えません。")
+    return train_cfg
+
+
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Train with RSL-RL agent."""
     # override configurations with non-hydra CLI arguments
     agent_cfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    # インストールされている rsl-rl のバージョンに合わせて agent 設定を変換する。新しい isaaclab_rl の
+    # 設定には rsl-rl >= 4 向けの項目 (algorithm.optimizer など) があり、rsl-rl 3.x の PPO に渡すと
+    # TypeError になる (2026-10-18、環境の再構築で isaaclab_rl が更新されたため)。
+    try:
+        from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+    except ImportError:  # 古い isaaclab_rl には無い (変換も不要)
+        handle_deprecated_rsl_rl_cfg = None
+    if handle_deprecated_rsl_rl_cfg is not None:
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, installed_version)
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
     agent_cfg.max_iterations = (
         args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
@@ -241,7 +305,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+        # --checkpoint に実在するファイルパスが渡された場合はそれを直接使う (別 experiment の
+        # checkpoint、例えば widen_history_checkpoint.py の出力から始めるため)。
+        if agent_cfg.load_checkpoint and os.path.isfile(agent_cfg.load_checkpoint):
+            resume_path = os.path.abspath(agent_cfg.load_checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     # wrap for video recording
     if args_cli.video:
@@ -262,7 +331,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # create runner from rsl-rl
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
+        runner = OnPolicyRunner(env, _filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=log_dir, device=agent_cfg.device)
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=log_dir, device=agent_cfg.device)
     else:
@@ -275,10 +344,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # When resetting std, also drop the optimizer state. The saved Adam moments for the std
         # parameter carry strong "push std down" momentum that immediately drives std negative on
         # the first update, regardless of any post-load clamp.
-        load_optimizer = args_cli.reset_noise_std is None
+        # --reset_critic では critic を作り直すので optimizer の状態も使えない。
+        # optimizer の状態を含まない checkpoint (widen_history_checkpoint.py の出力) も読まない。
+        has_optimizer = "optimizer_state_dict" in torch.load(resume_path, weights_only=False, map_location="cpu")
+        load_optimizer = args_cli.reset_noise_std is None and not args_cli.reset_critic and has_optimizer
         runner.load(resume_path, load_optimizer=load_optimizer)
         if not load_optimizer:
-            print("[INFO]: Skipped optimizer state load (--reset_noise_std set).")
+            print(
+                "[INFO]: Skipped optimizer state load"
+                f" (--reset_noise_std={args_cli.reset_noise_std}, --reset_critic={args_cli.reset_critic},"
+                f" checkpoint has optimizer state={has_optimizer})."
+            )
 
         policy = runner.alg.policy
 
@@ -317,11 +393,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         f"        after  std: {policy.log_std.data.exp().tolist()}"
                     )
 
+        if args_cli.reset_critic:
+            # 新しいステージの開始: critic を作り直し、common_step_counter は 0 のまま
+            # (報酬のフェードインなど、ステップ数基準のカリキュラムを最初から回す)。
+            stage_transition_utils.reset_critic(policy)
+            print("[INFO]: --reset_critic: common_step_counter は同期せず 0 から始めます。")
         # sync common_step_counter so curriculum resumes from the correct phase
-        if agent_cfg.resume:
+        elif agent_cfg.resume:
             synced_steps = runner.current_learning_iteration * runner.cfg["num_steps_per_env"]
             env.unwrapped.common_step_counter = synced_steps
             print(f"[INFO]: Set common_step_counter to {synced_steps} (iteration {runner.current_learning_iteration})")
+        # 状態を持つカリキュラム (dribble_target_range_curriculum など) を checkpoint の横の json から復元する。
+        # --reset_critic (新しいステージ) では前ステージの状態は使わない。
+        if not args_cli.reset_critic:
+            stage_transition_utils.load_curriculum_state(env, resume_path)
     # transfer learning: load pretrained weights with strict=False (observation dim may differ)
     elif args_cli.load_pretrained is not None:
         pretrained_path = os.path.abspath(args_cli.load_pretrained)
@@ -465,6 +550,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                         f"        before std: {before.tolist()}\n"
                         f"        after  std: {policy.log_std.data.exp().tolist()}"
                     )
+
+    # 状態を持つカリキュラムの状態を checkpoint と一緒に保存する (model_*_curriculum.json)
+    stage_transition_utils.attach_curriculum_state_io(runner, env)
+
+    # 前ステージで常に 0 だった観測項の正規化統計を、現在の環境で集めた統計で上書きする (§9-2)
+    if args_cli.reestimate_obs_norm_terms:
+        terms = [t.strip() for t in args_cli.reestimate_obs_norm_terms.split(",") if t.strip()]
+        stage_transition_utils.reestimate_obs_normalizer(
+            env, runner.alg.policy, terms, args_cli.reestimate_obs_norm_steps
+        )
 
     # dump the configuration into log-directory
     dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)

@@ -1,0 +1,1009 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Curriculum functions for the K1 locomotion task."""
+
+from __future__ import annotations
+
+import math
+import torch
+from collections.abc import Sequence
+from typing import TYPE_CHECKING
+
+from isaaclab.assets import Articulation
+from isaaclab.managers import ManagerTermBase
+from isaaclab.managers.manager_term_cfg import CurriculumTermCfg
+
+if TYPE_CHECKING:
+    from isaaclab.envs import ManagerBasedRLEnv
+
+
+def modify_command_resampling_time_range(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    command_name: str,
+    resampling_time_range: tuple[float, float],
+    num_steps: int,
+):
+    """指定ステップ数を超えたら、コマンドのリサンプリング時間範囲を変更する。"""
+    if env.common_step_counter > num_steps:
+        term = env.command_manager.get_term(command_name)
+        term.cfg.resampling_time_range = resampling_time_range
+
+
+def modify_push_robot(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    num_steps: int,
+    interval_range_s: tuple[float, float] | None = None,
+    velocity_range: dict[str, tuple[float, float]] | None = None,
+):
+    """指定ステップ数を超えたら、push_robot イベントの interval_range_s と velocity_range を更新する。
+
+    EventManager は次回のインターバルサンプリング時に ``term_cfg.interval_range_s`` を
+    再読込するため、cfg の書き換えだけで反映される。``velocity_range`` は ``params`` 経由で
+    イベント関数に渡されるので、こちらも cfg.params を上書きすれば次回呼び出しで反映される。
+    """
+    if env.common_step_counter > num_steps:
+        term_cfg = env.event_manager.get_term_cfg(term_name)
+        if interval_range_s is not None:
+            term_cfg.interval_range_s = interval_range_s
+        if velocity_range is not None:
+            term_cfg.params["velocity_range"] = velocity_range
+
+
+def extreme_command_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    command_name: str,
+    num_steps: int,
+    ramp_steps: int,
+    extreme_prob: float,
+    extreme_frac: float = 0.7,
+    resampling_time_range: tuple[float, float] | None = None,
+    env_steps_per_iteration: int = 48,
+) -> dict[str, float]:
+    """学習後半に「レンジ端の組み合わせコマンド」を段階導入するカリキュラム。
+
+    ``num_steps`` を超えてから ``ramp_steps`` かけて
+    ``ExtremeVelocityCommand.cfg.extreme_prob`` を 0 → ``extreme_prob`` へ線形に上げる。
+    ランプ完了後、``resampling_time_range`` が指定されていればリサンプリング間隔も
+    差し替え、極端なコマンド間の速い遷移にも晒す。
+
+    Note:
+        ``num_steps`` / ``ramp_steps`` は **学習イテレーション数** (train.py の
+        ``--max_iterations`` と同じ単位)。内部で ``env.common_step_counter ÷
+        env_steps_per_iteration`` により現在イテレーションへ換算して比較する
+        (``env_steps_per_iteration`` は rsl_rl_ppo_cfg の ``num_steps_per_env`` に
+        合わせること。既定 48)。
+        他の num_steps 系カリキュラム (``modify_push_robot`` 等) は
+        ``common_step_counter`` と **直接** 比較する (イテレーション換算なし) ため、
+        同じ値でも発動時期が 1/48 になる点に注意。
+
+    Note:
+        resume 時は ``common_step_counter`` が 0 から数え直される。学習済み
+        checkpoint から本カリキュラムを即時有効にしたい場合は override で
+        ``num_steps`` を 0 にすること。
+    """
+    it = env.common_step_counter / float(max(1, env_steps_per_iteration))
+    if it <= num_steps:
+        return {"extreme_prob": 0.0}
+    alpha = min(1.0, (it - num_steps) / max(1, int(ramp_steps)))
+    term = env.command_manager.get_term(command_name)
+    term.cfg.extreme_prob = float(extreme_prob) * alpha
+    term.cfg.extreme_frac = float(extreme_frac)
+    if resampling_time_range is not None and alpha >= 1.0:
+        term.cfg.resampling_time_range = tuple(resampling_time_range)
+    return {"extreme_prob": float(extreme_prob) * alpha}
+
+
+def randomize_ball_init_velocity(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    num_steps: int,
+    velocity_range: dict[str, tuple[float, float]],
+):
+    """指定ステップ数を超えたら、reset イベントの ``velocity_range`` を差し替えてボールに初速を与える。
+
+    ``term_name`` は ``mdp.reset_root_state_uniform`` を使ったイベント (例: ``reset_ball``)
+    を指す。EventManager は reset 呼び出し時に ``term_cfg.params`` を再読込するため、
+    ``params["velocity_range"]`` を上書きするだけで次回 reset から反映される。
+
+    Note:
+        ``num_steps`` は ``env.common_step_counter`` (env.step 呼び出し回数 ≒ num_steps_per_env *
+        iteration 数) と比較するので、「総学習ステップ数の半分」を狙うなら
+        ``num_steps_per_env * max_iterations // 2`` を渡せばよい。
+    """
+    if env.common_step_counter > num_steps:
+        term_cfg = env.event_manager.get_term_cfg(term_name)
+        term_cfg.params["velocity_range"] = velocity_range
+
+def reset_base_velocity_curriculum(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str = "reset_base",
+    start_speed: float = 0.5,
+    end_speed: float = 1.4,
+    num_steps: int = 300,
+    ramp_steps: int = 1200,
+    axes: Sequence[str] = ("x", "y"),
+    env_steps_per_iteration: int = 48,
+) -> dict[str, float]:
+    """reset 時の初期線速度レンジ (``events.<term_name>.params["velocity_range"]``) を
+    ``±start_speed`` → ``±end_speed`` へ線形に広げるカリキュラム。
+
+    リセット直後から機体が動いている状態に晒すことで、「静止した公称姿勢からしか
+    動作を始められない」方策になるのを防ぐ。実機では歩行中など任意の運動状態から
+    指令が飛んでくるため、その分布をリセット側からも作る。
+
+    最初から広いレンジを与えると初期の「立つ」獲得と競合するので、``num_steps``
+    イテレーションまでは ``start_speed`` に据え置き、そこから ``ramp_steps``
+    かけて ``end_speed`` へ線形に広げる。
+
+    Args:
+        term_name: 対象の reset イベント項名 (既定 ``"reset_base"``)。
+        start_speed / end_speed: 線速度レンジの片側幅 [m/s]。``(-speed, +speed)`` を書き込む。
+        axes: 広げる軸。既定は水平の ``("x", "y")`` のみ。``"z"`` を含めると
+            リセット時に鉛直方向へ射出/叩きつけることになるので通常は含めない。
+            ``velocity_range`` の他のキー (z / roll / pitch / yaw) は変更しない。
+        env_steps_per_iteration: ``num_steps`` / ``ramp_steps`` をイテレーション単位で
+            解釈するための換算値 (rsl_rl_ppo_cfg の ``num_steps_per_env`` に合わせる)。
+
+    Note:
+        ``num_steps`` / ``ramp_steps`` は **学習イテレーション数**
+        (``extreme_command_curriculum`` と同じ単位)。``modify_push_robot`` 等の
+        ``common_step_counter`` 直接比較型とは単位が違うので注意。
+
+    Note:
+        resume 時は ``common_step_counter`` が 0 から数え直されるため、学習済み
+        checkpoint から即時フルレンジにしたい場合は ``num_steps=0``,
+        ``ramp_steps=1`` を override すること。
+    """
+    it = env.common_step_counter / float(max(1, env_steps_per_iteration))
+    alpha = (it - num_steps) / float(max(1, int(ramp_steps)))
+    alpha = min(1.0, max(0.0, alpha))
+    speed = float(start_speed) + (float(end_speed) - float(start_speed)) * alpha
+
+    term_cfg = env.event_manager.get_term_cfg(term_name)
+    # 既存の dict を破壊せずコピーしてから対象軸だけ差し替える
+    # (z / roll / pitch / yaw は cfg の値をそのまま残す)。
+    vel_range = dict(term_cfg.params["velocity_range"])
+    for ax in axes:
+        vel_range[ax] = (-speed, speed)
+    term_cfg.params["velocity_range"] = vel_range
+
+    return {"reset_lin_vel_max": speed, "alpha": alpha}
+
+
+def modify_reward_weight_linear(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    start_weight: float,
+    end_weight: float,
+    start_step: int,
+    end_step: int,
+):
+    """報酬項の weight を ``start_step`` → ``end_step`` で ``start_weight`` → ``end_weight`` に線形変化させる。
+
+    ``start_step`` 以前は ``start_weight``、``end_step`` 以降は ``end_weight`` で据え置く。
+    ペナルティを学習初期は弱く(または 0)、後半で強めたい場合に使う。
+
+    Note:
+        ``start_step`` / ``end_step`` は ``env.common_step_counter`` (env.step 呼び出し回数
+        ≒ num_steps_per_env * iteration 数) と比較する。
+    """
+    s = env.common_step_counter
+    if s <= start_step:
+        weight = start_weight
+    elif s >= end_step:
+        weight = end_weight
+    else:
+        alpha = (s - start_step) / float(end_step - start_step)
+        weight = start_weight + alpha * (end_weight - start_weight)
+    term_cfg = env.reward_manager.get_term_cfg(term_name)
+    term_cfg.weight = weight
+    env.reward_manager.set_term_cfg(term_name, term_cfg)
+
+
+def randomize_ball_init_pose(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    term_name: str,
+    num_steps: int,
+    pose_range: dict[str, tuple[float, float]],
+):
+    """指定ステップ数を超えたら、reset イベントの ``pose_range`` を差し替えてボールに初期姿勢を与える。
+
+    ``term_name`` は ``mdp.reset_root_state_uniform`` を使ったイベント (例: ``reset_ball``)
+    を指す。EventManager は reset 呼び出し時に ``term_cfg.params`` を再読込するため、
+    ``params["pose_range"]`` を上書きするだけで次回 reset から反映される。
+
+    Note:
+        ``num_steps`` は ``env.common_step_counter`` (env.step 呼び出し回数 ≒ num_steps_per_env *
+        iteration 数) と比較するので、「総学習ステップ数の半分」を狙うなら
+        ``num_steps_per_env * max_iterations // 2`` を渡せばよい。
+    """
+    if env.common_step_counter > num_steps:
+        term_cfg = env.event_manager.get_term_cfg(term_name)
+        term_cfg.params["pose_range"] = pose_range
+
+class lin_vel_command_curriculum(ManagerTermBase):
+    """線速度コマンド範囲(lin_vel_x / lin_vel_y)を段階的に拡げるカリキュラム。
+
+    全環境にわたるトラッキング誤差 ``||cmd_xy - root_lin_vel_b_xy||_2`` の指数移動平均(EMA)が
+    ``error_threshold`` を下回ったら次のステージに進む。最終ステージに到達したら以降は据え置く。
+
+    Args:
+        stages_x: 各ステージで ``lin_vel_x`` に適用する ``(min, max)`` のリスト。
+        stages_y: 各ステージで ``lin_vel_y`` に適用する ``(min, max)`` のリスト。 ``stages_x`` と同じ長さでなければならない。
+        error_threshold: ステージを進めるためのEMA誤差(m/s)の上限。
+            単一の float を渡すと全ステージ共通の閾値になる。
+            ``stages_x`` と同じ長さのリストを渡すとステージごとに閾値を設定でき、
+            広い速度範囲のステージほど緩い(大きい)閾値にして難易度を均せる。
+        command_name: 対象コマンド名(例: ``"base_velocity"``)。
+        asset_name: ロボットのアセット名。
+        ema_alpha: EMA の更新係数 (0,1]。大きいほど直近の誤差を強く反映する。
+        min_updates: ステージ進行を許可する前に必要な呼び出し回数(EMAを温めるため)。
+        stage_cooldown_resamples: ステージを進めた直後、誤差計測(EMA)を再開するまで待つ
+            「コマンド再サンプリング周期」の倍数。ステージを進めると ``cfg.ranges`` は即座に
+            広がるが、各 env が新しい範囲のコマンドを実際に引くのは次回の再サンプリング時
+            (最大 ``resampling_time_range[1]`` 秒後)である。この待機を入れないと、ステージ変更
+            直後の EMA は依然として古い狭い範囲の誤差を映しており、緩い次ステージ閾値を即座に
+            満たして 0→1→2 と一気に遷移してしまう。再サンプリング周期 (= ``resampling_time_range``
+            の最大値) と env.step_dt から待機ステップ数を算出する。1.0 で「全 env が最低 1 回は
+            新範囲を引く」のを保証し、EMA 収束の余裕を見て既定 1.5。
+        post_switch_hold_steps: ステージを進めた直後に EMA を高い値で固定し、計測・更新・判定を
+            止める最小ステップ数 (既定 500)。実際の hold は ``stage_cooldown_resamples`` から
+            算出した再サンプリング待ちステップ数とこの値の大きい方になる。固定値で下限を
+            設けることで、再サンプリング周期が短い設定でも切替直後の一気な遷移を確実に防ぐ。
+        post_switch_ema_scale: 切替直後に EMA を固定する初期値の、新ステージ閾値に対する倍率
+            (既定 2.0)。hold 明けはこの高い値から実測値へ向けて減衰するため、運良く低い誤差を
+            引いただけで即遷移するのを防ぐ。大きいほど次遷移までの猶予が長くなる。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages_x: list[tuple[float, float]] = [tuple(s) for s in params["stages_x"]]
+        self._stages_y: list[tuple[float, float]] = [tuple(s) for s in params["stages_y"]]
+        if len(self._stages_x) != len(self._stages_y):
+            raise ValueError(
+                f"stages_x と stages_y は同じ長さでなければなりません: "
+                f"len(stages_x)={len(self._stages_x)}, len(stages_y)={len(self._stages_y)}"
+            )
+        # error_threshold は float(全ステージ共通)または stages と同じ長さのリスト(ステージ毎)
+        raw_threshold = params["error_threshold"]
+        if isinstance(raw_threshold, (list, tuple)):
+            self._error_thresholds: list[float] = [float(t) for t in raw_threshold]
+            if len(self._error_thresholds) != len(self._stages_x):
+                raise ValueError(
+                    f"error_threshold をリストで渡す場合は stages と同じ長さでなければなりません: "
+                    f"len(error_threshold)={len(self._error_thresholds)}, len(stages_x)={len(self._stages_x)}"
+                )
+        else:
+            self._error_thresholds = [float(raw_threshold)] * len(self._stages_x)
+        self._command_name: str = params["command_name"]
+        self._asset_name: str = params.get("asset_name", "robot")
+
+        self._current_stage: int = 0
+        # EMA は GPU 上のスカラーテンソルのまま保持し、毎ステップの .item() 同期を避ける。
+        # 閾値判定・ログ用に CPU 値が必要なときだけ同期する (下記 __call__ 参照)。
+        self._error_ema: torch.Tensor | None = None
+        self._cached_ema: float = 0.0  # ログ表示用にキャッシュした EMA(同期時のみ更新)
+        self._update_count: int = 0
+        # ステージ変更直後の hold ステップ数。残っている間は EMA 計測・更新・判定を
+        # 完全に停止し、EMA を高い値に固定したまま待つ。全 env が新しい範囲のコマンドを
+        # 引いてポリシーがある程度適応するのを待ってから計測を再開する (チェーン遷移を防ぐ)。
+        self._hold_remaining: int = 0
+
+        # 初期ステージの範囲を即時適用
+        self._apply_stage(self._current_stage)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages_x: Sequence[Sequence[float]],
+        stages_y: Sequence[Sequence[float]],
+        error_threshold: float | Sequence[float],
+        command_name: str,
+        asset_name: str = "robot",
+        ema_alpha: float = 0.02,
+        min_updates: int = 50,
+        stage_cooldown_resamples: float = 1.5,
+        post_switch_hold_steps: int = 500,
+        post_switch_ema_scale: float = 2.0,
+    ) -> dict[str, float]:
+        asset: Articulation = env.scene[asset_name]
+        cmd_term = env.command_manager.get_term(command_name)
+
+        current_threshold = self._error_thresholds[self._current_stage]
+
+        # --- ステージ変更直後の hold ---
+        # ステージを進めると cfg.ranges は即座に広がるが、各 env が新しい範囲のコマンドを
+        # 実際に引くのは次回の再サンプリング時 (最大 resampling_time_range[1] 秒後)。
+        # さらにポリシーが新範囲に適応するにも時間がかかる。この間に EMA を更新・判定すると、
+        # 依然として古い狭い範囲の誤差を見て次の (より緩い) 閾値を即満たし、0→1→2 と
+        # 一気に遷移してしまう。hold 中は EMA を高い値に固定したまま計測・更新・判定を
+        # 完全に止め、全 env が新範囲を引いて適応するのを待つ。hold 明けも EMA は高い値の
+        # ままなので、実測値へ向けて減衰しきる (= 本当に追従できる) まで次遷移は起きない。
+        if self._hold_remaining > 0:
+            self._hold_remaining -= 1
+            return {
+                "stage": float(self._current_stage),
+                "error_ema": float(self._cached_ema),
+                "error_threshold": float(current_threshold),
+                "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
+                "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
+            }
+
+        cmd_lin_xy = cmd_term.command[:, :2]
+        actual_lin_xy = asset.data.root_lin_vel_b[:, :2]
+        # 誤差(全env平均)は GPU 上のスカラーテンソルのまま計算する。ここで .item() しない
+        # ことで、毎ステップ走る curriculum 更新での GPU→CPU 同期(collection の律速要因)を排除する。
+        err = torch.norm(cmd_lin_xy - actual_lin_xy, dim=-1).mean()
+
+        if self._error_ema is None:
+            self._error_ema = err
+        else:
+            self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
+        self._update_count += 1
+
+        # 閾値判定とログ値の更新は min_updates ステップごとにまとめて行う。
+        # CPU への同期 (.item()) はこの分岐の中だけで起き、毎ステップではなくなる。
+        # NOTE: 旧実装は warm-up 後は毎ステップ判定していたが、本実装では判定が周期的になる
+        #       (ステージ進行が最大 min_updates ステップ遅れる)。EMA 値自体は同一に更新され続け、
+        #       カリキュラムの挙動への実質的な影響はない。
+        if self._update_count >= min_updates:
+            ema_val = float(self._error_ema)  # 同期はここだけ (min_updates 回に1回)
+            self._cached_ema = ema_val
+            if self._current_stage < len(self._stages_x) - 1 and ema_val < current_threshold:
+                self._current_stage += 1
+                self._apply_stage(self._current_stage)
+                current_threshold = self._error_thresholds[self._current_stage]
+                # 切り替え直後は EMA を「新ステージ閾値より十分高い値」で固定する。
+                # こうすると hold 明けに実測値で seed し直す代わりに、この高い値から
+                # 実測値へ向けて徐々に減衰していくため、運良く低い誤差を 1 回引いただけで
+                # 即次ステージへ進む (一気に遷移する) ことを防げる。
+                high_ema = float(current_threshold) * post_switch_ema_scale
+                self._error_ema = self._error_ema.new_full((), high_ema)
+                self._cached_ema = high_ema
+                # hold は「新範囲が全 env に行き渡るまで」と「固定 500 ステップ」の
+                # 大きい方。前者は resampling_time_range の最大値 (秒) ÷ step_dt (秒)。
+                max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                resample_steps = int(
+                    math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt)
+                )
+                self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            self._update_count = 0
+
+        return {
+            "stage": float(self._current_stage),
+            "error_ema": float(self._cached_ema),
+            "error_threshold": float(current_threshold),
+            "lin_vel_x_max": float(self._stages_x[self._current_stage][1]),
+            "lin_vel_y_max": float(self._stages_y[self._current_stage][1]),
+        }
+
+    def _apply_stage(self, stage_idx: int) -> None:
+        cmd_term = self._env.command_manager.get_term(self._command_name)
+        cmd_term.cfg.ranges.lin_vel_x = tuple(self._stages_x[stage_idx])
+        cmd_term.cfg.ranges.lin_vel_y = tuple(self._stages_y[stage_idx])
+
+
+class turn_angle_curriculum(ManagerTermBase):
+    """その場回転タスクの目標角レンジ (``turn_angle_range``) を段階的に拡げるカリキュラム。
+
+    ``lin_vel_command_curriculum`` の構造をそのまま踏襲し、監視する誤差だけを
+    「全 env 平均の残り角 ``|Δψ|`` [rad]」に差し替えたもの。この値が
+    ``error_threshold`` を下回ったら次のステージに進む。
+
+    残り角の平均には「再サンプリング直後でまだ大きい env」も含まれるため、
+    完璧なポリシーでも 0 にはならない (到達が速いほど小さくなる)。したがって
+    閾値は絶対精度ではなく「その角度レンジをどれだけ速く畳めているか」の指標として
+    実測に合わせて調整すること。
+
+    Args:
+        stages: 各ステージで ``turn_angle_range`` に適用する ``(min, max)`` [rad] のリスト。
+        error_threshold: ステージを進めるための EMA 残り角 [rad] の上限。float なら全ステージ共通、
+            ``stages`` と同じ長さのリストならステージごと (広いレンジほど緩める)。
+            最終ステージの値は遷移判定に使われずログ表示専用。
+        command_name: 対象コマンド名 (``TargetHeadingCommand`` であること)。
+        ema_alpha / min_updates / stage_cooldown_resamples / post_switch_hold_steps /
+        post_switch_ema_scale: :class:`lin_vel_command_curriculum` と同じ意味。
+            ステージ切替直後に「旧レンジの低い誤差」で 0→1→2 と一気に遷移するのを防ぐ。
+
+    NOTE: ``__init__`` で ``_apply_stage(0)`` を呼ぶので、cfg 側に書いた
+    ``turn_angle_range`` は環境構築時に stage0 の値で上書きされる。カリキュラムを
+    無効化して固定レンジで回したい場合は、この CurrTerm を ``None`` にしたうえで
+    ``commands.base_velocity.turn_angle_range`` を明示的に設定すること
+    (``K1FlatStancePlanePolishCfg`` が lin_vel 側で同じ回避をしている)。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages: list[tuple[float, float]] = [tuple(s) for s in params["stages"]]
+
+        raw_threshold = params["error_threshold"]
+        if isinstance(raw_threshold, (list, tuple)):
+            self._error_thresholds: list[float] = [float(t) for t in raw_threshold]
+            if len(self._error_thresholds) != len(self._stages):
+                raise ValueError(
+                    f"error_threshold をリストで渡す場合は stages と同じ長さでなければなりません: "
+                    f"len(error_threshold)={len(self._error_thresholds)}, len(stages)={len(self._stages)}"
+                )
+        else:
+            self._error_thresholds = [float(raw_threshold)] * len(self._stages)
+        self._command_name: str = params["command_name"]
+
+        self._current_stage: int = 0
+        # EMA は GPU 上のスカラーテンソルのまま保持し、毎ステップの .item() 同期を避ける。
+        self._error_ema: torch.Tensor | None = None
+        self._cached_ema: float = 0.0
+        self._update_count: int = 0
+        self._hold_remaining: int = 0
+
+        self._apply_stage(self._current_stage)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages: Sequence[Sequence[float]],
+        error_threshold: float | Sequence[float],
+        command_name: str,
+        ema_alpha: float = 0.026,
+        min_updates: int = 50,
+        stage_cooldown_resamples: float = 1.5,
+        post_switch_hold_steps: int = 500,
+        post_switch_ema_scale: float = 2.0,
+    ) -> dict[str, float]:
+        cmd_term = env.command_manager.get_term(command_name)
+        current_threshold = self._error_thresholds[self._current_stage]
+
+        if self._hold_remaining > 0:
+            self._hold_remaining -= 1
+            return {
+                "stage": float(self._current_stage),
+                "error_ema": float(self._cached_ema),
+                "error_threshold": float(current_threshold),
+                "turn_angle_max": float(self._stages[self._current_stage][1]),
+            }
+
+        # 全 env 平均の残り角 [rad]。.item() せず GPU 上のスカラーのまま保持する。
+        err = cmd_term.heading_error.abs().mean()
+
+        if self._error_ema is None:
+            self._error_ema = err
+        else:
+            self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
+        self._update_count += 1
+
+        if self._update_count >= min_updates:
+            ema_val = float(self._error_ema)  # 同期はここだけ
+            self._cached_ema = ema_val
+            if self._current_stage < len(self._stages) - 1 and ema_val < current_threshold:
+                self._current_stage += 1
+                self._apply_stage(self._current_stage)
+                current_threshold = self._error_thresholds[self._current_stage]
+                high_ema = float(current_threshold) * post_switch_ema_scale
+                self._error_ema = self._error_ema.new_full((), high_ema)
+                self._cached_ema = high_ema
+                max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                resample_steps = int(
+                    math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt)
+                )
+                self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            self._update_count = 0
+
+        return {
+            "stage": float(self._current_stage),
+            "error_ema": float(self._cached_ema),
+            "error_threshold": float(current_threshold),
+            "turn_angle_max": float(self._stages[self._current_stage][1]),
+        }
+
+    def _apply_stage(self, stage_idx: int) -> None:
+        cmd_term = self._env.command_manager.get_term(self._command_name)
+        cmd_term.cfg.turn_angle_range = tuple(self._stages[stage_idx])
+
+
+class ball_max_speed_curriculum(ManagerTermBase):
+    """ball_velocity_toward_target の max_speed を段階的に上げるカリキュラム。
+
+    全環境にわたる「目標方向へのボール速度成分」 v_along の EMA が
+    ``threshold_ratio * 現在 max_speed`` を超えたら次のステージに進む。
+    最終ステージに到達したら据え置く。
+
+    Args:
+        stages: 各ステージで使用する ``max_speed`` の値のリスト (昇順)。
+        threshold_ratio: ステージを進めるための ``v_along_ema / max_speed`` の下限。
+        reward_term_name: 更新対象の reward term 名 (params["max_speed"] を書き換える)。
+        command_name: ボールの目標位置を持つコマンド名。
+        ball_asset: ボールのシーンエンティティ名。
+        ema_alpha: EMA の更新係数 (0,1]。
+        min_updates: ステージ進行を許可する前に必要な呼び出し回数。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages: list[float] = [float(s) for s in params["stages"]]
+        self._threshold_ratio: float = float(params["threshold_ratio"])
+        self._reward_term_name: str = params["reward_term_name"]
+        self._command_name: str = params.get("command_name", "target_pos")
+        self._ball_asset: str = params.get("ball_asset", "soccer_ball")
+
+        self._current_stage: int = 0
+        self._v_along_ema: float | None = None
+        self._update_count: int = 0
+
+        self._apply_stage(self._stages[self._current_stage])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages: Sequence[float],
+        threshold_ratio: float,
+        reward_term_name: str,
+        command_name: str = "target_pos",
+        ball_asset: str = "soccer_ball",
+        ema_alpha: float = 0.02,
+        min_updates: int = 50,
+    ) -> dict[str, float]:
+        ball = env.scene[ball_asset]
+        ball_pos_w = ball.data.root_pos_w[:, :2]
+        ball_vel_w = ball.data.root_com_vel_w[:, :2]
+        target_pos_w = env.command_manager.get_term(command_name).pos_command_w[:, :2]
+        desired_dir = target_pos_w - ball_pos_w
+        desired_unit = desired_dir / (torch.norm(desired_dir, dim=1, keepdim=True) + 1e-6)
+        v_along = (ball_vel_w * desired_unit).sum(dim=1).clamp(min=0.0)
+        v_along_mean = v_along.mean().item()
+
+        if self._v_along_ema is None:
+            self._v_along_ema = v_along_mean
+        else:
+            self._v_along_ema = (1.0 - ema_alpha) * self._v_along_ema + ema_alpha * v_along_mean
+        self._update_count += 1
+
+        current_max_speed = self._stages[self._current_stage]
+        if (
+            self._current_stage < len(self._stages) - 1
+            and self._update_count >= min_updates
+            and self._v_along_ema > threshold_ratio * current_max_speed
+        ):
+            self._current_stage += 1
+            self._apply_stage(self._stages[self._current_stage])
+            self._update_count = 0
+            self._v_along_ema = None
+
+        return {
+            "stage": float(self._current_stage),
+            "v_along_ema": float(self._v_along_ema if self._v_along_ema is not None else 0.0),
+            "max_speed": float(self._stages[self._current_stage]),
+        }
+
+    def _apply_stage(self, max_speed: float) -> None:
+        term_cfg = self._env.reward_manager.get_term_cfg(self._reward_term_name)
+        term_cfg.params["max_speed"] = max_speed
+
+
+class kick_direction_command_curriculum(ManagerTermBase):
+    """蹴り方向 (target_pos の pos_y 範囲) を段階的に拡げるカリキュラム。
+
+    動いているボールに対して ``1 - cos(ball_vel, desired_dir)`` の EMA が
+    ``error_threshold`` を下回ったら次のステージへ。
+    最終ステージに到達したら据え置く。
+
+    Args:
+        stages: 各ステージで使用する ``(pos_y_min, pos_y_max)`` のリスト。
+            最初のステージを ``(0.0, 0.0)`` にすれば「正面のみ」になる。
+        error_threshold: ステージを進めるための ``1 - cos_sim`` の上限。
+            例: 0.2 なら cos_sim > 0.8 (≒ 37° 以内) になったら進む。
+        command_name: 対象コマンド名 (UniformPose2dCommandCfg)。
+        ball_asset: ボールのシーンエンティティ名。
+        min_speed: 角度誤差を集計する際のボール速度下限 [m/s]。
+            停止中はノイズになるので除外する。
+        ema_alpha: EMA の更新係数 (0,1]。
+        min_updates: ステージ進行を許可する前に必要な呼び出し回数。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages: list[tuple[float, float]] = [tuple(s) for s in params["stages"]]
+        self._error_threshold: float = float(params["error_threshold"])
+        self._command_name: str = params["command_name"]
+        self._ball_asset: str = params.get("ball_asset", "soccer_ball")
+        self._min_speed: float = float(params.get("min_speed", 0.5))
+
+        self._current_stage: int = 0
+        self._error_ema: float | None = None
+        self._update_count: int = 0
+
+        self._apply_stage(self._stages[self._current_stage])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages: Sequence[Sequence[float]],
+        error_threshold: float,
+        command_name: str,
+        ball_asset: str = "soccer_ball",
+        min_speed: float = 0.5,
+        ema_alpha: float = 0.02,
+        min_updates: int = 50,
+    ) -> dict[str, float]:
+        ball = env.scene[ball_asset]
+        ball_pos_w = ball.data.root_pos_w[:, :2]
+        ball_vel_w = ball.data.root_com_vel_w[:, :2]
+        target_pos_w = env.command_manager.get_term(command_name).pos_command_w[:, :2]
+        desired_dir = target_pos_w - ball_pos_w
+
+        ball_speed = torch.norm(ball_vel_w, dim=1)
+        mask = ball_speed > min_speed
+        if mask.any():
+            cos_sim = torch.nn.functional.cosine_similarity(
+                ball_vel_w[mask], desired_dir[mask], dim=1, eps=1e-6
+            )
+            err = (1.0 - cos_sim).mean().item()
+            if self._error_ema is None:
+                self._error_ema = err
+            else:
+                self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
+
+        self._update_count += 1
+
+        if (
+            self._current_stage < len(self._stages) - 1
+            and self._update_count >= min_updates
+            and self._error_ema is not None
+            and self._error_ema < error_threshold
+        ):
+            self._current_stage += 1
+            self._apply_stage(self._stages[self._current_stage])
+            self._update_count = 0
+            self._error_ema = None
+
+        return {
+            "stage": float(self._current_stage),
+            "error_ema": float(self._error_ema if self._error_ema is not None else -1.0),
+            "pos_y_max": float(self._stages[self._current_stage][1]),
+        }
+
+    def _apply_stage(self, y_range: tuple[float, float]) -> None:
+        cmd_term = self._env.command_manager.get_term(self._command_name)
+        cmd_term.cfg.ranges.pos_y = tuple(y_range)
+
+
+class kick_angle_range_curriculum(ManagerTermBase):
+    """``KickDirectionCommand`` の ``angle_range`` を性能ベースで段階的に拡げるカリキュラム。
+
+    最初は正面付近の狭い角度レンジ (例: ``(-0.5, 0.5)``) のみを出題する。ロボットの初期
+    yaw はほぼ正面・ボールも正面なので、狭いレンジでは「直線接近 → そのまま前へ蹴る」が
+    そのまま正解になり、回り込みを必要としない。これにより「とにかく蹴る」局所解ではなく
+    「正しい方向に蹴る」挙動を先に獲得させ、その後レンジを ``(-π, π)`` まで広げて
+    回り込みが必要なケースを徐々に導入する。
+
+    動いているボールに対する方向誤差 ``1 - cos(ball_vel, kick_dir)`` の EMA が
+    ``error_threshold`` を下回ったら次のステージへ進む。最終ステージで据え置く。
+
+    Args:
+        stages: 各ステージで使用する ``(angle_min, angle_max)`` [rad] のリスト。
+            0 を中心に対称に広げるのが基本 (例: ``[(-0.5,0.5), (-1.2,1.2), (-2.0,2.0), (-π,π)]``)。
+        error_threshold: ステージを進めるための ``1 - cos_sim`` の上限。
+            例: 0.3 なら cos_sim > 0.7 (≒ 45° 以内) で進む。
+            float を渡すと全ステージ共通。``stages`` と同じ長さのリストを渡すとステージ毎に
+            設定でき、広い角度レンジのステージほど緩い (大きい) 閾値にして「広い範囲は本質的に
+            精度が落ちる」分を均し、永久停滞を防げる。
+        command_name: 対象コマンド名 (``KickDirectionCommandCfg``)。
+        ball_asset: ボールのシーンエンティティ名。
+        min_speed: 角度誤差を集計するボール速度下限 [m/s]。停止中はノイズなので除外する。
+        ema_alpha: EMA の更新係数 (0,1]。
+        min_updates: 閾値判定を行う呼び出し回数の周期 (EMA を温める)。
+        stage_cooldown_resamples: ステージを進めた直後、計測を再開するまで待つ「コマンド
+            再サンプリング周期」の倍数。レンジを広げても各 env が新レンジのキック方向を
+            実際に引くのは次の再サンプリング時 (最大 ``resampling_time_range[1]`` 秒後) で、
+            それまでに蹴られて飛んでいるボールは **前の狭いレンジ** のものなので、待たずに
+            計測すると古い (揃った) 誤差を見て即連鎖遷移する。再サンプリング周期 ÷ step_dt で
+            待機ステップ数を算出する。
+        post_switch_hold_steps: 切替直後に計測・更新・判定を止める最小ステップ数。実際の
+            hold は再サンプリング待ちとこの値の大きい方。固定下限で確実に連鎖遷移を防ぐ。
+        post_switch_ema_scale: 切替直後にログ表示用 EMA をスパイクさせる、閾値に対する倍率
+            (判定には未使用)。切替が TensorBoard 上で見えるようにするためだけのもの。
+        confirm_windows: ステージ進行を確定させるために必要な「連続で閾値を下回った評価
+            ウィンドウ」数 (既定 3)。1 ウィンドウだけの偶発的な低誤差では進行せず、
+            confirm_windows 回連続で下回ったときのみ進む。stage 0/1 は正面付近で誤差が偶発的に
+            低くなりやすいため、これがないと収束前に一気に駆け抜けて (0→1→2) しまう。途中で
+            1 度でも上回るとカウンタは 0 に戻るので、真に追従できる場合のみ進行する。
+        min_stage_steps: 各ステージに最低限留まる呼び出し (env-step) 回数のハードフロア
+            (既定 0 = 無効)。性能ベースのゲートは正面付近の狭いレンジ (stage 0/1) では
+            「前進 ≒ 正方向キック」で誤差が偶発的に低くなり、ポリシーが本当に方向制御を
+            学ぶ前に通過してしまう。このフロアを設けると、誤差が閾値を下回っても
+            min_stage_steps 経過するまでは進行せず、各レンジで実際に学習する時間を確保できる。
+            ``num_steps_per_env`` 倍すると iteration 換算 (例: 8000 / 24 ≒ 333 iter)。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        params = cfg.params
+        self._stages: list[tuple[float, float]] = [tuple(s) for s in params["stages"]]
+        # error_threshold は float (全ステージ共通) か stages と同じ長さのリスト (ステージ毎)。
+        raw_threshold = params["error_threshold"]
+        if isinstance(raw_threshold, (list, tuple)):
+            self._error_thresholds: list[float] = [float(t) for t in raw_threshold]
+            if len(self._error_thresholds) != len(self._stages):
+                raise ValueError(
+                    f"error_threshold をリストで渡す場合は stages と同じ長さにすること: "
+                    f"len(error_threshold)={len(self._error_thresholds)}, len(stages)={len(self._stages)}"
+                )
+        else:
+            self._error_thresholds = [float(raw_threshold)] * len(self._stages)
+        self._command_name: str = params["command_name"]
+        self._ball_asset: str = params.get("ball_asset", "soccer_ball")
+        self._min_speed: float = float(params.get("min_speed", 0.5))
+
+        self._current_stage: int = 0
+        self._error_ema: float | None = None
+        self._cached_ema: float = -1.0
+        self._update_count: int = 0
+        self._hold_remaining: int = 0
+        # 閾値を連続で下回った評価ウィンドウ数 (デバウンス用)。1 回だけの偶発的な
+        # 低誤差では進行させず、confirm_windows 回連続で下回ったときのみ進行する。
+        self._confirm_count: int = 0
+        # 現ステージに入ってからの呼び出し (env-step) 回数。min_stage_steps 未満の間は
+        # 性能が良く見えても進行を許さない (早期ステージが簡単すぎて即通過するのを防ぐ
+        # ハードフロア)。
+        self._steps_in_stage: int = 0
+
+        self._apply_stage(self._stages[self._current_stage])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        stages: Sequence[Sequence[float]],
+        error_threshold: float | Sequence[float],
+        command_name: str,
+        ball_asset: str = "soccer_ball",
+        min_speed: float = 0.5,
+        ema_alpha: float = 0.02,
+        min_updates: int = 100,
+        stage_cooldown_resamples: float = 1.5,
+        post_switch_hold_steps: int = 1500,
+        post_switch_ema_scale: float = 2.0,
+        confirm_windows: int = 3,
+        min_stage_steps: int = 0,
+    ) -> dict[str, float]:
+        current_threshold = self._error_thresholds[self._current_stage]
+        self._steps_in_stage += 1
+
+        # --- ステージ変更直後の hold ---
+        # 新レンジのキック方向が全 env に行き渡り、前レンジで飛んでいたボールが消えて
+        # ポリシーが適応するまで、計測・更新・判定を完全に止める (連鎖遷移を防ぐ)。
+        if self._hold_remaining > 0:
+            self._hold_remaining -= 1
+            return {
+                "stage": float(self._current_stage),
+                "error_ema": float(self._cached_ema),
+                "error_threshold": float(current_threshold),
+                "angle_max": float(self._stages[self._current_stage][1]),
+            }
+
+        ball = env.scene[ball_asset]
+        ball_vel_w = ball.data.root_com_vel_w[:, :2]
+        kick_dir_w = env.command_manager.get_term(command_name).command  # (N, 2) 単位ベクトル
+
+        ball_speed = torch.norm(ball_vel_w, dim=1)
+        mask = ball_speed > min_speed
+        if mask.any():
+            cos_sim = torch.nn.functional.cosine_similarity(
+                ball_vel_w[mask], kick_dir_w[mask], dim=1, eps=1e-6
+            )
+            err = (1.0 - cos_sim).mean()
+            if self._error_ema is None:
+                self._error_ema = err
+            else:
+                self._error_ema = (1.0 - ema_alpha) * self._error_ema + ema_alpha * err
+
+        self._update_count += 1
+
+        # 閾値判定とログ用 .item() 同期は min_updates 周期でまとめて行う。
+        if self._update_count >= min_updates and self._error_ema is not None:
+            ema_val = float(self._error_ema)
+            self._cached_ema = ema_val
+            can_advance = (
+                self._current_stage < len(self._stages) - 1
+                and self._steps_in_stage >= min_stage_steps
+            )
+            if can_advance and ema_val < current_threshold:
+                # デバウンス: 1 ウィンドウだけ閾値を下回っても進行せず、confirm_windows 回
+                # 連続で下回ったときのみ進行する。stage 0/1 は「前進 ≒ 正方向キック」で
+                # 誤差が偶発的に低くなりやすく、これがないと収束前に一気に駆け抜けてしまう。
+                self._confirm_count += 1
+                if self._confirm_count >= confirm_windows:
+                    self._current_stage += 1
+                    self._apply_stage(self._stages[self._current_stage])
+                    current_threshold = self._error_thresholds[self._current_stage]
+                    self._confirm_count = 0
+                    self._steps_in_stage = 0
+                    # 前ステージの EMA は破棄し (None)、hold 明けに新レンジの実測値から
+                    # 測り直す。seed-high 方式だと前ステージの低い誤差から減衰した値が残り、
+                    # 1 ウィンドウ下回った瞬間に連鎖遷移してしまうため、純粋に新レンジを測る。
+                    self._error_ema = None
+                    # cached_ema はログ表示用に切替を見えるようスパイクさせるだけ (判定には未使用)。
+                    self._cached_ema = current_threshold * post_switch_ema_scale
+                    # hold = 「新レンジが全 env に行き渡るまで」と固定下限の大きい方。
+                    cmd_term = env.command_manager.get_term(command_name)
+                    max_resample_s = float(cmd_term.cfg.resampling_time_range[1])
+                    resample_steps = int(math.ceil(stage_cooldown_resamples * max_resample_s / env.step_dt))
+                    self._hold_remaining = max(int(post_switch_hold_steps), resample_steps)
+            else:
+                # 閾値を上回ったら連続カウンタをリセット (sustained でなければ進めない)。
+                self._confirm_count = 0
+            self._update_count = 0
+
+        return {
+            "stage": float(self._current_stage),
+            "error_ema": float(self._cached_ema),
+            "error_threshold": float(current_threshold),
+            "angle_max": float(self._stages[self._current_stage][1]),
+        }
+
+    def _apply_stage(self, angle_range: tuple[float, float]) -> None:
+        cmd_term = self._env.command_manager.get_term(self._command_name)
+        cmd_term.cfg.angle_range = tuple(angle_range)
+
+
+# ---------------------------------------------------------------------------
+# ドリブル (Isaac-Velocity-Flat-K1-Dribble-Target-v0) 用のカリキュラム
+# ---------------------------------------------------------------------------
+
+
+class dribble_target_range_curriculum(ManagerTermBase):
+    """目標距離・経路形状・障害物を Level1〜N で段階的に難しくするカリキュラム。
+
+    ゲート指標は「終了したエピソードのうち success_term_name (ball_reached_target) で
+    終わらなかった割合」= 失敗率の EMA。``min_updates`` 回更新した後、EMA が
+    ``error_threshold[level]`` を下回ったら次のレベルへ進む。進んだ直後は EMA を 1.0、
+    更新回数を 0 に戻して温め直す (一気に何段も進むのを防ぐ)。
+
+    各ステージ (dict) のキー:
+        pos_x, pos_y: 目標点のオフセット範囲 [m] (WaypointPose2dCommandCfg.ranges)
+        path_shape: 経路形状 (省略時 "straight")
+        num_obstacles: 障害物の本数 (省略時 0 = 退避)
+        corner_obstacles: Z字のコーナーに置く (省略時 False)
+        corridor: 2 本をゲート状に置く (省略時 False)
+
+    状態 (level / EMA / 更新回数) は :meth:`state_dict` / :meth:`load_state_dict` で保存・復元できる。
+    train.py が checkpoint と同じ名前の ``model_*_curriculum.json`` に保存し、再開時に読み込む。
+    """
+
+    def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self._stages = cfg.params["stages"]
+        self._command_name = cfg.params["command_name"]
+        self.level = 0
+        self.failure_ema = 1.0
+        self.num_updates = 0
+        self._apply_stage(env)
+
+    def _apply_stage(self, env: ManagerBasedRLEnv):
+        stage = self._stages[self.level]
+        cmd_cfg = env.command_manager.get_term(self._command_name).cfg
+        cmd_cfg.ranges.pos_x = tuple(stage["pos_x"])
+        cmd_cfg.ranges.pos_y = tuple(stage["pos_y"])
+        cmd_cfg.path_shape = stage.get("path_shape", "straight")
+        env._dribble_num_obstacles = int(stage.get("num_obstacles", 0))
+        env._dribble_corner_obstacles = bool(stage.get("corner_obstacles", False))
+        env._dribble_corridor = bool(stage.get("corridor", False))
+
+    def state_dict(self) -> dict:
+        return {"level": self.level, "failure_ema": self.failure_ema, "num_updates": self.num_updates}
+
+    def load_state_dict(self, state: dict):
+        self.level = min(int(state["level"]), len(self._stages) - 1)
+        self.failure_ema = float(state["failure_ema"])
+        self.num_updates = int(state["num_updates"])
+        self._apply_stage(self._env)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        env_ids: Sequence[int],
+        command_name: str,
+        success_term_name: str,
+        stages: list[dict],
+        error_threshold: list[float],
+        ema_alpha: float = 0.02,
+        min_updates: int = 50,
+    ) -> dict[str, float]:
+        if env_ids is not None and len(env_ids) > 0:
+            env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+            # 環境構築直後の一斉リセット (エピソード長 0) は数えない
+            finished = env_ids[env.episode_length_buf[env_ids] > 0]
+            if len(finished) > 0:
+                success = env.termination_manager.get_term(success_term_name)[finished]
+                failure_rate = 1.0 - success.float().mean().item()
+                self.failure_ema = (1.0 - ema_alpha) * self.failure_ema + ema_alpha * failure_rate
+                self.num_updates += 1
+                if (
+                    self.level < len(stages) - 1
+                    and self.num_updates >= min_updates
+                    and self.failure_ema < error_threshold[self.level]
+                ):
+                    self.level += 1
+                    self.failure_ema = 1.0
+                    self.num_updates = 0
+                    self._apply_stage(env)
+                    print(f"[dribble_target_range_curriculum] Level {self.level + 1} に進級: {stages[self.level]}")
+        return {"level": float(self.level + 1), "failure_ema": self.failure_ema}
+
+
+def modify_gait_phase_cmd_threshold_linear(
+    env: ManagerBasedRLEnv,
+    env_ids: Sequence[int],
+    start_threshold: float,
+    end_threshold: float,
+    start_step: int,
+    end_step: int,
+    obs_groups: tuple[str, ...] = ("policy", "critic"),
+    obs_term_name: str = "gait_phase",
+    reward_term_names: tuple[str, ...] = ("feet_phase",),
+) -> float:
+    """gait_phase 観測 (と feet_phase 報酬) の cmd_threshold を線形に変化させる。
+
+    Stage1 の値 (_COMMAND_THRESHOLD: コマンドがゼロなら位相もゼロ) から、到達しない値
+    (-1.0: 位相を常に 1.8Hz で回す) へ ``start_step`` → ``end_step`` で移す。即時に切り替えると
+    Stage1 のポリシーが経験していない「位相≠0 かつ velocity_commands=0」にいきなり晒され、
+    転倒率が ~99.5% に張り付いた (2026-10-06-b)。
+
+    feet_phase 報酬も同じ閾値にそろえる。そろえないと、コマンドがゼロの Stage2 では
+    feet_phase が「両足接地」を要求し続け、足を上げるたびに罰が入る (歩けなくなる)。
+    """
+    s = env.common_step_counter
+    if s <= start_step:
+        threshold = start_threshold
+    elif s >= end_step:
+        threshold = end_threshold
+    else:
+        alpha = (s - start_step) / float(end_step - start_step)
+        threshold = start_threshold + alpha * (end_threshold - start_threshold)
+    obs_manager = env.observation_manager
+    for group in obs_groups:
+        names = obs_manager._group_obs_term_names.get(group, [])
+        if obs_term_name in names:
+            term_cfg = obs_manager._group_obs_term_cfgs[group][names.index(obs_term_name)]
+            term_cfg.params["cmd_threshold"] = threshold
+    for name in reward_term_names:
+        if name in env.reward_manager.active_terms:
+            term_cfg = env.reward_manager.get_term_cfg(name)
+            term_cfg.params["cmd_threshold"] = threshold
+            env.reward_manager.set_term_cfg(name, term_cfg)
+    return threshold
+
+
+def log_ball_front_ratio(env: ManagerBasedRLEnv, env_ids: Sequence[int]) -> float:
+    """終了したエピソードの「ボールが前方 ±45° 以内にあった時間の割合」の平均を返す (ログ専用)。
+
+    集計は interval イベント mdp.events.track_ball_front_ratio が毎ステップ行う。
+    """
+    steps = getattr(env, "_ball_front_steps", None)
+    if steps is None or env_ids is None or len(env_ids) == 0:
+        return getattr(env, "_ball_front_ratio_last", 0.0)
+    env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    total = env._ball_front_total[env_ids]
+    valid = total > 0
+    if valid.any():
+        env._ball_front_ratio_last = (steps[env_ids][valid] / total[valid]).mean().item()
+    steps[env_ids] = 0.0
+    env._ball_front_total[env_ids] = 0.0
+    return getattr(env, "_ball_front_ratio_last", 0.0)
