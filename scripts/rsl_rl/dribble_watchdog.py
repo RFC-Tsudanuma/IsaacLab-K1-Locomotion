@@ -11,7 +11,11 @@
 2. 回復の判定: iteration が --stop_check_iter (既定 22000) を初めて超えたとき、直近 --window
    iteration の転倒率 (Episode_Termination/base_height) の平均が --max_fall (既定 0.3) 以上なら学習を止める。
    判定は 1 回だけ。
-3. 途中エクスポート: カリキュラムが初めて Level --export_level (既定 3) に達した checkpoint
+3. 報告 (止めない): iteration が --level_check_iter (既定 23000) を初めて超えたときにまだ Level1 なら記録する。
+   直近 --plateau_window (既定 500) iteration で成功率 (Episode_Termination/ball_reached_target) の伸びが
+   --plateau_min_gain (既定 0.02) 未満になったら記録する (伸びが戻ったら、次に横ばいになったときにまた記録する)。
+   成功率は前後それぞれ 50 iteration の平均で比べる。
+4. 途中エクスポート: カリキュラムが初めて Level --export_level (既定 3) に達した checkpoint
    (model_*_curriculum.json の level が Level-1 以上の最初のもの) を、export_dribble_target.py で
    ONNX + 仕様 JSON に書き出す (別プロセス)。
 
@@ -45,9 +49,17 @@ def _log(path: str, msg: str) -> None:
         f.write(line + "\n")
 
 
-def _parse_console(path: str) -> tuple[dict[int, float], int | None, str | None, bool]:
-    """iteration → 転倒率、最新 iteration、NaN が出た行、学習が完了したか を返す。"""
+_METRIC_KEYS = {
+    "Episode_Termination/base_height": "fall",
+    "Episode_Termination/ball_reached_target": "success",
+    "Curriculum/dribble_target_range/level": "level",
+}
+
+
+def _parse_console(path: str) -> tuple[dict[int, float], int | None, str | None, bool, dict]:
+    """iteration → 転倒率、最新 iteration、NaN が出た行、学習が完了したか、指標 (名前 → iteration → 値) を返す。"""
     falls: dict[int, float] = {}
+    metrics: dict[str, dict[int, float]] = {v: {} for v in _METRIC_KEYS.values()}
     it = None
     nan_line = None
     done = False
@@ -58,16 +70,24 @@ def _parse_console(path: str) -> tuple[dict[int, float], int | None, str | None,
                 it = int(m.group(1))
                 continue
             s = line.strip()
-            if it is not None and s.startswith("Episode_Termination/base_height:"):
-                try:
-                    falls[it] = float(s.split(":")[1])
-                except ValueError:
-                    pass
+            if it is not None and ":" in s:
+                key, _, val = s.partition(":")
+                if key.strip() in _METRIC_KEYS:
+                    try:
+                        metrics[_METRIC_KEYS[key.strip()]][it] = float(val)
+                    except ValueError:
+                        pass
             if nan_line is None and any(k in s for k in _NAN_KEYS) and re.search(r"\bnan\b", s, re.IGNORECASE):
                 nan_line = f"iteration {it}: {s}"
             if s.startswith("Training time:"):
                 done = True
-    return falls, it, nan_line, done
+    falls = metrics["fall"]
+    return falls, it, nan_line, done, metrics
+
+
+def _mean(d: dict[int, float], lo: int, hi: int) -> float | None:
+    vals = [d[i] for i in range(lo, hi + 1) if i in d]
+    return sum(vals) / len(vals) if vals else None
 
 
 def _training_pids(task: str) -> list[int]:
@@ -99,6 +119,9 @@ def main():
     parser.add_argument("--max_fall", type=float, default=0.3)
     parser.add_argument("--window", type=int, default=50)
     parser.add_argument("--export_level", type=int, default=3)
+    parser.add_argument("--level_check_iter", type=int, default=23000)
+    parser.add_argument("--plateau_window", type=int, default=500)
+    parser.add_argument("--plateau_min_gain", type=float, default=0.02)
     parser.add_argument("--interval_s", type=int, default=120)
     args = parser.parse_args()
 
@@ -110,7 +133,10 @@ def main():
     export_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_dribble_target.py")
 
     while True:
-        falls, it, nan_line, done = _parse_console(args.console_log)
+        falls, it, nan_line, done, metrics = _parse_console(args.console_log)
+        state.setdefault("level_checked", False)
+        state.setdefault("plateau_active", False)
+        state.setdefault("plateau_reports", [])
 
         if nan_line:
             _stop_training(args.task, logfile, f"NaN を検出: {nan_line}")
@@ -126,6 +152,34 @@ def main():
                 json.dump(state, open(state_path, "w"), indent=2)
                 break
             _log(logfile, f"回復の判定: iteration {args.stop_check_iter} の直近 {len(window)} iteration の転倒率の平均 {mean:.3f} < {args.max_fall} → 続行")
+
+        # 報告 (止めない): iteration 23000 でまだ Level1 か
+        if it is not None and not state["level_checked"] and it >= args.level_check_iter:
+            state["level_checked"] = True
+            level = metrics["level"].get(max(i for i in metrics["level"] if i <= args.level_check_iter), None) if metrics["level"] else None
+            if level is not None and level < 2:
+                _log(logfile, f"[報告] iteration {args.level_check_iter} の時点でまだ Level1 です (成功率 直近50 "
+                     f"{_mean(metrics['success'], args.level_check_iter - 49, args.level_check_iter):.3f})。学習は続けます")
+            else:
+                _log(logfile, f"[報告] iteration {args.level_check_iter} の時点で Level {level:.0f} です")
+
+        # 報告 (止めない): 直近 plateau_window iteration で成功率の伸びが plateau_min_gain 未満
+        succ = metrics["success"]
+        if it is not None and succ:
+            first = min(succ)
+            if it - first >= args.plateau_window + 49:
+                now = _mean(succ, it - 49, it)
+                before = _mean(succ, it - args.plateau_window - 49, it - args.plateau_window)
+                if now is not None and before is not None:
+                    gain = now - before
+                    if gain < args.plateau_min_gain and not state["plateau_active"]:
+                        state["plateau_active"] = True
+                        state["plateau_reports"].append({"iteration": it, "success_now": now, "success_before": before})
+                        _log(logfile, f"[報告] 成功率が横ばいです: iteration {it - args.plateau_window} → {it} で "
+                             f"{before:.3f} → {now:.3f} (伸び {gain:+.3f} < {args.plateau_min_gain})。学習は続けます")
+                    elif gain >= args.plateau_min_gain and state["plateau_active"]:
+                        state["plateau_active"] = False
+                        _log(logfile, f"[報告] 成功率が再び伸びています: iteration {it}、直近 {args.plateau_window} iteration で {gain:+.3f}")
 
         if state["exported"] is None:
             for cur in sorted(glob.glob(os.path.join(run_dir, "model_*_curriculum.json")),
