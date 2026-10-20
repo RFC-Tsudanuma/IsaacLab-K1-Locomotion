@@ -14,6 +14,7 @@ from isaaclab.app import AppLauncher
 
 # local imports
 import cli_args  # isort: skip
+import stage_transition_utils  # isort: skip
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with RSL-RL.")
@@ -110,6 +111,11 @@ from isaaclab_k1_locomotion.tasks.manager_based.locomotion.networks import (
     ActorCriticHistoryCNN,
     export_history_policy_as_jit,
     export_history_policy_as_onnx,
+)
+from isaaclab_k1_locomotion.tasks.manager_based.dribble_target.agents.history_policy_exporter import (
+    export_history_policy_as_jit as export_dribble_history_policy_as_jit,
+    export_history_policy_as_onnx as export_dribble_history_policy_as_onnx,
+    is_history_policy as is_dribble_history_policy,
 )
 
 
@@ -348,6 +354,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
+    # インストールされている rsl-rl のバージョンに合わせて agent 設定を変換する (train.py と同じ)。
+    try:
+        import importlib.metadata as _metadata
+
+        from isaaclab_rl.rsl_rl import handle_deprecated_rsl_rl_cfg
+    except ImportError:  # 古い isaaclab_rl には無い (変換も不要)
+        handle_deprecated_rsl_rl_cfg = None
+    if handle_deprecated_rsl_rl_cfg is not None:
+        agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _metadata.version("rsl-rl-lib"))
     env_cfg.scene.num_envs = args_cli.num_envs if args_cli.num_envs is not None else env_cfg.scene.num_envs
 
     # set the environment seed
@@ -406,7 +421,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO]: Loading model checkpoint from: {resume_path}")
     # load previously trained model
     if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        runner = OnPolicyRunner(
+            env, stage_transition_utils.filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=None, device=agent_cfg.device
+        )
     elif agent_cfg.class_name == "DistillationRunner":
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
@@ -448,7 +465,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     run_dir = os.path.dirname(resume_path)
     export_model_dir = os.path.join(run_dir, "exported")
     onnx_filename = f"{agent_cfg.experiment_name}_{os.path.basename(run_dir)}.onnx"
-    if isinstance(policy_nn, ActorCriticHistoryCNN):
+    if is_dribble_history_policy(policy_nn):
+        # dribble_target パッケージの HistoryActorCritic (歩行 49 次元 / ドリブル 59 次元)。
+        # 入力は command (1, 3) と obs_history (1, 100, 項の合計次元)、正規化器はグラフに含める。
+        export_dribble_history_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_dribble_history_policy_as_onnx(
+            policy_nn, normalizer=normalizer, path=export_model_dir, filename=onnx_filename
+        )
+    elif isinstance(policy_nn, ActorCriticHistoryCNN):
         # 観測履歴を見る actor は nn.Sequential ではないので標準 exporter が使えない
         # (actor[0].in_features を見に行く)。入力は (1, history, obs_dim)。
         export_history_policy_as_jit(policy_nn, path=export_model_dir, filename="policy.pt")
