@@ -30,6 +30,13 @@ parser.add_argument("--num_envs", type=int, default=512)
 parser.add_argument("--steps", type=int, default=500)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--output", default=None, help="結果の JSON を書き出すファイル")
+parser.add_argument(
+    "--training_like",
+    action="store_true",
+    help="学習時の指標にそろえる: 行動ノイズ (std) を入れてサンプリング、エピソード長を最初にばらつかせる、"
+    "速度コマンドを Stage1 の最後と同じ分布 (x ±2.0 / y ±0.9 / yaw ±1.0、extreme 0.35) にする。"
+    "終わったエピソードのうち転倒で終わった割合 (Episode_Termination/base_height 相当) も出す",
+)
 parser.add_argument("--lin_vel_x", type=float, default=1.5)
 parser.add_argument("--lin_vel_y", type=float, default=0.9)
 parser.add_argument("--ang_vel_z", type=float, default=1.0)
@@ -72,10 +79,16 @@ def main():
     env_cfg.curriculum.extreme_commands = None
     env_cfg.curriculum.command_resampling_time_range = None
     r = env_cfg.commands.base_velocity.ranges
-    r.lin_vel_x = (-args_cli.lin_vel_x, args_cli.lin_vel_x)
-    r.lin_vel_y = (-args_cli.lin_vel_y, args_cli.lin_vel_y)
-    r.ang_vel_z = (-args_cli.ang_vel_z, args_cli.ang_vel_z)
-    env_cfg.commands.base_velocity.resampling_time_range = (4.0, 8.0)
+    if args_cli.training_like:
+        r.lin_vel_x, r.lin_vel_y, r.ang_vel_z = (-2.0, 2.0), (-0.9, 0.9), (-1.0, 1.0)
+        env_cfg.commands.base_velocity.extreme_prob = 0.35
+        env_cfg.commands.base_velocity.extreme_frac = 0.7
+        env_cfg.commands.base_velocity.resampling_time_range = (0.8, 8.0)
+    else:
+        r.lin_vel_x = (-args_cli.lin_vel_x, args_cli.lin_vel_x)
+        r.lin_vel_y = (-args_cli.lin_vel_y, args_cli.lin_vel_y)
+        r.ang_vel_z = (-args_cli.ang_vel_z, args_cli.ang_vel_z)
+        env_cfg.commands.base_velocity.resampling_time_range = (4.0, 8.0)
 
     agent_cfg = load_cfg_from_registry(TASK, "rsl_rl_cfg_entry_point")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, metadata.version("rsl-rl-lib"))
@@ -87,6 +100,9 @@ def main():
     )
     runner.load(args_cli.checkpoint, load_optimizer=False)
     policy = runner.get_inference_policy(device="cuda:0")
+    if args_cli.training_like:
+        runner.alg.policy.eval()
+        policy = runner.alg.policy.act  # 学習時と同じく行動ノイズ入りでサンプリング
 
     u = env.unwrapped
     robot = u.scene["robot"]
@@ -100,6 +116,9 @@ def main():
 
     from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
+    if args_cli.training_like:  # rsl_rl の init_at_random_ep_len と同じ
+        u.episode_length_buf = torch.randint_like(u.episode_length_buf, high=int(u.max_episode_length))
+    ended, ended_fall = 0, 0
     obs = wrapped.get_observations()
     with torch.no_grad():  # inference_mode だと env.reset の in-place 操作でエラーになる
         for _ in range(args_cli.steps):
@@ -107,6 +126,8 @@ def main():
             term = u.termination_manager
             failed = (term.get_term("base_height") | term.get_term("base_contact")) & dones.bool()
             fell |= failed
+            ended += int(dones.sum().item())
+            ended_fall += int((term.get_term("base_height") & dones.bool()).sum().item())
             since_reset = torch.where(dones.bool(), torch.zeros_like(since_reset), since_reset + 1)
 
             cmd = u.command_manager.get_command("base_velocity")
@@ -134,6 +155,9 @@ def main():
         "ang_vel_err_mean": ang_err / max(err_count, 1),
         "feet_air_time_mean": air_sum / max(air_count, 1),
         "fly_pct": 100.0 * fly_steps / max(total_steps, 1),
+        "training_like": args_cli.training_like,
+        "episodes_ended": ended,
+        "ended_by_fall_fraction": ended_fall / max(ended, 1),
         "command": {"lin_vel_x": args_cli.lin_vel_x, "lin_vel_y": args_cli.lin_vel_y, "ang_vel_z": args_cli.ang_vel_z},
     }
     print("[RESULT] " + json.dumps(result), flush=True)

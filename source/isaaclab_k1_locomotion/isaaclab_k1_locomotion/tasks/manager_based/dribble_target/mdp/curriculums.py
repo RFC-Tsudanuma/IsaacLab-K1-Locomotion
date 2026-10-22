@@ -899,9 +899,11 @@ class dribble_target_range_curriculum(ManagerTermBase):
     def _apply_stage(self, env: ManagerBasedRLEnv):
         stage = self._stages[self.level]
         cmd_cfg = env.command_manager.get_term(self._command_name).cfg
-        cmd_cfg.ranges.pos_x = tuple(stage["pos_x"])
-        cmd_cfg.ranges.pos_y = tuple(stage["pos_y"])
+        # ローカル座標で作る形 (oval など) は pos_x / pos_y を使わないので省略できる
+        cmd_cfg.ranges.pos_x = tuple(stage.get("pos_x", (1.0, 1.0)))
+        cmd_cfg.ranges.pos_y = tuple(stage.get("pos_y", (0.0, 0.0)))
         cmd_cfg.path_shape = stage.get("path_shape", "straight")
+        cmd_cfg.shape_params = dict(stage.get("shape_params", {}))
         env._dribble_num_obstacles = int(stage.get("num_obstacles", 0))
         env._dribble_corner_obstacles = bool(stage.get("corner_obstacles", False))
         env._dribble_corridor = bool(stage.get("corridor", False))

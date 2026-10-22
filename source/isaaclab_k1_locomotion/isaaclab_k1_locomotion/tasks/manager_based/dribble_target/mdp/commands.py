@@ -1116,8 +1116,59 @@ class TransitionCommandCfg(CommandTermCfg):
 # ドリブル (Isaac-Velocity-Flat-K1-Dribble-Target-v0) 用の目標点コマンド
 # ---------------------------------------------------------------------------
 
-_PATH_SHAPES = ("straight", "curve", "l_shape", "z_shape")
-_MAX_WAYPOINTS = 3
+_PATH_SHAPES = ("straight", "curve", "l_shape", "z_shape", "oval", "s_curve", "v_turn", "u_turn", "figure8")
+# ローカル座標 (始点 = ボール、x = 進行方向、y = 左) で作る形。shape_params で大きさの範囲を指定する。
+_LOCAL_SHAPES = ("oval", "s_curve", "v_turn", "u_turn", "figure8")
+_MAX_WAYPOINTS = 32
+
+
+def _u(n: int, rng, device) -> torch.Tensor:
+    """(lo, hi) の一様乱数 (n, 1)。"""
+    lo, hi = rng
+    return torch.empty(n, 1, device=device).uniform_(float(lo), float(hi))
+
+
+def _local_path(shape: str, params: dict, n: int, device) -> torch.Tensor:
+    """ローカル座標のウェイポイント列 (n, K, 2) を返す (始点 (0, 0) は含まない、最後が最終目標)。
+
+    すべて「左に曲がる」向きで作り、呼び出し側で y を確率 0.5 で反転する。
+
+    * oval     (O 字): 始点で +x に接する楕円を 1 周して始点に戻る。半軸 a (進行方向)・b (横)。K = n_points
+    * s_curve  (S 字スラローム): y = A sin(2π x / λ)、x ∈ (0, periods·λ]。K = n_points
+    * v_turn   (V 字の鋭角ターン): +x に leg1 進み、turn_deg (120〜150°) 左に向きを変えて leg2 進む。K = 2
+    * u_turn   (U ターン): +x に leg1 進み、横に width 移り、-x に leg2 戻る。K = 3
+    * figure8  (8 の字): 半径 R の円を 2 つ、始点 (交点) から左回り → 右回りで 1 周ずつ。K = 2 × n_points_per_loop
+    """
+    if shape == "oval":
+        a, b = _u(n, params["a"], device), _u(n, params["b"], device)
+        k = int(params.get("n_points", 16))
+        t = -math.pi / 2 + 2 * math.pi * torch.arange(1, k + 1, device=device).float() / k  # (k,)
+        return torch.stack([a * torch.cos(t), b + b * torch.sin(t)], dim=2)
+    if shape == "s_curve":
+        amp, lam, per = _u(n, params["amplitude"], device), _u(n, params["wavelength"], device), _u(n, params["periods"], device)
+        k = int(params.get("n_points", 12))
+        x = per * lam * torch.arange(1, k + 1, device=device).float() / k  # (n, k)
+        return torch.stack([x, amp * torch.sin(2 * math.pi * x / lam)], dim=2)
+    if shape == "v_turn":
+        l1, l2 = _u(n, params["leg1"], device), _u(n, params["leg2"], device)
+        phi = torch.deg2rad(_u(n, params["turn_deg"], device))
+        corner = torch.cat([l1, torch.zeros_like(l1)], dim=1)
+        goal = corner + l2 * torch.cat([torch.cos(phi), torch.sin(phi)], dim=1)
+        return torch.stack([corner, goal], dim=1)
+    if shape == "u_turn":
+        l1, l2, w = _u(n, params["leg1"], device), _u(n, params["leg2"], device), _u(n, params["width"], device)
+        c1 = torch.cat([l1, torch.zeros_like(l1)], dim=1)
+        c2 = torch.cat([l1, w], dim=1)
+        goal = torch.cat([l1 - l2, w], dim=1)
+        return torch.stack([c1, c2, goal], dim=1)
+    if shape == "figure8":
+        r = _u(n, params["radius"], device)
+        k = int(params.get("n_points_per_loop", 12))
+        t = 2 * math.pi * torch.arange(1, k + 1, device=device).float() / k  # (k,)
+        loop1 = torch.stack([r * torch.sin(t), r - r * torch.cos(t)], dim=2)  # 左回り、中心 (0, R)
+        loop2 = torch.stack([r * torch.sin(t), -(r - r * torch.cos(t))], dim=2)  # 右回り、中心 (0, -R)
+        return torch.cat([loop1, loop2], dim=1)
+    raise ValueError(shape)
 
 
 class WaypointPose2dCommand(CommandTerm):
@@ -1231,7 +1282,17 @@ class WaypointPose2dCommand(CommandTerm):
         shape = self.cfg.path_shape
         if shape not in _PATH_SHAPES:
             raise ValueError(f"WaypointPose2dCommand: 未知の path_shape {shape!r} ({_PATH_SHAPES})")
-        if shape == "straight":
+        if shape in _LOCAL_SHAPES:
+            # 進行方向 ψ: 通常はワールド +x (リセット直後のロボットの向き)、omni_prob の割合で全方位
+            psi = torch.where(omni.squeeze(1), bearing, torch.zeros_like(bearing))
+            local = _local_path(shape, self.cfg.shape_params, n, self.device)
+            local = local * torch.stack([torch.ones_like(sign), sign], dim=2)  # 左右をランダムに反転
+            c, s_ = torch.cos(psi).view(n, 1), torch.sin(psi).view(n, 1)
+            world = torch.stack([c * local[..., 0] - s_ * local[..., 1], s_ * local[..., 0] + c * local[..., 1]], dim=2)
+            world = world + start.unsqueeze(1)
+            points = [world[:, i] for i in range(world.shape[1])]
+            goal = points[-1]
+        elif shape == "straight":
             points = [goal]
         elif shape == "curve":
             points = [start + 0.5 * seg + sign * self.cfg.curve_offset_frac * length * normal, goal]
@@ -1321,6 +1382,10 @@ class WaypointPose2dCommandCfg(CommandTermCfg):
     """curve: 中間点を S→G の長さのこの割合だけ横にずらす。"""
 
     z_amplitude: float = 1.0
+
+    shape_params: dict = {}
+    """ローカル座標で作る形 (oval / s_curve / v_turn / u_turn / figure8) の大きさの範囲。
+    dribble_target_range_curriculum がレベルの設定 (stage の "shape_params") から書き換える。"""
     """z_shape: 1/3・2/3 点を横にずらす量 [m]。"""
 
     goal_visualizer_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(

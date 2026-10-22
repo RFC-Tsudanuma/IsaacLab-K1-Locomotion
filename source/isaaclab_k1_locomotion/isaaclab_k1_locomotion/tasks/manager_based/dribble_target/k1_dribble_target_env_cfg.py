@@ -867,48 +867,45 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
                 # Level1-2=直線/Level3=カーブ/Level4=L字/Level5=Z字という対応を採用)。
                 # Level7 も「障害物10個ランダム散布」から「Z字経路のコーナーに障害物を
                 # 置いてジグザグに回避させる」設計に変更した (corner_obstacles=True)。
+                # 2026-10-22: 障害物のレベル (旧 Level6〜8) をやめ、コースの形で難しくする 10 レベルに作り直した。
+                # 障害物の回避は戦略側の経路計画 (pathplan_lib) に任せ、ポリシーは渡されたウェイポイント列を
+                # たどることに専念する。レベルの並び:
+                #   Level1〜2   直線                     (実装済みの straight)
+                #   Level3〜5   連続的な旋回と重心移動 (止まらず曲がる): C 字 (curve) / O 字 (oval) / S 字 (s_curve)
+                #   Level6〜8   減速・ピボット・再加速を伴う方向転換: L 字 (l_shape) / V 字 (v_turn) / U ターン (u_turn)
+                #   Level9〜10  複合軌道: Z 字 (z_shape) / 8 の字 (figure8)
+                # straight / curve / l_shape / z_shape は目標のオフセット (pos_x, pos_y、ワールド軸) から作る従来の形。
+                # oval 以降はローカル座標 (始点 = ボール、x = 進行方向) で shape_params の範囲から作る
+                # (mdp/commands.py の _local_path)。左右はランダムに反転し、omni_prob の割合で進行方向を全方位にする。
                 "stages": [
-                    {"pos_x": (2.0, 2.5), "pos_y": (0.0, 0.0)}, # Level1: 近距離・正面・直線 (2.0~2.5m、ボールspawn重複回避のため2026-09-26に1.5→2.0へ引き上げ)
-                    {"pos_x": (2.5, 4.0), "pos_y": (-0.5, 0.5)}, # Level2: 中距離・微小なブレ・直線 (2.5~4.0m)
-                    {"pos_x": (4.0, 6.0), "pos_y": (-1.0, 1.0), "path_shape": "curve"}, # Level3: 長距離・緩やかなカーブ (4.0~6.0m)
-                    {"pos_x": (6.0, 8.0), "pos_y": (-1.5, 1.5), "path_shape": "l_shape"}, # Level4: 超長距離・L字 (直角1回) (6.0~8.0m)
-                    {"pos_x": (8.0, 10.0), "pos_y": (-2.0, 2.0), "path_shape": "z_shape"}, # Level5: 最大距離・Z字 (切り返し2回) (8.0~10.0m)
-                    # 2026-09-27 追加: Level5 と同じ距離レンジのまま、スタートと目標の間に
-                    # 障害物 (静的な円柱) を配置し、ロボット/ボールが衝突すると failure 扱いに
-                    # なる (termination_penalty) 障害物回避レベル。num_obstacles=1 が
-                    # env._dribble_num_obstacles を 1 にする唯一のトリガー (そのまま
-                    # fraction_range/lateral_offset_range の狙った1本配置になる)。
-                    # path_shape は指定しない (= "straight") ので、まずは直線+障害物1本の
-                    # 基本的な回避だけを学ばせる (Level7 でジグザグ+障害物に進む前の足場)。
-                    {
-                        "pos_x": (8.0, 10.0), "pos_y": (-2.0, 2.0),
-                        "num_obstacles": 1,
-                    }, # Level6: 障害物回避・1本・直線 (Level5 と同距離)
-                    # 2026-10-09 変更: 「ランダム散布を避ければ良い」から「Z字経路の
-                    # コーナー (折り返し地点) に障害物を置き、外側を回り込ませる」設計に
-                    # 変更した (ジグザグ回避、events.py の reset_obstacle_between_start_and_target
-                    # 参照)。corner_obstacles=True かつ num_obstacles=2 (Z字のコーナー2箇所
-                    # それぞれに1本)。
-                    {
-                        "pos_x": (8.0, 10.0), "pos_y": (-2.0, 2.0),
-                        "path_shape": "z_shape", "num_obstacles": 2, "corner_obstacles": True,
-                    }, # Level7: Z字コーナーの障害物をジグザグに回避
-                    # 2026-10-06 追加: 障害物2本を経路中間点にゲート状に配置し、中心間距離
-                    # 1.4m (障害物半径0.2m×2を引いた通過可能幅は約1.0m) の隙間を通らせる
-                    # コリドール通過レベル。corridor=True で先頭2本がゲート配置になる
-                    # (events.py の reset_obstacle_between_start_and_target 参照)。
-                    {
-                        "pos_x": (8.0, 10.0), "pos_y": (-2.0, 2.0),
-                        "num_obstacles": 2, "corridor": True,
-                    }, # Level8: 1m幅コリドール通過・直線
+                    {"pos_x": (2.0, 2.5), "pos_y": (0.0, 0.0)},  # Level1: 近距離・直線 (2.0〜2.5m)
+                    {"pos_x": (2.5, 4.0), "pos_y": (-0.5, 0.5)},  # Level2: 中距離・直線 (2.5〜4.0m)
+                    {"pos_x": (4.0, 6.0), "pos_y": (-1.0, 1.0), "path_shape": "curve"},  # Level3: 緩やかなカーブ (C 字)
+                    {  # Level4: 大きな円軌道 (O 字、楕円を 1 周、周長 約 11〜17m)
+                        "path_shape": "oval",
+                        "shape_params": {"a": (2.0, 3.0), "b": (1.5, 2.5), "n_points": 16},
+                    },
+                    {  # Level5: S 字スラローム (振幅 0.5〜1.0m、波長 3〜4m、1.5〜2 周期 = 長さ 4.5〜8m)
+                        "path_shape": "s_curve",
+                        "shape_params": {"amplitude": (0.5, 1.0), "wavelength": (3.0, 4.0), "periods": (1.5, 2.0), "n_points": 12},
+                    },
+                    {"pos_x": (6.0, 8.0), "pos_y": (-1.5, 1.5), "path_shape": "l_shape"},  # Level6: L 字 (直角 1 回)
+                    {  # Level7: V 字の鋭角ターン (120〜150° 向きを変える)
+                        "path_shape": "v_turn",
+                        "shape_params": {"leg1": (2.0, 4.0), "leg2": (2.0, 4.0), "turn_deg": (120.0, 150.0)},
+                    },
+                    {  # Level8: U ターン (幅 1.0〜2.0m で折り返す)
+                        "path_shape": "u_turn",
+                        "shape_params": {"leg1": (2.0, 4.0), "leg2": (2.0, 4.0), "width": (1.0, 2.0)},
+                    },
+                    {"pos_x": (8.0, 10.0), "pos_y": (-2.0, 2.0), "path_shape": "z_shape"},  # Level9: Z 字 (切り返し 2 回)
+                    {  # Level10: 8 の字 (半径 1.2〜1.8m の円を左回り・右回りで 1 周ずつ、周長 約 15〜23m)
+                        "path_shape": "figure8",
+                        "shape_params": {"radius": (1.2, 1.8), "n_points_per_loop": 12},
+                    },
                 ],
-                # 進級用の許容誤差 = 失敗率EMAの上限 (0=全員成功, 1=全員失敗)。距離が
-                # 遠くなるほど毎回1m以内へ寸分違わず運ぶのは物理的に難しいため、遠い
-                # ステージほど許容する失敗率を緩める (最終値 Level8 は遷移判定に
-                # 使われないので実質フォールバック値)。初期値は経験則であり、実測の
-                # 成功率カーブを見ながら調整する前提。Level6-8 は段階的に障害物回避が
-                # 難化するため、閾値も段階的に緩めている。
-                "error_threshold": [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8],
+                # 進級に必要な失敗率 EMA (Level10 の値は進級に使わない)。
+                "error_threshold": [0.2, 0.3, 0.4, 0.5, 0.5, 0.5, 0.55, 0.6, 0.6, 0.6],
                 "ema_alpha": 0.02,
                 "min_updates": 50,
             },
