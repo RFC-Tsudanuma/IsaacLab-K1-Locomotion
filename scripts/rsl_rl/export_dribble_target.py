@@ -148,6 +148,17 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
             "frame": "env 原点基準のワールド座標オフセット (ロボットの向きには合わせない)。既定位置 (0.30, 0, 0.11) に加算",
             "pose_range": {k: list(v) for k, v in env["events"]["reset_ball"]["params"]["pose_range"].items() if k in ("x", "y")},
             "robot_pose_range": {k: list(v) for k, v in env["events"]["reset_base"]["params"]["pose_range"].items()},
+            # 上の 2 つ (ボールの位置・ロボットの位置と向き) を合わせた、ロボットから見たボールの範囲
+            # (body yaw 座標、100 万サンプルの数値計算)。実機はこの範囲に入ったらドリブルに切り替える。
+            "ball_relative_to_robot_body_yaw": {
+                "forward_x_m": {"min": 0.56, "max": 1.01, "p1": 0.62, "p99": 0.97},
+                "lateral_y_m": {"min": -0.38, "max": 0.38, "p1": -0.27, "p99": 0.27},
+                "azimuth_deg": {"min": -28, "max": 28, "p1": -19, "p99": 19},
+                "ball_velocity": "0 (静止)",
+                "note": "env の値 (ボール x 0.70〜0.90 / y ±0.1、ロボット ±0.1m・yaw ±0.2rad) から計算",
+            },
+            "joint_pos_reset": "既定姿勢のまま (reset_joints_by_scale (1.0, 1.0)、ランダム化なし。best_walk の系の値)",
+            "robot_velocity_reset": "各軸 ±0.5 (m/s, rad/s)",
         },
         "terminations": {
             name: (t.get("params") or {}) if name not in ("obstacle_collision", "base_contact") else name

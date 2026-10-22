@@ -13,7 +13,8 @@
    判定は 1 回だけ。
 3. 報告 (止めない): iteration が --level_check_iter (既定 23000) を初めて超えたときにまだ Level1 なら記録する。
    直近 --plateau_window (既定 500) iteration で成功率 (Episode_Termination/ball_reached_target) の伸びが
-   --plateau_min_gain (既定 0.02) 未満になったら記録する (伸びが戻ったら、次に横ばいになったときにまた記録する)。
+   --plateau_min_gain (既定 0.02) 未満になったら記録する。伸びが --regrowth_min_gain (既定 0.03) 以上に戻ったら
+   「再び伸びた」と記録し、次に横ばいになったときにまた記録する (2 つの閾値を分けて、境目で報告が交互に出ないようにする)。
    成功率は前後それぞれ 50 iteration の平均で比べる。
 4. 途中エクスポート: カリキュラムが初めて Level --export_level (既定 3) に達した checkpoint
    (model_*_curriculum.json の level が Level-1 以上の最初のもの) を、export_dribble_target.py で
@@ -122,6 +123,7 @@ def main():
     parser.add_argument("--level_check_iter", type=int, default=23000)
     parser.add_argument("--plateau_window", type=int, default=500)
     parser.add_argument("--plateau_min_gain", type=float, default=0.02)
+    parser.add_argument("--regrowth_min_gain", type=float, default=0.03)
     parser.add_argument("--interval_s", type=int, default=120)
     args = parser.parse_args()
 
@@ -177,7 +179,7 @@ def main():
                         state["plateau_reports"].append({"iteration": it, "success_now": now, "success_before": before})
                         _log(logfile, f"[報告] 成功率が横ばいです: iteration {it - args.plateau_window} → {it} で "
                              f"{before:.3f} → {now:.3f} (伸び {gain:+.3f} < {args.plateau_min_gain})。学習は続けます")
-                    elif gain >= args.plateau_min_gain and state["plateau_active"]:
+                    elif gain >= args.regrowth_min_gain and state["plateau_active"]:
                         state["plateau_active"] = False
                         _log(logfile, f"[報告] 成功率が再び伸びています: iteration {it}、直近 {args.plateau_window} iteration で {gain:+.3f}")
 
