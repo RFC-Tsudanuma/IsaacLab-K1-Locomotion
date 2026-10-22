@@ -229,3 +229,26 @@ def enable_critic_warmup(runner, num_iterations: int) -> None:
         f"[INFO]: --critic_warmup_iters: 最初の {num_iterations} 回の更新は actor / std "
         f"({len(frozen)} テンソル) を固定し critic だけを学習します (学習率 {fixed_lr:.2e} で固定)。"
     )
+
+
+def load_for_inference(runner, path: str) -> None:
+    """推論用 (評価・再生) に checkpoint を読む。critic の形が今のレイアウトと違えば critic は読まない。
+
+    2026-10-22 に critic を 66 → 64 次元にしたので、それ以前の checkpoint も評価できるようにする。
+    actor が合わないときはエラーにする。
+    """
+    import torch
+
+    ckpt = torch.load(path, weights_only=False, map_location=runner.device)
+    state = ckpt["model_state_dict"]
+    live = runner.alg.policy.state_dict()
+    skipped = [k for k, v in state.items() if k.startswith("critic") and k in live and live[k].shape != v.shape]
+    if not skipped:
+        runner.load(path, load_optimizer=False)
+        return
+    state = {k: v for k, v in state.items() if k not in skipped}
+    missing, unexpected = torch.nn.Module.load_state_dict(runner.alg.policy, state, strict=False)  # rsl_rl のものは bool を返す
+    bad = [k for k in missing if not k.startswith("critic")]
+    if bad or unexpected:
+        raise RuntimeError(f"actor の読み込みが合いません: missing={bad}, unexpected={unexpected}")
+    print(f"[INFO] critic の形が今のレイアウトと違うので読まない (推論には不要): {skipped}")

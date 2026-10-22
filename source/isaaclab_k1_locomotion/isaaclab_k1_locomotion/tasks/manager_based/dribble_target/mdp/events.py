@@ -327,3 +327,27 @@ def track_ball_front_ratio(
     azimuth = torch.atan2(offset_b[:, 1], offset_b[:, 0]).abs()
     env._ball_front_steps[env_ids] += (azimuth <= math.radians(max_azimuth_deg)).float()
     env._ball_front_total[env_ids] += 1.0
+
+
+# ---------------------------------------------------------------------------
+# ドリブル: エピソードの途中の経路の引き直し
+# ---------------------------------------------------------------------------
+
+
+def replan_dribble_path(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    command_name: str = "dribble_target",
+    probability: float = 0.3,
+    offset_range: tuple[float, float] = (0.2, 0.8),
+):
+    """interval イベント: 呼ばれた env のうち確率 probability で、未通過の途中のウェイポイントを横にずらす。
+
+    実機の戦略は毎周期経路を計画し直すので、ウェイポイントが途中で動くことがある。その再現。
+    最終目標は動かさない (WaypointPose2dCommand.replan 参照)。
+    """
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
+    chosen = env_ids[torch.rand(len(env_ids), device=env.device) < probability]
+    env.command_manager.get_term(command_name).replan(chosen, offset_range)

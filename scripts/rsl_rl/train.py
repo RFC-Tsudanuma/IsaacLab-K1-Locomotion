@@ -324,7 +324,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # optimizer の状態を含まない checkpoint (widen_history_checkpoint.py の出力) も読まない。
         has_optimizer = "optimizer_state_dict" in torch.load(resume_path, weights_only=False, map_location="cpu")
         load_optimizer = args_cli.reset_noise_std is None and not args_cli.reset_critic and has_optimizer
-        runner.load(resume_path, load_optimizer=load_optimizer)
+        if args_cli.reset_critic:
+            # critic は作り直すので読まない (観測のレイアウトが変わって critic の形が合わないこともある。
+            # 2026-10-22 に critic を 66 → 64 次元にした)。actor・std・actor の正規化器だけを読み、iteration を引き継ぐ。
+            _ckpt = torch.load(resume_path, weights_only=False, map_location=agent_cfg.device)
+            _actor_state = {
+                k: v for k, v in _ckpt["model_state_dict"].items() if not k.startswith(("critic.", "critic_obs_normalizer."))
+            }
+            # rsl_rl の ActorCritic.load_state_dict は bool を返すので、torch 本来のものを呼んで読めなかったキーを受け取る
+            _missing, _unexpected = torch.nn.Module.load_state_dict(runner.alg.policy, _actor_state, strict=False)
+            _bad = [k for k in _missing if not k.startswith(("critic.", "critic_obs_normalizer."))]
+            if _bad or _unexpected:
+                raise RuntimeError(f"--reset_critic: actor の読み込みが合いません: missing={_bad}, unexpected={_unexpected}")
+            runner.current_learning_iteration = _ckpt["iter"]
+            print(f"[INFO]: --reset_critic: actor だけを読みました (iteration {_ckpt['iter']} から続ける)。")
+        else:
+            runner.load(resume_path, load_optimizer=load_optimizer)
         if not load_optimizer:
             print(
                 "[INFO]: Skipped optimizer state load"
@@ -340,11 +355,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         ckpt_msd = ckpt["model_state_dict"]
         live_msd = policy.state_dict()
         mismatched = [
-            k for k in ckpt_msd if k in live_msd and not torch.equal(live_msd[k].cpu(), ckpt_msd[k].cpu())
+            k
+            for k in ckpt_msd
+            if k in live_msd
+            and live_msd[k].shape == ckpt_msd[k].shape
+            and not (args_cli.reset_critic and k.startswith(("critic.", "critic_obs_normalizer.")))
+            and not torch.equal(live_msd[k].cpu(), ckpt_msd[k].cpu())
         ]
         if mismatched:
             print(f"[WARN]: runner.load no-op detected; force-loading {len(mismatched)} mismatched keys.")
-            policy.load_state_dict(ckpt_msd, strict=False)
+            policy.load_state_dict({k: ckpt_msd[k] for k in mismatched}, strict=False)
 
         # re-inject action noise std if requested (recover from collapsed std after long training)
         if args_cli.reset_noise_std is not None:

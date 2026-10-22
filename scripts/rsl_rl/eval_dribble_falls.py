@@ -40,6 +40,9 @@ parser.add_argument("--corner_window", type=int, default=50)
 parser.add_argument("--resample_window", type=int, default=50)
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--output", default=None)
+parser.add_argument("--polyline_prob", type=float, default=0.0,
+                    help="ランダムな折れ線にするエピソードの割合 (学習では 0.2。既定 0 = そのレベルのコースだけ)")
+parser.add_argument("--no_replan", action="store_true", help="エピソードの途中の経路の引き直しを切る")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.headless = True
@@ -77,6 +80,10 @@ def main():
     env_cfg.commands.dribble_target.debug_vis = False
     stages = env_cfg.curriculum.dribble_target_range.params["stages"]
     env_cfg.curriculum.dribble_target_range.params["error_threshold"] = [-1.0] * len(stages)  # 進級させない
+    env_cfg.curriculum.dribble_target_range.params["prev_level_mix_prob"] = 0.0  # 前のレベルを混ぜない
+    env_cfg.commands.dribble_target.random_polyline_prob = args_cli.polyline_prob
+    if args_cli.no_replan:
+        env_cfg.events.replan_dribble_path = None
     # 報酬のフェードイン・gait_phase の閾値は学習の最後の状態 (フェード済み) にする
     for term in vars(env_cfg.curriculum).values():
         p = getattr(term, "params", None)
@@ -91,7 +98,7 @@ def main():
     runner = OnPolicyRunner(
         wrapped, stage_transition_utils.filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=None, device="cuda:0"
     )
-    runner.load(ckpt, load_optimizer=False)
+    stage_transition_utils.load_for_inference(runner, ckpt)
     policy_nn = runner.alg.policy
     policy_nn.eval()
     act = policy_nn.act if args_cli.stochastic else policy_nn.act_inference
@@ -105,7 +112,7 @@ def main():
     results = {}
 
     for level in args_cli.levels:
-        term.load_state_dict({"level": level - 1, "failure_ema": 1.0, "num_updates": 0})
+        term.load_state_dict({"level": level - 1, "failure_ema": 1.0})
         obs, _ = wrapped.reset()
         obs = wrapped.get_observations()
         big = torch.full((n,), 10**6, device=dev)
@@ -118,6 +125,9 @@ def main():
         expo = {"touch": 0, "corner": 0, "resample": 0, "none": 0, "all": 0}
         fall_ctx = {"speed": [], "turn_deg": [], "ball_dist": []}
         reset_prev = torch.zeros(n, dtype=torch.bool, device=dev)
+        speed_sum = 0.0
+        pass0 = dict(cmd.pass_count)
+        ep_len_sum, ep_len_n = 0.0, 0
         with torch.no_grad():
             for step in range(args_cli.steps):
                 # --- 状況のフラグは「ステップを進める前」の状態で計算する。IsaacLab は終了した env を
@@ -130,10 +140,9 @@ def main():
                 last_touch = torch.where(touch_now, torch.zeros_like(last_touch), last_touch + 1)
                 adv = (cmd.waypoint_index > prev_wp) & ~reset_prev
                 last_adv = torch.where(adv, torch.zeros_like(last_adv), last_adv + 1)
-                goal = cmd.waypoints_w[torch.arange(n, device=dev), cmd.num_waypoints - 1, :2]
-                resampled = (torch.norm(goal - prev_goal, dim=1) > 1e-3) & ~reset_prev
-                last_resample = torch.where(resampled, torch.zeros_like(last_resample), last_resample + 1)
-                prev_wp, prev_goal = cmd.waypoint_index.clone(), goal.clone()
+                # 経路の引き直し (replan_dribble_path イベント) からの経過ステップ
+                last_resample = (int(u.common_step_counter) - cmd.last_replan_step).clamp(min=0)
+                prev_wp = cmd.waypoint_index.clone()
                 rxy = robot.data.root_pos_w[:, :2]
                 idx = torch.arange(cmd.waypoints_w.shape[1], device=dev).unsqueeze(0)
                 inter = idx < (cmd.num_waypoints - 1).unsqueeze(1)
@@ -149,6 +158,7 @@ def main():
                 ctx_ball = torch.norm(ball.data.root_pos_w[:, :2] - rxy, dim=1)
                 ctx_tick = u.episode_length_buf.clone()
                 expo["all"] += n
+                speed_sum += float(ctx_speed.sum())
                 expo["touch"] += int(f_touch.sum())
                 expo["corner"] += int(near_corner.sum())
                 expo["resample"] += int(f_res.sum())
@@ -162,8 +172,12 @@ def main():
                     for key, name in (("success", "ball_reached_target"), ("fall", "base_height"),
                                       ("obstacle", "obstacle_collision"), ("contact", "base_contact"),
                                       ("ball_too_far", "ball_too_far"), ("time_out", "time_out")):
-                        c[key] += int((tm.get_term(name) & dones).sum())
+                        if name in tm.active_terms:  # obstacle_collision は 2026-10-22 に廃止
+                            c[key] += int((tm.get_term(name) & dones).sum())
                     fell = tm.get_term("base_height") & dones
+                    succ_ids = tm.get_term("ball_reached_target") & dones
+                    ep_len_sum += float(ctx_tick[succ_ids].sum()) * u.step_dt
+                    ep_len_n += int(succ_ids.sum())
                     for i in torch.nonzero(fell).flatten().tolist():
                         flags = [k for k, f in (("touch", f_touch), ("corner", near_corner), ("resample", f_res)) if bool(f[i])]
                         for k in flags:
@@ -192,6 +206,9 @@ def main():
             "falls_per_10k_steps_in_situation": per10k,
             "falls_per_10k_steps_overall": c["fall"] / max(expo["all"], 1) * 1e4,
             "at_fall_median": {k: med(v) for k, v in fall_ctx.items()},
+            "mean_robot_speed": speed_sum / max(expo["all"], 1),
+            "waypoint_passes": {k: cmd.pass_count[k] - pass0[k] for k in pass0},
+            "mean_success_time_s": ep_len_sum / max(ep_len_n, 1),
         }
         print(f"[RESULT] level {level}: {json.dumps(results[level], ensure_ascii=False, default=str)}", flush=True)
 

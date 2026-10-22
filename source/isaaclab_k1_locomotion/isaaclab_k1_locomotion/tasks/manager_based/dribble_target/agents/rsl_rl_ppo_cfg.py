@@ -241,7 +241,7 @@ class K1DribbleTargetPPORunnerCfg(K1FlatPPORunnerCfg):
     """ドリブル Stage2 (Isaac-Velocity-Flat-K1-Dribble-Target-v0) 用。
 
     歩行ポリシーと同じ HistoryActorCritic を、観測レイアウト "dribble_target"
-    (policy 59 次元 = 歩行 49 + ドリブル 10、critic 66 次元) で使う。
+    (policy 59 次元 = 歩行 49 + ドリブル 10、critic 64 次元) で使う。
     Stage1 の checkpoint から ``--resume --reset_critic`` で始める (max_iterations は追加分)。
     mirror loss はドリブル用の左右反転 (足→ボールの 2 項を左右で入れ替える) を使う。
     """

@@ -16,9 +16,9 @@
    --plateau_min_gain (既定 0.02) 未満になったら記録する。伸びが --regrowth_min_gain (既定 0.03) 以上に戻ったら
    「再び伸びた」と記録し、次に横ばいになったときにまた記録する (2 つの閾値を分けて、境目で報告が交互に出ないようにする)。
    成功率は前後それぞれ 50 iteration の平均で比べる。
-4. 途中エクスポート: カリキュラムが初めて Level --export_level (既定 3) に達した checkpoint
-   (model_*_curriculum.json の level が Level-1 以上の最初のもの) を、export_dribble_target.py で
-   ONNX + 仕様 JSON に書き出す (別プロセス)。
+4. 途中エクスポート: 各レベルを抜ける直前の checkpoint (次に保存された checkpoint でレベルが上がっているもの) を、
+   export_dribble_target.py で ONNX + 仕様 JSON に書き出す (別プロセス、レベルごとに 1 回)。後半のレベルで
+   行き詰まっても、そこまでの中から実機用のモデルを選べるようにするため。
 
 判断と実行したことは <run>/watchdog.log に書く。
 
@@ -119,7 +119,6 @@ def main():
     parser.add_argument("--stop_check_iter", type=int, default=22000)
     parser.add_argument("--max_fall", type=float, default=0.3)
     parser.add_argument("--window", type=int, default=50)
-    parser.add_argument("--export_level", type=int, default=3)
     parser.add_argument("--level_check_iter", type=int, default=23000)
     parser.add_argument("--plateau_window", type=int, default=500)
     parser.add_argument("--plateau_min_gain", type=float, default=0.02)
@@ -130,7 +129,7 @@ def main():
     run_dir = os.path.abspath(args.run_dir)
     logfile = os.path.join(run_dir, "watchdog.log")
     state_path = os.path.join(run_dir, "watchdog_state.json")
-    state = json.load(open(state_path)) if os.path.isfile(state_path) else {"stop_checked": False, "exported": None}
+    state = json.load(open(state_path)) if os.path.isfile(state_path) else {"stop_checked": False}
     _log(logfile, f"開始: run={run_dir}, console={args.console_log}, state={state}")
     export_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_dribble_target.py")
 
@@ -183,21 +182,24 @@ def main():
                         state["plateau_active"] = False
                         _log(logfile, f"[報告] 成功率が再び伸びています: iteration {it}、直近 {args.plateau_window} iteration で {gain:+.3f}")
 
-        if state["exported"] is None:
-            for cur in sorted(glob.glob(os.path.join(run_dir, "model_*_curriculum.json")),
-                              key=lambda p: int(re.search(r"model_(\d+)_curriculum", p).group(1))):
-                try:
-                    level = json.load(open(cur))["dribble_target_range"]["level"] + 1
-                except (OSError, ValueError, KeyError):
-                    continue
-                if level >= args.export_level:
-                    ckpt = cur.replace("_curriculum.json", ".pt")
-                    _log(logfile, f"Level {level} に達した最初の checkpoint: {os.path.basename(ckpt)} → エクスポートします")
-                    res = subprocess.run([sys.executable, export_script, "--checkpoint", ckpt], capture_output=True, text=True)
-                    tail = "\n".join(l for l in res.stdout.splitlines() if l.startswith("[export]") or l.startswith("[verify]"))
-                    _log(logfile, f"エクスポート終了 (exit={res.returncode}):\n{tail}\n{res.stderr[-1500:] if res.returncode else ''}")
-                    state["exported"] = {"checkpoint": ckpt, "level": level, "exit": res.returncode}
-                    break
+        # 各レベルを抜ける直前の checkpoint (次の checkpoint でレベルが上がっているもの) をエクスポートする
+        state.setdefault("exported_levels", {})
+        ckpts = []
+        for cur in glob.glob(os.path.join(run_dir, "model_*_curriculum.json")):
+            try:
+                ckpts.append((int(re.search(r"model_(\d+)_curriculum", cur).group(1)),
+                              json.load(open(cur))["dribble_target_range"]["level"] + 1, cur))
+            except (OSError, ValueError, KeyError, AttributeError):
+                continue
+        ckpts.sort()
+        for (it_a, lv_a, cur_a), (_, lv_b, _) in zip(ckpts, ckpts[1:]):
+            if lv_b > lv_a and str(lv_a) not in state["exported_levels"]:
+                ckpt = cur_a.replace("_curriculum.json", ".pt")
+                _log(logfile, f"Level {lv_a} を抜ける直前の checkpoint: {os.path.basename(ckpt)} → エクスポートします")
+                res = subprocess.run([sys.executable, export_script, "--checkpoint", ckpt], capture_output=True, text=True)
+                tail = "\n".join(l for l in res.stdout.splitlines() if l.startswith("[export]") or l.startswith("[verify]"))
+                _log(logfile, f"エクスポート終了 (exit={res.returncode}):\n{tail}\n{res.stderr[-1500:] if res.returncode else ''}")
+                state["exported_levels"][str(lv_a)] = {"checkpoint": ckpt, "iteration": it_a, "exit": res.returncode}
 
         json.dump(state, open(state_path, "w"), indent=2)
         if done or (it is not None and not _training_pids(args.task) and done):

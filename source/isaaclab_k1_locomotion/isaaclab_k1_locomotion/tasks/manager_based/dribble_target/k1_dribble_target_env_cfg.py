@@ -61,7 +61,7 @@ from .mdp.curriculums import (
     modify_reward_weight_linear,
 )
 from .mdp.commands import WaypointPose2dCommandCfg
-from .mdp.events import reset_obstacle_between_start_and_target, track_ball_front_ratio
+from .mdp.events import replan_dribble_path, track_ball_front_ratio
 from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 from .mdp.observations import (
     ball_pos_rel,
@@ -69,7 +69,6 @@ from .mdp.observations import (
     ball_vel,
     ball_vel_rel_vision,
     foot_to_ball_pos_rel,
-    obstacle_pos_rel,
     target_pos_rel,
     zero_obs,
 )
@@ -81,35 +80,16 @@ from .mdp.rewards import (
     ball_trajectory_deviation_penalty,
     ball_velocity_toward_target,
     impact_kick_reward,
-    obstacle_avoidance_penalty,
     penalize_ball_clamping,
     push_ball_toward_target,
     robot_facing_ball,
     robot_progress_to_target,
     touch_ball,
 )
-from .mdp.terminations import ball_reached_target, ball_too_far, obstacle_collision
+from .mdp.terminations import ball_reached_target, ball_too_far, dribble_time_out
 
 
-def _make_obstacle_cfg(prim_path: str) -> RigidObjectCfg:
-    """Level6-8 の障害物用の静的な円柱 (kinematic_enabled=True、prim_path のみ可変)。"""
-    return RigidObjectCfg(
-        prim_path=prim_path,
-        spawn=sim_utils.CylinderCfg(
-            radius=0.2,
-            height=1.0,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(rigid_body_enabled=True, kinematic_enabled=True),
-            mass_props=MassPropertiesCfg(mass=50.0),
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.9, 0.2, 0.1), metallic=0.0, roughness=0.8),
-            collision_props=CollisionPropertiesCfg(collision_enabled=True),
-        ),
-        init_state=RigidObjectCfg.InitialStateCfg(pos=(100.0, 0.0, 0.5)),
-    )
-
-# 障害物シーンエンティティ名の一覧 (obstacle, obstacle_1, ..., obstacle_9 の10個)。
-# observations/rewards/terminations/events の各関数へ obstacle_cfgs として渡す。
-OBSTACLE_SCENE_NAMES: list[str] = ["obstacle"] + [f"obstacle_{i}" for i in range(1, 10)]
-OBSTACLE_SCENE_CFGS: list[SceneEntityCfg] = [SceneEntityCfg(name) for name in OBSTACLE_SCENE_NAMES]
+# NOTE (2026-10-22): 障害物 (旧 Level6〜8) は廃止した。障害物の回避は戦略側の経路計画 (pathplan_lib) に任せる。
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +185,6 @@ class K1DribbleTargetCriticHistoryCfg(K1FlatCriticHistoryCfg):
     target_pos_rel = ObsTerm(func=target_pos_rel, params={"command_name": "dribble_target"})
     ball_pos_rel = ObsTerm(func=ball_pos_rel)
     ball_vel = ObsTerm(func=ball_vel)
-    obstacle_pos_rel = ObsTerm(func=obstacle_pos_rel, params={"obstacle_cfgs": OBSTACLE_SCENE_CFGS})
     foot_left_ball_pos_rel = ObsTerm(func=foot_to_ball_pos_rel, params={"foot_body_name": "left_foot_link"})
     foot_right_ball_pos_rel = ObsTerm(func=foot_to_ball_pos_rel, params={"foot_body_name": "right_foot_link"})
 
@@ -265,27 +244,7 @@ class K1DribbleTargetSceneCfg(MySceneCfg):
         filter_prim_paths_expr=["{ENV_REGEX_NS}/SoccerBall"],
     )
 
-    # 2026-09-27: Level6 の障害物回避用の静的な円柱。kinematic_enabled=True により
-    # 物理的に押されない (衝突判定はできるが外力・接触力の影響を受けない) 固定障害物。
-    # Level1-5 では reset_obstacle_between_start_and_target イベントにより
-    # 衝突しえない遠方へ退避させておく (シーンからは削除しない — 削除/再生成は
-    # 環境構築時にしかできないため、カリキュラム段階の切り替えには対応できない)。
-    #
-    # 2026-10-06: Level7 (ゴール前にランダム配置の障害物10個) / Level8 (1m幅の
-    # コリドール通過、障害物2本をゲート状に配置) 対応で、障害物を10本 (obstacle +
-    # obstacle_1..obstacle_9) に増やした。全て同じ円柱定義を _make_obstacle_cfg で
-    # 共通化する (prim_path のみ差し替え)。観測 (obstacle_pos_rel) は複数あっても
-    # 「最も近い1個」だけを見るので次元は増えない (既存チェックポイント互換)。
-    obstacle: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle")
-    obstacle_1: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_1")
-    obstacle_2: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_2")
-    obstacle_3: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_3")
-    obstacle_4: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_4")
-    obstacle_5: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_5")
-    obstacle_6: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_6")
-    obstacle_7: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_7")
-    obstacle_8: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_8")
-    obstacle_9: RigidObjectCfg = _make_obstacle_cfg("/World/envs/env_.*/Obstacle_9")
+    # NOTE (2026-10-22): 障害物 (旧 Level6〜8) は廃止した。障害物の回避は戦略側の経路計画 (pathplan_lib) に任せる。
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +272,15 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         # 戻らないこと」の両方が要るため、episode_length_s と resampling_time_range を
         # セットで延長する (20s/1000step, 8-15s 再サンプリングのままだと Level5 の
         # 8-10m 到達前にエピソードが尽きるか、目標が入れ替わってしまう)。
-        self.episode_length_s = 25.0
+        # 2026-10-22: 25 → 30 秒 (O 字は最長 15m)。8 の字 (Level10、最長 22m) だけ 45 秒にする (dribble_time_out)。
+        # 曲がるコースでのドリブル中の平均の速さ 0.5〜0.6m/s (model_24600 の C 字・L 字で測定) では、22m に 37〜44 秒かかるため。
+        # episode_length_s はレベルごとの制限時間の最大値にしておき、実際の打ち切りは time_out の終了条件が行う。
+        self.episode_length_s = 45.0
+        self.terminations.time_out = DoneTerm(
+            func=dribble_time_out,
+            time_out=True,
+            params={"command_name": "dribble_target", "default_s": 30.0, "per_level_s": {"10": 45.0}},
+        )
 
         # 目標座標コマンド (ワールド xy)。継続タスクなので定期的に再サンプリングし続ける
         # (目標到達によるエピソード終了はしない)。初期レンジは Level1 相当だが、
@@ -330,7 +297,16 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             ),
             waypoint_reach_radius=0.3,
             debug_vis=True,
-            resampling_time_range=(20.0, 30.0),
+            # 2026-10-22: エピソードの途中で目標を全面的に引き直すのはやめた (O 字・8 の字を途中で打ち切らないため)。
+            # 代わりに replan_dribble_path イベントが、未通過のウェイポイントだけを横にずらす。
+            resampling_time_range=(1.0e6, 1.0e6),
+            # 各レベルのエピソードの 20% は、同じ長さのランダムな折れ線 (実機の経路計画の出力に近い形) にする。
+            random_polyline_prob=0.2,
+            # 通過判定: 0.3m 以内に入る、または「入ってきた区間に垂直な線」を越える (行き過ぎて引き返す転倒の対策)。
+            # 線を越えた方は、ウェイポイントから 1.0m 以内に限る (O 字・8 の字でループの内側を突っ切ったとき、
+            # 離れたウェイポイントの線を次々に越えて「通過」になるのを防ぐ。幾何のテストで、制限なしでは最大 4.6m
+            # 離れた通過が出て、1.0m に制限すると 0 になった。コースに沿って 0.5m 外を回る通過は 0.5〜0.9m で認められる)。
+            pass_line_max_distance=1.0,
         )
 
         # NOTE (2026-09-20): base_velocity を BallFollowVelocityCommand (ボール追従の強制コマンド)
@@ -409,14 +385,14 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             "x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-0.2, 0.2),
         }
 
-        # 2026-09-27: Level6-8 (障害物回避) 用。Level1-5 では
-        # dribble_target_range_curriculum が env._dribble_num_obstacles=0 を
-        # セットしているため、このイベントは障害物を衝突しえない遠方へ退避させる
-        # だけになる (mdp/events.py の reset_obstacle_between_start_and_target 参照)。
-        self.events.reset_obstacle = EventTerm(
-            func=reset_obstacle_between_start_and_target,
-            mode="reset",
-            params={"command_name": "dribble_target", "obstacle_cfgs": OBSTACLE_SCENE_CFGS},
+        # 2026-10-22: エピソードの途中の経路の引き直し。実機の戦略は毎周期経路を計画し直すので、ウェイポイントが
+        # 途中で動くことがある。env ごとに 2〜5 秒間隔で、確率 0.3 で未通過の途中のウェイポイントを横に 0.2〜0.8m ずらす
+        # (最終目標は動かさない。mdp/commands.py の WaypointPose2dCommand.replan)。
+        self.events.replan_dribble_path = EventTerm(
+            func=replan_dribble_path,
+            mode="interval",
+            interval_range_s=(2.0, 5.0),
+            params={"command_name": "dribble_target", "probability": 0.3, "offset_range": (0.2, 0.8)},
         )
 
         # ドリブル報酬。Stage 1→2 のフェードインに合わせて weight=0 で登録する。
@@ -522,29 +498,7 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             params={"command_name": "dribble_target", "distance_threshold": 1.0},
         )
 
-        # 2026-09-27: Level6-8 (障害物回避)。ロボット/ボールが障害物に近づくほど罰する
-        # 密な shaping 項 (衝突半径の外側でも勾配を作る) を、ロボット用・ボール用それぞれ
-        # 用意する (sigma/weight はロボットより小さいボールの方を敏感にする)。Level1-5 では
-        # 障害物が遠方に退避しているため exp(-huge/sigma) が実質 0 になり自然に無効化される。
-        # 2026-10-06: Level7 (障害物10個) / Level8 (コリドール2本) 対応で obstacle_cfgs
-        # を10個の障害物全てに拡張 (複数が近接するほど罰が合算される、events.py/
-        # rewards.py/terminations.py 側の一般化と対応)。
-        self.rewards.obstacle_avoidance_penalty_robot = RewTerm(
-            func=obstacle_avoidance_penalty,
-            weight=0.0,
-            params={"sigma": 0.8, "asset_cfg": SceneEntityCfg("robot"), "obstacle_cfgs": OBSTACLE_SCENE_CFGS},
-        )
-        self.rewards.obstacle_avoidance_penalty_ball = RewTerm(
-            func=obstacle_avoidance_penalty,
-            weight=0.0,
-            params={"sigma": 0.5, "asset_cfg": SceneEntityCfg("soccer_ball"), "obstacle_cfgs": OBSTACLE_SCENE_CFGS},
-        )
-        # ハードな衝突は termination_penalty (下記 term_keys に obstacle_collision を追加)
-        # が一律の失敗ペナルティとして扱う。専用の追加報酬は用意しない
-        # (ball_reached_target と同型: DoneTerm 登録だけで「あたるとー報酬」を満たす)。
-        self.terminations.obstacle_collision = DoneTerm(
-            func=obstacle_collision, params={"obstacle_cfgs": OBSTACLE_SCENE_CFGS}
-        )
+        # NOTE (2026-10-22): 障害物 (旧 Level6〜8) は廃止した。障害物の回避は戦略側の経路計画 (pathplan_lib) に任せる。
 
         # 2026-10-01: 「両足でボールを挟み込んでペンギン歩きのように運ぶ」局所解への対策。
         # touch_ball (片足でも満額) だけでは挟み込みを防げなかった (挟めば ball_too_far も
@@ -602,7 +556,7 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         self.rewards.termination_penalty = RewTerm(
             func=mdp.is_terminated_term,
             weight=-300.0, # 元 -200 (rough_env_cfg.py) → -500 → -300
-            params={"term_keys": ["base_contact", "base_height", "ball_too_far", "obstacle_collision"]},
+            params={"term_keys": ["base_contact", "base_height", "ball_too_far"]},
         )
         self.rewards.flat_orientation_l2.weight = -40.0 # 元 -20 (rough_env_cfg.py)
 
@@ -782,21 +736,6 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             func=modify_reward_weight_linear,
             params={"term_name": "ball_reached_target_bonus", "start_weight": 0.0, "end_weight": 300.0, **_phase2},
         )
-        # weight目安: exp(-(dist/sigma)^2) は [0,1] のクランプ済み密な信号。Level1-5 では
-        # 障害物が遠方に退避していて常時ほぼ0なので、フェードインが早くても実害はない
-        # (他の Stage2 報酬と足並みを揃えて同じ _phase2 で 0→本番値にする)。
-        self.curriculum.obstacle_avoidance_robot_weight = CurrTerm(
-            func=modify_reward_weight_linear,
-            params={
-                "term_name": "obstacle_avoidance_penalty_robot", "start_weight": 0.0, "end_weight": -1.0, **_phase2,
-            },
-        )
-        self.curriculum.obstacle_avoidance_ball_weight = CurrTerm(
-            func=modify_reward_weight_linear,
-            params={
-                "term_name": "obstacle_avoidance_penalty_ball", "start_weight": 0.0, "end_weight": -1.5, **_phase2,
-            },
-        )
         # 2026-10-01: 挟み込み局所解対策の4項。他の密な報酬 (push_ball_toward_target=3.0,
         # ball_proximity 系と同程度) とスケールを揃えて暴走リスクを抑える。
         self.curriculum.clamping_penalty_weight = CurrTerm(
@@ -906,8 +845,13 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
                 ],
                 # 進級に必要な失敗率 EMA (Level10 の値は進級に使わない)。
                 "error_threshold": [0.2, 0.3, 0.4, 0.5, 0.5, 0.5, 0.55, 0.6, 0.6, 0.6],
-                "ema_alpha": 0.02,
-                "min_updates": 50,
+                # 2026-10-22: 進級が速すぎた (旧 Level6 は約 2 iteration で通過) ので、各レベルに最低 300 iteration 留まり、
+                # EMA は終わったエピソード 1 つごとに重み 1/2000 で更新する。エピソードの 25% は通過済みのレベルから選ぶ
+                # (曲がり方を忘れた対策)。混合・ランダムな折れ線のエピソードは進級の判定に数えない。
+                "ema_episode_weight": 1.0 / 2000.0,
+                "min_iterations": 300,
+                "steps_per_iteration": 48,
+                "prev_level_mix_prob": 0.25,
             },
         )
 
@@ -948,8 +892,6 @@ class K1DribbleTargetEnvCfg_ResumeMature(K1DribbleTargetEnvCfg):
             "touch_ball_weight",
             "ball_proximity_weight",
             "ball_reached_bonus_weight",
-            "obstacle_avoidance_robot_weight",
-            "obstacle_avoidance_ball_weight",
             "clamping_penalty_weight",
             "ball_velocity_weight",
             "impact_kick_weight",
@@ -1013,15 +955,16 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.scene.soccer_ball = None
         self.scene.contact_balls_left = None
         self.scene.contact_balls_right = None
-        for _obstacle_name in OBSTACLE_SCENE_NAMES:
-            setattr(self.scene, _obstacle_name, None)
         self.events.reset_ball = None
-        self.events.reset_obstacle = None
+        self.events.replan_dribble_path = None
         self.events.track_ball_front_ratio = None
         self.curriculum.ball_front_ratio = None
         # ボールが存在しないので目標座標コマンドも不要 (計算コスト削減)。
         # target_pos_rel obs は下で zero_obs に差し替え済みなのでコマンド削除に副作用はない。
         self.commands.dribble_target = None
+        # Stage1 は学習済みの設定 (エピソード 25 秒、通常の time_out) のまま
+        self.episode_length_s = 25.0
+        self.terminations.time_out = DoneTerm(func=mdp.time_out, time_out=True)
 
         # 2026-10-06: K1DribbleTargetEnvCfg.__post_init__ (super() 経由で継承される) が
         # Stage2 向けに base_velocity を定数ゼロへ固定し、lin_vel_command/extreme_commands
@@ -1067,8 +1010,6 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.observations.critic.ball_vel.func = zero_obs
         self.observations.critic.ball_vel.params = {"dim": 2}
         # 2026-10-06: obstacle_pos_rel は Policy から削除済み (Critic専用)。
-        self.observations.critic.obstacle_pos_rel.func = zero_obs
-        self.observations.critic.obstacle_pos_rel.params = {"dim": 2}
         self.observations.policy.foot_left_ball_pos_rel.func = zero_obs
         self.observations.policy.foot_left_ball_pos_rel.params = {"dim": 2}
         self.observations.policy.foot_right_ball_pos_rel.func = zero_obs
@@ -1094,15 +1035,12 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.rewards.push_ball_toward_target = None
         self.rewards.ball_proximity_to_target = None
         self.rewards.ball_reached_target_bonus = None
-        self.rewards.obstacle_avoidance_penalty_robot = None
-        self.rewards.obstacle_avoidance_penalty_ball = None
         self.rewards.penalize_ball_clamping = None
         self.rewards.ball_velocity_toward_target = None
         self.rewards.impact_kick_reward = None
         self.rewards.ball_trajectory_deviation_penalty = None
         self.terminations.ball_too_far = None
         self.terminations.ball_reached_target = None
-        self.terminations.obstacle_collision = None
         # termination_penalty の term_keys が walk-phase に存在しない termination term
         # (ball_too_far/ball_reached_target/obstacle_collision) を含んだままだと
         # mdp.is_terminated_term の find_terms が "見つからない regex" で ValueError を出す。
@@ -1117,8 +1055,6 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.curriculum.push_ball_weight = None
         self.curriculum.ball_proximity_weight = None
         self.curriculum.ball_reached_bonus_weight = None
-        self.curriculum.obstacle_avoidance_robot_weight = None
-        self.curriculum.obstacle_avoidance_ball_weight = None
         self.curriculum.clamping_penalty_weight = None
         self.curriculum.ball_velocity_weight = None
         self.curriculum.impact_kick_weight = None

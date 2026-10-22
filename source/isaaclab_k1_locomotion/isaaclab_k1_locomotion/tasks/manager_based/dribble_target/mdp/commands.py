@@ -1171,33 +1171,127 @@ def _local_path(shape: str, params: dict, n: int, device) -> torch.Tensor:
     raise ValueError(shape)
 
 
+_LEGACY_SHAPES = ("straight", "curve", "l_shape", "z_shape")
+
+
+def _legacy_path(shape: str, stage: dict, n: int, sign: torch.Tensor, cfg, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """従来の形 (straight / curve / l_shape / z_shape) を、始点 (0, 0) からの相対位置 (ワールド軸) で作る。
+
+    目標 G = (pos_x, pos_y)。omni_prob の割合で方位を一様に回し、far_prob の割合で距離を伸ばす
+    (2026-10-18 からの作り方そのまま)。戻り値は (点 (n, K, 2), 点の数 (n,))。
+    """
+    offset = torch.cat([_u(n, stage.get("pos_x", (1.0, 1.0)), device), _u(n, stage.get("pos_y", (0.0, 0.0)), device)], 1)
+    dist = torch.norm(offset, dim=1, keepdim=True).clamp(min=1e-6)
+    mode = torch.rand(n, 1, device=device)
+    bearing = torch.empty(n, 1, device=device).uniform_(-math.pi, math.pi)
+    omni_offset = dist * torch.cat([torch.cos(bearing), torch.sin(bearing)], 1)
+    px, py = stage.get("pos_x", (1.0, 1.0)), stage.get("pos_y", (0.0, 0.0))
+    max_dist = math.hypot(max(abs(v) for v in px), max(abs(v) for v in py))
+    far_offset = offset / dist * torch.empty(n, 1, device=device).uniform_(max_dist, max_dist * cfg.far_scale)
+    omni = mode < cfg.omni_prob
+    far = (mode >= cfg.omni_prob) & (mode < cfg.omni_prob + cfg.far_prob)
+    goal = torch.where(omni, omni_offset, torch.where(far, far_offset, offset))
+    length = torch.norm(goal, dim=1, keepdim=True).clamp(min=1e-6)
+    normal = torch.cat([-goal[:, 1:2], goal[:, 0:1]], 1) / length
+    if shape == "straight":
+        pts = [goal]
+    elif shape == "curve":
+        pts = [0.5 * goal + sign * cfg.curve_offset_frac * length * normal, goal]
+    elif shape == "l_shape":
+        pts = [torch.cat([goal[:, 0:1], torch.zeros_like(goal[:, 1:2])], 1), goal]
+    else:  # z_shape
+        amp = sign * cfg.z_amplitude
+        pts = [goal / 3.0 + amp * normal, 2.0 * goal / 3.0 - amp * normal, goal]
+    return torch.stack(pts, 1), torch.full((n,), len(pts), dtype=torch.long, device=device)
+
+
+def random_polyline(n: int, target_length: torch.Tensor, device, min_seg: float = 0.5, max_seg: float = 3.0,
+                    min_points: int = 2, max_points: int = 5, max_turn_deg: float = 90.0) -> tuple[torch.Tensor, torch.Tensor]:
+    """経路計画 (障害物を迂回する経路) に近い「ランダムな折れ線」をローカル座標で作る。
+
+    始点 (0, 0) から +x 向きに出発し、点の数 k ∈ [min_points, max_points] (始点を含まない)、
+    各区間の長さ ∈ [min_seg, max_seg]、各点での曲がり ∈ [0, max_turn_deg]° (左右ランダム)。
+    合計の長さが target_length (n,) になるよう、k は「その長さを作れる範囲」から一様に選び、
+    区間の長さは一様乱数を合計が target_length になるよう比例配分してから [min_seg, max_seg] に収める
+    (target_length が max_points × max_seg を超えるときは、その上限の長さになる)。
+    戻り値は (点 (n, max_points, 2)、余りは最後の点で埋める, 点の数 (n,))。
+    """
+    L = target_length.clamp(min=min_seg * min_points)
+    k_lo = torch.clamp(torch.ceil(L / max_seg), min=min_points, max=max_points)
+    k_hi = torch.clamp(torch.floor(L / min_seg), min=min_points, max=max_points)
+    k_hi = torch.maximum(k_hi, k_lo)
+    k = (k_lo + torch.floor(torch.rand(n, device=device) * (k_hi - k_lo + 1))).clamp(max=k_hi).long()  # (n,)
+    idx = torch.arange(max_points, device=device).unsqueeze(0)  # (1, P)
+    active = idx < k.unsqueeze(1)  # (n, P)
+    raw = torch.empty(n, max_points, device=device).uniform_(min_seg, max_seg) * active
+    seg = (raw * (L / raw.sum(dim=1).clamp(min=1e-6)).unsqueeze(1)).clamp(min_seg, max_seg) * active
+    turn = torch.deg2rad(torch.empty(n, max_points, device=device).uniform_(0.0, max_turn_deg))
+    turn = turn * torch.where(torch.rand(n, max_points, device=device) < 0.5, -1.0, 1.0)
+    turn[:, 0] = 0.0  # 最初の区間は +x 向き (曲がりは 2 点目以降)
+    heading = torch.cumsum(turn, dim=1)
+    step = torch.stack([seg * torch.cos(heading), seg * torch.sin(heading)], dim=2)
+    pts = torch.cumsum(step, dim=1)  # 非アクティブな区間は長さ 0 なので最後の点のまま
+    return pts, k
+
+
+def path_length(points: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
+    """始点 (0, 0) からの折れ線 (n, K, 2) の長さ (n,)。count 個目以降は無視する。"""
+    full = torch.cat([torch.zeros_like(points[:, :1]), points], 1)
+    seg = torch.norm(full[:, 1:] - full[:, :-1], dim=2)
+    mask = torch.arange(points.shape[1], device=points.device).unsqueeze(0) < count.unsqueeze(1)
+    return (seg * mask).sum(1)
+
+
+def waypoint_passed(
+    ball_xy: torch.Tensor, wp_xy: torch.Tensor, prev_xy: torch.Tensor, radius: float, max_cross_distance: float | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """ウェイポイントの通過判定 (実機の推論ノードも同じ式を使う)。
+
+    W = 今のウェイポイント、P = 1 つ前の点 (最初のウェイポイントでは経路の始点)、B = ボール中心 (xy)、
+    u = (W - P) / |W - P| (入ってきた区間の向き) として、次のどちらかで通過:
+
+    * 到達:   |B - W| < radius
+    * 越えた: (B - W)・u >= 0   (W を通り、入ってきた区間に垂直な直線を、進行方向に越えた)
+
+    二等分線ではなく「入ってきた区間に垂直な線」を使うので、V 字・U ターンでも角 W まで行かないと通過しない。
+    max_cross_distance を指定すると、「越えた」は |B - W| < max_cross_distance のときだけ数える
+    (O 字・8 の字でループの内側を突っ切って、離れたウェイポイントの線を次々に越えるのを防ぐ)。
+    戻り値は (到達で通過, 越えて通過) の bool (n,)。
+    """
+    d = ball_xy - wp_xy
+    reached = torch.norm(d, dim=1) < radius
+    seg = wp_xy - prev_xy
+    u = seg / torch.norm(seg, dim=1, keepdim=True).clamp(min=1e-6)
+    crossed = (d * u).sum(dim=1) >= 0.0
+    if max_cross_distance is not None:
+        crossed = crossed & (torch.norm(d, dim=1) < max_cross_distance)
+    return reached, crossed
+
+
 class WaypointPose2dCommand(CommandTerm):
-    """ワールド座標の目標点 (x, y) へ、経路形状に応じた中間ウェイポイントを経由させるコマンド。
+    """ボールをウェイポイント列に沿って運ばせるコマンド (ワールド座標の点列)。
 
-    サンプリング時の始点 S は「ボールの現在位置」(ボールが無ければロボット)。最終目標 G は
-    ``S + (pos_x, pos_y)`` (ワールド軸。リセット直後のロボットは +x を向いている)。
-    heading は使わない。
+    実機では戦略の経路計画 (pathplan_lib) が、ボールを始点に障害物を避けるウェイポイント列を出し、推論ノードが
+    今のウェイポイントを target_pos_rel として入れる。学習ではその点列をコースの形から作る。
 
-    実機では戦略がフィールド座標の目標点を直接指定するので、ボールの後方や遠い目標も混ぜる
-    (2026-10-18):
+    **レベル (env ごと)**: dribble_target_range_curriculum が env ごとのレベル (:attr:`env_level`) を決め、
+    :attr:`stages` (レベルの設定の一覧) を渡す。経路は env のレベルの形で作る。カリキュラムが無いとき
+    (再生など) は cfg の path_shape / ranges / shape_params の 1 レベルとして扱う。
 
-    * 確率 ``omni_prob``: 方位を (-π, π] で一様にし、距離は ``|(pos_x, pos_y)|`` と同じ分布
-      (ボールの後方・横の目標)
-    * 確率 ``far_prob``: 前方の目標のまま、距離をそのレベルの上限の 1〜``far_scale`` 倍にする
-    * 残り: 従来どおり ``S + (pos_x, pos_y)``経路形状 ``cfg.path_shape`` (カリキュラムのレベルが指定):
+    **経路の作り方**: 始点 S = ボールの現在位置。進行方向は通常ワールド +x (リセット直後のロボットの向き)、
+    omni_prob の割合で全方位。左右はランダムに反転。
 
-    * ``straight``: [G]
-    * ``curve``:    [S→G の中点を横に curve_offset_frac×|SG| ずらした点, G]
-    * ``l_shape``:  [(G.x, S.y) (直角に 1 回曲がる), G]
-    * ``z_shape``:  [S→G の 1/3 点を +z_amplitude 横へ, 2/3 点を -z_amplitude 横へ, G] (切り返し 2 回)
+    * 従来の形 (straight / curve / l_shape / z_shape): 目標のオフセット (pos_x, pos_y) から (_legacy_path)
+    * ローカル座標で作る形 (oval / s_curve / v_turn / u_turn / figure8): shape_params の範囲から (_local_path)
+    * random_polyline_prob の割合で、同じレベルのコースの長さを持つ「ランダムな折れ線」(random_polyline) に置き換える
 
-    ボールが現在のウェイポイントから ``waypoint_reach_radius`` 以内に入ると次のウェイポイントへ進む
-    (最終ウェイポイントでは進まない。成功判定は terminations.ball_reached_target)。
-    観測・報酬は :attr:`pos_command_w` (= 現在のウェイポイント) だけを見る。
+    **通過判定**: :func:`waypoint_passed` (到達 0.3m、または入ってきた区間に垂直な線を越えた)。最終ウェイポイントでは
+    進まない (成功判定は terminations.ball_reached_target)。
 
-    障害物レベル (env._dribble_num_obstacles > 0) では、経路を作った直後に
-    :func:`mdp.events.place_dribble_obstacles` で障害物を経路に合わせて配置する
-    (障害物の退避は reset イベント reset_obstacle_between_start_and_target が先に行う)。
+    **経路の引き直し**: :meth:`replan` (events.replan_dribble_path から呼ばれる) が、未通過の途中のウェイポイントを
+    横にずらす。最終目標は動かさない。
+
+    観測・報酬は :attr:`pos_command_w` (= 今のウェイポイント) だけを見る。
     """
 
     cfg: WaypointPose2dCommandCfg
@@ -1205,19 +1299,29 @@ class WaypointPose2dCommand(CommandTerm):
     def __init__(self, cfg: WaypointPose2dCommandCfg, env: ManagerBasedEnv):
         super().__init__(cfg, env)
         self.robot: Articulation = env.scene[cfg.asset_name]
-        self.start_w = torch.zeros(self.num_envs, 2, device=self.device)
-        self.waypoints_w = torch.zeros(self.num_envs, _MAX_WAYPOINTS, 3, device=self.device)
-        self.num_waypoints = torch.ones(self.num_envs, dtype=torch.long, device=self.device)
-        self.waypoint_index = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
-        self.pos_command_b = torch.zeros(self.num_envs, 2, device=self.device)
-        self.metrics["ball_target_distance"] = torch.zeros(self.num_envs, device=self.device)
-        self.metrics["waypoint_index"] = torch.zeros(self.num_envs, device=self.device)
+        n, dev = self.num_envs, self.device
+        self.start_w = torch.zeros(n, 2, device=dev)
+        self.waypoints_w = torch.zeros(n, _MAX_WAYPOINTS, 3, device=dev)
+        self.num_waypoints = torch.ones(n, dtype=torch.long, device=dev)
+        self.waypoint_index = torch.zeros(n, dtype=torch.long, device=dev)
+        self.pos_command_b = torch.zeros(n, 2, device=dev)
+        # env ごとのレベル (0 始まり) とエピソードの種類。カリキュラムが書き換える。
+        self.stages: list[dict] | None = None
+        self.env_level = torch.zeros(n, dtype=torch.long, device=dev)
+        self.env_mixed = torch.zeros(n, dtype=torch.bool, device=dev)  # 前のレベルの混合で選ばれた
+        self.env_polyline = torch.zeros(n, dtype=torch.bool, device=dev)  # ランダムな折れ線
+        # ログ・解析用: 最後にウェイポイントを進めた / 経路を引き直したときの common_step_counter
+        self.last_advance_step = torch.full((n,), -(10**9), dtype=torch.long, device=dev)
+        self.last_replan_step = torch.full((n,), -(10**9), dtype=torch.long, device=dev)
+        self.pass_count = {"reached": 0, "crossed": 0}
+        self.metrics["ball_target_distance"] = torch.zeros(n, device=dev)
+        self.metrics["waypoint_index"] = torch.zeros(n, device=dev)
 
     def __str__(self) -> str:
         return (
             "WaypointPose2dCommand:\n"
             f"\tCommand dimension: {tuple(self.command.shape[1:])}\n"
-            f"\tPath shape: {self.cfg.path_shape}\n"
+            f"\tLevels: {len(self.stages) if self.stages else 1}\n"
             f"\tResampling time range: {self.cfg.resampling_time_range}"
         )
 
@@ -1225,8 +1329,15 @@ class WaypointPose2dCommand(CommandTerm):
 
     @property
     def pos_command_w(self) -> torch.Tensor:
-        """現在のウェイポイント (N, 3) [ワールド]。"""
+        """今のウェイポイント (N, 3) [ワールド]。"""
         return self.waypoints_w[torch.arange(self.num_envs, device=self.device), self.waypoint_index]
+
+    @property
+    def prev_point_w(self) -> torch.Tensor:
+        """今のウェイポイントの 1 つ前の点 (N, 2) (最初のウェイポイントでは経路の始点)。"""
+        prev_idx = (self.waypoint_index - 1).clamp(min=0)
+        prev = self.waypoints_w[torch.arange(self.num_envs, device=self.device), prev_idx, :2]
+        return torch.where((self.waypoint_index == 0).unsqueeze(1), self.start_w, prev)
 
     @property
     def is_final_waypoint(self) -> torch.Tensor:
@@ -1234,7 +1345,7 @@ class WaypointPose2dCommand(CommandTerm):
 
     @property
     def command(self) -> torch.Tensor:
-        """現在のウェイポイントの相対位置 (N, 2) [body yaw 座標]。"""
+        """今のウェイポイントの相対位置 (N, 2) [body yaw 座標]。"""
         return self.pos_command_b
 
     def _tracked_xy(self) -> torch.Tensor:
@@ -1243,91 +1354,131 @@ class WaypointPose2dCommand(CommandTerm):
             return self._env.scene[name].data.root_pos_w[:, :2]
         return self.robot.data.root_pos_w[:, :2]
 
+    def _stage_list(self) -> list[dict]:
+        if self.stages:
+            return self.stages
+        return [{
+            "pos_x": self.cfg.ranges.pos_x, "pos_y": self.cfg.ranges.pos_y,
+            "path_shape": self.cfg.path_shape, "shape_params": self.cfg.shape_params,
+        }]
+
     # -- implementation
 
     def _update_metrics(self):
         self.metrics["ball_target_distance"] = torch.norm(self.pos_command_w[:, :2] - self._tracked_xy(), dim=1)
         self.metrics["waypoint_index"] = self.waypoint_index.float()
 
+    def _make_local(self, stage: dict, n: int, sign: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """レベルの形の点列 (始点からの相対、(n, K, 2)) と点の数 (n,) を返す。"""
+        shape = stage.get("path_shape", "straight")
+        if shape in _LEGACY_SHAPES:
+            return _legacy_path(shape, stage, n, sign, self.cfg, self.device)
+        if shape in _LOCAL_SHAPES:
+            pts = _local_path(shape, stage.get("shape_params", {}), n, self.device)
+            pts = pts * torch.stack([torch.ones_like(sign), sign], dim=2)
+            return pts, torch.full((n,), pts.shape[1], dtype=torch.long, device=self.device)
+        raise ValueError(f"WaypointPose2dCommand: 未知の path_shape {shape!r} ({_PATH_SHAPES})")
+
     def _resample_command(self, env_ids: Sequence[int]):
         if len(env_ids) == 0:
             return
         env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
-        n = len(env_ids)
-        r = torch.empty(n, device=self.device)
-        start = self._tracked_xy()[env_ids].clone()
-        offset = torch.stack(
-            [r.uniform_(*self.cfg.ranges.pos_x).clone(), torch.empty(n, device=self.device).uniform_(*self.cfg.ranges.pos_y)],
-            dim=1,
-        )
-        dist = torch.norm(offset, dim=1, keepdim=True).clamp(min=1e-6)
-        mode = torch.rand(n, device=self.device)
-        # 全方位 (ボールの後方・横を含む): 距離はそのままで方位だけ一様に回す
-        omni = (mode < self.cfg.omni_prob).unsqueeze(1)
-        bearing = torch.empty(n, device=self.device).uniform_(-math.pi, math.pi)
-        omni_offset = dist * torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=1)
-        # 遠方: 前方の向きのまま、距離をそのレベルの上限の 1〜far_scale 倍にする
-        far = ((mode >= self.cfg.omni_prob) & (mode < self.cfg.omni_prob + self.cfg.far_prob)).unsqueeze(1)
-        max_dist = math.hypot(max(abs(v) for v in self.cfg.ranges.pos_x), max(abs(v) for v in self.cfg.ranges.pos_y))
-        far_dist = torch.empty(n, 1, device=self.device).uniform_(max_dist, max_dist * self.cfg.far_scale)
-        far_offset = offset / dist * far_dist
-        offset = torch.where(omni, omni_offset, torch.where(far, far_offset, offset))
-        goal = start + offset
+        stages = self._stage_list()
+        levels = self.env_level[env_ids].clamp(max=len(stages) - 1) if self.stages else torch.zeros_like(env_ids)
+        polyline = torch.rand(len(env_ids), device=self.device) < self.cfg.random_polyline_prob
+        self.env_polyline[env_ids] = polyline
+        start_all = self._tracked_xy()[env_ids].clone()
+        wps_all = torch.zeros(len(env_ids), _MAX_WAYPOINTS, 2, device=self.device)
+        cnt_all = torch.ones(len(env_ids), dtype=torch.long, device=self.device)
 
-        seg = goal - start
-        length = torch.norm(seg, dim=1, keepdim=True).clamp(min=1e-6)
-        normal = torch.stack([-seg[:, 1], seg[:, 0]], dim=1) / length
-        sign = torch.where(torch.rand(n, 1, device=self.device) < 0.5, -1.0, 1.0)
-
-        shape = self.cfg.path_shape
-        if shape not in _PATH_SHAPES:
-            raise ValueError(f"WaypointPose2dCommand: 未知の path_shape {shape!r} ({_PATH_SHAPES})")
-        if shape in _LOCAL_SHAPES:
-            # 進行方向 ψ: 通常はワールド +x (リセット直後のロボットの向き)、omni_prob の割合で全方位
-            psi = torch.where(omni.squeeze(1), bearing, torch.zeros_like(bearing))
-            local = _local_path(shape, self.cfg.shape_params, n, self.device)
-            local = local * torch.stack([torch.ones_like(sign), sign], dim=2)  # 左右をランダムに反転
+        for lv in torch.unique(levels).tolist():
+            sel = torch.nonzero(levels == lv).flatten()
+            n = len(sel)
+            sign = torch.where(torch.rand(n, 1, device=self.device) < 0.5, -1.0, 1.0)
+            pts, cnt = self._make_local(stages[lv], n, sign)
+            # ランダムな折れ線: 同じレベルのコースと同じ長さ
+            pl = polyline[sel]
+            if pl.any():
+                poly, pcnt = random_polyline(
+                    n, path_length(pts, cnt), self.device,
+                    min_seg=self.cfg.polyline_segment[0], max_seg=self.cfg.polyline_segment[1],
+                    min_points=self.cfg.polyline_points[0], max_points=self.cfg.polyline_points[1],
+                    max_turn_deg=self.cfg.polyline_max_turn_deg,
+                )
+                k = max(pts.shape[1], poly.shape[1])
+                pts = torch.cat([pts, pts[:, -1:].expand(n, k - pts.shape[1], 2)], 1)
+                poly = torch.cat([poly, poly[:, -1:].expand(n, k - poly.shape[1], 2)], 1)
+                pts = torch.where(pl.view(n, 1, 1), poly, pts)
+                cnt = torch.where(pl, pcnt, cnt)
+            # 進行方向: ワールド +x、omni_prob の割合で全方位 (従来の形は _legacy_path の中で回し済み)
+            psi = torch.where(
+                torch.rand(n, device=self.device) < self.cfg.omni_prob,
+                torch.empty(n, device=self.device).uniform_(-math.pi, math.pi),
+                torch.zeros(n, device=self.device),
+            )
+            if stages[lv].get("path_shape", "straight") in _LEGACY_SHAPES:
+                psi = torch.where(pl, psi, torch.zeros_like(psi))  # 従来の形の部分はすでに回してある
             c, s_ = torch.cos(psi).view(n, 1), torch.sin(psi).view(n, 1)
-            world = torch.stack([c * local[..., 0] - s_ * local[..., 1], s_ * local[..., 0] + c * local[..., 1]], dim=2)
-            world = world + start.unsqueeze(1)
-            points = [world[:, i] for i in range(world.shape[1])]
-            goal = points[-1]
-        elif shape == "straight":
-            points = [goal]
-        elif shape == "curve":
-            points = [start + 0.5 * seg + sign * self.cfg.curve_offset_frac * length * normal, goal]
-        elif shape == "l_shape":
-            points = [torch.stack([goal[:, 0], start[:, 1]], dim=1), goal]
-        else:  # z_shape
-            amp = sign * self.cfg.z_amplitude
-            points = [start + seg / 3.0 + amp * normal, start + 2.0 * seg / 3.0 - amp * normal, goal]
+            rot = torch.stack([c * pts[..., 0] - s_ * pts[..., 1], s_ * pts[..., 0] + c * pts[..., 1]], dim=2)
+            k = min(rot.shape[1], _MAX_WAYPOINTS)
+            wps = rot[:, :k]
+            # 点の数より後ろは最後の点で埋める
+            last = wps[torch.arange(n, device=self.device), (cnt - 1).clamp(max=k - 1)]
+            idx = torch.arange(_MAX_WAYPOINTS, device=self.device).unsqueeze(0)
+            full = torch.cat([wps, last.unsqueeze(1).expand(n, _MAX_WAYPOINTS - k, 2)], 1)
+            full = torch.where((idx < cnt.unsqueeze(1)).unsqueeze(2), full, last.unsqueeze(1))
+            wps_all[sel] = full
+            cnt_all[sel] = cnt.clamp(max=_MAX_WAYPOINTS)
 
-        wps = torch.zeros(n, _MAX_WAYPOINTS, 3, device=self.device)
-        for i, p in enumerate(points):
-            wps[:, i, :2] = p
-        for i in range(len(points), _MAX_WAYPOINTS):
-            wps[:, i, :2] = goal
-        wps[:, :, 2] = self.robot.data.default_root_state[env_ids, 2].unsqueeze(1)
-        self.waypoints_w[env_ids] = wps
-        self.num_waypoints[env_ids] = len(points)
+        wps_all = wps_all + start_all.unsqueeze(1)
+        z = self.robot.data.default_root_state[env_ids, 2].view(-1, 1, 1).expand(-1, _MAX_WAYPOINTS, 1)
+        self.waypoints_w[env_ids] = torch.cat([wps_all, z], dim=2)
+        self.num_waypoints[env_ids] = cnt_all
         self.waypoint_index[env_ids] = 0
-        self.start_w[env_ids] = start
-
-        # 障害物レベルなら経路に合わせて障害物を置く (退避は reset イベントが先に済ませている)
-        if getattr(self._env, "_dribble_num_obstacles", 0) > 0:
-            from .events import place_dribble_obstacles
-
-            place_dribble_obstacles(self._env, env_ids, start, goal, wps[:, : len(points), :2], sign, normal)
+        self.start_w[env_ids] = start_all
+        self.last_advance_step[env_ids] = -(10**9)
+        self.last_replan_step[env_ids] = -(10**9)
 
     def _update_command(self):
-        # ボールが現在のウェイポイントに届いたら次へ (最終ウェイポイントでは進まない)
-        reached = torch.norm(self.pos_command_w[:, :2] - self._tracked_xy(), dim=1) < self.cfg.waypoint_reach_radius
-        advance = reached & ~self.is_final_waypoint
-        self.waypoint_index = torch.where(advance, self.waypoint_index + 1, self.waypoint_index)
+        # 通過判定 (最終ウェイポイントでは進まない)
+        reached, crossed = waypoint_passed(
+            self._tracked_xy(), self.pos_command_w[:, :2], self.prev_point_w, self.cfg.waypoint_reach_radius,
+            self.cfg.pass_line_max_distance,
+        )
+        advance = (reached | crossed) & ~self.is_final_waypoint
+        if advance.any():
+            self.pass_count["reached"] += int((advance & reached).sum())
+            self.pass_count["crossed"] += int((advance & ~reached).sum())
+            self.waypoint_index = torch.where(advance, self.waypoint_index + 1, self.waypoint_index)
+            self.last_advance_step[advance] = int(self._env.common_step_counter)
         target_vec = self.pos_command_w - self.robot.data.root_pos_w
         self.pos_command_b[:] = math_utils.quat_apply_inverse(
             math_utils.yaw_quat(self.robot.data.root_quat_w), target_vec
         )[:, :2]
+
+    def replan(self, env_ids: torch.Tensor, offset_range: tuple[float, float]) -> None:
+        """未通過の途中のウェイポイント (今のウェイポイント以降、最終の手前まで) を横にずらす。
+
+        戦略の経路計画が毎周期計画し直してウェイポイントが動くことの再現。ずらす量は env ごとに 1 つ
+        (大きさ U(offset_range)、向きは左右ランダム) で、各点の「入ってきた区間」に垂直な向きにずらす
+        (迂回路のように、残りの区間がまとめて横に動く)。最終目標は動かさない。途中のウェイポイントが
+        残っていない env (直線のコースや最終区間) では何もしない。
+        """
+        if len(env_ids) == 0:
+            return
+        wps = self.waypoints_w[env_ids, :, :2]  # (m, K, 2)
+        m, k = wps.shape[0], wps.shape[1]
+        prev = torch.cat([self.start_w[env_ids].unsqueeze(1), wps[:, :-1]], 1)
+        seg = wps - prev
+        normal = torch.stack([-seg[..., 1], seg[..., 0]], dim=2) / torch.norm(seg, dim=2, keepdim=True).clamp(min=1e-6)
+        idx = torch.arange(k, device=self.device).unsqueeze(0)
+        movable = (idx >= self.waypoint_index[env_ids].unsqueeze(1)) & (idx < (self.num_waypoints[env_ids] - 1).unsqueeze(1))
+        amount = torch.empty(m, 1, device=self.device).uniform_(*offset_range)
+        amount = amount * torch.where(torch.rand(m, 1, device=self.device) < 0.5, -1.0, 1.0)
+        moved = wps + normal * (amount * movable).unsqueeze(2)
+        self.waypoints_w[env_ids, :, :2] = moved
+        did = movable.any(dim=1)
+        self.last_replan_step[env_ids[did]] = int(self._env.common_step_counter)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -1353,39 +1504,55 @@ class WaypointPose2dCommandCfg(CommandTermCfg):
     """ロボットのシーン名。"""
 
     tracked_asset_name: str | None = "soccer_ball"
-    """経路の始点・ウェイポイント到達判定に使うシーン要素 (ボール)。無ければロボットを使う。"""
+    """経路の始点・通過判定に使うシーン要素 (ボール)。無ければロボットを使う。"""
 
     @configclass
     class Ranges:
         pos_x: tuple[float, float] = MISSING
-        """始点からの目標点の x オフセット [m] (ワールド軸)。"""
+        """始点からの目標点の x オフセット [m] (ワールド軸、従来の形)。"""
         pos_y: tuple[float, float] = MISSING
-        """始点からの目標点の y オフセット [m] (ワールド軸)。"""
+        """始点からの目標点の y オフセット [m] (ワールド軸、従来の形)。"""
 
     ranges: Ranges = MISSING
+    """カリキュラムが無いときに使う 1 レベル分の設定 (path_shape / shape_params と組で使う)。"""
 
     path_shape: str = "straight"
-    """経路形状 (straight / curve / l_shape / z_shape)。dribble_target_range_curriculum が書き換える。"""
+    """カリキュラムが無いときの経路の形。"""
+
+    shape_params: dict = {}
+    """カリキュラムが無いときの、ローカル座標で作る形の大きさの範囲。"""
 
     omni_prob: float = 0.25
-    """目標の方位を (-π, π] で一様にする割合 (ボールの後方・横の目標)。"""
+    """進行方向を全方位にする割合 (ボールの後方・横の目標)。"""
 
     far_prob: float = 0.1
-    """目標の距離をそのレベルの上限の 1〜far_scale 倍にする割合。"""
+    """従来の形で、目標の距離をそのレベルの上限の 1〜far_scale 倍にする割合。"""
 
     far_scale: float = 2.0
 
+    random_polyline_prob: float = 0.2
+    """エピソードをランダムな折れ線 (同じレベルのコースと同じ長さ) にする割合。"""
+
+    polyline_segment: tuple[float, float] = (0.5, 3.0)
+    """ランダムな折れ線の区間の長さ [m]。"""
+
+    polyline_points: tuple[int, int] = (2, 5)
+    """ランダムな折れ線の点の数 (始点を含まない)。"""
+
+    polyline_max_turn_deg: float = 90.0
+    """ランダムな折れ線の 1 か所の曲がりの最大 [deg] (0〜この値、左右ランダム)。"""
+
     waypoint_reach_radius: float = 0.3
-    """ボールがこの距離 [m] 以内に入ったら次のウェイポイントへ進む。"""
+    """ボールがこの距離 [m] 以内に入ったら次のウェイポイントへ進む (垂直な線を越えた場合も進む)。"""
+
+    pass_line_max_distance: float | None = None
+    """「入ってきた区間に垂直な線を越えた」で通過とみなすのを、ウェイポイントから この距離 [m] 以内に限る。
+    None で制限なし。"""
 
     curve_offset_frac: float = 0.25
     """curve: 中間点を S→G の長さのこの割合だけ横にずらす。"""
 
     z_amplitude: float = 1.0
-
-    shape_params: dict = {}
-    """ローカル座標で作る形 (oval / s_curve / v_turn / u_turn / figure8) の大きさの範囲。
-    dribble_target_range_curriculum がレベルの設定 (stage の "shape_params") から書き換える。"""
     """z_shape: 1/3・2/3 点を横にずらす量 [m]。"""
 
     goal_visualizer_cfg: VisualizationMarkersCfg = VisualizationMarkersCfg(

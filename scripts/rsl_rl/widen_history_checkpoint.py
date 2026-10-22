@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 """歩行ポリシー (HistoryActorCritic、1 ステップ 49 次元) の checkpoint を、ドリブル用の
-観測レイアウト (policy 59 次元 / critic 66 次元) に広げる。
+観測レイアウト (policy 59 次元 / critic 64 次元) に広げる。
 
 ドリブル用の項は各フレームの末尾に追加されている (history_layout.DRIBBLE_TARGET_*_TERM_SPECS)
 ので、形が変わるのは次のテンソルだけ:
@@ -139,7 +139,14 @@ def _build_policy(layout_name: str, num_actions: int, history_length: int, ckpt_
         critic_obs_normalization=True,
         obs_layout=layout_name,
     )
-    policy.load_state_dict(ckpt_state, strict=True)
+    # critic の次元はレイアウトの変更 (2026-10-22 に 66 → 64) で変わりうる。actor だけ使う用途 (エクスポート) のため、
+    # 形の合わない critic のテンソルは読まない (actor が合わなければエラーにする)。
+    live = policy.state_dict()
+    skipped = [k for k, v in ckpt_state.items() if k.startswith("critic") and k in live and live[k].shape != v.shape]
+    state = {k: v for k, v in ckpt_state.items() if k not in skipped}
+    policy.load_state_dict(state, strict=not skipped)
+    if skipped:
+        print(f"[load] critic の形が今のレイアウトと違うので読まない: {skipped}")
     # float32 だと「0 の列が増えて行列積の足し算の順序が変わる」だけで 1e-5 程度の丸め誤差が出るので、
     # 等価性は float64 で確認する (追加分の重みが 0 なら float64 では誤差がほぼ 0 になるはず)。
     policy.double()

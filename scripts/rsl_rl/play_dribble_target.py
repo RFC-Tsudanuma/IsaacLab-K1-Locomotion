@@ -35,6 +35,9 @@ parser.add_argument("--video_length", type=int, default=1000, help="動画の長
 parser.add_argument("--with_noise", action="store_true", help="学習時と同じ観測ノイズを入れる")
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--no_real_time", action="store_true", help="画面再生を実時間に合わせない")
+parser.add_argument("--polyline_prob", type=float, default=0.0,
+                    help="ランダムな折れ線にするエピソードの割合 (学習では 0.2。既定 0 = そのレベルのコースだけ)")
+parser.add_argument("--no_replan", action="store_true", help="エピソードの途中の経路の引き直しを切る")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 if args_cli.video:
@@ -81,6 +84,10 @@ def main():
     if not 1 <= args_cli.level <= len(stages):
         raise SystemExit(f"--level は 1〜{len(stages)} で指定してください")
     cur.params["error_threshold"] = [-1.0] * len(stages)
+    env_cfg.curriculum.dribble_target_range.params["prev_level_mix_prob"] = 0.0  # 前のレベルを混ぜない
+    env_cfg.commands.dribble_target.random_polyline_prob = args_cli.polyline_prob
+    if args_cli.no_replan:
+        env_cfg.events.replan_dribble_path = None
 
     agent_cfg = load_cfg_from_registry(TASK, "rsl_rl_cfg_entry_point")
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, metadata.version("rsl-rl-lib"))
@@ -88,7 +95,7 @@ def main():
     env = gym.make(TASK, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     u = env.unwrapped
     term = u.curriculum_manager._term_cfgs[u.curriculum_manager.active_terms.index("dribble_target_range")].func
-    term.load_state_dict({"level": args_cli.level - 1, "failure_ema": 1.0, "num_updates": 0})
+    term.load_state_dict({"level": args_cli.level - 1, "failure_ema": 1.0})
     print(f"[INFO] Level {args_cli.level}: {stages[args_cli.level - 1]}", flush=True)
 
     if args_cli.video:
@@ -105,7 +112,7 @@ def main():
     runner = OnPolicyRunner(
         wrapped, stage_transition_utils.filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=None, device="cuda:0"
     )
-    runner.load(ckpt, load_optimizer=False)
+    stage_transition_utils.load_for_inference(runner, ckpt)
     policy = runner.get_inference_policy(device="cuda:0")
     print(f"[INFO] checkpoint: {ckpt}", flush=True)
 

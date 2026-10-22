@@ -74,13 +74,12 @@ DRIBBLE_TARGET_POLICY_TERM_SPECS = POLICY_TERM_SPECS + (
     ("foot_right_ball_pos_rel", 2, "foot_r"),
 )
 
-# Critic は特権情報 (ノイズなしのボール観測・obstacle_pos_rel) を含む。
-# obstacle_pos_rel は実機で安定して取れないため critic 専用 (policy には入れない)。
+# Critic は特権情報 (ノイズなしのボール観測) を含む。1 ステップ 64 次元。
+# 2026-10-22: 障害物を廃止したので obstacle_pos_rel を外した (66 → 64 次元)。
 DRIBBLE_TARGET_CRITIC_TERM_SPECS = CRITIC_TERM_SPECS + (
     ("target_pos_rel", 2, "xy"),
     ("ball_pos_rel", 2, "xy"),
     ("ball_vel", 2, "xy"),
-    ("obstacle_pos_rel", 2, "xy"),
     ("foot_left_ball_pos_rel", 2, "foot_l"),
     ("foot_right_ball_pos_rel", 2, "foot_r"),
 )

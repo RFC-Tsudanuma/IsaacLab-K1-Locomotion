@@ -13,6 +13,7 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 from isaaclab.assets import Articulation
+import isaaclab.utils.math as math_utils
 from isaaclab.managers import ManagerTermBase
 from isaaclab.managers.manager_term_cfg import CurriculumTermCfg
 
@@ -869,53 +870,85 @@ class kick_angle_range_curriculum(ManagerTermBase):
 
 
 class dribble_target_range_curriculum(ManagerTermBase):
-    """目標距離・経路形状・障害物を Level1〜N で段階的に難しくするカリキュラム。
+    """ドリブルのコースを Level1〜N で段階的に難しくするカリキュラム (2026-10-22 改訂)。
 
-    ゲート指標は「終了したエピソードのうち success_term_name (ball_reached_target) で
-    終わらなかった割合」= 失敗率の EMA。``min_updates`` 回更新した後、EMA が
-    ``error_threshold[level]`` を下回ったら次のレベルへ進む。進んだ直後は EMA を 1.0、
-    更新回数を 0 に戻して温め直す (一気に何段も進むのを防ぐ)。
+    **レベルは env ごと**: エピソードの開始時に env ごとのレベルを決めて WaypointPose2dCommand に渡す
+    (コマンドはそのレベルのコースを作る)。
 
-    各ステージ (dict) のキー:
-        pos_x, pos_y: 目標点のオフセット範囲 [m] (WaypointPose2dCommandCfg.ranges)
-        path_shape: 経路形状 (省略時 "straight")
-        num_obstacles: 障害物の本数 (省略時 0 = 退避)
-        corner_obstacles: Z字のコーナーに置く (省略時 False)
-        corridor: 2 本をゲート状に置く (省略時 False)
+    * 確率 prev_level_mix_prob (0.25) で、通過済みのレベル (0〜今のレベル-1) から一様に選ぶ (忘れるのを防ぐ)
+    * それ以外は今のレベル
 
-    状態 (level / EMA / 更新回数) は :meth:`state_dict` / :meth:`load_state_dict` で保存・復元できる。
-    train.py が checkpoint と同じ名前の ``model_*_curriculum.json`` に保存し、再開時に読み込む。
+    **進級**: 今のレベルの「混合でない・ランダムな折れ線でない」エピソードだけで、失敗率の EMA を
+    エピソード 1 つごとに重み ema_episode_weight (1/2000) で更新する (失敗 = success_term_name で終わらなかった
+    エピソード、time_out を含む)。そのレベルに min_iterations (300) iteration 以上いて、EMA が
+    error_threshold[level] を下回ったら次のレベルへ。進級したら EMA を 1.0 に戻す。
+
+    **ログ** (TensorBoard の Curriculum/dribble_target_range/...、混合・折れ線のエピソードも含む):
+
+    * L{k}_success / L{k}_fall: レベル k のエピソードの成功率・転倒率 (エピソードごとに重み log_episode_weight の EMA)。
+      一度もエピソードが無いレベルは出さない
+    * fall_{replan,corner,overshoot,other}: 終わったエピソードのうち、その状況で転倒したものの割合 (4 つの和 = 転倒率)。
+      判定はリセット前の状態 (この関数はリセットの最初に呼ばれる) で、優先順は replan > corner > overshoot > other:
+        - replan:    経路の引き直しから recent_window_s 秒以内
+        - corner:    途中のウェイポイント (曲がり角) から corner_radius m 以内、またはウェイポイントを進めてから recent_window_s 秒以内
+        - overshoot: 今のウェイポイントがロボットの後ろ側 (body yaw 座標で方位 90° 超) にある (行き過ぎた後)
+
+    状態は :meth:`state_dict` / :meth:`load_state_dict` で保存・復元できる (train.py が model_*_curriculum.json に保存)。
     """
 
     def __init__(self, cfg: CurriculumTermCfg, env: ManagerBasedRLEnv):
         super().__init__(cfg, env)
-        self._stages = cfg.params["stages"]
-        self._command_name = cfg.params["command_name"]
+        p = cfg.params
+        self._stages = p["stages"]
+        self._command_name = p["command_name"]
+        self._n_levels = len(self._stages)
         self.level = 0
         self.failure_ema = 1.0
-        self.num_updates = 0
-        self._apply_stage(env)
-
-    def _apply_stage(self, env: ManagerBasedRLEnv):
-        stage = self._stages[self.level]
-        cmd_cfg = env.command_manager.get_term(self._command_name).cfg
-        # ローカル座標で作る形 (oval など) は pos_x / pos_y を使わないので省略できる
-        cmd_cfg.ranges.pos_x = tuple(stage.get("pos_x", (1.0, 1.0)))
-        cmd_cfg.ranges.pos_y = tuple(stage.get("pos_y", (0.0, 0.0)))
-        cmd_cfg.path_shape = stage.get("path_shape", "straight")
-        cmd_cfg.shape_params = dict(stage.get("shape_params", {}))
-        env._dribble_num_obstacles = int(stage.get("num_obstacles", 0))
-        env._dribble_corner_obstacles = bool(stage.get("corner_obstacles", False))
-        env._dribble_corridor = bool(stage.get("corridor", False))
+        self.level_entry_step = int(env.common_step_counter)
+        self.level_stats = {}  # level (1 始まり) → {"success": ema, "fall": ema, "episodes": n}
+        self.fall_context = {"replan": 0.0, "corner": 0.0, "overshoot": 0.0, "other": 0.0}
+        cmd = env.command_manager.get_term(self._command_name)
+        cmd.stages = self._stages
+        cmd.env_level[:] = 0
+        cmd.env_mixed[:] = False
 
     def state_dict(self) -> dict:
-        return {"level": self.level, "failure_ema": self.failure_ema, "num_updates": self.num_updates}
+        return {
+            "level": self.level,
+            "failure_ema": self.failure_ema,
+            "level_entry_step": self.level_entry_step,
+            "level_stats": self.level_stats,
+            "fall_context": self.fall_context,
+        }
 
     def load_state_dict(self, state: dict):
-        self.level = min(int(state["level"]), len(self._stages) - 1)
+        self.level = min(int(state["level"]), self._n_levels - 1)
         self.failure_ema = float(state["failure_ema"])
-        self.num_updates = int(state["num_updates"])
-        self._apply_stage(self._env)
+        # 再開時は「今のレベルに入った時刻」を今にする (common_step_counter の基準がプロセスごとに変わりうるため、
+        # 最低 iteration 数は再開してから数え直す)
+        self.level_entry_step = int(self._env.common_step_counter)
+        self.level_stats = {int(k): v for k, v in state.get("level_stats", {}).items()}
+        self.fall_context = dict(state.get("fall_context", self.fall_context))
+
+    def _fall_context(self, env: ManagerBasedRLEnv, ids: torch.Tensor, cmd, corner_radius: float, window_steps: int) -> torch.Tensor:
+        """転倒した env ids の状況 (0 replan / 1 corner / 2 overshoot / 3 other) を返す。リセット前の状態を使う。"""
+        step = int(env.common_step_counter)
+        robot = env.scene["robot"]
+        rxy = robot.data.root_pos_w[ids, :2]
+        replan = (step - cmd.last_replan_step[ids]) <= window_steps
+        wps = cmd.waypoints_w[ids, :, :2]
+        k = torch.arange(wps.shape[1], device=env.device).unsqueeze(0)
+        inter = k < (cmd.num_waypoints[ids] - 1).unsqueeze(1)
+        near = ((torch.norm(wps - rxy.unsqueeze(1), dim=2) < corner_radius) & inter).any(dim=1)
+        corner = near | ((step - cmd.last_advance_step[ids]) <= window_steps)
+        tgt = cmd.waypoints_w[ids, cmd.waypoint_index[ids]] - robot.data.root_pos_w[ids]
+        tgt_b = math_utils.quat_apply_inverse(math_utils.yaw_quat(robot.data.root_quat_w[ids]), tgt)
+        overshoot = tgt_b[:, 0] < 0.0
+        out = torch.full((len(ids),), 3, dtype=torch.long, device=env.device)
+        out = torch.where(overshoot, torch.full_like(out, 2), out)
+        out = torch.where(corner, torch.full_like(out, 1), out)
+        out = torch.where(replan, torch.full_like(out, 0), out)
+        return out
 
     def __call__(
         self,
@@ -925,29 +958,80 @@ class dribble_target_range_curriculum(ManagerTermBase):
         success_term_name: str,
         stages: list[dict],
         error_threshold: list[float],
-        ema_alpha: float = 0.02,
-        min_updates: int = 50,
+        fall_term_name: str = "base_height",
+        ema_episode_weight: float = 1.0 / 2000.0,
+        min_iterations: int = 300,
+        steps_per_iteration: int = 48,
+        prev_level_mix_prob: float = 0.25,
+        log_episode_weight: float = 1.0 / 500.0,
+        corner_radius: float = 1.0,
+        recent_window_s: float = 1.0,
     ) -> dict[str, float]:
+        cmd = env.command_manager.get_term(command_name)
         if env_ids is not None and len(env_ids) > 0:
             env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
-            # 環境構築直後の一斉リセット (エピソード長 0) は数えない
+            # --- 終わったエピソードの集計 (環境構築直後の一斉リセット = エピソード長 0 は数えない)
             finished = env_ids[env.episode_length_buf[env_ids] > 0]
             if len(finished) > 0:
-                success = env.termination_manager.get_term(success_term_name)[finished]
-                failure_rate = 1.0 - success.float().mean().item()
-                self.failure_ema = (1.0 - ema_alpha) * self.failure_ema + ema_alpha * failure_rate
-                self.num_updates += 1
+                tm = env.termination_manager
+                success = tm.get_term(success_term_name)[finished]
+                fall = tm.get_term(fall_term_name)[finished]
+                lv = cmd.env_level[finished]
+                # 進級判定: 今のレベルの、混合でも折れ線でもないエピソード
+                gate = (lv == self.level) & ~cmd.env_mixed[finished] & ~cmd.env_polyline[finished]
+                k = int(gate.sum())
+                if k > 0:
+                    fail_rate = 1.0 - success[gate].float().mean().item()
+                    keep = (1.0 - ema_episode_weight) ** k
+                    self.failure_ema = keep * self.failure_ema + (1.0 - keep) * fail_rate
+                # レベルごとの成功率・転倒率
+                for l in torch.unique(lv).tolist():
+                    m = lv == l
+                    kk = int(m.sum())
+                    st = self.level_stats.setdefault(l + 1, {"success": success[m].float().mean().item(),
+                                                             "fall": fall[m].float().mean().item(), "episodes": 0})
+                    keep = (1.0 - log_episode_weight) ** kk
+                    st["success"] = keep * st["success"] + (1.0 - keep) * success[m].float().mean().item()
+                    st["fall"] = keep * st["fall"] + (1.0 - keep) * fall[m].float().mean().item()
+                    st["episodes"] += kk
+                # 転倒の状況別 (終わったエピソードに占める割合)
+                ctx = torch.full((len(finished),), -1, dtype=torch.long, device=env.device)
+                if fall.any():
+                    window = int(round(recent_window_s / env.step_dt))
+                    ctx[fall] = self._fall_context(env, finished[fall], cmd, corner_radius, window)
+                keep = (1.0 - log_episode_weight) ** len(finished)
+                for i, name in enumerate(("replan", "corner", "overshoot", "other")):
+                    rate = (ctx == i).float().mean().item()
+                    self.fall_context[name] = keep * self.fall_context[name] + (1.0 - keep) * rate
+                # 進級
+                iters = (int(env.common_step_counter) - self.level_entry_step) / steps_per_iteration
                 if (
                     self.level < len(stages) - 1
-                    and self.num_updates >= min_updates
+                    and iters >= min_iterations
                     and self.failure_ema < error_threshold[self.level]
                 ):
                     self.level += 1
                     self.failure_ema = 1.0
-                    self.num_updates = 0
-                    self._apply_stage(env)
-                    print(f"[dribble_target_range_curriculum] Level {self.level + 1} に進級: {stages[self.level]}")
-        return {"level": float(self.level + 1), "failure_ema": self.failure_ema}
+                    self.level_entry_step = int(env.common_step_counter)
+                    print(f"[dribble_target_range_curriculum] Level {self.level + 1} に進級 ({iters:.0f} iteration 在籍): "
+                          f"{stages[self.level]}")
+            # --- 次のエピソードのレベルを決める (この後のコマンドの再サンプリングで使われる)
+            n = len(env_ids)
+            mixed = (torch.rand(n, device=env.device) < prev_level_mix_prob) & (self.level > 0)
+            prev = torch.randint(0, max(self.level, 1), (n,), device=env.device)
+            cmd.env_level[env_ids] = torch.where(mixed, prev, torch.full_like(prev, self.level))
+            cmd.env_mixed[env_ids] = mixed
+        out = {
+            "level": float(self.level + 1),
+            "failure_ema": self.failure_ema,
+            "iterations_in_level": (int(env.common_step_counter) - self.level_entry_step) / steps_per_iteration,
+        }
+        for l, st in sorted(self.level_stats.items()):
+            out[f"L{l}_success"] = st["success"]
+            out[f"L{l}_fall"] = st["fall"]
+        for name, v in self.fall_context.items():
+            out[f"fall_{name}"] = v
+        return out
 
 
 def modify_gait_phase_cmd_threshold_linear(

@@ -100,6 +100,8 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
     act = env["actions"]["joint_pos"]
     gait = pol["gait_phase"]["params"]
     cmd = env["commands"]["dribble_target"]
+    cur = (env.get("curriculum") or {}).get("dribble_target_range") or {}
+    cur_stages = (cur.get("params") or {}).get("stages")
     return {
         "task": "Isaac-Velocity-Flat-K1-Dribble-Target-v0",
         "run": os.path.basename(os.path.normpath(run_dir)),
@@ -161,11 +163,25 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
             "robot_velocity_reset": "各軸 ±0.5 (m/s, rad/s)",
         },
         "terminations": {
-            name: (t.get("params") or {}) if name not in ("obstacle_collision", "base_contact") else name
+            name: (t.get("params") or {}) if name != "base_contact" else name
             for name, t in env["terminations"].items()
             if t
         },
-        "obstacle_collision": "障害物レベルのみ。ロボット 0.45m / ボール 0.31m 以内 (中心間 xy)",
+        "waypoints": {
+            "source": "実機では戦略の経路計画 (pathplan_lib) が、ボールを始点に障害物を避けるウェイポイント列を出す。"
+            "今のウェイポイントを target_pos_rel として入れる",
+            "pass_rule": {
+                "evaluate_at": "50Hz (毎制御周期)。最終ウェイポイントでは進まない (成功判定は ball_reached_target)",
+                "definitions": "W = 今のウェイポイント、P = 1 つ前の点 (最初のウェイポイントでは経路の始点 = 経路を受け取ったときのボール位置)、"
+                "B = ボール中心 (xy、ワールド)、u = (W - P) / |W - P|",
+                "rule": "|B - W| < r  または  (B - W)・u >= 0  なら次のウェイポイントへ (1 周期に 1 つだけ進める)",
+                "r_m": cmd["waypoint_reach_radius"],
+                "note": "(B - W)・u >= 0 は「W を通り、入ってきた区間に垂直な直線を、進行方向に越えた」。二等分線ではないので、"
+                "V 字・U ターンでも角まで行かないと通過しない",
+            },
+            "replan_in_training": "2〜5 秒ごとに確率 0.3 で、未通過の途中のウェイポイントを入ってきた区間に垂直に 0.2〜0.8m ずらす (最終目標は固定)",
+        },
+        "curriculum_levels": cur_stages,
         "agent": {"num_envs": env["scene"]["num_envs"], "num_steps_per_env": agent["num_steps_per_env"],
                   "num_mini_batches": agent["algorithm"]["num_mini_batches"]},
     }
@@ -221,7 +237,8 @@ def main():
         from tensordict import TensorDict
 
         flat = [obs_history[:, :, a:b].reshape(1, -1) for a, b in (f["channels"] for f in build_spec(env, agent, layout, run_dir, it, None)["frame_layout"])]
-        td = TensorDict({"command": command, "policy": torch.cat(flat, -1), "critic": torch.zeros(1, 66 * layout.HISTORY_LENGTH)}, batch_size=[1])
+        critic_dim = layout.term_specs_dim(layout.DRIBBLE_TARGET_CRITIC_TERM_SPECS) * layout.HISTORY_LENGTH
+        td = TensorDict({"command": command, "policy": torch.cat(flat, -1), "critic": torch.zeros(1, critic_dim)}, batch_size=[1])
         direct = policy.act_inference(td.to(torch.float64) if next(policy.parameters()).dtype == torch.float64 else td).numpy()
     got = ReferenceEvaluator(model).run(None, {"command": command.numpy(), "obs_history": obs_history.numpy()})[0]
     diff_onnx = float(np.abs(got - ref).max())

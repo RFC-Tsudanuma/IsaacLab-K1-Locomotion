@@ -98,7 +98,7 @@ def main():
     runner = OnPolicyRunner(
         wrapped, stage_transition_utils.filter_unsupported_alg_args(agent_cfg.to_dict()), log_dir=None, device="cuda:0"
     )
-    runner.load(args_cli.checkpoint, load_optimizer=False)
+    stage_transition_utils.load_for_inference(runner, args_cli.checkpoint)
     policy = runner.get_inference_policy(device="cuda:0")
     if args_cli.training_like:
         runner.alg.policy.eval()
