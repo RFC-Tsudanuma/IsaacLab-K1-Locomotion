@@ -117,23 +117,23 @@ def main():
         combos: dict[str, int] = {}
         expo = {"touch": 0, "corner": 0, "resample": 0, "none": 0, "all": 0}
         fall_ctx = {"speed": [], "turn_deg": [], "ball_dist": []}
+        reset_prev = torch.zeros(n, dtype=torch.bool, device=dev)
         with torch.no_grad():
             for step in range(args_cli.steps):
-                obs, _, dones, _ = wrapped.step(act(obs))
-                dones = dones.bool()
-                tm = u.termination_manager
-                # --- 状況のフラグ (このステップの状態)
+                # --- 状況のフラグは「ステップを進める前」の状態で計算する。IsaacLab は終了した env を
+                # ステップの中で自動的にリセットするので、ステップ後に読むとリセット後の状態になってしまう。
+                # 終了した env については、これが終了の 1 ステップ (20ms) 前の状態になる。
                 touch_now = (torch.norm(s_left.data.force_matrix_w[:, 0, 0], dim=1) > 0.1) | (
                     torch.norm(s_right.data.force_matrix_w[:, 0, 0], dim=1) > 0.1
                 )
+                touch_now &= ~reset_prev
                 last_touch = torch.where(touch_now, torch.zeros_like(last_touch), last_touch + 1)
-                adv = (cmd.waypoint_index > prev_wp) & ~dones
+                adv = (cmd.waypoint_index > prev_wp) & ~reset_prev
                 last_adv = torch.where(adv, torch.zeros_like(last_adv), last_adv + 1)
                 goal = cmd.waypoints_w[torch.arange(n, device=dev), cmd.num_waypoints - 1, :2]
-                resampled = (torch.norm(goal - prev_goal, dim=1) > 1e-3) & ~dones & (u.episode_length_buf > 1)
+                resampled = (torch.norm(goal - prev_goal, dim=1) > 1e-3) & ~reset_prev
                 last_resample = torch.where(resampled, torch.zeros_like(last_resample), last_resample + 1)
                 prev_wp, prev_goal = cmd.waypoint_index.clone(), goal.clone()
-                # 曲がり角 = 途中のウェイポイント (最終以外) から corner_radius 以内
                 rxy = robot.data.root_pos_w[:, :2]
                 idx = torch.arange(cmd.waypoints_w.shape[1], device=dev).unsqueeze(0)
                 inter = idx < (cmd.num_waypoints - 1).unsqueeze(1)
@@ -141,13 +141,22 @@ def main():
                 near_corner = ((dwp < args_cli.corner_radius) & inter).any(dim=1) | (last_adv <= args_cli.corner_window)
                 f_touch = last_touch <= args_cli.touch_window
                 f_res = last_resample <= args_cli.resample_window
-                live = ~dones
-                expo["all"] += int(live.sum())
-                expo["touch"] += int((f_touch & live).sum())
-                expo["corner"] += int((near_corner & live).sum())
-                expo["resample"] += int((f_res & live).sum())
-                expo["none"] += int((~f_touch & ~near_corner & ~f_res & live).sum())
-                # --- 終了したエピソード
+                v_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), robot.data.root_lin_vel_w)[:, :2]
+                tgt3 = torch.cat([cmd.pos_command_w[:, :2] - rxy, torch.zeros(n, 1, device=dev)], 1)
+                tgt_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), tgt3)
+                ctx_speed = torch.norm(v_b, dim=1)
+                ctx_turn = torch.rad2deg(torch.atan2(tgt_b[:, 1], tgt_b[:, 0])).abs()
+                ctx_ball = torch.norm(ball.data.root_pos_w[:, :2] - rxy, dim=1)
+                ctx_tick = u.episode_length_buf.clone()
+                expo["all"] += n
+                expo["touch"] += int(f_touch.sum())
+                expo["corner"] += int(near_corner.sum())
+                expo["resample"] += int(f_res.sum())
+                expo["none"] += int((~f_touch & ~near_corner & ~f_res).sum())
+
+                obs, _, dones, _ = wrapped.step(act(obs))
+                dones = dones.bool()
+                tm = u.termination_manager
                 if dones.any():
                     c["episodes"] += int(dones.sum())
                     for key, name in (("success", "ball_reached_target"), ("fall", "base_height"),
@@ -163,17 +172,14 @@ def main():
                             falls["none"] += 1
                         key = "+".join(flags) or "none"
                         combos[key] = combos.get(key, 0) + 1
-                        v_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w[i : i + 1]), robot.data.root_lin_vel_w[i : i + 1])[0]
-                        tgt = quat_apply_inverse(
-                            yaw_quat(robot.data.root_quat_w[i : i + 1]),
-                            torch.cat([cmd.pos_command_w[i : i + 1, :2] - rxy[i : i + 1], torch.zeros(1, 1, device=dev)], 1),
-                        )[0]
-                        fall_ctx["speed"].append(float(torch.norm(v_b[:2])))
-                        fall_ctx["turn_deg"].append(float(torch.rad2deg(torch.atan2(tgt[1], tgt[0])).abs()))
-                        fall_ctx["ball_dist"].append(float(torch.norm(ball.data.root_pos_w[i, :2] - rxy[i])))
+                        fall_ctx["speed"].append(float(ctx_speed[i]))
+                        fall_ctx["turn_deg"].append(float(ctx_turn[i]))
+                        fall_ctx["ball_dist"].append(float(ctx_ball[i]))
+                        fall_ctx.setdefault("time_s", []).append(float(ctx_tick[i]) * u.step_dt)
                     last_touch[dones] = 10**6
                     last_adv[dones] = 10**6
                     last_resample[dones] = 10**6
+                reset_prev = dones
         per10k = {k: (falls[k] / expo[k] * 1e4 if expo[k] else None) for k in ("touch", "corner", "resample", "none")}
         med = lambda xs: (sorted(xs)[len(xs) // 2] if xs else None)  # noqa: E731
         results[level] = {
