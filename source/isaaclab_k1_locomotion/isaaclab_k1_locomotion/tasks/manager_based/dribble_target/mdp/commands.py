@@ -1288,8 +1288,11 @@ class WaypointPose2dCommand(CommandTerm):
     **通過判定**: :func:`waypoint_passed` (到達 0.3m、または入ってきた区間に垂直な線を越えた)。最終ウェイポイントでは
     進まない (成功判定は terminations.ball_reached_target)。
 
-    **経路の引き直し**: :meth:`replan` (events.replan_dribble_path から呼ばれる) が、未通過の途中のウェイポイントを
-    横にずらす。最終目標は動かさない。
+    **経路の引き直し**: :meth:`replan` (events.replan_dribble_path から呼ばれる) が、実機と同じく「今のボール位置を始点、
+    未通過の点を先頭」の新しい列にして、途中のウェイポイントを横にずらす。最終目標は動かさない。
+
+    **制限時間**: エピソードの経路の長さ L から max(time_limit_min_s, L / time_limit_speed + time_limit_margin_s)
+    (上限 time_limit_max_s)。terminations.dribble_time_out が使う。
 
     観測・報酬は :attr:`pos_command_w` (= 今のウェイポイント) だけを見る。
     """
@@ -1314,6 +1317,9 @@ class WaypointPose2dCommand(CommandTerm):
         self.last_advance_step = torch.full((n,), -(10**9), dtype=torch.long, device=dev)
         self.last_replan_step = torch.full((n,), -(10**9), dtype=torch.long, device=dev)
         self.pass_count = {"reached": 0, "crossed": 0}
+        # エピソードの経路の長さと制限時間 (dribble_time_out が使う)
+        self.path_length_m = torch.zeros(n, device=dev)
+        self.time_limit_s = torch.full((n,), float(cfg.time_limit_min_s), device=dev)
         self.metrics["ball_target_distance"] = torch.zeros(n, device=dev)
         self.metrics["waypoint_index"] = torch.zeros(n, device=dev)
 
@@ -1430,6 +1436,13 @@ class WaypointPose2dCommand(CommandTerm):
             wps_all[sel] = full
             cnt_all[sel] = cnt.clamp(max=_MAX_WAYPOINTS)
 
+        # 制限時間 = 経路の長さ ÷ time_limit_speed + time_limit_margin_s (time_limit_min_s〜time_limit_max_s)。
+        # 遅くても完走できる時間にする (time_out は進級の判定で失敗に数えるため)。
+        length = path_length(wps_all, cnt_all)
+        self.path_length_m[env_ids] = length
+        self.time_limit_s[env_ids] = (length / self.cfg.time_limit_speed + self.cfg.time_limit_margin_s).clamp(
+            self.cfg.time_limit_min_s, self.cfg.time_limit_max_s
+        )
         wps_all = wps_all + start_all.unsqueeze(1)
         z = self.robot.data.default_root_state[env_ids, 2].view(-1, 1, 1).expand(-1, _MAX_WAYPOINTS, 1)
         self.waypoints_w[env_ids] = torch.cat([wps_all, z], dim=2)
@@ -1457,15 +1470,26 @@ class WaypointPose2dCommand(CommandTerm):
         )[:, :2]
 
     def replan(self, env_ids: torch.Tensor, offset_range: tuple[float, float]) -> None:
-        """未通過の途中のウェイポイント (今のウェイポイント以降、最終の手前まで) を横にずらす。
+        """経路を計画し直す: 新しいウェイポイント列を「今のボール位置を始点、未通過の点を先頭」にし、途中の点を横にずらす。
 
-        戦略の経路計画が毎周期計画し直してウェイポイントが動くことの再現。ずらす量は env ごとに 1 つ
-        (大きさ U(offset_range)、向きは左右ランダム) で、各点の「入ってきた区間」に垂直な向きにずらす
-        (迂回路のように、残りの区間がまとめて横に動く)。最終目標は動かさない。途中のウェイポイントが
-        残っていない env (直線のコースや最終区間) では何もしない。
+        実機の推論ノードと同じ扱いにする: 戦略が経路を計画し直すとウェイポイント列が入れ替わり、最初の
+        ウェイポイントの 1 つ前の点 P (通過判定に使う) は「経路を作った時点のボール位置」になる。そこで
+        (1) 通過済みの点を落として残りを先頭に詰め (今のウェイポイントが index 0)、(2) 始点 = 今のボール位置にし、
+        (3) 残りの途中の点 (最終の手前まで) を横にずらす。ずらす量は env ごとに 1 つ (大きさ U(offset_range)、
+        向きは左右ランダム) で、各点の「入ってきた区間」に垂直な向き (迂回路のように残りがまとめて横に動く)。
+        最終目標は動かさない。制限時間はエピソードの開始時のまま。
         """
         if len(env_ids) == 0:
             return
+        # (1)(2) 通過済みの点を落とし、始点を今のボール位置にする
+        k_all = self.waypoints_w.shape[1]
+        idx0 = self.waypoint_index[env_ids]
+        src = (torch.arange(k_all, device=self.device).unsqueeze(0) + idx0.unsqueeze(1)).clamp(max=k_all - 1)
+        self.waypoints_w[env_ids] = torch.gather(self.waypoints_w[env_ids], 1, src.unsqueeze(2).expand(-1, -1, 3))
+        self.num_waypoints[env_ids] = self.num_waypoints[env_ids] - idx0
+        self.waypoint_index[env_ids] = 0
+        self.start_w[env_ids] = self._tracked_xy()[env_ids]
+        # (3) 途中の点を横にずらす
         wps = self.waypoints_w[env_ids, :, :2]  # (m, K, 2)
         m, k = wps.shape[0], wps.shape[1]
         prev = torch.cat([self.start_w[env_ids].unsqueeze(1), wps[:, :-1]], 1)
@@ -1477,8 +1501,7 @@ class WaypointPose2dCommand(CommandTerm):
         amount = amount * torch.where(torch.rand(m, 1, device=self.device) < 0.5, -1.0, 1.0)
         moved = wps + normal * (amount * movable).unsqueeze(2)
         self.waypoints_w[env_ids, :, :2] = moved
-        did = movable.any(dim=1)
-        self.last_replan_step[env_ids[did]] = int(self._env.common_step_counter)
+        self.last_replan_step[env_ids] = int(self._env.common_step_counter)
 
     def _set_debug_vis_impl(self, debug_vis: bool):
         if debug_vis:
@@ -1544,6 +1567,16 @@ class WaypointPose2dCommandCfg(CommandTermCfg):
 
     waypoint_reach_radius: float = 0.3
     """ボールがこの距離 [m] 以内に入ったら次のウェイポイントへ進む (垂直な線を越えた場合も進む)。"""
+
+    time_limit_speed: float = 0.5
+    """制限時間 = 経路の長さ ÷ この速さ [m/s] + time_limit_margin_s。遅くても完走できる時間にする。"""
+
+    time_limit_margin_s: float = 5.0
+
+    time_limit_min_s: float = 30.0
+
+    time_limit_max_s: float = 60.0
+    """制限時間の上限。環境の episode_length_s はこれ以上にしておくこと。"""
 
     pass_line_max_distance: float | None = None
     """「入ってきた区間に垂直な線を越えた」で通過とみなすのを、ウェイポイントから この距離 [m] 以内に限る。

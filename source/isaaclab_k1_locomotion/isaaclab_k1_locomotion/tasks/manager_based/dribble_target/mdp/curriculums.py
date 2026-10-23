@@ -885,7 +885,8 @@ class dribble_target_range_curriculum(ManagerTermBase):
 
     **ログ** (TensorBoard の Curriculum/dribble_target_range/...、混合・折れ線のエピソードも含む):
 
-    * L{k}_success / L{k}_fall: レベル k のエピソードの成功率・転倒率 (エピソードごとに重み log_episode_weight の EMA)。
+    * L{k}_success / L{k}_fall / L{k}_timeout: レベル k のエピソードの成功率・転倒率・time_out の割合
+      (エピソードごとに重み log_episode_weight の EMA。time_out の割合は制限時間が足りているかを見るため)。
       一度もエピソードが無いレベルは出さない
     * fall_{replan,corner,overshoot,other}: 終わったエピソードのうち、その状況で転倒したものの割合 (4 つの和 = 転倒率)。
       判定はリセット前の状態 (この関数はリセットの最初に呼ばれる) で、優先順は replan > corner > overshoot > other:
@@ -959,6 +960,7 @@ class dribble_target_range_curriculum(ManagerTermBase):
         stages: list[dict],
         error_threshold: list[float],
         fall_term_name: str = "base_height",
+        timeout_term_name: str = "time_out",
         ema_episode_weight: float = 1.0 / 2000.0,
         min_iterations: int = 300,
         steps_per_iteration: int = 48,
@@ -976,6 +978,7 @@ class dribble_target_range_curriculum(ManagerTermBase):
                 tm = env.termination_manager
                 success = tm.get_term(success_term_name)[finished]
                 fall = tm.get_term(fall_term_name)[finished]
+                timeout = tm.get_term(timeout_term_name)[finished]
                 lv = cmd.env_level[finished]
                 # 進級判定: 今のレベルの、混合でも折れ線でもないエピソード
                 gate = (lv == self.level) & ~cmd.env_mixed[finished] & ~cmd.env_polyline[finished]
@@ -988,11 +991,12 @@ class dribble_target_range_curriculum(ManagerTermBase):
                 for l in torch.unique(lv).tolist():
                     m = lv == l
                     kk = int(m.sum())
-                    st = self.level_stats.setdefault(l + 1, {"success": success[m].float().mean().item(),
-                                                             "fall": fall[m].float().mean().item(), "episodes": 0})
+                    rates = {"success": success[m], "fall": fall[m], "timeout": timeout[m]}
+                    st = self.level_stats.setdefault(l + 1, {"episodes": 0})
                     keep = (1.0 - log_episode_weight) ** kk
-                    st["success"] = keep * st["success"] + (1.0 - keep) * success[m].float().mean().item()
-                    st["fall"] = keep * st["fall"] + (1.0 - keep) * fall[m].float().mean().item()
+                    for key, flags in rates.items():
+                        r = flags.float().mean().item()
+                        st[key] = keep * st[key] + (1.0 - keep) * r if key in st else r
                     st["episodes"] += kk
                 # 転倒の状況別 (終わったエピソードに占める割合)
                 ctx = torch.full((len(finished),), -1, dtype=torch.long, device=env.device)
@@ -1029,6 +1033,7 @@ class dribble_target_range_curriculum(ManagerTermBase):
         for l, st in sorted(self.level_stats.items()):
             out[f"L{l}_success"] = st["success"]
             out[f"L{l}_fall"] = st["fall"]
+            out[f"L{l}_timeout"] = st.get("timeout", 0.0)
         for name, v in self.fall_context.items():
             out[f"fall_{name}"] = v
         return out

@@ -272,14 +272,13 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         # 戻らないこと」の両方が要るため、episode_length_s と resampling_time_range を
         # セットで延長する (20s/1000step, 8-15s 再サンプリングのままだと Level5 の
         # 8-10m 到達前にエピソードが尽きるか、目標が入れ替わってしまう)。
-        # 2026-10-22: 25 → 30 秒 (O 字は最長 15m)。8 の字 (Level10、最長 22m) だけ 45 秒にする (dribble_time_out)。
-        # 曲がるコースでのドリブル中の平均の速さ 0.5〜0.6m/s (model_24600 の C 字・L 字で測定) では、22m に 37〜44 秒かかるため。
-        # episode_length_s はレベルごとの制限時間の最大値にしておき、実際の打ち切りは time_out の終了条件が行う。
-        self.episode_length_s = 45.0
+        # 2026-10-23: 制限時間はエピソードごとに経路の長さから決める: max(30 秒, 長さ ÷ 0.5m/s + 5 秒)、上限 60 秒
+        # (WaypointPose2dCommandCfg.time_limit_*、terminations.dribble_time_out)。time_out は進級の判定で失敗に数えるので、
+        # 遅くても完走できる時間にする。曲がるコースでのドリブル中の平均の速さは 0.5〜0.6m/s (model_24600 の C 字・L 字で測定)。
+        # episode_length_s は制限時間の上限にしておき、実際の打ち切りは time_out の終了条件が行う。
+        self.episode_length_s = 60.0
         self.terminations.time_out = DoneTerm(
-            func=dribble_time_out,
-            time_out=True,
-            params={"command_name": "dribble_target", "default_s": 30.0, "per_level_s": {"10": 45.0}},
+            func=dribble_time_out, time_out=True, params={"command_name": "dribble_target"}
         )
 
         # 目標座標コマンド (ワールド xy)。継続タスクなので定期的に再サンプリングし続ける

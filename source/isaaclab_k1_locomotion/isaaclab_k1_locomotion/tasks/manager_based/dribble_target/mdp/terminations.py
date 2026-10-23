@@ -135,20 +135,13 @@ def obstacle_collision(
     return hit
 
 
-def dribble_time_out(
-    env: ManagerBasedRLEnv,
-    command_name: str = "dribble_target",
-    default_s: float = 30.0,
-    per_level_s: dict | None = None,
-) -> torch.Tensor:
-    """レベルごとの制限時間の time_out (DoneTerm(time_out=True) で使う)。
+def dribble_time_out(env: ManagerBasedRLEnv, command_name: str = "dribble_target") -> torch.Tensor:
+    """エピソードごとの制限時間の time_out (DoneTerm(time_out=True) で使う)。
 
-    env のレベル (WaypointPose2dCommand.env_level、1 始まりで per_level_s のキー) の制限時間を超えたら終了。
-    per_level_s に無いレベルは default_s。環境の episode_length_s は、この中の最大値以上にしておくこと。
-    2026-10-22: 8 の字 (Level10、経路 15〜22m) は、曲がるコースでの平均の速さ 0.5〜0.6m/s では 30 秒で回り切れないため 45 秒にした。
+    制限時間は WaypointPose2dCommand が経路を作るときに決める:
+    max(30 秒, 経路の長さ ÷ 0.5 m/s + 5 秒)、上限 60 秒 (WaypointPose2dCommandCfg.time_limit_*)。
+    time_out は進級の判定で失敗に数えるので、遅くても完走できる時間にしている (2026-10-23)。
+    環境の episode_length_s は time_limit_max_s 以上にしておくこと。
     """
     cmd = env.command_manager.get_term(command_name)
-    limit = torch.full((env.num_envs,), default_s, device=env.device)
-    for level, seconds in (per_level_s or {}).items():
-        limit = torch.where(cmd.env_level == int(level) - 1, torch.full_like(limit, float(seconds)), limit)
-    return env.episode_length_buf >= torch.round(limit / env.step_dt).long()
+    return env.episode_length_buf >= torch.round(cmd.time_limit_s / env.step_dt).long()
