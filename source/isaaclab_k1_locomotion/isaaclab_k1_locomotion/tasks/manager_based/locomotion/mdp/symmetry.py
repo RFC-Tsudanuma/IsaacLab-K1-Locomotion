@@ -27,7 +27,14 @@ if TYPE_CHECKING:
 
     from isaaclab.envs import ManagerBasedRLEnv
 
-from ..history_layout import CRITIC_TERM_SPECS, HISTORY_LENGTH, LATEST_FRAME_GROUP, POLICY_TERM_SPECS
+from ..history_layout import (
+    CRITIC_TERM_SPECS,
+    HISTORY_LENGTH,
+    LATEST_FRAME_GROUP,
+    POLICY_TERM_SPECS,
+    critic_specs_for_dim,
+    policy_specs_for_dim,
+)
 
 # import 可能な関数を明示
 __all__ = ["compute_symmetric_states"]
@@ -99,11 +106,12 @@ def _mirror_joints(joint_data: torch.Tensor) -> torch.Tensor:
     左脚と右脚を入れ替えたうえで、roll / yaw 関節の符号を反転する。
     joint_pos / joint_vel / action のいずれにも使える。
     """
-    out = torch.empty_like(joint_data)
+    out = joint_data.clone()  # 13 次元目 (歩行周波数の action, キック) は左右で変わらないのでそのまま
     out[..., _LEFT_JOINT_IDX] = joint_data[..., _RIGHT_JOINT_IDX]
     out[..., _RIGHT_JOINT_IDX] = joint_data[..., _LEFT_JOINT_IDX]
     sign = _mirror_consts(joint_data.device, joint_data.dtype)["joint_sign"]
-    return out * sign
+    out[..., :12] *= sign
+    return out
 
 
 def _mirror_policy_obs(obs: torch.Tensor) -> torch.Tensor:
@@ -150,6 +158,11 @@ _KIND_TRANSFORMS = {
     "joint": (tuple(_RIGHT_JOINT_IDX + _LEFT_JOINT_IDX), tuple(_JOINT_MIRROR_SIGN)),
     "phase": ((2, 3, 0, 1), None),              # [sin_L, cos_L, sin_R, cos_R] の左右入れ替え
     "zmp": (None, (1.0, -1.0)),                 # 横方向(y) を反転
+    # -- キック (history_layout.KICK_EXTRA_TERM_SPECS)
+    "ball_xy": (None, (1.0, -1.0)),             # ボール位置・速度の横方向(y) を反転
+    "neg": (None, (-1.0,)),                     # 角度 (キック方向) の符号を反転
+    "dir_sincos": (None, (-1.0, 1.0)),          # (sin, cos) の sin を反転
+    "none": (None, None),                       # フラグ・スカラー: 不変
 }
 
 # (specs_key, device, dtype) → (perm, sign) のキャッシュ
@@ -261,13 +274,8 @@ def compute_symmetric_states(
             aug_groups["command"] = cmd_aug
 
             policy = obs["policy"]
-            expected = sum(dim for _, dim, _ in POLICY_TERM_SPECS) * HISTORY_LENGTH
-            if policy.shape[-1] != expected:
-                raise ValueError(
-                    f"symmetry: 観測グループ 'policy' の次元が想定 ({expected}) と異なります:"
-                    f" {policy.shape[-1]}。history_layout.py の項リストと mdp/symmetry.py を"
-                    " 観測定義に合わせて更新してください。"
-                )
+            # 歩行 / キック (history_layout.KICK_*) のどちらのレイアウトかを次元で選ぶ
+            policy_specs = policy_specs_for_dim(policy.shape[-1])
 
             if actions is None:
                 # mirror loss 用途: 対称性の評価は直近 1 ステップの生の観測のみで行う。
@@ -276,10 +284,10 @@ def compute_symmetric_states(
                 # LATEST_FRAME_GROUP として返す。HistoryActorCritic 側がこのフレームを
                 # 履歴長ぶんタイル展開して方策入力を構築する (エピソード開始直後の
                 # CircularBuffer バックフィル状態と同じ形の実在しうる観測)。
-                frame_idx = _latest_frame_indices(POLICY_TERM_SPECS, policy.device)
+                frame_idx = _latest_frame_indices(policy_specs, policy.device)
                 frame = policy.index_select(-1, frame_idx)
                 perm, sign = _history_mirror_consts(
-                    "policy_frame", POLICY_TERM_SPECS, policy.device, policy.dtype, history_length=1
+                    f"policy_frame_{len(policy_specs)}", policy_specs, policy.device, policy.dtype, history_length=1
                 )
                 frame_aug = torch.empty(2 * batch_size, frame.shape[-1], device=frame.device, dtype=frame.dtype)
                 frame_aug[:batch_size] = frame
@@ -289,12 +297,14 @@ def compute_symmetric_states(
             else:
                 # data augmentation 用途: 拡張バッチが学習にそのまま使われるため、
                 # policy / critic の履歴全体を反転する。
-                mirror_targets = [("policy", POLICY_TERM_SPECS)]
+                mirror_targets = [("policy", policy_specs)]
                 if "critic" in obs.keys():
-                    mirror_targets.append(("critic", CRITIC_TERM_SPECS))
+                    mirror_targets.append(("critic", critic_specs_for_dim(obs["critic"].shape[-1])))
                 for group_name, term_specs in mirror_targets:
                     group = obs[group_name]
-                    perm, sign = _history_mirror_consts(group_name, term_specs, group.device, group.dtype)
+                    perm, sign = _history_mirror_consts(
+                        f"{group_name}_{len(term_specs)}", term_specs, group.device, group.dtype
+                    )
                     # 一時テンソルを作らず、拡張バッファの後半に直接書き込む
                     group_aug = torch.empty(
                         2 * batch_size, group.shape[-1], device=group.device, dtype=group.dtype

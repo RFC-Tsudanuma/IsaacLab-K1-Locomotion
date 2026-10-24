@@ -45,13 +45,16 @@ from ..history_layout import (
     LATEST_FRAME_GROUP,
     MLP_HISTORY_STEPS,
     POLICY_TERM_SPECS,
+    critic_specs_for_dim,
+    policy_specs_for_dim,
     term_specs_dim,
 )
 
-# 履歴バッファを持つ観測グループ名 → 項レイアウト
+# 履歴バッファを持つ観測グループ名 → 項レイアウトの選び方。
+# 歩行 (POLICY/CRITIC_TERM_SPECS) とキック (KICK_*_TERM_SPECS) を観測の次元で選ぶ。
 _HISTORY_GROUP_SPECS = {
-    "policy": POLICY_TERM_SPECS,
-    "critic": CRITIC_TERM_SPECS,
+    "policy": policy_specs_for_dim,
+    "critic": critic_specs_for_dim,
 }
 
 # 1-D CNN のデフォルト構成: 各層 [kernel size, filter size (out channels), stride]
@@ -182,7 +185,7 @@ class HistoryActorCritic(ActorCritic):
                     f"obs_groups['{set_name}'] ({groups}) は履歴グループ"
                     f" ({list(_HISTORY_GROUP_SPECS)}) をちょうど 1 つ、末尾に置くこと。"
                 )
-            specs = _HISTORY_GROUP_SPECS[history_groups[0]]
+            specs = _HISTORY_GROUP_SPECS[history_groups[0]](obs[history_groups[0]].shape[-1], history_length)
             expected = term_specs_dim(specs) * history_length
             if obs[history_groups[0]].shape[-1] != expected:
                 raise ValueError(
@@ -229,7 +232,7 @@ class HistoryActorCritic(ActorCritic):
         # policy グループ相当のベクトルを作るための添字。
         tile_indices: list[int] = []
         frame_offset = 0
-        for _, dim, _ in POLICY_TERM_SPECS:
+        for _, dim, _ in head_args["policy"]["term_specs"]:
             tile_indices.extend(list(range(frame_offset, frame_offset + dim)) * history_length)
             frame_offset += dim
         self.register_buffer(

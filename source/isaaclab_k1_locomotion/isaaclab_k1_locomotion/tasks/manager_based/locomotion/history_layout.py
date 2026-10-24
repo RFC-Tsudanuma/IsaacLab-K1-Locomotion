@@ -62,3 +62,45 @@ def term_specs_dim(term_specs) -> int:
 # mirror loss 用に symmetry 関数が返す「直近 1 ステップの生の policy 観測」グループ名。
 # HistoryActorCritic がこのグループを履歴長ぶんタイル展開して方策入力を構築する。
 LATEST_FRAME_GROUP = "policy_latest"
+
+
+# ---------------------------------------------------------------------------
+# B-Human 版キック (bhuman_walk_kick) のレイアウト
+# ---------------------------------------------------------------------------
+# 歩行の項 (POLICY_TERM_SPECS / CRITIC_TERM_SPECS) は**そのまま先頭に置き**、キック用の項を
+# 後ろに足す。こうすると歩行の checkpoint の重みを「足した入力の重みを 0」で移せる
+# (scripts/rsl_rl/convert_walk_to_bhuman_kick.py)。並びを変えたら変換スクリプトも直すこと。
+KICK_EXTRA_TERM_SPECS = (
+    ("ball_position", 2, "ball_xy"),           # 両足裏の中点から見たボール位置 (yaw フレーム) * 0.1
+    ("kick_direction", 1, "neg"),              # キック方向 [rad] / pi (胴体の向き基準)
+    ("kick_direction_sincos", 2, "dir_sincos"),  # (sin, cos)
+    ("kick_flags", 3, "none"),                 # 強キック / 精度不問 / 逸脱可
+    ("ball_velocity", 2, "ball_xy"),           # ボール速度 (yaw フレーム) * 0.1
+    ("expected_ball_velocity", 1, "none"),     # 目標距離に必要なボール初速 * 0.1
+    ("gait_frequency_action", 1, "none"),      # 歩行周波数の action (前ステップ)
+)
+
+KICK_POLICY_TERM_SPECS = POLICY_TERM_SPECS + KICK_EXTRA_TERM_SPECS
+
+KICK_CRITIC_TERM_SPECS = CRITIC_TERM_SPECS + KICK_EXTRA_TERM_SPECS + (
+    ("kick_pose_state", 2, "none"),            # B-Human の inside_kick_pose_counter, ball_close_to_kick_pose
+)
+
+_ALL_POLICY_SPECS = (POLICY_TERM_SPECS, KICK_POLICY_TERM_SPECS)
+_ALL_CRITIC_SPECS = (CRITIC_TERM_SPECS, KICK_CRITIC_TERM_SPECS)
+
+
+def policy_specs_for_dim(dim: int, history_length: int = HISTORY_LENGTH):
+    """履歴グループの次元から policy の項レイアウトを選ぶ (歩行 / キック)。"""
+    for specs in _ALL_POLICY_SPECS:
+        if term_specs_dim(specs) * history_length == dim:
+            return specs
+    raise ValueError(f"policy 履歴の次元 {dim} に合う項レイアウトがありません (history_layout.py)")
+
+
+def critic_specs_for_dim(dim: int, history_length: int = HISTORY_LENGTH):
+    """履歴グループの次元から critic の項レイアウトを選ぶ (歩行 / キック)。"""
+    for specs in _ALL_CRITIC_SPECS:
+        if term_specs_dim(specs) * history_length == dim:
+            return specs
+    raise ValueError(f"critic 履歴の次元 {dim} に合う項レイアウトがありません (history_layout.py)")

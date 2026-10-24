@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 _PHASE_FREQ_ATTR = "_phase_freq_per_env"
 _PHASE_FREQ_OFFSET_ATTR = "_phase_freq_offset_per_env"
+GAIT_FREQ_ACTION_ATTR = "_gait_freq_action_offset"
 _GAIT_PHASE_ATTR = "_gait_phase_left"
 _GAIT_PHASE_STEP_ATTR = "_gait_phase_last_step"
 
@@ -104,6 +105,11 @@ def compute_cmd_phase_freq(
     offset = getattr(env, _PHASE_FREQ_OFFSET_ATTR, None)
     if offset is not None:
         freq = freq + offset
+    # 方策が歩行周波数を出力するタスク (bhuman_walk_kick の GaitFrequencyAction) だけが
+    # この属性を持つ。B-Human の 13 番目の action (±0.5 Hz) を基本周波数に足す。
+    action_offset = getattr(env, GAIT_FREQ_ACTION_ATTR, None)
+    if action_offset is not None:
+        freq = freq + action_offset
     return freq
 
 
