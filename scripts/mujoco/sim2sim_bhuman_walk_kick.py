@@ -158,17 +158,21 @@ def export_onnx(ckpt: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # MuJoCo model
 # --------------------------------------------------------------------------- #
-def build_model(friction: float) -> mujoco.MjModel:
+def build_model(friction: float, ball_friction: float = 1.0, ball_foot_friction: float | None = None) -> mujoco.MjModel:
     spec = mujoco.MjSpec.from_file(str(URDF))
     spec.compiler.discardvisual = False
     spec.compiler.fusestatic = False
     spec.option.timestep = SIM_DT
     spec.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
     spec.body("Trunk").add_freejoint()
-    for g in spec.geoms:
+    robot_geoms = []
+    for i, g in enumerate(spec.geoms):
         # ロボット同士は当たらない (学習: enabled_self_collisions=False)、床とボールには当たる
         g.contype, g.conaffinity = 1, 0
         g.friction = [friction, 0.005, 0.0001]
+        if not g.name:
+            g.name = f"robot_geom_{i}"
+        robot_geoms.append(g.name)
     world = spec.worldbody
     world.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.05], contype=0, conaffinity=1,
                    friction=[friction, 0.005, 0.0001], rgba=[0.35, 0.55, 0.35, 1])
@@ -176,7 +180,17 @@ def build_model(friction: float) -> mujoco.MjModel:
     ball = world.add_body(name="ball", pos=[1.0, 0.0, BALL_R])
     ball.add_freejoint()
     ball.add_geom(name="ball", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_R, 0, 0], mass=BALL_M, contype=1,
-                  conaffinity=1, condim=3, friction=[1.0, 0.005, 0.0001], rgba=[1.0, 0.45, 0.0, 1])
+                  conaffinity=1, condim=3, friction=[ball_friction, 0.005, 0.0001], rgba=[1.0, 0.45, 0.0, 1],
+                  priority=1)  # ボールの接触はボールの摩擦を使う (MuJoCo 既定は大きい方)
+    if ball_foot_friction is not None:
+        # 学習 (PhysX) では ボール-床 = ボール 1.0 × 床 1.0 (multiply)、ボール-足 = (ボール 1.0 + 足 0.3〜1.0) / 2 (average)
+        # で、足との摩擦は 0.65〜1.0。ボールとロボットの接触だけ明示の pair にして摩擦を別に決める。
+        bodies = {spec.geoms[i].parent.name for i in range(len(spec.geoms)) if spec.geoms[i].name in robot_geoms}
+        for b in bodies:
+            spec.add_exclude(bodyname1="ball", bodyname2=b)
+        for gname in robot_geoms:
+            spec.add_pair(geomname1="ball", geomname2=gname, condim=3,
+                          friction=[ball_foot_friction, ball_foot_friction, 0.005, 0.0001, 0.0001])
     target = world.add_body(name="target_marker", mocap=True, pos=[0, 0, 0.002])
     target.add_geom(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.05, 0.002, 0], contype=0, conaffinity=0,
                     rgba=[1.0, 0.0, 0.0, 0.8])
@@ -221,14 +235,15 @@ DEFAULT_SCENARIOS = [
 
 
 class Sim:
-    def __init__(self, onnx_path: Path, friction: float, delay: int, ball_delay: int):
+    def __init__(self, onnx_path: Path, friction: float, delay: int, ball_delay: int, ball_friction: float = 1.0,
+                 ball_foot_friction: float | None = None):
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = 1
         so.inter_op_num_threads = 1
         self.sess = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
-        self.m = build_model(friction)
+        self.m = build_model(friction, ball_friction, ball_foot_friction)
         self.d = mujoco.MjData(self.m)
         self.qadr = np.array([self.m.joint(n).qposadr[0] for n in JOINTS])
         self.dadr = np.array([self.m.joint(n).dofadr[0] for n in JOINTS])
@@ -485,6 +500,12 @@ class Sim:
                 end_step = min(n_steps, step + int(round(after_kick / STEP_DT)))
             if rec["kick_t"] is not None and t - rec["kick_t"] <= 0.4:
                 kick_window.append((speed, math.atan2(bv[1], bv[0])))
+            # 蹴った瞬間の速さは足に押された一瞬の値で、すぐ転がりに変わって落ちる。
+            # 「転がっていく速さ」として 0.3 秒後の速さと、1 秒間に進んだ距離も記録する。
+            if rec["kick_t"] is not None and "speed_0p3" not in rec and t - rec["kick_t"] >= 0.3 - 1e-6:
+                rec["speed_0p3"] = speed
+            if rec["kick_t"] is not None and "disp_1s" not in rec and t - rec["kick_t"] >= 1.0 - 1e-6:
+                rec["disp_1s"] = float(np.linalg.norm(d.xpos[self.ball][:2] - ball_at_kick))
             if renderer is not None and step % max(1, int(round(1.0 / fps / STEP_DT))) == 0:
                 cam.lookat[:] = [(d.qpos[0] + d.xpos[self.ball][0]) / 2, (d.qpos[1] + d.xpos[self.ball][1]) / 2, 0.3]
                 renderer.update_scene(d, cam)
@@ -539,6 +560,8 @@ def summarize(scenarios, results) -> dict:
         "falls": sum(r["fell"] for r in results.values()),
         "kicked": len(kicked),
         "strong_speed_mean": float(np.mean([r["kick_speed"] for r in strong])) if strong else None,
+        "strong_speed_0p3_mean": float(np.mean([r.get("speed_0p3", 0.0) for r in strong])) if strong else None,
+        "strong_disp_1s_mean": float(np.mean([r.get("disp_1s", 0.0) for r in strong])) if strong else None,
         "normal_speed_abs_err_mean": float(np.mean([abs(r["kick_speed"] - r["expected_kick_speed"]) for r in normal]))
         if normal else None,
         "dir_err_abs_mean_deg": float(np.mean(errs)) if errs else None,
@@ -555,6 +578,9 @@ def main(argv=None) -> int:
     ap.add_argument("--duration", type=float, default=15.0, help="1 シナリオの上限 [s]")
     ap.add_argument("--after_kick", type=float, default=1.5, help="蹴ってからこの時間で打ち切る [s]")
     ap.add_argument("--friction", type=float, default=0.7)
+    ap.add_argument("--ball_friction", type=float, default=1.0, help="ボールと床の摩擦 (学習: 1.0)")
+    ap.add_argument("--ball_foot_friction", type=float, default=0.8,
+                    help="ボールとロボットの摩擦 (学習: 0.65〜1.0)。負なら pair を作らずボールの摩擦を使う")
     ap.add_argument("--delay", type=int, default=4, help="PD 目標の遅れ [物理ステップ] (学習: 2〜7)")
     ap.add_argument("--ball_delay", type=int, default=1, help="観測するボール位置の遅れ [制御ステップ] (学習: 1〜3)")
     ap.add_argument("--scenarios", type=str, default=None, help="カンマ区切りで既定シナリオを絞る")
@@ -592,7 +618,8 @@ def main(argv=None) -> int:
     if a.scenarios:
         names = set(a.scenarios.split(","))
         scenarios = [s for s in scenarios if s.name in names]
-    sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay)
+    bff = None if a.ball_foot_friction < 0 else a.ball_foot_friction
+    sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff)
     results = {}
     for sc in scenarios:
         video = a.video_dir / f"{sc.name}.mp4" if a.video_dir else None

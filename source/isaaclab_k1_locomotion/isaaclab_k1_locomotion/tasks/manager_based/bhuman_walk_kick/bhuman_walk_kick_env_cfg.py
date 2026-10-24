@@ -165,6 +165,22 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
             },
         )
 
+        # ボールの摩擦のランダム化 (B-Human には無い。s4b から)。ボール-床は 床 1.0 × ボール (multiply)、
+        # ボール-足は (ボール + 足) / 2 (average) になる。MuJoCo で床との摩擦 1.0 のときだけ、蹴った足が
+        # ボールの上をこすって引き戻す・倒れることがあり (0.5〜0.7 なら起きない)、摩擦に頼った蹴り方になっていたため。
+        self.events.ball_material = EventTerm(
+            func=loco_mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "static_friction_range": (0.4, 1.0),
+                "dynamic_friction_range": (0.4, 1.0),
+                "restitution_range": (0.1, 0.1),
+                "num_buckets": 64,
+                "make_consistent": True,
+            },
+        )
+
         # ---- curriculum: 速度コマンド系は使わない。押しは歩行の最終段 (model_34995 は通過済み) に固定 ----
         self.curriculum.command_resampling_time_range = None
         self.curriculum.lin_vel_command = None
