@@ -81,6 +81,7 @@ KCFG = dict(
 WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4,
             kick_through_speed=0.5)
 SOLE_OFFSET = np.array([0.0, 0.0, -0.038])
+FEET_EDGES = np.array([[0.1185, 0.035, -0.038], [0.1185, -0.035, -0.038], [-0.0665, 0.035, -0.038], [-0.0665, -0.035, -0.038]])
 BASE_INIT = np.array([0.0, 0.0, 0.6])
 
 
@@ -487,6 +488,16 @@ class Sim:
                 mujoco.mj_step(m, d)
                 if rec["touch_t"] is None and self.robot_ball_contact():
                     rec["touch_t"] = step * STEP_DT
+                    # 当たった瞬間の、ボールに近い方の足の足裏の一番低い点の高さ (学習の kick_strike_height と同じ)
+                    bw = d.xpos[self.ball]
+                    best = None
+                    for b in self.feet:
+                        R = d.xmat[b].reshape(3, 3)
+                        e = d.xpos[b] + FEET_EDGES @ R.T
+                        dist = np.min(np.linalg.norm(e[:, :2] - bw[:2], axis=1))
+                        if best is None or dist < best[0]:
+                            best = (dist, float(e[:, 2].min()))
+                    rec["strike_h"] = best[1]
             self.ball_buf.append(d.xpos[self.ball].copy())
             self.update_kick_state()
             self.command = self.walk_command()
@@ -562,6 +573,7 @@ def summarize(scenarios, results) -> dict:
         "strong_speed_mean": float(np.mean([r["kick_speed"] for r in strong])) if strong else None,
         "strong_speed_0p3_mean": float(np.mean([r.get("speed_0p3", 0.0) for r in strong])) if strong else None,
         "strong_disp_1s_mean": float(np.mean([r.get("disp_1s", 0.0) for r in strong])) if strong else None,
+        "strong_strike_h_mean": float(np.mean([r.get("strike_h", 0.0) for r in strong])) if strong else None,
         "normal_speed_abs_err_mean": float(np.mean([abs(r["kick_speed"] - r["expected_kick_speed"]) for r in normal]))
         if normal else None,
         "dir_err_abs_mean_deg": float(np.mean(errs)) if errs else None,

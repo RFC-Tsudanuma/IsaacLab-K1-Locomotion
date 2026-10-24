@@ -116,6 +116,8 @@ def main(env_cfg, agent_cfg):
             "disp_m_mean": float(cat["disp_m"].mean()),
             "disp_m_strong_mean": float(cat["disp_m"][st].mean()) if st.any() else None,
             "speed_from_disp_strong": float((cat["disp_m"][st] * 0.75 / (1 - torch.exp(-0.75 * cat["kick_counter"][st] * uenv.step_dt))).mean()) if st.any() else None,
+            "strike_h_strong_mean": float(cat["strike_h"][st].mean()) if st.any() else None,
+            "strike_vz_strong_mean": float(cat["strike_vz"][st].mean()) if st.any() else None,
             "dir_err_mean_deg": float(err.mean()),
             "dir_err_median_deg": float(err.median()),
             "dir_within_15deg": float((err < 15).float().mean()),

@@ -257,9 +257,13 @@ class K1BHumanWalkKickStage4EnvCfg(K1BHumanWalkKickStage3EnvCfg):
         k.kick_direction_negative_factor = 3.0
         self.rewards.ball_sole_yaw.weight = 5.0
         self.rewards.ball_walk_target_overshoot.weight = -10.0
-        # B-Human の feet_swing 3 → 0.75 (足上げ報酬を 1/4 にして脚を自由にする) に相当するものとして、
-        # 土台の walk の位相報酬 feet_phase を 1.5 → 0.375 (同じく 1/4) にする。
-        self.rewards.feet_phase.weight = 0.375
+        # B-Human はここで feet_swing (足上げ報酬) を 3 → 0.75 にする。うちの walk の位相報酬 feet_phase を同じく 1/4
+        # (1.5 → 0.375) にしたら (s4/s4b)、蹴り足をボールの上の方へ振り下ろす蹴り方に変わり、MuJoCo で倒れる・ボールを
+        # 引きずるようになったので、feet_phase は 1.5 のまま下げない (B-Human からの変更)。
+        # さらにボールの中心より上を踏みつけるように当てたキックは褒めない (strike_height_range, B-Human に無い)。
+        # 当たる直前の足裏の一番低い点が 0.05 m 以下なら満額、0.09 m で 0
+        # (IsaacLab の評価で強キックの平均は s3: 0.056 m、s4b: 0.072 m。MuJoCo で s4b は倒れる・引きずる)。
+        k.strike_height_range = (0.05, 0.09)
 
 
 @configclass

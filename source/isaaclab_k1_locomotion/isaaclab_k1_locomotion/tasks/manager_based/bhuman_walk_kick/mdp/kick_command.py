@@ -153,6 +153,7 @@ class BHumanKickCommand(CommandTerm):
         self.feet_contact = torch.zeros(n, 2, dtype=torch.bool, device=dev)
         self.last_feet_contact = torch.zeros_like(self.feet_contact)
         self.feet_height_over_ground = torch.zeros(n, 2, **f)
+        self.last_feet_height_over_ground = torch.zeros(n, 2, **f)
 
         # ---- ボール状態 ----
         self.ball_pos_w = torch.zeros(n, 3, **f)
@@ -239,12 +240,15 @@ class BHumanKickCommand(CommandTerm):
         # キック 1 回ごとに「ボールの最高速度」「目標方向とのずれ」を測り、直近のキックの
         # 指数移動平均でログに出す (reset() の戻り値 → Metrics/kick/*)。
         self.kick_target_dir = torch.zeros(n, **f)  # キックした瞬間の「ボール → 目標点」の向き (ワールド)
+        self.kick_strike_height = torch.zeros(n, **f)  # キックした瞬間の蹴り足の足裏の一番低い点の高さ [m]
+        self.kick_strike_vz = torch.zeros(n, **f)  # キックした瞬間の蹴り足の上下の速さ [m/s] (確認用)
         self.kick_stats = {
             "kick_speed": 0.0,             # 全キックのボール最高速度 [m/s]
             "kick_speed_strong": 0.0,      # 強キックのボール最高速度 [m/s]
             "kick_speed_err_normal": 0.0,  # 距離指定キック: |最高速度 - 必要な初速| [m/s]
             "kick_dir_err_deg": 0.0,       # 目標方向とボールの進んだ向きのずれ [deg]
             "kick_dir_ok_rate": 0.0,       # ずれ 15° 以内の割合
+            "kick_strike_height": 0.0,     # 当てた瞬間の蹴り足の足裏の一番低い点の高さ [m]
         }
         self.kick_total = 0.0  # 学習開始からのキック回数 (全 env)
         self.kick_stats_alpha = 0.002
@@ -379,6 +383,7 @@ class BHumanKickCommand(CommandTerm):
         # ---- 前ステップの値を退避 (B-Human では step 末尾で last_* に入れている値) ----
         self.last_feet_pos[:] = self.feet_pos
         self.last_feet_contact[:] = self.feet_contact
+        self.last_feet_height_over_ground[:] = self.feet_height_over_ground
         self.last_world_pose[:] = self.current_world_pose
         self.last_relative_ball_pos[:] = self.ball_pos[:, :2]
         self.last_ball_vel_w[:] = self.ball_vel_w[:, :3]
@@ -426,6 +431,15 @@ class BHumanKickCommand(CommandTerm):
         ball_moved_kick = (ball_acc > 0.1) & self.allow_ball_kick
         ball_kicked_mask = (ball_still_allow_kick | ball_moved_kick) & (min_distance < self.touch_dist)
         self.ball_kicked_counter += ((self.ball_kicked_counter > 0) | ball_kicked_mask).float()
+
+        # キックした瞬間の蹴り足 (ボールに近い方) の足裏の一番低い点の高さ (B-Human に無い。strike_height_range 参照)
+        # キックの検出は当たった次の制御ステップになるので、1 ステップ前 (当たる直前) の高さを使う
+        self.kick_strike_height[:] = torch.where(
+            self.ball_kicked_counter == 1, self.last_feet_height_over_ground[ar, foot_idx], self.kick_strike_height
+        )
+        self.kick_strike_vz[:] = torch.where(
+            self.ball_kicked_counter == 1, self.feet_vel[ar, foot_idx, 2], self.kick_strike_vz
+        )
 
         # 2) キック開始時のボール位置
         self.ball_pos_at_kick[:] = torch.where(
@@ -689,6 +703,7 @@ class BHumanKickCommand(CommandTerm):
             "kick_speed_err_normal": torch.abs(speed - self.expected_vel()[ids])[~strong],
             "kick_dir_err_deg": torch.rad2deg(err),
             "kick_dir_ok_rate": (err < math.radians(15.0)).float(),
+            "kick_strike_height": self.kick_strike_height[ids],
         }
         if self.eval_log is not None:  # 評価スクリプト (eval_bhuman_walk_kick.py) 用の生データ
             self.eval_log.append({
@@ -699,6 +714,8 @@ class BHumanKickCommand(CommandTerm):
                 "disp_m": torch.norm(disp, dim=-1).cpu(),
                 "kick_counter": self.ball_kicked_counter[ids].cpu(),
                 "hspeed_now": torch.norm(self.ball_vel_w[ids, :2], dim=-1).cpu(),
+                "strike_h": self.kick_strike_height[ids].cpu(),
+                "strike_vz": self.kick_strike_vz[ids].cpu(),
             })
         for key, v in vals.items():
             if v.numel() == 0:
@@ -731,10 +748,17 @@ class BHumanKickCommand(CommandTerm):
         ).clip(0.0, 1.0)
         ball_vel_negative_scale = 1.0 - 0.9 * self.ball_vel_before_kick.clip(max=2.0) / 2.0
         negative_scale = 0.1 + 0.9 * ((self.request_changed - 0.25 / self.dt) / (0.5 / self.dt)).clip(0.0, 1.0)
+        positive = reward * height_ratio * kick_pose_counter_factor * sole_yaw_factor
+        if cfg.strike_height_range is not None:
+            # B-Human に無い (s4d から): 足裏の一番低い点がボールの中心より上でボールに当たると (上から踏みつける
+            # ように当たると)、PhysX では強く飛ぶが MuJoCo ではボールを床に押し付けて引きずる・倒れる。
+            # 低い位置 (ボールの中心かそれより下) で当てたキックだけを褒める。
+            lo, hi = cfg.strike_height_range
+            positive = positive * (1.0 - ((self.kick_strike_height - lo) / (hi - lo)).clip(0.0, 1.0))
         return torch.where(
             reward < 0,
             reward * cfg.kick_direction_negative_factor * ball_vel_negative_scale * negative_scale,
-            reward * height_ratio * kick_pose_counter_factor * sole_yaw_factor,
+            positive,
         )
 
     # ------------------------------------------------------------------ #
@@ -1005,6 +1029,9 @@ class BHumanKickCommandCfg(CommandTermCfg):
     disable_sole_yaw_direction_penalty: bool = False
     disable_deviation_flag: bool = True
     disable_extra_deviation_flag: bool = True
+    strike_height_range: tuple[float, float] | None = None
+    """(B-Human に無い) キックした瞬間の蹴り足の足裏の一番低い点の高さが lo 以下なら 1、hi 以上なら 0 を
+    キック方向の報酬 (正のとき) に掛ける。None で無効。"""
 
     # --- noise: (ball observation) ---
     obs_noise: bool = True
