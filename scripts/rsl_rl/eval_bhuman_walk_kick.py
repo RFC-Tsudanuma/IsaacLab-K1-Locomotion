@@ -27,6 +27,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--json_out", type=str, default=None)
+parser.add_argument("--ball_max_depen", type=float, default=None, help="ボールの max_depenetration_velocity を上書き")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -56,6 +57,8 @@ def main(env_cfg, agent_cfg):
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     agent_cfg.device = env_cfg.sim.device
+    if args_cli.ball_max_depen is not None:
+        env_cfg.scene.soccer_ball.spawn.rigid_props.max_depenetration_velocity = args_cli.ball_max_depen
     env = gym.make(args_cli.task, cfg=env_cfg)
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
@@ -109,6 +112,10 @@ def main(env_cfg, agent_cfg):
             "speed_normal_abs_err": float((sp - tsp)[~st].abs().mean()) if (~st).any() else None,
             "speed_normal_target_mean": float(tsp[~st].mean()) if (~st).any() else None,
             "speed_normal_mean": float(sp[~st].mean()) if (~st).any() else None,
+            # 蹴ってからボールを片付けるまでの移動距離 (ボールの減速 0.75/s を戻して初速に直した値も出す)
+            "disp_m_mean": float(cat["disp_m"].mean()),
+            "disp_m_strong_mean": float(cat["disp_m"][st].mean()) if st.any() else None,
+            "speed_from_disp_strong": float((cat["disp_m"][st] * 0.75 / (1 - torch.exp(-0.75 * cat["kick_counter"][st] * uenv.step_dt))).mean()) if st.any() else None,
             "dir_err_mean_deg": float(err.mean()),
             "dir_err_median_deg": float(err.median()),
             "dir_within_15deg": float((err < 15).float().mean()),

@@ -696,6 +696,9 @@ class BHumanKickCommand(CommandTerm):
                 "dir_err_deg": torch.rad2deg(err).cpu(),
                 "kick_dir_rel_deg": torch.rad2deg(wrap_to_pi(self.kick_target_dir[ids] - self.robot_direction_ref[ids])).cpu(),
                 "ball_steps": self.ball_steps[ids].cpu(),
+                "disp_m": torch.norm(disp, dim=-1).cpu(),
+                "kick_counter": self.ball_kicked_counter[ids].cpu(),
+                "hspeed_now": torch.norm(self.ball_vel_w[ids, :2], dim=-1).cpu(),
             })
         for key, v in vals.items():
             if v.numel() == 0:

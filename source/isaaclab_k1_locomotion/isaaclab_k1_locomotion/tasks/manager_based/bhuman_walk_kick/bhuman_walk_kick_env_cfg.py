@@ -204,12 +204,22 @@ class K1BHumanWalkKickStage2EnvCfg(K1BHumanWalkKickEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         k = self.commands.kick
-        k.target_sole_yaw_angle = 1.5705
+        # B-Human はここで target_sole_yaw_angle = 1.5705 (足をキック方向に対して 90° 横に向ける = インサイドで
+        # 押し出すキック) にする。今回の目的は「強く・正確に」なので、Stage 1 で育った
+        # 「足先をキック方向に向けて振り抜く」蹴り方を保ち、0 のままにする (B-Human からの変更)。
+        # 足の向きの報酬 (ball_sole_yaw) と sigma の絞り込みは B-Human どおり使う (足先をキック方向へ揃える向きに働く)。
+        k.target_sole_yaw_angle = 0.0
         k.disable_sole_yaw_direction_penalty = True
         k.disable_deviation_flag = False
         k.ball_pos_noise_x = (0.03, k.ball_pos_noise_x[1])
         k.ball_pos_noise_y = (0.03, k.ball_pos_noise_y[1])
         self.rewards.ball_sole_yaw.weight = 25.0
+        # Stage 1 で強キックが目標 (3.46 m/s) に届いたので、強キックの重みは B-Human の 5 に戻す
+        # (距離指定キックまで強く蹴りすぎるのを抑える)。
+        self.rewards.ball_kick_velocity_strong.weight = 5.0
+        # B-Human は蹴ってから 20 ステップ (0.4 秒) でボールを置き直す。MuJoCo で蹴った後に転がるボールが
+        # 脚に絡んで倒れることがあったので、1 秒 (50 ステップ) ボールを残して蹴った後の動きも学習させる (B-Human からの変更)。
+        k.time_after_kick = 50
 
 
 @configclass
