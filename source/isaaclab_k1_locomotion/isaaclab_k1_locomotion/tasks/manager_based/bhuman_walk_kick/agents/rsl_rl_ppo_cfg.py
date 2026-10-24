@@ -23,6 +23,7 @@ from ...locomotion.agents.rsl_rl_ppo_cfg import K1FlatPPORunnerCfg
 class ActorFreezePpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "PPOActorFreeze"
     actor_freeze_iterations: int = 100
+    std_range: tuple | None = None
 
 
 @configclass

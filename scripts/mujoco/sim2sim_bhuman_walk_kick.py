@@ -78,7 +78,8 @@ KCFG = dict(
     ball_y_dis_ratio=(2.0, 2.0), ball_distance_offset=0.3, ball_rotation_offset=0.1, ball_avoidance_range=0.55,
 )
 # walk_command.BallWalkVelocityCommandCfg
-WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4)
+WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4,
+            kick_through_speed=0.5)
 SOLE_OFFSET = np.array([0.0, 0.0, -0.038])
 BASE_INIT = np.array([0.0, 0.0, 0.6])
 
@@ -365,6 +366,9 @@ class Sim:
         err = wrap(head_near + bl * wrap(head_far - head_near))
         vx = float(np.clip(w["gain_xy"] * t[0], *w["vx_range"]))
         vx *= (1.0 - bl) + bl * max(math.cos(head_far), 0.0)
+        through = float(np.clip(-self.ball_close_to_kick_pose, 0.0, 1.0)) * w["kick_through_speed"]
+        through *= max(math.cos(head_near), 0.0) * (1.0 if self.ball_pos[0] > 0 else 0.0)
+        vx = max(vx, through)
         vy = float(np.clip(w["gain_xy"] * t[1], -w["max_vy"], w["max_vy"]))
         wz = float(np.clip(w["gain_yaw"] * err, -w["max_wz"], w["max_wz"]))
         return np.array([vx, vy, wz])
@@ -554,12 +558,17 @@ def main(argv=None) -> int:
     ap.add_argument("--delay", type=int, default=4, help="PD 目標の遅れ [物理ステップ] (学習: 2〜7)")
     ap.add_argument("--ball_delay", type=int, default=1, help="観測するボール位置の遅れ [制御ステップ] (学習: 1〜3)")
     ap.add_argument("--scenarios", type=str, default=None, help="カンマ区切りで既定シナリオを絞る")
+    ap.add_argument("--random", type=int, default=0,
+                    help="既定シナリオの代わりに N 個のランダムなシナリオ (ボール 0.5〜2 m・全方向、キック方向 全方向、強/距離指定 半々)")
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stage_cfg", type=str, default=None,
                     help='KCFG の上書き (JSON)。例: \'{"ball_distance_offset": 0.7, "ball_rotation_offset": 0.2}\'')
+    ap.add_argument("--kick_through_speed", type=float, default=0.5, help="学習の walk_command と合わせる (s1/s1b は 0)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
     a = ap.parse_args(argv)
 
+    WCFG["kick_through_speed"] = a.kick_through_speed
     if a.stage_cfg:
         KCFG.update(json.loads(a.stage_cfg))
     onnx_path = a.onnx or export_onnx(a.checkpoint)
@@ -570,6 +579,16 @@ def main(argv=None) -> int:
         os.environ.setdefault("MUJOCO_GL", "egl")
         a.video_dir.mkdir(parents=True, exist_ok=True)
     scenarios = DEFAULT_SCENARIOS
+    if a.random > 0:
+        rng = np.random.default_rng(a.seed)
+        scenarios = []
+        for i in range(a.random):
+            dist, ang = rng.uniform(0.5, 2.0), rng.uniform(-math.pi, math.pi)
+            kick = rng.uniform(-180.0, 180.0)
+            strong = bool(rng.random() < 0.5)
+            rng_m = float(np.exp(rng.uniform(math.log(1.0), math.log(8.0))))
+            scenarios.append(Scenario(f"rand{i:02d}_{'S' if strong else 'N'}{kick:+04.0f}",
+                                      (dist * math.cos(ang), dist * math.sin(ang)), kick, strong, rng_m))
     if a.scenarios:
         names = set(a.scenarios.split(","))
         scenarios = [s for s in scenarios if s.name in names]

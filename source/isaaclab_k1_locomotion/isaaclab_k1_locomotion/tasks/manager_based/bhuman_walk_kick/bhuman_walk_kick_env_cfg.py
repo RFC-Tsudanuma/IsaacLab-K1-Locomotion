@@ -73,7 +73,8 @@ class BHumanWalkKickActionsCfg:
 class BHumanWalkKickCommandsCfg:
     # kick を先に置く (base_velocity は kick の状態から作るので、CommandManager で後に計算する)
     kick = mdp.BHumanKickCommandCfg(joint_names=tuple(JOINT_NAMES_K1), ball_radius=BALL_RADIUS)
-    base_velocity = mdp.BallWalkVelocityCommandCfg()
+    # kick_through_speed: キック姿勢に入った後も 0.5 m/s で歩き込ませる (s1b までは 0。walk_command.py 参照)
+    base_velocity = mdp.BallWalkVelocityCommandCfg(kick_through_speed=0.5)
 
 
 # --------------------------------------------------------------------------- #
@@ -180,7 +181,10 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.track_ang_vel_z_exp = None
         self.rewards.ball_kick_direction = RewTerm(func=mdp.ball_kick_direction, weight=10.0)
         self.rewards.ball_kick_velocity = RewTerm(func=mdp.ball_kick_velocity, weight=4.0, params={"sigma_scale": 1.0})
-        self.rewards.ball_kick_velocity_strong = RewTerm(func=mdp.ball_kick_velocity_strong, weight=5.0)
+        # B-Human は 5。強く蹴る動きが育たず (s1/s1b: 1000 iter でボール最高速度 1.3 m/s のまま)、
+        # B-Human の学習量 (4096 env × 何万 iter) に比べてうちは試行回数が少ないので、強キックの報酬を 2 倍にする。
+        # (README も片足しか使わない時に ball_kick_velocity_strong / ball_kick_velocity の重みを動かしている)
+        self.rewards.ball_kick_velocity_strong = RewTerm(func=mdp.ball_kick_velocity_strong, weight=10.0)
         self.rewards.ball_walk_speed = RewTerm(func=mdp.ball_walk_speed, weight=2.0)
         self.rewards.ball_walk_target_overshoot = RewTerm(func=mdp.ball_walk_target_overshoot, weight=-100.0)
         self.rewards.ball_sole_yaw = RewTerm(func=mdp.ball_sole_yaw, weight=0.0)
@@ -189,6 +193,83 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
         # ---- terminations: 歩行の転倒判定 + B-Human のエピソード区切り ----
         self.terminations.kicks_done = DoneTerm(func=mdp.kicks_done, time_out=True)
         self.terminations.ball_timeout = DoneTerm(func=mdp.ball_timeout, time_out=True)
+
+
+# --------------------------------------------------------------------------- #
+# 段階学習 (B-Human README「Training kick」の 2) 以降)。段の番号は README の 2), 3), 3), 4), 5), 6) を
+# 順に 2..7 とした (README は「3)」が 2 回ある)。前の段の checkpoint から --resume で続ける。
+# --------------------------------------------------------------------------- #
+@configclass
+class K1BHumanWalkKickStage2EnvCfg(K1BHumanWalkKickEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        k = self.commands.kick
+        k.target_sole_yaw_angle = 1.5705
+        k.disable_sole_yaw_direction_penalty = True
+        k.disable_deviation_flag = False
+        k.ball_pos_noise_x = (0.03, k.ball_pos_noise_x[1])
+        k.ball_pos_noise_y = (0.03, k.ball_pos_noise_y[1])
+        self.rewards.ball_sole_yaw.weight = 25.0
+
+
+@configclass
+class K1BHumanWalkKickStage3EnvCfg(K1BHumanWalkKickStage2EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        # README: target_sole_yaw_sigma を「何段かに分けて」0.1 へ。ここでは 1 段で 0.1 にする
+        self.commands.kick.target_sole_yaw_sigma = 0.1
+        self.rewards.ball_walk_speed.weight = 1.0
+        self.rewards.ball_sole_yaw.weight = 15.0
+
+
+@configclass
+class K1BHumanWalkKickStage4EnvCfg(K1BHumanWalkKickStage3EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        k = self.commands.kick
+        k.disable_sole_yaw_direction_penalty = False
+        k.kick_direction_negative_factor = 3.0
+        self.rewards.ball_sole_yaw.weight = 5.0
+        self.rewards.ball_walk_target_overshoot.weight = -10.0
+        # B-Human の feet_swing 3 → 0.75 (足上げ報酬を 1/4 にして脚を自由にする) に相当するものとして、
+        # 土台の walk の位相報酬 feet_phase を 1.5 → 0.375 (同じく 1/4) にする。
+        self.rewards.feet_phase.weight = 0.375
+
+
+@configclass
+class K1BHumanWalkKickStage5EnvCfg(K1BHumanWalkKickStage4EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.kick.kick_direction_sigma_range = 0.75
+        self.commands.kick.kick_direction_sigma_just_hit = 0.5
+
+
+@configclass
+class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        k = self.commands.kick
+        k.kick_direction_sigma_range = 0.25
+        k.random_ball_distance_reset = 0.0005
+        self.rewards.ball_sole_yaw.weight = 0.0
+        self.rewards.ball_walk_speed.weight = 1.0
+
+
+@configclass
+class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        k = self.commands.kick
+        k.random_ball_reset = (0.01, 0.02, 0.02)
+        k.reset_ball_request = 0.005
+        k.add_ball_vel = 0.0001
+        k.add_ball_vel_in_direction = 0.0001
+        k.kick_pose_increase_value = 0.2
+        k.ball_distance_offset = 0.7
+        k.ball_rotation_offset = 0.2
+        self.rewards.ball_kick_direction.weight = 5.0
+        self.rewards.ball_walk_speed.weight = 0.75
+        self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
 
 
 @configclass

@@ -75,6 +75,13 @@ class BallWalkVelocityCommand(CommandTerm):
         err = wrap_to_pi(head_near + w * wrap_to_pi(head_far - head_near))
         vx = (cfg.gain_xy * target[:, 0]).clamp(*cfg.vx_range)
         vx = vx * ((1.0 - w) + w * torch.cos(head_far).clamp(min=0.0))
+        # キック姿勢に入ったら (ball_close_to_kick_pose < 0) 速度を落とさず、kick_through_speed で
+        # ボールへ歩き込ませる。目標点がボールに近づくと gain_xy * 距離 では止まりかけの速度になり、
+        # 足がボールに当たる時の勢いが無くなる (ボールを押すだけになる) ため。
+        # B-Human の ball_walk_speed もボールの近くで 0.5 m/s (clip_max_speed_near_ball) までは歩く速さを褒める。
+        through = (-k.ball_close_to_kick_pose).clamp(0.0, 1.0) * cfg.kick_through_speed
+        through = through * torch.cos(head_near).clamp(min=0.0) * (k.ball_pos[:, 0] > 0).float()
+        vx = torch.maximum(vx, through)
         vy = (cfg.gain_xy * target[:, 1]).clamp(-cfg.max_vy, cfg.max_vy)
         wz = (cfg.gain_yaw * err).clamp(-cfg.max_wz, cfg.max_wz)
         self.vel_command_b[:] = torch.stack((vx, vy, wz), dim=-1)
@@ -94,3 +101,5 @@ class BallWalkVelocityCommandCfg(CommandTermCfg):
     """ボールまでこれより近いとキック方向を向く [m]。"""
     blend_dist: float = 0.4
     """near_dist からこの距離かけて「目標点を向く」へ切り替える [m]。"""
+    kick_through_speed: float = 0.0
+    """キック姿勢に入った後の最低前進速度 [m/s] (0 で無効 = s1 まで)。"""
