@@ -60,9 +60,10 @@ class _HistoryPolicyExporter(nn.Module):
             self.normalizer = copy.deepcopy(normalizer)
         else:
             self.normalizer = nn.Identity()
-        self.history_length = HISTORY_LENGTH
-        self.term_dims = tuple(dim for _, dim, _ in POLICY_TERM_SPECS)
-        self.step_dim = term_specs_dim(POLICY_TERM_SPECS)
+        # 項の並びは actor 自身が持っている (歩行 POLICY_TERM_SPECS / キック KICK_POLICY_TERM_SPECS)
+        self.history_length = getattr(self.actor, "history_length", HISTORY_LENGTH)
+        self.term_dims = tuple(getattr(self.actor, "term_dims", tuple(dim for _, dim, _ in POLICY_TERM_SPECS)))
+        self.step_dim = sum(self.term_dims)
 
     def forward(self, command: torch.Tensor, obs_history: torch.Tensor) -> torch.Tensor:
         # (N, H, C) → 項ごとに (N, H, dim) を切り出して (N, H*dim) に flatten (ステップ優先)
