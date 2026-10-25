@@ -61,7 +61,12 @@ from .mdp.curriculums import (
     modify_reward_weight_linear,
 )
 from .mdp.commands import WaypointPose2dCommandCfg
-from .mdp.events import replan_dribble_path, track_ball_front_ratio
+from .mdp.events import (
+    apply_ball_damping,
+    randomize_ball_damping,
+    replan_dribble_path,
+    track_ball_front_ratio,
+)
 from .mdp.obs_noise_models import SensorArtifactNoiseCfg
 from .mdp.observations import (
     ball_pos_rel,
@@ -213,8 +218,10 @@ class K1DribbleTargetSceneCfg(MySceneCfg):
                 # physics_material の摩擦だけでは動画で見られた「一度触れると氷上のように
                 # 転がり続ける」挙動を止められない。linear/angular_damping で明示的に
                 # 減衰を与えて芝生・人工芝相当の「転がると徐々に失速する」挙動にする。
-                linear_damping=0.5,
-                angular_damping=0.5,
+                # 2026-10-25: 減衰は env ごとにランダム化する (U(0.2, 0.8))。IsaacLab には env ごとに damping を変える手段が
+                # 無いので、ここは 0 にして、events.apply_ball_damping が毎ステップ同じ効果の力とトルクをかける。
+                linear_damping=0.0,
+                angular_damping=0.0,
             ),
             mass_props=MassPropertiesCfg(mass=0.45),
             visual_material=sim_utils.PreviewSurfaceCfg(
@@ -224,7 +231,11 @@ class K1DribbleTargetSceneCfg(MySceneCfg):
             # dynamic_friction を明示しないと RigidBodyMaterialCfg のデフォルト値 0.5 が
             # 使われ、static_friction=1.0 と食い違っていた (滑り接触時の摩擦だけ弱くなる)。
             # 両方 1.0 に揃える (床側 velocity_env_cfg.py の physics_material も 1.0/1.0)。
-            physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0),
+            # 2026-10-25: 摩擦・反発係数は env ごとにランダム化する (events.randomize_ball_material)。反発の合成モードは
+            # "max" (ボールの値をそのまま使う)。地面の側も "max" にしないと跳ねない (K1DribbleTargetEnvCfg.__post_init__ 参照)。
+            physics_material=sim_utils.RigidBodyMaterialCfg(
+                static_friction=1.0, dynamic_friction=1.0, restitution=0.5, restitution_combine_mode="max"
+            ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(0.30, 0.0, 0.11)),
     )
@@ -383,6 +394,39 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         self.events.reset_base.params["pose_range"] = {
             "x": (-0.1, 0.1), "y": (-0.1, 0.1), "yaw": (-0.2, 0.2),
         }
+
+        # 2026-10-25: ボールの物理のランダム化。学習のボール (跳ねない、摩擦 1.0、damping 0.5) と MuJoCo / 実機のボール
+        # (反発係数 約 0.57、摩擦 0.5、転がり摩擦あり) が大きく違い、MuJoCo での sim2sim で転倒が多かったため。
+        #   反発係数 U(0.3, 0.7)、摩擦 U(0.4, 1.0)  … env ごとに固定 (startup、64 通りのマテリアルから割り当て)
+        #   damping (linear / angular) U(0.2, 0.8) … エピソードごとに引き直す
+        # 地面のマテリアルの反発の合成モードを "multiply" → "max" にする。"multiply" のままだと、ボール側を "max" にしても
+        # 地面の反発 0 との掛け算になって跳ねなかった (Isaac Sim で落下させて確認)。"max" にすると、測った反発係数が設定値と
+        # 平均 0.005 で一致した。地面の反発は 0 のままなので、ロボットの足 (反発 0) と地面の接触は max(0, 0) = 0 で変わらない。
+        self.scene.terrain.physics_material.restitution_combine_mode = "max"
+        self.sim.physics_material = self.scene.terrain.physics_material
+        self.events.randomize_ball_material = EventTerm(
+            func=mdp.randomize_rigid_body_material,
+            mode="startup",
+            params={
+                "asset_cfg": SceneEntityCfg("soccer_ball"),
+                "static_friction_range": (0.4, 1.0),
+                "dynamic_friction_range": (0.4, 1.0),
+                "restitution_range": (0.3, 0.7),
+                "num_buckets": 64,
+                "make_consistent": True,
+            },
+        )
+        self.events.randomize_ball_damping = EventTerm(
+            func=randomize_ball_damping,
+            mode="reset",
+            params={"linear_range": (0.2, 0.8), "angular_range": (0.2, 0.8)},
+        )
+        self.events.apply_ball_damping = EventTerm(
+            func=apply_ball_damping,
+            mode="interval",
+            interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
+            params={},
+        )
 
         # 2026-10-22: エピソードの途中の経路の引き直し。実機の戦略は毎周期経路を計画し直すので、ウェイポイントが
         # 途中で動くことがある。env ごとに 2〜5 秒間隔で、確率 0.3 で未通過の途中のウェイポイントを横に 0.2〜0.8m ずらす
@@ -956,6 +1000,9 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.scene.contact_balls_right = None
         self.events.reset_ball = None
         self.events.replan_dribble_path = None
+        self.events.randomize_ball_material = None
+        self.events.randomize_ball_damping = None
+        self.events.apply_ball_damping = None
         self.events.track_ball_front_ratio = None
         self.curriculum.ball_front_ratio = None
         # ボールが存在しないので目標座標コマンドも不要 (計算コスト削減)。

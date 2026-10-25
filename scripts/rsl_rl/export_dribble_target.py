@@ -87,6 +87,29 @@ def _actuator_doc(env: dict) -> dict:
     }
 
 
+def _ball_physics_doc(env: dict) -> dict:
+    """学習時のボールの物理 (ランダム化の範囲)。"""
+    ev = env.get("events") or {}
+    ball = env["scene"]["soccer_ball"]["spawn"]
+    out = {
+        "radius_m": ball.get("radius"),
+        "mass_kg": (ball.get("mass_props") or {}).get("mass"),
+        "physx_damping": [ (ball.get("rigid_props") or {}).get("linear_damping"), (ball.get("rigid_props") or {}).get("angular_damping")],
+    }
+    mat = (ev.get("randomize_ball_material") or {}).get("params")
+    if mat:
+        out["friction_static_range"] = list(mat["static_friction_range"])
+        out["friction_dynamic_range"] = list(mat["dynamic_friction_range"])
+        out["restitution_range"] = list(mat["restitution_range"])
+        out["material_note"] = "env ごとに固定 (64 通り)。反発の合成モードはボール・地面とも max (ボールの値がそのまま効く)"
+    dmp = (ev.get("randomize_ball_damping") or {}).get("params")
+    if dmp:
+        out["damping_linear_range"] = list(dmp["linear_range"])
+        out["damping_angular_range"] = list(dmp["angular_range"])
+        out["damping_note"] = "エピソードごとに引き直し。制御周期ごとに速度・角速度に exp(-c × 0.02) を掛ける"
+    return out
+
+
 def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, curriculum_state: dict | None) -> dict:
     pol = env["observations"]["policy"]
     h = int(pol.get("history_length") or layout.HISTORY_LENGTH)
@@ -182,6 +205,7 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
             "replan_in_training": "2〜5 秒ごとに確率 0.3 で、未通過の途中のウェイポイントを入ってきた区間に垂直に 0.2〜0.8m ずらす (最終目標は固定)",
         },
         "curriculum_levels": cur_stages,
+        "ball_physics_training": _ball_physics_doc(env),
         "agent": {"num_envs": env["scene"]["num_envs"], "num_steps_per_env": agent["num_steps_per_env"],
                   "num_mini_batches": agent["algorithm"]["num_mini_batches"]},
     }

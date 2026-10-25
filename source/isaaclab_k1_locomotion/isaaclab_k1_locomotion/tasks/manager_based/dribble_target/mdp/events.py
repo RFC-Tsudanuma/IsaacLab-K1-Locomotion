@@ -351,3 +351,47 @@ def replan_dribble_path(
     env_ids = torch.as_tensor(env_ids, device=env.device, dtype=torch.long)
     chosen = env_ids[torch.rand(len(env_ids), device=env.device) < probability]
     env.command_manager.get_term(command_name).replan(chosen, offset_range)
+
+
+# ---------------------------------------------------------------------------
+# ドリブル: ボールの減衰 (damping) のランダム化 (2026-10-25)
+# ---------------------------------------------------------------------------
+# IsaacLab には剛体の linear / angular damping を env ごとに変えるイベントが無いので、PhysX 側の damping は 0 にして、
+# 制御周期 (20ms) ごとにボールの速度・角速度に exp(-c × dt) を掛ける (PhysX の damping dv/dt = -c v を 50Hz で離散化したもの)。
+# NOTE: 最初は「-c × 質量 × 速度」の外力を permanent_wrench_composer でかけたが、composer はワールド→ボール座標の変換に
+# 最初の呼び出し時の姿勢を使い続ける (リセットまで更新しない) ため、転がって回転するボールでは力の向きがずれて効かなかった。
+# c は env ごとにエピソードの開始時に U(damping_range) で引く。本物のボールの転がり抵抗 (MuJoCo では転がり摩擦) の代わりでもある。
+
+
+def randomize_ball_damping(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    linear_range: tuple[float, float] = (0.2, 0.8),
+    angular_range: tuple[float, float] = (0.2, 0.8),
+):
+    """reset イベント: ボールの linear / angular damping の係数を env ごとに引き直す。"""
+    if not hasattr(env, "_ball_damping"):
+        env._ball_damping = torch.zeros(env.num_envs, 2, device=env.device)
+        env._ball_damping[:, 0] = 0.5 * (linear_range[0] + linear_range[1])
+        env._ball_damping[:, 1] = 0.5 * (angular_range[0] + angular_range[1])
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    env._ball_damping[env_ids, 0] = torch.empty(n, device=env.device).uniform_(*linear_range)
+    env._ball_damping[env_ids, 1] = torch.empty(n, device=env.device).uniform_(*angular_range)
+
+
+def apply_ball_damping(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+):
+    """interval イベント (毎制御周期): ボールの速度・角速度に exp(-c × step_dt) を掛ける。"""
+    if not hasattr(env, "_ball_damping"):
+        randomize_ball_damping(env, None)
+    ball = env.scene[asset_cfg.name]
+    decay = torch.exp(-env._ball_damping * env.step_dt)  # (N, 2): linear, angular
+    vel = ball.data.root_vel_w.clone()  # (N, 6): 線速度, 角速度 (ワールド)
+    vel[:, :3] *= decay[:, 0:1]
+    vel[:, 3:] *= decay[:, 1:2]
+    ball.write_root_velocity_to_sim(vel)
