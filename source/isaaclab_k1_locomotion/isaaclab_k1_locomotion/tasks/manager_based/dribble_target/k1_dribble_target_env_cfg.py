@@ -64,6 +64,7 @@ from .mdp.commands import WaypointPose2dCommandCfg
 from .mdp.events import (
     apply_ball_damping,
     randomize_ball_damping,
+    randomize_observation_delays,
     replan_dribble_path,
     track_ball_front_ratio,
 )
@@ -118,13 +119,16 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # NOTE (2026-10-07): 19時間学習が停滞した件の原因切り分け (Run A) で一時的に
     # hold_prob_range/delay_range を (0,0) にしていたが、真因は別 (obstacle_pos_rel
     # 除去の移行スクリプトのバグ) と判明したため、本来の値に戻した。
+    # 2026-10-26: 自己位置の遅れ U(100, 250)ms を入れる (localization_delay、mdp/observations.py の「観測の遅れ」)。
+    # 遅れた自己位置 (位置・向き) で今の目標点を見る。これと二重にならないよう、ノイズモデルの遅れ (0〜0.1 秒) は 0 にした
+    # (ホールド = 自己位置の更新が 10〜20Hz であることの再現、とノイズは残す)。
     target_pos_rel = ObsTerm(
         func=target_pos_rel,
-        params={"command_name": "dribble_target"},
+        params={"command_name": "dribble_target", "localization_delay": True},
         noise=SensorArtifactNoiseCfg(
             noise_cfg=Unoise(n_min=-0.05, n_max=0.05),
             hold_prob_range=(0.6, 0.8),
-            delay_range=(0.0, 0.1),
+            delay_range=(0.0, 0.0),
         ),
     )
     # 2026-10-06: 実機 vision_filter の「ボールが足元に近いほど見失い/hold が増える、
@@ -159,6 +163,7 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
             "near_distance": 0.35, "far_distance": 2.0,
             "near_hold_prob": 0.6, "far_hold_prob": 0.05,
             "noise_range": 0.05,
+            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(50, 150)ms
         },
     )
     ball_vel = ObsTerm(
@@ -168,6 +173,7 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
             "near_hold_prob": 0.6, "far_hold_prob": 0.05,
             "near_invalid_prob": 0.4, "far_invalid_prob": 0.02,
             "noise_range": 0.1,
+            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(50, 150)ms
         },
     )
     # 2026-10-06: obstacle_pos_rel は Policy から削除した (Critic専用に戻す)。
@@ -176,11 +182,16 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # 2026-10-01: 「両足でボールを挟み込んで運ぶ」局所解対策。片足ずつボールとの
     # 相対位置を見せることで、挟み込みではなく個別の足によるボールコントロールを
     # 学習しやすくする。obstacle_pos_rel と同じく末尾追記、移行作業が必要。
+    # 2026-10-26: ボールの位置にだけ検出の遅れ U(50, 150)ms を入れる (足の位置は今のもの)。
     foot_left_ball_pos_rel = ObsTerm(
-        func=foot_to_ball_pos_rel, params={"foot_body_name": "left_foot_link"}, noise=Unoise(n_min=-0.05, n_max=0.05)
+        func=foot_to_ball_pos_rel,
+        params={"foot_body_name": "left_foot_link", "ball_delay": True},
+        noise=Unoise(n_min=-0.05, n_max=0.05),
     )
     foot_right_ball_pos_rel = ObsTerm(
-        func=foot_to_ball_pos_rel, params={"foot_body_name": "right_foot_link"}, noise=Unoise(n_min=-0.05, n_max=0.05)
+        func=foot_to_ball_pos_rel,
+        params={"foot_body_name": "right_foot_link", "ball_delay": True},
+        noise=Unoise(n_min=-0.05, n_max=0.05),
     )
 
 @configclass
@@ -426,6 +437,15 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             mode="interval",
             interval_range_s=(self.sim.dt * self.decimation, self.sim.dt * self.decimation),
             params={},
+        )
+
+        # 2026-10-26: 観測の遅れのランダム化 (エピソードごと)。MuJoCo の sim2sim で、自己位置 170ms + ボール検出 100ms の
+        # 遅れがあると成功 0.03・転倒 0.90 (遅れなしでは成功 0.47・転倒 0.40) だったため。ボール検出 U(50, 150)ms、
+        # 自己位置 U(100, 250)ms。ワールド座標の履歴から body yaw 座標の値を作り直す (mdp/observations.py の「観測の遅れ」)。
+        self.events.randomize_observation_delays = EventTerm(
+            func=randomize_observation_delays,
+            mode="reset",
+            params={"ball_delay_range_s": (0.05, 0.15), "localization_delay_range_s": (0.10, 0.25)},
         )
 
         # 2026-10-22: エピソードの途中の経路の引き直し。実機の戦略は毎周期経路を計画し直すので、ウェイポイントが
@@ -1003,6 +1023,7 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.events.randomize_ball_material = None
         self.events.randomize_ball_damping = None
         self.events.apply_ball_damping = None
+        self.events.randomize_observation_delays = None
         self.events.track_ball_front_ratio = None
         self.curriculum.ball_front_ratio = None
         # ボールが存在しないので目標座標コマンドも不要 (計算コスト削減)。

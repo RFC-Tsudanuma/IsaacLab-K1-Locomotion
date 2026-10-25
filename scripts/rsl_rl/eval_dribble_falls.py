@@ -43,6 +43,10 @@ parser.add_argument("--output", default=None)
 parser.add_argument("--polyline_prob", type=float, default=0.0,
                     help="ランダムな折れ線にするエピソードの割合 (学習では 0.2。既定 0 = そのレベルのコースだけ)")
 parser.add_argument("--no_replan", action="store_true", help="エピソードの途中の経路の引き直しを切る")
+parser.add_argument("--ball_delay_ms", type=float, default=None,
+                    help="ボール検出の遅れを固定する [ms] (既定: 学習と同じランダム化。0 で遅れなし)")
+parser.add_argument("--loc_delay_ms", type=float, default=None,
+                    help="自己位置の遅れを固定する [ms] (既定: 学習と同じランダム化。0 で遅れなし)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.headless = True
@@ -84,6 +88,14 @@ def main():
     env_cfg.commands.dribble_target.random_polyline_prob = args_cli.polyline_prob
     if args_cli.no_replan:
         env_cfg.events.replan_dribble_path = None
+    delay_ev = getattr(env_cfg.events, "randomize_observation_delays", None)
+    if delay_ev is not None:
+        if args_cli.ball_delay_ms is not None:
+            d = args_cli.ball_delay_ms / 1000.0
+            delay_ev.params["ball_delay_range_s"] = (d, d)
+        if args_cli.loc_delay_ms is not None:
+            d = args_cli.loc_delay_ms / 1000.0
+            delay_ev.params["localization_delay_range_s"] = (d, d)
     # 報酬のフェードイン・gait_phase の閾値は学習の最後の状態 (フェード済み) にする
     for term in vars(env_cfg.curriculum).values():
         p = getattr(term, "params", None)

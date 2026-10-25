@@ -206,6 +206,16 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
         },
         "curriculum_levels": cur_stages,
         "ball_physics_training": _ball_physics_doc(env),
+        "observation_delays_training": (
+            {
+                "ball_detection_delay_range_s": list((ev := (env.get("events") or {}).get("randomize_observation_delays", {}).get("params", {}))["ball_delay_range_s"]),
+                "localization_delay_range_s": list(ev["localization_delay_range_s"]),
+                "note": "エピソードごとに抽選。ボール: d_ball 前のワールドのボール位置・速度を今のロボットの姿勢で body yaw 座標に直す。"
+                "目標点: 今の目標点を d_loc 前のロボットの位置・向きで body yaw 座標に直す",
+            }
+            if (env.get("events") or {}).get("randomize_observation_delays")
+            else None
+        ),
         "agent": {"num_envs": env["scene"]["num_envs"], "num_steps_per_env": agent["num_steps_per_env"],
                   "num_mini_batches": agent["algorithm"]["num_mini_batches"]},
     }

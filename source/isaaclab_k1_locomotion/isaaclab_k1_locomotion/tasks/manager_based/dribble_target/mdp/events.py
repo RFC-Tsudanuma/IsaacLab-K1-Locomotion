@@ -395,3 +395,28 @@ def apply_ball_damping(
     vel[:, :3] *= decay[:, 0:1]
     vel[:, 3:] *= decay[:, 1:2]
     ball.write_root_velocity_to_sim(vel)
+
+
+# ---------------------------------------------------------------------------
+# ドリブル: 観測の遅れのランダム化 (2026-10-26)
+# ---------------------------------------------------------------------------
+
+
+def randomize_observation_delays(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    ball_delay_range_s: tuple[float, float] = (0.05, 0.15),
+    localization_delay_range_s: tuple[float, float] = (0.10, 0.25),
+):
+    """reset イベント: ボール検出の遅れ d_ball と自己位置の遅れ d_loc [秒] を env ごとに引き直す。
+
+    遅れの入れ方は mdp/observations.py の「観測の遅れ」の節 (ワールド座標の履歴から body yaw 座標の値を作り直す)。
+    実機 (チームの試合用 sim の設定): 自己位置 170ms、ボール検出 100ms。
+    """
+    if "_obs_delay_s" not in env.__dict__:
+        env._obs_delay_s = torch.zeros(env.num_envs, 2, device=env.device)
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    env._obs_delay_s[env_ids, 0] = torch.empty(n, device=env.device).uniform_(*ball_delay_range_s)
+    env._obs_delay_s[env_ids, 1] = torch.empty(n, device=env.device).uniform_(*localization_delay_range_s)

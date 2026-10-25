@@ -125,6 +125,101 @@ def _to_body_yaw_xy(robot: Articulation, vec_w_xy: torch.Tensor) -> torch.Tensor
     return quat_apply_inverse(yaw_quat(robot.data.root_quat_w), vec_w)[:, :2]
 
 
+# ---------------------------------------------------------------------------
+# 観測の遅れ (2026-10-26): ボール検出の遅れ・自己位置の遅れの再現
+# ---------------------------------------------------------------------------
+# 実機では、ボールの観測は検出の遅れ (約 100ms)、目標点の相対位置は自己位置の遅れ (約 170ms) を含む。観測ベクトルを
+# そのまま遅らせるのではなく、毎制御周期ワールド座標の量 (ボールの位置・速度、ロボットの位置・向き) を履歴に残し、
+# 遅れた量と姿勢から body yaw 座標の値を作り直す (遅れている間もロボットは動いたり向きを変えたりしているため):
+#
+#   ボールの観測:   R(ψ(t))ᵀ (b(t - d_ball) - p(t))      … 遅れたボール位置を、今のロボットの姿勢で見る
+#   目標点:         R(ψ(t - d_loc))ᵀ (W(t) - p(t - d_loc)) … 今の目標点を、遅れた自己位置 (位置・向き) で見る
+#
+# d_ball / d_loc は env ごと・エピソードごとに mdp.events.randomize_observation_delays が引く (env._obs_delay_s)。
+# 20ms (制御周期) の間は線形補間する。critic は遅れの無い真値のまま。
+
+_OBS_HIST_LEN = 16  # 制御周期 × 15 = 300ms まで
+
+
+class _ObsDelayHistory:
+    """ワールド座標の量の履歴 (index 0 が今)。1 制御周期に 1 回だけ進める。"""
+
+    def __init__(self, env: ManagerBasedRLEnv, ball_name: str, robot_name: str):
+        n, dev = env.num_envs, env.device
+        # 列: ボール位置 xy, ボール速度 xy, ロボット位置 xy, ロボットの向き (cos ψ, sin ψ)
+        self.buf = torch.zeros(n, _OBS_HIST_LEN, 8, device=dev)
+        self.step = -1
+        self.ball_name, self.robot_name = ball_name, robot_name
+
+    def _current(self, env) -> torch.Tensor:
+        ball = env.scene[self.ball_name]
+        robot = env.scene[self.robot_name]
+        q = robot.data.root_quat_w  # (w, x, y, z)
+        yaw = torch.atan2(2.0 * (q[:, 0] * q[:, 3] + q[:, 1] * q[:, 2]), 1.0 - 2.0 * (q[:, 2] ** 2 + q[:, 3] ** 2))
+        return torch.cat([
+            ball.data.root_pos_w[:, :2], ball.data.root_com_vel_w[:, :2],
+            robot.data.root_pos_w[:, :2], torch.stack([torch.cos(yaw), torch.sin(yaw)], 1),
+        ], 1)
+
+    def update(self, env):
+        cur = self._current(env)
+        step = int(env.common_step_counter)
+        if step != self.step:
+            self.buf = torch.roll(self.buf, shifts=1, dims=1)
+            self.step = step
+        self.buf[:, 0] = cur
+        fresh = env.episode_length_buf == 0  # エピソードの開始直後は履歴全体を今の値で埋める
+        if fresh.any():
+            self.buf[fresh] = cur[fresh].unsqueeze(1)
+
+    def delayed(self, delay_s: torch.Tensor, step_dt: float) -> torch.Tensor:
+        """delay_s (N,) 秒前の値 (N, 8) を線形補間で返す。"""
+        d = (delay_s / step_dt).clamp(0.0, _OBS_HIST_LEN - 1.001)
+        i0 = torch.floor(d).long()
+        f = (d - i0.float()).unsqueeze(1)
+        idx = torch.arange(len(d), device=d.device)
+        return (1.0 - f) * self.buf[idx, i0] + f * self.buf[idx, i0 + 1]
+
+
+def _obs_history(env: ManagerBasedRLEnv, ball_name: str = "soccer_ball", robot_name: str = "robot") -> _ObsDelayHistory:
+    hist = env.__dict__.get("_obs_delay_history")
+    if hist is None:
+        hist = _ObsDelayHistory(env, ball_name, robot_name)
+        env.__dict__["_obs_delay_history"] = hist
+    hist.update(env)
+    return hist
+
+
+def _obs_delays(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """env ごとの遅れ [秒] (N, 2): ボール検出, 自己位置。未設定なら 0。"""
+    d = env.__dict__.get("_obs_delay_s")
+    return d if d is not None else torch.zeros(env.num_envs, 2, device=env.device)
+
+
+def _rotate_to_yaw(vec_xy: torch.Tensor, cos_sin: torch.Tensor) -> torch.Tensor:
+    """ワールド xy ベクトルを、向き (cos ψ, sin ψ) の body yaw 座標に回す。"""
+    c, s_ = cos_sin[:, 0], cos_sin[:, 1]
+    norm = torch.sqrt(c * c + s_ * s_).clamp(min=1e-6)  # 補間で長さが 1 から少しずれるので正規化
+    c, s_ = c / norm, s_ / norm
+    return torch.stack([c * vec_xy[:, 0] + s_ * vec_xy[:, 1], -s_ * vec_xy[:, 0] + c * vec_xy[:, 1]], 1)
+
+
+def _corruption_enabled(env: ManagerBasedRLEnv) -> bool:
+    policy_cfg = getattr(env.cfg.observations, "policy", None)
+    return bool(getattr(policy_cfg, "enable_corruption", True))
+
+
+def delayed_ball_xy(env: ManagerBasedRLEnv, what: str = "pos") -> torch.Tensor:
+    """ボール検出の遅れ d_ball だけ前のボールのワールド位置 (what="pos") / 速度 (what="vel") の xy。"""
+    hist = _obs_history(env)
+    past = hist.delayed(_obs_delays(env)[:, 0], env.step_dt)
+    return past[:, 0:2] if what == "pos" else past[:, 2:4]
+
+
+def robot_yaw_cos_sin(env: ManagerBasedRLEnv) -> torch.Tensor:
+    return _obs_history(env).buf[:, 0, 6:8]
+
+
 def zero_obs(env: ManagerBasedRLEnv, dim: int = 2) -> torch.Tensor:
     """常に 0 を返す観測 (Stage1 でドリブル用スロットを埋めるため)。
 
@@ -138,21 +233,33 @@ def zero_obs(env: ManagerBasedRLEnv, dim: int = 2) -> torch.Tensor:
 def target_pos_rel(
     env: ManagerBasedRLEnv,
     command_name: str = "dribble_target",
+    localization_delay: bool = False,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
-    """目標点 (ワールド xy、現在のウェイポイント) のロボットからの相対位置 [m] (body yaw 座標)。"""
+    """目標点 (ワールド xy、現在のウェイポイント) のロボットからの相対位置 [m] (body yaw 座標)。
+
+    localization_delay=True (policy 用) では、自己位置の遅れ d_loc を入れる:
+    今の目標点 W を、d_loc 前のロボットの位置・向きで見る R(ψ(t - d_loc))ᵀ (W - p(t - d_loc))。
+    policy の enable_corruption=False (再生など) では遅れを入れない。
+    """
     robot: Articulation = env.scene[asset_cfg.name]
     target_w = env.command_manager.get_term(command_name).pos_command_w[:, :2]
+    if localization_delay and _corruption_enabled(env):
+        past = _obs_history(env).delayed(_obs_delays(env)[:, 1], env.step_dt)
+        return _rotate_to_yaw(target_w - past[:, 4:6], past[:, 6:8])
     return _to_body_yaw_xy(robot, target_w - robot.data.root_pos_w[:, :2])
 
 
 def foot_to_ball_pos_rel(
     env: ManagerBasedRLEnv,
     foot_body_name: str,
+    ball_delay: bool = False,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
     """足 (foot_link の原点) からボール中心への相対位置 [m] (body yaw 座標、xy のみ)。
+
+    ball_delay=True (policy 用) では、ボールの位置だけ検出の遅れ d_ball 前のものを使う (足の位置と向きは今のもの)。
 
     ``offset_b = yaw_quat(robot_quat)^-1 · (ball_pos_w[:2] − foot_link_pos_w[:2])``。
     足の点は足裏中心ではなく foot_link の原点、ボールは中心の xy のみ (z は含めない)、
@@ -168,7 +275,8 @@ def foot_to_ball_pos_rel(
             raise ValueError(f"foot_to_ball_pos_rel: body '{foot_body_name}' が一意に見つかりません: {ids}")
         cache[foot_body_name] = ids[0]
     foot_pos_w = robot.data.body_pos_w[:, cache[foot_body_name], :2]
-    return _to_body_yaw_xy(robot, ball.data.root_pos_w[:, :2] - foot_pos_w)
+    ball_xy = delayed_ball_xy(env, "pos") if ball_delay and _corruption_enabled(env) else ball.data.root_pos_w[:, :2]
+    return _to_body_yaw_xy(robot, ball_xy - foot_pos_w)
 
 
 def obstacle_pos_rel(
@@ -253,13 +361,17 @@ class ball_pos_rel_vision(_BallVisionTerm):
         near_hold_prob: float = 0.6,
         far_hold_prob: float = 0.05,
         noise_range: float = 0.05,
+        ball_delay: bool = False,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     ) -> torch.Tensor:
         robot, _, offset_w, dist = self._ball_dist_and_robot(env, asset_cfg, ball_cfg)
-        out = _to_body_yaw_xy(robot, offset_w)
         if not self._corruption_enabled(env):
-            return out
+            return _to_body_yaw_xy(robot, offset_w)
+        if ball_delay:  # 検出の遅れ: d_ball 前のボール位置を、今のロボットの姿勢で見る
+            offset_w = delayed_ball_xy(env, "pos") - robot.data.root_pos_w[:, :2]
+            dist = torch.norm(offset_w, dim=1)
+        out = _to_body_yaw_xy(robot, offset_w)
         out = out + torch.empty_like(out).uniform_(-noise_range, noise_range)
         p_hold = self._lerp_prob(dist, near_distance, far_distance, near_hold_prob, far_hold_prob)
         return self._hold(out, p_hold)
@@ -282,13 +394,18 @@ class ball_vel_rel_vision(_BallVisionTerm):
         near_invalid_prob: float = 0.4,
         far_invalid_prob: float = 0.02,
         noise_range: float = 0.1,
+        ball_delay: bool = False,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     ) -> torch.Tensor:
         robot, ball, _, dist = self._ball_dist_and_robot(env, asset_cfg, ball_cfg)
-        out = _to_body_yaw_xy(robot, ball.data.root_com_vel_w[:, :2])
         if not self._corruption_enabled(env):
-            return out
+            return _to_body_yaw_xy(robot, ball.data.root_com_vel_w[:, :2])
+        vel_w = ball.data.root_com_vel_w[:, :2]
+        if ball_delay:  # 検出の遅れ: d_ball 前のボール速度を、今のロボットの向きで見る
+            vel_w = delayed_ball_xy(env, "vel")
+            dist = torch.norm(delayed_ball_xy(env, "pos") - robot.data.root_pos_w[:, :2], dim=1)
+        out = _to_body_yaw_xy(robot, vel_w)
         out = out + torch.empty_like(out).uniform_(-noise_range, noise_range)
         p_invalid = self._lerp_prob(dist, near_distance, far_distance, near_invalid_prob, far_invalid_prob)
         invalid = torch.rand_like(p_invalid) < p_invalid
