@@ -85,6 +85,12 @@ def main():
         raise SystemExit(f"--level は 1〜{len(stages)} で指定してください")
     cur.params["error_threshold"] = [-1.0] * len(stages)
     env_cfg.curriculum.dribble_target_range.params["prev_level_mix_prob"] = 0.0  # 前のレベルを混ぜない
+    # 報酬のフェードイン・gait_phase の閾値の移行は、学習の最後の状態 (完了済み) にする。ステップ数 0 から始めると
+    # 最初の 24000 ステップは gait_phase の閾値が 0 より大きく、位相が 0 (止まれの合図) として入ってしまう。
+    for _term in vars(env_cfg.curriculum).values():
+        _p = getattr(_term, "params", None)
+        if isinstance(_p, dict) and "end_step" in _p:
+            _p["start_step"], _p["end_step"] = -1, 0
     env_cfg.commands.dribble_target.random_polyline_prob = args_cli.polyline_prob
     if args_cli.no_replan:
         env_cfg.events.replan_dribble_path = None
