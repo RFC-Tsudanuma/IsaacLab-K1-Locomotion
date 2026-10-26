@@ -10,6 +10,10 @@
 
 * 最初の 100 update は actor を固定して critic を慣らす (PPOActorFreeze)。
 * env 数が 1024 (履歴観測が大きく GPU 8GB に載せるため)。
+* mirror loss (左右対称の損失) を「実際の履歴 100 ステップをそのまま左右反転して比べる」版にする
+  (locomotion.mdp.symmetry.compute_symmetric_states_full_history)。歩行の版は最新の 1 フレームを並べた入力でしか
+  比べないので、Stage 3a までに右足のキックだけ当たる位置が高い (右 3.1 cm / 左 1.3 cm) 左右差ができた。
+  2026-10-26 の Stage 3b 途中 (s3b_mirrorfull) から。それより前の run は歩行の版。
 """
 
 from isaaclab.utils import configclass
@@ -17,6 +21,7 @@ from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlPpoAlgorithmCfg
 
 from ...locomotion.agents.rsl_rl_ppo_cfg import K1FlatPPORunnerCfg
+from ...locomotion.mdp.symmetry import compute_symmetric_states_full_history
 
 
 @configclass
@@ -49,3 +54,5 @@ class K1BHumanWalkKickPPORunnerCfg(K1FlatPPORunnerCfg):
             max_grad_norm=a.max_grad_norm,
             symmetry_cfg=a.symmetry_cfg,
         )
+        if self.algorithm.symmetry_cfg is not None:
+            self.algorithm.symmetry_cfg.data_augmentation_func = compute_symmetric_states_full_history

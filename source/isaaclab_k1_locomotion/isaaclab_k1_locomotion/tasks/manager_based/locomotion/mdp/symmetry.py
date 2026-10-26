@@ -37,7 +37,7 @@ from ..history_layout import (
 )
 
 # import 可能な関数を明示
-__all__ = ["compute_symmetric_states"]
+__all__ = ["compute_symmetric_states", "compute_symmetric_states_full_history"]
 
 
 # ---------------------------------------------------------------------------
@@ -335,3 +335,38 @@ def compute_symmetric_states(
         actions_aug = None
 
     return obs_aug, actions_aug
+
+
+@torch.no_grad()
+def compute_symmetric_states_full_history(
+    env: ManagerBasedRLEnv,
+    obs: TensorDict | None = None,
+    actions: torch.Tensor | None = None,
+):
+    """:func:`compute_symmetric_states` の mirror loss 版で、policy の履歴全体 (100 ステップ) を左右反転する。
+
+    :func:`compute_symmetric_states` の mirror loss は「最新の 1 フレームを履歴長ぶん並べた入力」だけで
+    ``policy(mirror(obs)) ≈ mirror(policy(obs))`` を見るので、実際の履歴を入れたときの左右差は抑えられない。
+    bhuman_walk_kick (Stage 3a, 2026-10-26) で、右足のキックだけ当たる高さが 3.1 cm (左 1.3 cm) になり、
+    MuJoCo で転倒・向きのずれが右足に集中したため、実際の履歴そのものを反転して比べる版を作った。
+    GPU メモリは元と同じ程度 (元も最新フレームを履歴長に並べた (2B, 履歴次元) の入力を作っている)。
+    データ拡張 (actions あり) や履歴の無いレイアウトは :func:`compute_symmetric_states` と同じ。
+    """
+    if obs is None or actions is not None or "command" not in obs.keys():
+        return compute_symmetric_states(env, obs, actions)
+    from tensordict import TensorDict
+
+    batch_size = obs.batch_size[0]
+    consts = _mirror_consts(obs["command"].device, obs["command"].dtype)
+    cmd = obs["command"]
+    cmd_aug = torch.empty(2 * batch_size, cmd.shape[-1], device=cmd.device, dtype=cmd.dtype)
+    cmd_aug[:batch_size] = cmd
+    torch.mul(cmd, consts["vel_cmd"], out=cmd_aug[batch_size:])
+    policy = obs["policy"]
+    specs = policy_specs_for_dim(policy.shape[-1])
+    perm, sign = _history_mirror_consts(f"policy_{len(specs)}", specs, policy.device, policy.dtype)
+    pol_aug = torch.empty(2 * batch_size, policy.shape[-1], device=policy.device, dtype=policy.dtype)
+    pol_aug[:batch_size] = policy
+    torch.index_select(policy, -1, perm, out=pol_aug[batch_size:])
+    pol_aug[batch_size:].mul_(sign)
+    return TensorDict({"command": cmd_aug, "policy": pol_aug}, batch_size=[2 * batch_size]), None
