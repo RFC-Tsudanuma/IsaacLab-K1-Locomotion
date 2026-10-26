@@ -153,6 +153,15 @@ def main(env_cfg, agent_cfg):
             "trunk_yaw_inside_mean_deg": float(cat["trunk_yaw_in"].mean()),
             "hip_yaw_out_mean_deg": float(cat["hip_yaw_out"].mean()),
         })
+        # 蹴り足の左右別 (MuJoCo で右足のキックだけ悪かったので、IsaacLab でも左右差があるかを見る)
+        for side, m in (("L", cat["kick_left"]), ("R", ~cat["kick_left"])):
+            if m.any():
+                out[f"side_{side}_n"] = int(m.sum())
+                out[f"side_{side}_yaw_ok"] = float(((cat["foot_yaw_abs"][m] - 90).abs() <= 25).float().mean())
+                out[f"side_{side}_inside_ok"] = float((cat["ball_yin_foot"][m] > cat["ball_x_foot"][m].abs()).float().mean())
+                out[f"side_{side}_strike_h"] = float(cat["strike_h"][m].mean())
+                out[f"side_{side}_dir_err_deg"] = float(err[m].mean())
+                out[f"side_{side}_speed"] = float(sp[m].mean())
         if k.eval_walkoff:
             wo = torch.cat(k.eval_walkoff)
             out["spec_walkoff_ok"] = float((wo >= 0.3).float().mean())

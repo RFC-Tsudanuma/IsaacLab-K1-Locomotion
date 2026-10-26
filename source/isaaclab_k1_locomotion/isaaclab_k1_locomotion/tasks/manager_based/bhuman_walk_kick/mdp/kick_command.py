@@ -261,6 +261,8 @@ class BHumanKickCommand(CommandTerm):
             "kick_walkoff_rate": 0.0,      # 蹴って 3 秒以内に胴体の水平速度 (0.2 秒平均) が 0.3 m/s を超えた割合
             "kick_trunk_yaw_in_deg": 0.0,  # 胴体の向き - キック方向 (蹴り足の側へ回っていれば +。B-Human は約 30°)
             "kick_hip_yaw_out_deg": 0.0,   # 蹴り足の股関節 yaw (足先を外へ開く向きが +。B-Human は約 45°)
+            "kick_strike_height_L": 0.0,   # 左足で蹴ったときの当たる直前の足裏の一番低い点 [m] (左右差を見る)
+            "kick_strike_height_R": 0.0,   # 右足で蹴ったとき
         }
         # 仕様の項目を測るための記録 (報酬には使わない)
         self.speed_hist = torch.zeros(n, int(round(1.5 / self.dt)), **f)  # 胴体の水平速度 (古い → 新しい)
@@ -275,6 +277,7 @@ class BHumanKickCommand(CommandTerm):
         self.km_foot_air = torch.zeros(n, dtype=torch.bool, device=dev)
         self.km_foot_hvel = torch.zeros(n, **f)
         self.km_trunk_yaw_in = torch.zeros(n, **f)
+        self.km_kick_left = torch.zeros(n, dtype=torch.bool, device=dev)
         self.km_hip_yaw_out = torch.zeros(n, **f)
         self.since_kick = torch.full((n,), -1, dtype=torch.long, device=dev)
         self.walkoff_max = torch.zeros(n, **f)
@@ -678,6 +681,7 @@ class BHumanKickCommand(CommandTerm):
         self.km_foot_hvel[ids] = prev["hvel"][ids].gather(1, k[:, None]).squeeze(1)
         # 胴体の向き - キック方向、蹴り足の股関節 yaw (蹴り足が左なら +、右なら - を掛ける。足先を外へ開く向きが +)
         sgn = torch.where(left, 1.0, -1.0)
+        self.km_kick_left[ids] = left
         self.km_trunk_yaw_in[ids] = torch.rad2deg(wrap_to_pi(prev["trunk_yaw"][ids] - global_direction[ids])) * sgn
         self.km_hip_yaw_out[ids] = torch.rad2deg(prev["hip_yaw"][ids].gather(1, k[:, None]).squeeze(1)) * sgn
         self.since_kick[ids] = 0
@@ -813,6 +817,8 @@ class BHumanKickCommand(CommandTerm):
             "kick_swing_rate": (self.km_foot_air[ids] & (self.km_foot_hvel[ids] >= 1.0)).float(),
             "kick_trunk_yaw_in_deg": self.km_trunk_yaw_in[ids],
             "kick_hip_yaw_out_deg": self.km_hip_yaw_out[ids],
+            "kick_strike_height_L": self.kick_strike_height[ids][self.km_kick_left[ids]],
+            "kick_strike_height_R": self.kick_strike_height[ids][~self.km_kick_left[ids]],
         }
         if self.eval_log is not None:  # 評価スクリプト (eval_bhuman_walk_kick.py) 用の生データ
             self.eval_log.append({
@@ -835,6 +841,7 @@ class BHumanKickCommand(CommandTerm):
                 "foot_air": self.km_foot_air[ids].cpu(),
                 "foot_hvel": self.km_foot_hvel[ids].cpu(),
                 "trunk_yaw_in": self.km_trunk_yaw_in[ids].cpu(),
+                "kick_left": self.km_kick_left[ids].cpu(),
                 "hip_yaw_out": self.km_hip_yaw_out[ids].cpu(),
             })
         for key, v in vals.items():
