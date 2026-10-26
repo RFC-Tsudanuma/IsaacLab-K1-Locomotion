@@ -278,6 +278,8 @@ class BHumanKickCommand(CommandTerm):
         self.km_foot_hvel = torch.zeros(n, **f)
         self.km_trunk_yaw_in = torch.zeros(n, **f)
         self.km_kick_left = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.km_foot_roll_in = torch.zeros(n, **f)
+        self.km_foot_pitch = torch.zeros(n, **f)
         self.km_hip_yaw_out = torch.zeros(n, **f)
         self.since_kick = torch.full((n,), -1, dtype=torch.long, device=dev)
         self.walkoff_max = torch.zeros(n, **f)
@@ -427,7 +429,7 @@ class BHumanKickCommand(CommandTerm):
         self.last_dof_vel[:] = self.dof_vel
         # 仕様の測定用: 当たる直前 (前の制御ステップ) の足とボール
         prev = dict(
-            yaw=self.feet_yaw.clone(), pos=self.feet_pos[..., :2].clone(),
+            yaw=self.feet_yaw.clone(), pos=self.feet_pos[..., :2].clone(), quat=self.feet_quat.clone(),
             hvel=torch.norm(self.feet_vel[..., :2], dim=-1), contact=self.feet_contact.clone(),
             streak=self.contact_streak.clone(), ball=self.ball_pos_w[:, :2].clone(),
             l_dis=self.l_dis.clone(), r_dis=self.r_dis.clone(), trunk_yaw=self.yaw.clone(),
@@ -682,6 +684,14 @@ class BHumanKickCommand(CommandTerm):
         # 胴体の向き - キック方向、蹴り足の股関節 yaw (蹴り足が左なら +、右なら - を掛ける。足先を外へ開く向きが +)
         sgn = torch.where(left, 1.0, -1.0)
         self.km_kick_left[ids] = left
+        # 蹴り足の傾き (MuJoCo の確認と同じ定義): 横 (+ = 足裏の内側が上がる、左足は +、右足は - を掛ける)、前後 (+ = つま先が下がる)
+        q = prev["quat"][ids].gather(1, k[:, None, None].expand(-1, 1, 4)).squeeze(1)
+        w_, x_, y_, z_ = q.unbind(-1)
+        r20 = 2.0 * (x_ * z_ - w_ * y_)
+        r21 = 2.0 * (y_ * z_ + w_ * x_)
+        r22 = 1.0 - 2.0 * (x_ * x_ + y_ * y_)
+        self.km_foot_roll_in[ids] = torch.rad2deg(torch.atan2(r21, r22)) * sgn
+        self.km_foot_pitch[ids] = torch.rad2deg(-torch.asin(r20.clamp(-1.0, 1.0)))
         self.km_trunk_yaw_in[ids] = torch.rad2deg(wrap_to_pi(prev["trunk_yaw"][ids] - global_direction[ids])) * sgn
         self.km_hip_yaw_out[ids] = torch.rad2deg(prev["hip_yaw"][ids].gather(1, k[:, None]).squeeze(1)) * sgn
         self.since_kick[ids] = 0
@@ -842,6 +852,8 @@ class BHumanKickCommand(CommandTerm):
                 "foot_hvel": self.km_foot_hvel[ids].cpu(),
                 "trunk_yaw_in": self.km_trunk_yaw_in[ids].cpu(),
                 "kick_left": self.km_kick_left[ids].cpu(),
+                "foot_roll_in": self.km_foot_roll_in[ids].cpu(),
+                "foot_pitch": self.km_foot_pitch[ids].cpu(),
                 "hip_yaw_out": self.km_hip_yaw_out[ids].cpu(),
             })
         for key, v in vals.items():

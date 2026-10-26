@@ -24,7 +24,7 @@ ONNX の入出力 (歩行 policy.onnx と同じ形で、1 ステップの観測�
 * ロボット: 学習と同じ K1_locomotion.urdf (腕・頭は固定、脚 12 関節)。自己衝突なし。
 * 関節 PD: 股・膝 kp 160 / kd 4、足首 kp 50 / kd 2.5、トルク上限 68/76/38.3/112/38.3/38.3 Nm、
   armature は股・膝が URDF 変換時の値、足首 0.0565。目標は物理ステップ (5 ms) で ``--delay`` だけ遅らせる
-  (学習: 2〜7 の一様乱数)。
+  (学習: 2〜7 の一様乱数)。目標は関節の範囲で切る (学習の PhysX と実機は範囲で硬く止まるため。``--no_clip_targets``)。
 * 制御: 5 ms × 4 = 50 Hz。
 * 位相: 周波数 = 速度コマンドから決まる値 (|v| ≤ 1.0 で 1.8 Hz、1.8 m/s で 2.0 Hz) + clip(action[12], ±0.5)。
   左足 sin/cos, 右足 (+π) sin/cos。コマンドの大きさが 0.05 未満なら位相の観測は 0。
@@ -214,6 +214,8 @@ class Sim:
         self.qadr = np.array([self.m.joint(n).qposadr[0] for n in JOINTS])
         self.dadr = np.array([self.m.joint(n).dofadr[0] for n in JOINTS])
         self.act = np.array([self.m.actuator(n).id for n in JOINTS])
+        self.jrange = np.array([self.m.jnt_range[self.m.joint(n).id] for n in JOINTS])
+        self.clip_targets = True
         self.trunk = self.w.trunk
         self.feet = self.w.feet
         self.delay = int(delay)
@@ -403,6 +405,12 @@ class Sim:
                                  "obs_history": self.history[None]})[0][0].astype(np.float64)
         self.last_action = a.copy()
         target_q = DEFAULT_Q + ACTION_SCALE * a[:12]
+        if self.clip_targets:
+            # 関節の目標を関節の範囲 (URDF) で切る。MuJoCo の関節の範囲はやわらかく、範囲の外を指令し続けると
+            # 大きくはみ出す (Stage 3b model_4000 の右足首 roll: 範囲 ±0.345 rad に対して -1.16 rad まで回った)。
+            # 学習 (PhysX) では範囲で硬く止まり、実機も機械的に止まる。B-Human も学習・実機の両方で目標を範囲で切っている
+            # (B-Human の完成品を回す sim2sim_bhuman_reference.py も同じ)。--no_clip_targets で切らない (2026-10-26 までの動き)。
+            target_q = np.clip(target_q, self.jrange[:, 0], self.jrange[:, 1])
         # 位相は「前ステップのコマンド + 今の周波数 action」で進む (学習: 報酬計算時に積分)
         self.phase = math.fmod(self.phase + 2 * math.pi * self.phase_freq(self.command, a[12]) * STEP_DT, 2 * math.pi)
         for i in range(DECIMATION):
@@ -442,6 +450,7 @@ def main(argv=None) -> int:
                     help='KCFG の上書き (JSON)。例: \'{"ball_distance_offset": 0.7, "ball_rotation_offset": 0.2}\'')
     ap.add_argument("--kick_through_speed", type=float, default=0.0,
                     help="学習の walk_command と合わせる (Stage 2 以降 0、s1c〜前回の s6b/s7 は 0.5)")
+    ap.add_argument("--no_clip_targets", action="store_true", help="関節の目標を関節の範囲で切らない (2026-10-26 までの動き)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
     km.add_scene_args(ap)
@@ -457,6 +466,7 @@ def main(argv=None) -> int:
     bff = None if a.ball_foot_friction < 0 else a.ball_foot_friction
     if a.view or a.view_seconds > 0:
         sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
+        sim.clip_targets = not a.no_clip_targets
         km.run_viewer(sim, km.scene_from_args(a), a.next_ball_delay, a.view_seconds, a.speed)
         return 0
     if a.video_dir is not None:
@@ -467,6 +477,7 @@ def main(argv=None) -> int:
         names = set(a.scenarios.split(","))
         scenarios = [s for s in scenarios if s.name in names]
     sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
+    sim.clip_targets = not a.no_clip_targets
     results = {}
     for sc in scenarios:
         video = a.video_dir / f"{sc.name}.mp4" if a.video_dir else None

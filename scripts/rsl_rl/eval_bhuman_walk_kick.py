@@ -162,6 +162,8 @@ def main(env_cfg, agent_cfg):
                 out[f"side_{side}_strike_h"] = float(cat["strike_h"][m].mean())
                 out[f"side_{side}_dir_err_deg"] = float(err[m].mean())
                 out[f"side_{side}_speed"] = float(sp[m].mean())
+                out[f"side_{side}_roll_in_deg"] = float(cat["foot_roll_in"][m].mean())
+                out[f"side_{side}_pitch_deg"] = float(cat["foot_pitch"][m].mean())
         if k.eval_walkoff:
             wo = torch.cat(k.eval_walkoff)
             out["spec_walkoff_ok"] = float((wo >= 0.3).float().mean())
