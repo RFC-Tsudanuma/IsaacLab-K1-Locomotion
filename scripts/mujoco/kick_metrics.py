@@ -454,8 +454,10 @@ def fmt(sc: Scenario, r: dict) -> str:
     fell = f"FELL {r['fell_t']:.2f}s" if r["fell"] else "ok"
     if r["kick_t"] is None:
         return f"{sc.name:18s} | {fell:10s} | no kick"
+    de = r.get("disp_dir_err_deg")
+    de = "   -" if de is None else f"{round(de):>4}"
     s = (f"{sc.name:18s} | {fell:10s} | kick {r['kick_t']:5.2f}s v {r['kick_speed']:.2f} (tgt {r['expected_kick_speed']:.2f})"
-         f" dir {r['disp_dir_err_deg'] if r.get('disp_dir_err_deg') is None else round(r['disp_dir_err_deg']):>4}")
+         f" dir {de}")
     if "foot_yaw_deg" in r:
         s += (f" | {r['kick_foot']} yaw {r['foot_yaw_inside_deg']:+4.0f} ball x {r['ball_x_in_foot']:+.2f} in {r['ball_y_inside_foot']:+.2f}"
               f" | stop {r['stop_s']:.2f}s plant {'Y' if r['plant_ok'] else 'n'} swing {'Y' if r['swing_ok'] else 'n'}"
