@@ -163,7 +163,8 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
             "near_distance": 0.35, "far_distance": 2.0,
             "near_hold_prob": 0.6, "far_hold_prob": 0.05,
             "noise_range": 0.05,
-            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(50, 150)ms
+            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(0, 150)ms
+            "ball_delay_mode": "capture",  # 実機と同じ: 撮影時刻のロボット座標で見た撮影時刻のボール
         },
     )
     ball_vel = ObsTerm(
@@ -173,7 +174,8 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
             "near_hold_prob": 0.6, "far_hold_prob": 0.05,
             "near_invalid_prob": 0.4, "far_invalid_prob": 0.02,
             "noise_range": 0.1,
-            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(50, 150)ms
+            "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(0, 150)ms
+            "ball_delay_mode": "capture",  # 実機と同じ: 撮影時刻のロボット座標で見た撮影時刻のボール
         },
     )
     # 2026-10-06: obstacle_pos_rel は Policy から削除した (Critic専用に戻す)。
@@ -182,15 +184,15 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # 2026-10-01: 「両足でボールを挟み込んで運ぶ」局所解対策。片足ずつボールとの
     # 相対位置を見せることで、挟み込みではなく個別の足によるボールコントロールを
     # 学習しやすくする。obstacle_pos_rel と同じく末尾追記、移行作業が必要。
-    # 2026-10-26: ボールの位置にだけ検出の遅れ U(50, 150)ms を入れる (足の位置は今のもの)。
+    # 2026-10-26: 実機と同じく「(撮影時刻のロボット座標で見たボール) - (今の足の位置)」(ball_delay_mode="capture")。
     foot_left_ball_pos_rel = ObsTerm(
         func=foot_to_ball_pos_rel,
-        params={"foot_body_name": "left_foot_link", "ball_delay": True},
+        params={"foot_body_name": "left_foot_link", "ball_delay": True, "ball_delay_mode": "capture"},
         noise=Unoise(n_min=-0.05, n_max=0.05),
     )
     foot_right_ball_pos_rel = ObsTerm(
         func=foot_to_ball_pos_rel,
-        params={"foot_body_name": "right_foot_link", "ball_delay": True},
+        params={"foot_body_name": "right_foot_link", "ball_delay": True, "ball_delay_mode": "capture"},
         noise=Unoise(n_min=-0.05, n_max=0.05),
     )
 
@@ -440,12 +442,17 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         )
 
         # 2026-10-26: 観測の遅れのランダム化 (エピソードごと)。MuJoCo の sim2sim で、自己位置 170ms + ボール検出 100ms の
-        # 遅れがあると成功 0.03・転倒 0.90 (遅れなしでは成功 0.47・転倒 0.40) だったため。ボール検出 U(50, 150)ms、
-        # 自己位置 U(100, 250)ms。ワールド座標の履歴から body yaw 座標の値を作り直す (mdp/observations.py の「観測の遅れ」)。
+        # 遅れがあると成功 0.03・転倒 0.90 (遅れなしでは成功 0.47・転倒 0.40) だったため。ワールド座標の履歴から body yaw 座標の
+        # 値を作り直す (mdp/observations.py の「観測の遅れ」)。作り方は実機と同じ: ボールは「撮影時刻のロボット座標で見た
+        # 撮影時刻のボール」(capture)、目標点は「遅れた自己位置で見た今の目標点」。範囲は 0 付近を含める (遅れが小さいときにも
+        # 崩れないように): ボール U(0, 150)ms、自己位置 U(0, 250)ms。
+        # 経緯: 最初のラン (2026-10-25_22-33-24) はボールを「今のロボットの姿勢で見る」作り方・遅れ 50〜150 / 100〜250ms で学習したが、
+        # 遅れありの成績がほぼ変わらず (成功 0.79 → 0.80)、遅れなしで悪化した (0.89 → 0.73)。実機と同じ capture の作り方で
+        # model_44997 を評価すると成功 0.37・転倒 0.50 まで崩れ (目標点の遅れだけなら 0.87)、ボールの作り方が原因と分かった。
         self.events.randomize_observation_delays = EventTerm(
             func=randomize_observation_delays,
             mode="reset",
-            params={"ball_delay_range_s": (0.05, 0.15), "localization_delay_range_s": (0.10, 0.25)},
+            params={"ball_delay_range_s": (0.0, 0.15), "localization_delay_range_s": (0.0, 0.25)},
         )
 
         # 2026-10-22: エピソードの途中の経路の引き直し。実機の戦略は毎周期経路を計画し直すので、ウェイポイントが

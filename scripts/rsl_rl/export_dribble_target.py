@@ -210,8 +210,8 @@ def build_spec(env: dict, agent: dict, layout, run_dir: str, ckpt_iter: int, cur
             {
                 "ball_detection_delay_range_s": list((ev := (env.get("events") or {}).get("randomize_observation_delays", {}).get("params", {}))["ball_delay_range_s"]),
                 "localization_delay_range_s": list(ev["localization_delay_range_s"]),
-                "note": "エピソードごとに抽選。ボール: d_ball 前のワールドのボール位置・速度を今のロボットの姿勢で body yaw 座標に直す。"
-                "目標点: 今の目標点を d_loc 前のロボットの位置・向きで body yaw 座標に直す",
+                "note": "エピソードごとに抽選。実機と同じ作り方: ボールは撮影時刻 (d_ball 前) のロボット座標で見た撮影時刻のボール位置・速度"
+                " (foot_*_ball_pos_rel はそこから今の足の位置を引く)。目標点は今の目標点を d_loc 前のロボットの位置・向きで body yaw 座標に直す",
             }
             if (env.get("events") or {}).get("randomize_observation_delays")
             else None
