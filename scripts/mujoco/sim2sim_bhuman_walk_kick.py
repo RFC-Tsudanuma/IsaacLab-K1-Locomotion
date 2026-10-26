@@ -145,7 +145,14 @@ def export_onnx(ckpt: Path) -> Path:
 
     pol = build_torch_policy(ckpt)
     out = ckpt.parent / "exported" / f"{ckpt.parent.name}_{ckpt.stem}.onnx"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        if not os.access(out.parent, os.W_OK):
+            raise PermissionError(out.parent)
+    except PermissionError:
+        # 学習の run ディレクトリはコンテナ (root) が作るので、ホストから書けないことがある
+        out = Path("/tmp") / f"bwk_onnx_{os.getuid()}" / out.name
+        out.parent.mkdir(parents=True, exist_ok=True)
     ex = (torch.zeros(1, 3), torch.zeros(1, HISTORY, STEP_DIM))
     torch.onnx.export(pol, ex, str(out), input_names=["command", "obs_history"], output_names=["actions"],
                       opset_version=17, dynamo=False)
