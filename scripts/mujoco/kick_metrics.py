@@ -243,9 +243,11 @@ class Recorder:
         feet = []
         for k, b in enumerate(w.feet):
             e = w.foot_edges(d, k)
+            Rf = d.xmat[b].reshape(3, 3)
             mujoco.mj_objectVelocity(w.m, d, mujoco.mjtObj.mjOBJ_BODY, b, vel, 0)
             feet.append(dict(edge_dist=float(np.min(np.linalg.norm(e[:, :2] - ball[:2], axis=1))),
-                             yaw=body_yaw(d, b), pos=d.xpos[b].copy(), hvel=float(np.linalg.norm(vel[3:5])),
+                             yaw=body_yaw(d, b), pos=d.xpos[b].copy(), hvel=float(np.linalg.norm(vel[3:5])), vz=float(vel[5]),
+                             roll=math.degrees(math.atan2(Rf[2, 1], Rf[2, 2])), pitch=math.degrees(-math.asin(max(-1.0, min(1.0, Rf[2, 0])))),
                              low_z=float(e[:, 2].min()), floor=bool(foot_floor[k])))
         bodies = set()
         bg = w.ball_geoms[self.ball_idx]
@@ -312,7 +314,9 @@ def contact_metrics(rec: Recorder, kick_t: float, ctrl_dt: float) -> dict:
         ball_x_in_foot=x_f, ball_y_inside_foot=y_in, inside_ok=y_in > abs(x_f),
         stop_s=stop_s, min_speed_win=min_speed_win,
         stop_ok=min_speed_win is not None and min_speed_win <= S["stop_speed"],
-        kick_foot_on_floor=f["floor"], kick_foot_hvel=f["hvel"], kick_foot_low_z=f["low_z"],
+        kick_foot_on_floor=f["floor"], kick_foot_vz=f["vz"],
+        # 蹴り足の傾き: 横の傾き (蹴り足が左なら +、右なら - を掛ける。+ = 足裏の内側が上がる)、前後の傾き (+ = つま先が下がる)
+        kick_foot_roll_in_deg=f["roll"] * (1.0 if k == 0 else -1.0), kick_foot_pitch_deg=f["pitch"], kick_foot_hvel=f["hvel"], kick_foot_low_z=f["low_z"],
         swing_ok=swing_ok,
         # 胴体の向き - キック方向 (蹴り足が左なら +、右なら - を掛ける。足と同じ向きに回っていれば +)、
         # 蹴り足の股関節 yaw (外向き = 足先を外へ開く向きが +)
