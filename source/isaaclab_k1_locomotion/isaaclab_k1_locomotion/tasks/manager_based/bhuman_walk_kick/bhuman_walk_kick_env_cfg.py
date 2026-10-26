@@ -149,6 +149,7 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
                 ),
                 mass_props=MassPropertiesCfg(mass=BALL_MASS),
                 collision_props=CollisionPropertiesCfg(contact_offset=0.02, rest_offset=0.0),
+                # B-Human (_create_ball_asset) と同じ: 摩擦 1.0、反発 0.1。摩擦の決め方は既定 ("average")。
                 physics_material=sim_utils.RigidBodyMaterialCfg(
                     static_friction=1.0, dynamic_friction=1.0, restitution=0.1
                 ),
@@ -166,21 +167,14 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
             },
         )
 
-        # ボールの摩擦のランダム化 (B-Human には無い。s4b から)。ボール-床は 床 1.0 × ボール (multiply)、
-        # ボール-足は (ボール + 足) / 2 (average) になる。MuJoCo で床との摩擦 1.0 のときだけ、蹴った足が
-        # ボールの上をこすって引き戻す・倒れることがあり (0.5〜0.7 なら起きない)、摩擦に頼った蹴り方になっていたため。
-        self.events.ball_material = EventTerm(
-            func=loco_mdp.randomize_rigid_body_material,
-            mode="startup",
-            params={
-                "asset_cfg": SceneEntityCfg("soccer_ball"),
-                "static_friction_range": (0.4, 1.0),
-                "dynamic_friction_range": (0.4, 1.0),
-                "restitution_range": (0.1, 0.1),
-                "num_buckets": 64,
-                "make_consistent": True,
-            },
-        )
+        # ボールの摩擦のランダム化 (s4b〜2026-10-26、B-Human に無い) はやめた。
+        # Stage 2 の model_2900 を MuJoCo で回すと、ボール-足の摩擦 0.4 / 0.6 では転倒 0 / 1・向きのずれ 9.7° / 9.0° なのに
+        # 0.8 / 1.0 では転倒 27 / 33・ずれ 38° / 57° (B-Human の完成品はどれでも転倒 0〜1・ずれ 2.4°)。学習で高い摩擦を
+        # あまり経験していない。IsaacLab で測ると、ランダム化したボールでは ボール-床の摩擦 = ボールの値 (0.40〜0.87) で、
+        # ボールの材質の決め方 ("max" にしても) はランダム化で材質が作り直されて効かなかった
+        # (scripts/rsl_rl/check_ball_friction.py。1.0 固定に戻した後は ボール-床 0.99)。B-Human はボール 1.0 固定、ロボット 0.3〜1.0 の
+        # "average" で、ボール-足 = 0.65〜1.0。ボールを 1.0 固定に戻すと、ボール-床 = 1.0 (MuJoCo の確認と同じ)、
+        # ボール-足 = (1.0 + 足) / 2 = 0.65〜1.0 (ロボットの材質が "multiply" として効く場合は 足の値 0.3〜1.0)。
 
         # ---- curriculum: 速度コマンド系は使わない。押しは歩行の最終段 (model_34995 は通過済み) に固定 ----
         self.curriculum.command_resampling_time_range = None
