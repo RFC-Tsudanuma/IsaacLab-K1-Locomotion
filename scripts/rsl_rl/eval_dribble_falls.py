@@ -45,6 +45,8 @@ parser.add_argument("--polyline_prob", type=float, default=0.0,
 parser.add_argument("--no_replan", action="store_true", help="エピソードの途中の経路の引き直しを切る")
 parser.add_argument("--ball_delay_ms", type=float, default=None,
                     help="ボール検出の遅れを固定する [ms] (既定: 学習と同じランダム化。0 で遅れなし)")
+parser.add_argument("--ball_delay_mode", choices=["current", "capture"], default=None,
+                    help="ボールの遅れの作り方 (既定: cfg のまま)。capture = 実機と同じ「撮影時刻のロボット座標で見た撮影時刻のボール」")
 parser.add_argument("--loc_delay_ms", type=float, default=None,
                     help="自己位置の遅れを固定する [ms] (既定: 学習と同じランダム化。0 で遅れなし)")
 AppLauncher.add_app_launcher_args(parser)
@@ -88,6 +90,9 @@ def main():
     env_cfg.commands.dribble_target.random_polyline_prob = args_cli.polyline_prob
     if args_cli.no_replan:
         env_cfg.events.replan_dribble_path = None
+    if args_cli.ball_delay_mode is not None:
+        for _name in ("ball_pos_rel", "ball_vel", "foot_left_ball_pos_rel", "foot_right_ball_pos_rel"):
+            getattr(env_cfg.observations.policy, _name).params["ball_delay_mode"] = args_cli.ball_delay_mode
     delay_ev = getattr(env_cfg.events, "randomize_observation_delays", None)
     if delay_ev is not None:
         if args_cli.ball_delay_ms is not None:
