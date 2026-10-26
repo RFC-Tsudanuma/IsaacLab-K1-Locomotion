@@ -48,8 +48,9 @@ from ..locomotion.flat_env_cfg import (
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1
 from . import mdp
 
-BALL_RADIUS = 0.11  # このリポジトリのキック系タスクと同じボール
-BALL_MASS = 0.45
+# B-Human K1_Ball.yaml (asset.ball) と同じボール (2026-10-26 から。それまではこのリポジトリの他のキックと同じ 0.11 m・0.45 kg)
+BALL_RADIUS = 0.095
+BALL_MASS = 0.29
 JOINT_ACTION_SCALE = 0.5
 
 
@@ -212,37 +213,38 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
 
 
 # --------------------------------------------------------------------------- #
-# 段階学習 (B-Human README「Training kick」の 2) 以降)。段の番号は README の 2), 3), 3), 4), 5), 6) を
-# 順に 2..7 とした (README は「3)」が 2 回ある)。前の段の checkpoint から --resume で続ける。
+# 段階学習 (B-Human README「Training kick」(IsaacGymRL/envs/readme.md) の 2) 以降)。段の番号は README の
+# 2), 3), 3), 4), 5), 6) を順に 2..7 とした (README は「3)」が 2 回ある)。前の段の checkpoint から --resume で続ける。
+# キック側 (B-Human) の値は README どおり。探索ノイズ・学習率・desired_kl は学習コマンドの側
+# (scripts/rsl_rl/train_bhuman_walk_kick.sh) で指定する。
 # --------------------------------------------------------------------------- #
 @configclass
 class K1BHumanWalkKickStage2EnvCfg(K1BHumanWalkKickEnvCfg):
+    """README 2): 蹴り足をキック方向に対して 90° 横に向ける (インサイドキック)。"""
+
     def __post_init__(self):
         super().__post_init__()
         k = self.commands.kick
-        # B-Human はここで target_sole_yaw_angle = 1.5705 (足をキック方向に対して 90° 横に向ける = インサイドで
-        # 押し出すキック) にする。今回の目的は「強く・正確に」なので、Stage 1 で育った
-        # 「足先をキック方向に向けて振り抜く」蹴り方を保ち、0 のままにする (B-Human からの変更)。
-        # 足の向きの報酬 (ball_sole_yaw) と sigma の絞り込みは B-Human どおり使う (足先をキック方向へ揃える向きに働く)。
-        k.target_sole_yaw_angle = 0.0
+        k.target_sole_yaw_angle = 1.5705
         k.disable_sole_yaw_direction_penalty = True
         k.disable_deviation_flag = False
         k.ball_pos_noise_x = (0.03, k.ball_pos_noise_x[1])
         k.ball_pos_noise_y = (0.03, k.ball_pos_noise_y[1])
         self.rewards.ball_sole_yaw.weight = 25.0
-        # Stage 1 で強キックが目標 (3.46 m/s) に届いたので、強キックの重みは B-Human の 5 に戻す
-        # (距離指定キックまで強く蹴りすぎるのを抑える)。
+        # Stage 1 だけ強キックの重みを 10 にしていた (B-Human からの変更、s1c)。ここから B-Human の 5。
         self.rewards.ball_kick_velocity_strong.weight = 5.0
-        # B-Human は蹴ってから 20 ステップ (0.4 秒) でボールを置き直す。MuJoCo で蹴った後に転がるボールが
-        # 脚に絡んで倒れることがあったので、1 秒 (50 ステップ) ボールを残して蹴った後の動きも学習させる (B-Human からの変更)。
-        k.time_after_kick = 50
+        # キック姿勢に入った後に 0.5 m/s で歩き込ませる指令 (B-Human に無い、Stage 1 の s1c で入れた) はやめる。
+        # 前回はこれで「歩いたまま足先で押す」蹴り方になった。歩行コマンドは B-Human の歩行目標へ向かうだけにする。
+        self.commands.base_velocity.kick_through_speed = 0.0
 
 
 @configclass
 class K1BHumanWalkKickStage3EnvCfg(K1BHumanWalkKickStage2EnvCfg):
+    """README 3) の 1 つ目。target_sole_yaw_sigma は「何段かに分けて」0.1 へ下げる。この class は最後の 0.1 で、
+    途中の 0.5 / 0.25 は学習コマンドで env.commands.kick.target_sole_yaw_sigma を上書きして回す。"""
+
     def __post_init__(self):
         super().__post_init__()
-        # README: target_sole_yaw_sigma を「何段かに分けて」0.1 へ。ここでは 1 段で 0.1 にする
         self.commands.kick.target_sole_yaw_sigma = 0.1
         self.rewards.ball_walk_speed.weight = 1.0
         self.rewards.ball_sole_yaw.weight = 15.0
@@ -250,6 +252,8 @@ class K1BHumanWalkKickStage3EnvCfg(K1BHumanWalkKickStage2EnvCfg):
 
 @configclass
 class K1BHumanWalkKickStage4EnvCfg(K1BHumanWalkKickStage3EnvCfg):
+    """README 3) の 2 つ目。"""
+
     def __post_init__(self):
         super().__post_init__()
         k = self.commands.kick
@@ -257,17 +261,15 @@ class K1BHumanWalkKickStage4EnvCfg(K1BHumanWalkKickStage3EnvCfg):
         k.kick_direction_negative_factor = 3.0
         self.rewards.ball_sole_yaw.weight = 5.0
         self.rewards.ball_walk_target_overshoot.weight = -10.0
-        # B-Human はここで feet_swing (足上げ報酬) を 3 → 0.75 にする。うちの walk の位相報酬 feet_phase を同じく 1/4
-        # (1.5 → 0.375) にしたら (s4/s4b)、蹴り足をボールの上の方へ振り下ろす蹴り方に変わり、MuJoCo で倒れる・ボールを
-        # 引きずるようになったので、feet_phase は 1.5 のまま下げない (B-Human からの変更)。
-        # さらにボールの中心より上を踏みつけるように当てたキックは褒めない (strike_height_range, B-Human に無い)。
-        # 当たる直前の足裏の一番低い点が 0.05 m 以下なら満額、0.09 m で 0
-        # (IsaacLab の評価で強キックの平均は s3: 0.056 m、s4b: 0.072 m。MuJoCo で s4b は倒れる・引きずる)。
-        k.strike_height_range = (0.05, 0.09)
+        # B-Human は足上げ報酬 feet_swing を 3 → 0.75 (1/4) にする。うちで同じ役目は歩行の位相報酬 feet_phase なので、
+        # 同じく 1/4 (1.5 → 0.375) にする。
+        self.rewards.feet_phase.weight = self.rewards.feet_phase.weight * 0.25
 
 
 @configclass
 class K1BHumanWalkKickStage5EnvCfg(K1BHumanWalkKickStage4EnvCfg):
+    """README 4)。"""
+
     def __post_init__(self):
         super().__post_init__()
         self.commands.kick.kick_direction_sigma_range = 0.75
@@ -276,6 +278,9 @@ class K1BHumanWalkKickStage5EnvCfg(K1BHumanWalkKickStage4EnvCfg):
 
 @configclass
 class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
+    """README 5)。kick_direction_sigma_range は 0.25 → 0.2 (良ければ 0.15, 0.1, 0.05) を学習コマンドで上書きして下げる。
+    desired_kl 0.003 と探索ノイズ (エントロピー [-16.6, -16.5] 相当) は学習コマンドの側。"""
+
     def __post_init__(self):
         super().__post_init__()
         k = self.commands.kick
@@ -287,6 +292,10 @@ class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
 
 @configclass
 class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
+    """README 6): ボールの置き直し・速度付与の確率を最終値へ (最初は最終値の 10% を学習コマンドで上書きして回す)。
+    heavy_ball (0.00001 → 0.0001 の確率でボールを 100 倍重くする) は移植していない: env を作る時に 1 回だけ決まる
+    値なので、1024 env では重いボールの env が 0.01〜0.1 個にしかならず、入れても入れなくても同じため。"""
+
     def __post_init__(self):
         super().__post_init__()
         k = self.commands.kick
@@ -299,14 +308,62 @@ class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
         k.ball_rotation_offset = 0.2
         self.rewards.ball_kick_direction.weight = 5.0
         self.rewards.ball_walk_speed.weight = 0.75
+        # K1_Ball.yaml ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」
         self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
+
+
+def _play(cfg):
+    """再生・評価用: env 16、観測ノイズ・ボール観測ノイズ・押しなし。"""
+    cfg.scene.num_envs = 16
+    cfg.observations.policy.enable_corruption = False
+    cfg.commands.kick.obs_noise = False
+    cfg.events.push_robot = None
+
+
+@configclass
+class K1BHumanWalkKickStage2EnvCfg_PLAY(K1BHumanWalkKickStage2EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
+@configclass
+class K1BHumanWalkKickStage3EnvCfg_PLAY(K1BHumanWalkKickStage3EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
+@configclass
+class K1BHumanWalkKickStage4EnvCfg_PLAY(K1BHumanWalkKickStage4EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
+@configclass
+class K1BHumanWalkKickStage5EnvCfg_PLAY(K1BHumanWalkKickStage5EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
+@configclass
+class K1BHumanWalkKickStage6EnvCfg_PLAY(K1BHumanWalkKickStage6EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
+@configclass
+class K1BHumanWalkKickStage7EnvCfg_PLAY(K1BHumanWalkKickStage7EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
 
 
 @configclass
 class K1BHumanWalkKickEnvCfg_PLAY(K1BHumanWalkKickEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.scene.num_envs = 16
-        self.observations.policy.enable_corruption = False
-        self.commands.kick.obs_noise = False
-        self.events.push_robot = None
+        _play(self)

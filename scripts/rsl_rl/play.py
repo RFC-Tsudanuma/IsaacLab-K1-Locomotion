@@ -45,6 +45,11 @@ parser.add_argument(
 parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
+parser.add_argument(
+    "--no_export", action="store_true", default=False,
+    help="再生だけする (checkpoint の隣の exported/policy.onnx, policy.pt を書き出さない = 上書きしない)。",
+)
+parser.add_argument("--max_steps", type=int, default=0, help="この制御ステップ数で終える (0 = 窓を閉じるまで)。")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -501,7 +506,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # export policy to onnx/jit
     export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    if is_history_policy(policy_nn):
+    if args_cli.no_export:
+        print("[INFO] --no_export: exported/ には書き出さない")
+    elif is_history_policy(policy_nn):
         # 履歴 + CNN 構成 (K1 Flat): 入力は command(N,3) + obs_history(N,H,C)。
         # 詳細は agents/history_policy_exporter.py の docstring を参照。
         export_history_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
@@ -523,8 +530,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     timestep = 0
     # manual frame buffer for robust video recording
     _manual_frames = [] if args_cli.video else None
+    n_steps = 0
     # simulate environment
     while simulation_app.is_running():
+        n_steps += 1
+        if args_cli.max_steps > 0 and n_steps > args_cli.max_steps:
+            print(f"[INFO] --max_steps {args_cli.max_steps} に達したので終える")
+            break
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():

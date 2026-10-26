@@ -30,12 +30,13 @@ gym.register(
 )
 
 for _i in range(2, 8):
-    gym.register(
-        id=f"Isaac-K1-BHuman-Walk-Kick-Stage{_i}-v0",
-        entry_point="isaaclab.envs:ManagerBasedRLEnv",
-        disable_env_checker=True,
-        kwargs={
-            "env_cfg_entry_point": f"{__name__}.bhuman_walk_kick_env_cfg:K1BHumanWalkKickStage{_i}EnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BHumanWalkKickPPORunnerCfg",
-        },
-    )
+    for _suffix, _cls in (("", ""), ("-Play", "_PLAY")):
+        gym.register(
+            id=f"Isaac-K1-BHuman-Walk-Kick-Stage{_i}{_suffix}-v0",
+            entry_point="isaaclab.envs:ManagerBasedRLEnv",
+            disable_env_checker=True,
+            kwargs={
+                "env_cfg_entry_point": f"{__name__}.bhuman_walk_kick_env_cfg:K1BHumanWalkKickStage{_i}EnvCfg{_cls}",
+                "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BHumanWalkKickPPORunnerCfg",
+            },
+        )

@@ -8,6 +8,12 @@
 * ボールの最高速度 (強キック / 距離指定キック別)、距離指定キックの |速度 - 必要な初速|
 * 目標方向とボールの進んだ向きのずれ (平均・中央値・15°/30° 以内の割合)
 * 転倒 (base_contact / base_height で終わったエピソード) の回数
+* 仕様 (docs/bhuman_walk_kick_spec.md) の項目 (キック 1 回ごとの割合。MuJoCo の場面ごとの値とは分母が違う):
+  蹴り足の向き 90±25°、ボールが蹴り足の内側、止まる (当たる前 1.5 秒に 0.6 m/s 以下まで減速)、
+  軸足 (0.1 秒以上前から接地)、振り、つながり (蹴って 3 秒以内に歩き出す)
+
+--task に段ごとのタスク (Isaac-K1-BHuman-Walk-Kick-Stage2-v0 など) を渡してよい。観測ノイズ・ボール観測ノイズ・押しは
+切って回す (Play と同じ。--keep_noise で残す)。
 """
 
 import argparse
@@ -27,6 +33,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--json_out", type=str, default=None)
+parser.add_argument("--keep_noise", action="store_true", help="観測ノイズと押しを学習のまま残す")
 parser.add_argument("--ball_max_depen", type=float, default=None, help="ボールの max_depenetration_velocity を上書き")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -57,6 +64,10 @@ def main(env_cfg, agent_cfg):
     env_cfg.seed = args_cli.seed
     env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
     agent_cfg.device = env_cfg.sim.device
+    if not args_cli.keep_noise:
+        env_cfg.observations.policy.enable_corruption = False
+        env_cfg.commands.kick.obs_noise = False
+        env_cfg.events.push_robot = None
     if args_cli.ball_max_depen is not None:
         env_cfg.scene.soccer_ball.spawn.rigid_props.max_depenetration_velocity = args_cli.ball_max_depen
     env = gym.make(args_cli.task, cfg=env_cfg)
@@ -74,6 +85,7 @@ def main(env_cfg, agent_cfg):
     uenv = env.unwrapped
     k = uenv.command_manager.get_term("kick")
     k.eval_log = []
+    k.eval_walkoff = []
     tm = uenv.termination_manager
     fall_terms = [n for n in tm.active_terms if n in ("base_contact", "base_height", "bad_orientation")]
     n_falls = 0
@@ -123,7 +135,28 @@ def main(env_cfg, agent_cfg):
             "dir_within_15deg": float((err < 15).float().mean()),
             "dir_within_30deg": float((err < 30).float().mean()),
             "dir_err_strong_mean_deg": float(err[st].mean()) if st.any() else None,
+            # 仕様の項目 (キック 1 回ごとの割合)
+            "spec_yaw_ok": float(((cat["foot_yaw_abs"] - 90).abs() <= 25).float().mean()),
+            "spec_foot_yaw_abs_mean_deg": float(cat["foot_yaw_abs"].mean()),
+            "spec_foot_yaw_inside_mean_deg": float(cat["foot_yaw_in"].mean()),
+            "spec_yaw_inside_ok": float(((cat["foot_yaw_in"] - 90).abs() <= 25).float().mean()),
+            "spec_inside_ok": float((cat["ball_yin_foot"] > cat["ball_x_foot"].abs()).float().mean()),
+            "spec_ball_x_foot_mean": float(cat["ball_x_foot"].mean()),
+            "spec_ball_yin_foot_mean": float(cat["ball_yin_foot"].mean()),
+            "spec_stop_ok": float((cat["min_speed"] <= 0.6).float().mean()),
+            "spec_min_speed_mean": float(cat["min_speed"].mean()),
+            "spec_stop_s_mean": float(cat["stop_s"].mean()),
+            "spec_plant_ok": float(cat["plant"].float().mean()),
+            "spec_swing_ok": float((cat["foot_air"] & (cat["foot_hvel"] >= 1.0)).float().mean()),
+            "spec_foot_air": float(cat["foot_air"].float().mean()),
+            "spec_foot_hvel_mean": float(cat["foot_hvel"].mean()),
+            "trunk_yaw_inside_mean_deg": float(cat["trunk_yaw_in"].mean()),
+            "hip_yaw_out_mean_deg": float(cat["hip_yaw_out"].mean()),
         })
+        if k.eval_walkoff:
+            wo = torch.cat(k.eval_walkoff)
+            out["spec_walkoff_ok"] = float((wo >= 0.3).float().mean())
+            out["spec_walkoff_n"] = int(wo.numel())
         # キック方向 (ロボットがボールを置かれた時の向き基準) 別のずれ
         rel = cat["kick_dir_rel_deg"].abs()
         for lo, hi in ((0, 45), (45, 90), (90, 135), (135, 181)):

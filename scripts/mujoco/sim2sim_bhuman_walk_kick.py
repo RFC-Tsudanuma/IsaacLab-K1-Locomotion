@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""bhuman_walk_kick (Isaac-K1-BHuman-Walk-Kick-v0) の方策を MuJoCo (CPU) で動かして確かめる。
+"""bhuman_walk_kick (Isaac-K1-BHuman-Walk-Kick-*) の方策を MuJoCo (CPU) で動かし、仕様の表の各項目を測る。
 
 IsaacLab を使わない。checkpoint (.pt) を渡すと ONNX に書き出してから回す (``<run>/exported/``)。
 
     ~/k1_deploy_env/bin/python scripts/mujoco/sim2sim_bhuman_walk_kick.py \
-        --checkpoint logs/rsl_rl/k1_bhuman_walk_kick/<run>/model_XXXX.pt [--video_dir out/] [--json out.json]
+        --checkpoint logs/rsl_rl/k1_bhuman_walk_kick/<run>/model_XXXX.pt --random 100 [--video_dir out/] [--json out.json]
+    # 画面で見る (実時間。蹴った後も次のボールが出て続く。--onnx で書き出し済みの ONNX も渡せる)
+    ~/k1_deploy_env/bin/python scripts/mujoco/sim2sim_bhuman_walk_kick.py --checkpoint <model_XXXX.pt> --view --scene left90_strong
+    ~/k1_deploy_env/bin/python scripts/mujoco/sim2sim_bhuman_walk_kick.py --checkpoint <model_XXXX.pt> --view \
+        --ball_x 1.0 --ball_y 0.3 --kick_deg 45 --strong
+
+場面の進め方と測り方 (蹴り足の向き・当て方・止まる・軸足・振り・つながり など) は kick_metrics.py にまとめてあり、
+B-Human の配布方策を回す sim2sim_bhuman_reference.py と同じ。仕様は docs/bhuman_walk_kick_spec.md。
 
 ONNX の入出力 (歩行 policy.onnx と同じ形で、1 ステップの観測とアクションが増えただけ):
 
@@ -21,13 +28,13 @@ ONNX の入出力 (歩行 policy.onnx と同じ形で、1 ステップの観測�
 * 制御: 5 ms × 4 = 50 Hz。
 * 位相: 周波数 = 速度コマンドから決まる値 (|v| ≤ 1.0 で 1.8 Hz、1.8 m/s で 2.0 Hz) + clip(action[12], ±0.5)。
   左足 sin/cos, 右足 (+π) sin/cos。コマンドの大きさが 0.05 未満なら位相の観測は 0。
-* ボール: 半径 0.11 m、0.45 kg、PhysX の線形/回転ダンピング (0.75 / 0.5) は外力で再現する。
+* ボール: 既定は B-Human と同じ 半径 0.095 m・0.29 kg (``--ball_radius/--ball_mass``)。PhysX の線形/回転ダンピング
+  (0.75 / 0.5) は外力で再現する。
 * キック用の観測・歩行コマンドは学習環境 (mdp/kick_command.py, mdp/walk_command.py, mdp/rewards._walk_target)
   の式を 1 env 分 numpy に写したもの (ノイズなし)。ボール位置は両足裏の中点・yaw フレーム、
   ``--ball_delay`` ステップ前の位置 (学習: 1〜3 ステップの一様乱数)。
-
-各シナリオで「転倒したか」「蹴ったか (ボールが動き出した時刻)」「ボールの最高速度と目標初速」
-「ボールの進んだ向きと指令方向のずれ」を出す。
+* ``--kick_through_speed``: 歩行コマンドの「キック姿勢に入った後の最低前進速度」。Stage 2 以降は 0 (既定)。
+  Stage 1 (s1c) 〜 前回の s6b/s7 は 0.5 で学習したので、それらを回すときは 0.5 を渡す。
 """
 
 from __future__ import annotations
@@ -38,13 +45,15 @@ import math
 import os
 import sys
 from collections import deque
-from dataclasses import dataclass
 from pathlib import Path
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
 
 import mujoco
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import kick_metrics as km  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
 URDF = REPO / "assets_soccer/booster_robotics_robots/K1/K1_locomotion.urdf"
@@ -69,9 +78,6 @@ STEP_DIM = sum(TERM_DIMS)
 PH_LOW_SPEED, PH_HIGH_SPEED, PH_LOW_F, PH_HIGH_F = 1.0, 1.8, 1.8, 2.0
 CMD_THRESHOLD = 0.05
 GAIT_LIMIT = (-0.5, 0.5)
-# ボール (bhuman_walk_kick_env_cfg.py)
-BALL_R, BALL_M = 0.11, 0.45
-BALL_LIN_DAMP, BALL_ANG_DAMP = 0.75, 0.5
 # kick_command.BHumanKickCommandCfg (Stage 1 の値。--stage_cfg で上書き)
 KCFG = dict(
     ball_friction=0.3, kick_strong_range=20.0, kick_pose_x=(0.0, -0.35), kick_pose_y_off=0.06,
@@ -79,19 +85,9 @@ KCFG = dict(
 )
 # walk_command.BallWalkVelocityCommandCfg
 WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4,
-            kick_through_speed=0.5)
-SOLE_OFFSET = np.array([0.0, 0.0, -0.038])
-FEET_EDGES = np.array([[0.1185, 0.035, -0.038], [0.1185, -0.035, -0.038], [-0.0665, 0.035, -0.038], [-0.0665, -0.035, -0.038]])
+            kick_through_speed=0.0)
 BASE_INIT = np.array([0.0, 0.0, 0.6])
-
-
-def wrap(a):
-    return (a + math.pi) % (2 * math.pi) - math.pi
-
-
-def rot2(v, a):
-    c, s = math.cos(a), math.sin(a)
-    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+wrap, rot2 = km.wrap, km.rot2
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +155,8 @@ def export_onnx(ckpt: Path) -> Path:
 # --------------------------------------------------------------------------- #
 # MuJoCo model
 # --------------------------------------------------------------------------- #
-def build_model(friction: float, ball_friction: float = 1.0, ball_foot_friction: float | None = None) -> mujoco.MjModel:
+def build_model(friction: float, ball_friction: float, ball_foot_friction: float | None, ball_r: float,
+                ball_m: float) -> mujoco.MjModel:
     spec = mujoco.MjSpec.from_file(str(URDF))
     spec.compiler.discardvisual = False
     spec.compiler.fusestatic = False
@@ -168,33 +165,15 @@ def build_model(friction: float, ball_friction: float = 1.0, ball_foot_friction:
     spec.body("Trunk").add_freejoint()
     robot_geoms = []
     for i, g in enumerate(spec.geoms):
+        if g.contype == 0 and g.conaffinity == 0:
+            continue  # 見た目だけのメッシュ (URDF の visual) は当てない (2026-10-26 まではこれも当たっていた)
         # ロボット同士は当たらない (学習: enabled_self_collisions=False)、床とボールには当たる
         g.contype, g.conaffinity = 1, 0
         g.friction = [friction, 0.005, 0.0001]
         if not g.name:
             g.name = f"robot_geom_{i}"
         robot_geoms.append(g.name)
-    world = spec.worldbody
-    world.add_geom(name="floor", type=mujoco.mjtGeom.mjGEOM_PLANE, size=[0, 0, 0.05], contype=0, conaffinity=1,
-                   friction=[friction, 0.005, 0.0001], rgba=[0.35, 0.55, 0.35, 1])
-    world.add_light(pos=[0, 0, 4], dir=[0, 0, -1], diffuse=[0.8, 0.8, 0.8])
-    ball = world.add_body(name="ball", pos=[1.0, 0.0, BALL_R])
-    ball.add_freejoint()
-    ball.add_geom(name="ball", type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[BALL_R, 0, 0], mass=BALL_M, contype=1,
-                  conaffinity=1, condim=3, friction=[ball_friction, 0.005, 0.0001], rgba=[1.0, 0.45, 0.0, 1],
-                  priority=1)  # ボールの接触はボールの摩擦を使う (MuJoCo 既定は大きい方)
-    if ball_foot_friction is not None:
-        # 学習 (PhysX) では ボール-床 = ボール 1.0 × 床 1.0 (multiply)、ボール-足 = (ボール 1.0 + 足 0.3〜1.0) / 2 (average)
-        # で、足との摩擦は 0.65〜1.0。ボールとロボットの接触だけ明示の pair にして摩擦を別に決める。
-        bodies = {spec.geoms[i].parent.name for i in range(len(spec.geoms)) if spec.geoms[i].name in robot_geoms}
-        for b in bodies:
-            spec.add_exclude(bodyname1="ball", bodyname2=b)
-        for gname in robot_geoms:
-            spec.add_pair(geomname1="ball", geomname2=gname, condim=3,
-                          friction=[ball_foot_friction, ball_foot_friction, 0.005, 0.0001, 0.0001])
-    target = world.add_body(name="target_marker", mocap=True, pos=[0, 0, 0.002])
-    target.add_geom(type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[0.05, 0.002, 0], contype=0, conaffinity=0,
-                    rgba=[1.0, 0.0, 0.0, 0.8])
+    km.add_world(spec, robot_geoms, friction, ball_friction, ball_foot_friction, ball_r, ball_m)
     for i, name in enumerate(JOINTS):
         a = spec.add_actuator(name=name, target=name, trntype=mujoco.mjtTrn.mjTRN_JOINT)
         a.gaintype = mujoco.mjtGain.mjGAIN_FIXED
@@ -212,81 +191,65 @@ def build_model(friction: float, ball_friction: float = 1.0, ball_foot_friction:
     return model
 
 
-@dataclass
-class Scenario:
-    name: str
-    ball_xy: tuple[float, float]  # ロボット初期姿勢 (原点・+x 向き) からの位置 [m]
-    kick_deg: float  # キック方向 (ロボットの初期向き基準) [deg]
-    strong: bool
-    range_m: float = 3.0  # 距離指定キックの距離 [m] (strong のときは 20 m)
-
-
-DEFAULT_SCENARIOS = [
-    Scenario("front_strong", (1.0, 0.0), 0.0, True),
-    Scenario("front_normal_2m", (1.0, 0.0), 0.0, False, 2.0),
-    Scenario("front_normal_5m", (1.0, 0.0), 0.0, False, 5.0),
-    Scenario("left30_strong", (1.0, 0.3), 30.0, True),
-    Scenario("right30_strong", (1.0, -0.3), -30.0, True),
-    Scenario("left60_normal_4m", (0.8, 0.4), 60.0, False, 4.0),
-    Scenario("right90_strong", (1.2, 0.0), -90.0, True),
-    Scenario("left90_strong", (1.2, 0.0), 90.0, True),
-    Scenario("behind_strong", (-0.8, 0.3), 180.0, True),
-    Scenario("far_front_strong", (2.5, 0.5), 0.0, True),
-]
-
-
 class Sim:
     def __init__(self, onnx_path: Path, friction: float, delay: int, ball_delay: int, ball_friction: float = 1.0,
-                 ball_foot_friction: float | None = None):
+                 ball_foot_friction: float | None = None, ball_r: float = km.BALL_R_DEFAULT,
+                 ball_m: float = km.BALL_M_DEFAULT):
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = 1
         so.inter_op_num_threads = 1
         self.sess = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
-        self.m = build_model(friction, ball_friction, ball_foot_friction)
+        self.m = build_model(friction, ball_friction, ball_foot_friction, ball_r, ball_m)
         self.d = mujoco.MjData(self.m)
+        self.w = km.World(self.m)
         self.qadr = np.array([self.m.joint(n).qposadr[0] for n in JOINTS])
         self.dadr = np.array([self.m.joint(n).dofadr[0] for n in JOINTS])
         self.act = np.array([self.m.actuator(n).id for n in JOINTS])
-        self.trunk = self.m.body("Trunk").id
-        self.feet = [self.m.body("left_foot_link").id, self.m.body("right_foot_link").id]
-        self.ball = self.m.body("ball").id
-        self.ball_q = self.m.joint(self.m.body_jntadr[self.ball]).qposadr[0]
-        self.ball_v = self.m.joint(self.m.body_jntadr[self.ball]).dofadr[0]
-        self.target_mocap = self.m.body("target_marker").mocapid[0]
-        self.floor = self.m.geom("floor").id
-        self.trunk_geoms = {g for g in range(self.m.ngeom) if self.m.geom_bodyid[g] == self.trunk}
-        self.robot_geoms = {g for g in range(self.m.ngeom) if self.m.geom_bodyid[g] not in (0, self.ball)}
-        self.ball_geom = self.m.geom("ball").id
+        self.trunk = self.w.trunk
+        self.feet = self.w.feet
         self.delay = int(delay)
         self.ball_delay = int(ball_delay)
-        self.ball_inertia = self.m.body_inertia[self.ball].copy()
+        self.ball_r = ball_r
+        self.ctrl_dt = STEP_DT
+        self.cur = 0
 
     # ------------------------------------------------------------------ #
-    def reset(self, sc: Scenario):
+    def ball_w(self):
+        return self.d.xpos[self.w.balls[self.cur]].copy()
+
+    def ball_v(self):
+        v = self.w.ball_v[self.cur]
+        return self.d.qvel[v:v + 3]
+
+    def reset(self, sc: km.Scenario):
         m, d = self.m, self.d
         mujoco.mj_resetData(m, d)
         d.qpos[0:3] = BASE_INIT
         d.qpos[3:7] = [1, 0, 0, 0]
         d.qpos[self.qadr] = DEFAULT_Q
-        d.qpos[self.ball_q:self.ball_q + 3] = [sc.ball_xy[0], sc.ball_xy[1], BALL_R]
-        d.qpos[self.ball_q + 3:self.ball_q + 7] = [1, 0, 0, 0]
+        self.w.place_ball(d, 0, sc.ball_xy, self.ball_r)
+        self.w.place_ball(d, 1, km.PARK_XY[1], self.ball_r)
         mujoco.mj_forward(m, d)
         self.last_action = np.zeros(13)
         self.phase = 0.0
         self.target_buf = deque([DEFAULT_Q.copy()] * (self.delay + 1), maxlen=self.delay + 1)
-        bp = d.xpos[self.ball].copy()
+        gdir = wrap(self.yaw() + math.radians(sc.kick_deg))
+        range0 = KCFG["kick_strong_range"] if sc.strong else sc.range_m
+        self.set_task(0, gdir, sc.strong, range0)
+        self.expected_vel0 = math.sqrt(2.0 * KCFG["ball_friction"] * range0)
+        self.history = None
+
+    def set_task(self, idx: int, gdir: float, strong: bool, range_m: float):
+        """学習の _reset_ball_idx / _resample_kick_ball: 見るボールとキック指令を変える。"""
+        self.cur = idx
+        bp = self.ball_w()
         self.ball_buf = deque([bp.copy()] * 4, maxlen=4)
-        # 学習の _resample_kick_ball: 基準向き = 今の yaw、目標点 = ボール + range * (cos, sin)
         self.ref_yaw = self.yaw()
-        self.range0 = KCFG["kick_strong_range"] if sc.strong else sc.range_m
-        gdir = wrap(self.ref_yaw + math.radians(sc.kick_deg))
-        self.global_dir0 = gdir
-        self.target = bp[:2] + self.range0 * np.array([math.cos(gdir), math.sin(gdir)])
-        d.mocap_pos[self.target_mocap] = [bp[0] + 0.6 * math.cos(gdir), bp[1] + 0.6 * math.sin(gdir), 0.002]
-        self.strong = sc.strong
-        # キック姿勢の状態 (kick_command._update の 6, 8)
+        self.target = bp[:2] + min(range_m, KCFG["kick_strong_range"]) * np.array([math.cos(gdir), math.sin(gdir)])
+        self.d.mocap_pos[self.w.target_mocap] = [bp[0] + 0.6 * math.cos(gdir), bp[1] + 0.6 * math.sin(gdir), 0.002]
+        self.strong = strong
         self.ball_close_to_kick_pose = 1.0
         self.ball_pos = self.ball_rel(bp)
         dac = wrap(gdir - self.yaw())
@@ -295,17 +258,18 @@ class Sim:
         self.ball_kick_pose = bp[:2] + np.array([math.cos(gdir), math.sin(gdir)]) * KCFG["kick_pose_x"][1]
         self.update_kick_state()
         self.command = self.walk_command()
-        self.history = None
+
+    def kick_direction(self) -> float:
+        return self.gdir
 
     def yaw(self):
-        R = self.d.xmat[self.trunk].reshape(3, 3)
-        return math.atan2(R[1, 0], R[0, 0])
+        return km.body_yaw(self.d, self.trunk)
 
     def origin(self):
         pts = []
         for b in self.feet:
             R = self.d.xmat[b].reshape(3, 3)
-            pts.append(self.d.xpos[b] + R @ SOLE_OFFSET)
+            pts.append(self.d.xpos[b] + R @ km.SOLE_OFFSET)
         return np.mean(pts, axis=0)
 
     def ball_rel(self, ball_w):
@@ -317,24 +281,22 @@ class Sim:
     def update_kick_state(self):
         """kick_command._update の 3.3, 4, 6, 8 (観測と歩行コマンドに要る部分)。"""
         k = KCFG
-        d = self.d
         yaw = self.yaw()
-        ball_w = d.xpos[self.ball].copy()
+        ball_w = self.ball_w()
         delayed = self.ball_buf[len(self.ball_buf) - 1 - self.ball_delay]
         self.ball_pos = self.ball_rel(delayed)
-        bv = d.qvel[self.ball_v:self.ball_v + 3]
-        self.ball_vel = rot2(bv[:2], -yaw)
+        self.ball_vel = rot2(self.ball_v()[:2], -yaw)
         to_target = self.target - ball_w[:2]
-        self.global_direction = math.atan2(to_target[1], to_target[0])
+        self.gdir = math.atan2(to_target[1], to_target[0])
         self.range = min(float(np.linalg.norm(to_target)), k["kick_strong_range"])
-        self.dac = wrap(self.global_direction - yaw)
+        self.dac = wrap(self.gdir - yaw)
         # 6) キック方向に回したボール位置
         rot_ratio = np.clip((abs(self.dac) - k["ball_rotation_offset"]) / 0.4, 0.0, 1.0)
         bik = rot2(self.ball_pos, -self.dac)
         by = bik[1]
         dist = float(np.linalg.norm(self.ball_pos))
         # 8) キック姿勢
-        y_ratio = np.clip((abs(by) - k["ball_y_dis_ratio"][0] * k["kick_pose_y_off"]) / (k["ball_y_dis_ratio"][1] * BALL_R),
+        y_ratio = np.clip((abs(by) - k["ball_y_dis_ratio"][0] * k["kick_pose_y_off"]) / (k["ball_y_dis_ratio"][1] * self.ball_r),
                           0.0, 1.0)
         self.kick_pose_translation_ratio = float(np.clip((abs(math.atan2(by, bik[0])) - 0.3) / 1.2, 0.0, 1.0))
         dist_ratio = np.clip((dist - k["ball_distance_offset"]) / 0.4, 0.0, 1.0)
@@ -345,7 +307,7 @@ class Sim:
         self.filtered_ball_pos = (1.0 - lp) * self.filtered_ball_pos + lp * bik
         kp0, kp1 = k["kick_pose_x"]
         kp = kp0 + (kp1 - kp0) * max(self.ball_close_to_kick_pose, 0.0)
-        self.ball_kick_pose = ball_w[:2] + np.array([math.cos(self.global_direction), math.sin(self.global_direction)]) * kp
+        self.ball_kick_pose = ball_w[:2] + np.array([math.cos(self.gdir), math.sin(self.gdir)]) * kp
 
     def walk_target(self):
         """rewards._walk_target (ロボットの yaw フレーム、胴体原点基準)。"""
@@ -353,16 +315,16 @@ class Sim:
         d = self.d
         yaw = self.yaw()
         base = d.qpos[0:3].copy()
-        ball_w = d.xpos[self.ball].copy()
+        ball_w = self.ball_w()
         kpir = rot2(self.ball_kick_pose - base[:2], -yaw)
-        extra = max((self.kick_pose_translation_ratio - 0.5) / 0.5, 0.0) * (BALL_R + 0.1)
+        extra = max((self.kick_pose_translation_ratio - 0.5) / 0.5, 0.0) * (self.ball_r + 0.1)
         x_off = -math.sin(self.dac) * (k["kick_pose_y_off"] + extra)
         y_off = math.cos(self.dac) * (k["kick_pose_y_off"] + extra)
         if self.filtered_ball_pos[1] < 0:
             wt = kpir + np.array([x_off, y_off])
         else:
             wt = kpir - np.array([x_off, y_off])
-        gdir = self.global_direction
+        gdir = self.gdir
         bir = rot2(ball_w[:2] - base[:2], -gdir)
         ratio = 0.0 if self.ball_close_to_kick_pose < 1 else float(np.clip(-bir[0] / 0.3, 0.0, 1.0))
         bir = bir.copy()
@@ -422,163 +384,30 @@ class Sim:
         ]).astype(np.float32)
 
     # ------------------------------------------------------------------ #
-    def trunk_floor_contact(self):
-        for i in range(self.d.ncon):
-            c = self.d.contact[i]
-            if (c.geom1 == self.floor and c.geom2 in self.trunk_geoms) or (
-                c.geom2 == self.floor and c.geom1 in self.trunk_geoms
-            ):
-                return True
-        return False
-
-    def robot_ball_contact(self):
-        for i in range(self.d.ncon):
-            c = self.d.contact[i]
-            if (c.geom1 == self.ball_geom and c.geom2 in self.robot_geoms) or (
-                c.geom2 == self.ball_geom and c.geom1 in self.robot_geoms
-            ):
-                return True
-        return False
-
-    def ball_damping(self):
-        v = self.d.qvel[self.ball_v:self.ball_v + 6]
-        f = np.zeros(6)
-        f[:3] = -BALL_M * BALL_LIN_DAMP * v[:3]
-        R = self.d.xmat[self.ball].reshape(3, 3)
-        w_local = R.T @ v[3:6]  # free joint の角速度はボール座標系
-        f[3:] = R @ (-self.ball_inertia * BALL_ANG_DAMP * w_local)
-        self.d.xfrc_applied[self.ball] = f
-
-    # ------------------------------------------------------------------ #
-    def run(self, sc: Scenario, duration: float, after_kick: float = 1.5, video: Path | None = None, fps: int = 25):
-        self.reset(sc)
+    def step(self, hook=None):
+        """制御 1 周期 (観測 → 方策 → 物理 4 ステップ)。hook(物理ステップの終わりの時刻 [s, 周期の頭から]) を呼ぶ。"""
         m, d = self.m, self.d
-        renderer = None
-        frames = []
-        if video is not None:
-            renderer = mujoco.Renderer(m, height=480, width=640)
-            cam = mujoco.MjvCamera()
-            cam.distance, cam.elevation, cam.azimuth = 3.0, -25, 135
-        ball0 = d.xpos[self.ball].copy()
-        exp_vel = math.sqrt(2.0 * KCFG["ball_friction"] * self.range0)
-        rec = dict(fell=False, fell_t=None, reason="", touch_t=None, kick_t=None, kick_speed=0.0,
-                   kick_dir_err_deg=None, min_base_z=1.0, max_abs_freq_offset=0.0)
-        n_steps = int(round(duration / STEP_DT))
-        kick_window = []
-        ball_at_kick = None
-        end_step = n_steps
-        for step in range(n_steps):
-            f = self.frame()
-            if self.history is None:  # CircularBuffer と同じく、最初のフレームで全履歴を埋める
-                self.history = np.repeat(f[None], HISTORY, axis=0)
-            else:
-                self.history = np.concatenate((self.history[1:], f[None]), axis=0)
-            a = self.sess.run(None, {"command": self.command[None].astype(np.float32),
-                                     "obs_history": self.history[None]})[0][0].astype(np.float64)
-            self.last_action = a.copy()
-            rec["max_abs_freq_offset"] = max(rec["max_abs_freq_offset"], abs(float(np.clip(a[12], *GAIT_LIMIT))))
-            target_q = DEFAULT_Q + ACTION_SCALE * a[:12]
-            # 位相は「前ステップのコマンド + 今の周波数 action」で進む (学習: 報酬計算時に積分)
-            self.phase = math.fmod(self.phase + 2 * math.pi * self.phase_freq(self.command, a[12]) * STEP_DT,
-                                   2 * math.pi)
-            for _ in range(DECIMATION):
-                self.target_buf.append(target_q)
-                d.ctrl[self.act] = self.target_buf[0]
-                self.ball_damping()
-                mujoco.mj_step(m, d)
-                if rec["touch_t"] is None and self.robot_ball_contact():
-                    rec["touch_t"] = step * STEP_DT
-                    # 当たった瞬間の、ボールに近い方の足の足裏の一番低い点の高さ (学習の kick_strike_height と同じ)
-                    bw = d.xpos[self.ball]
-                    best = None
-                    for b in self.feet:
-                        R = d.xmat[b].reshape(3, 3)
-                        e = d.xpos[b] + FEET_EDGES @ R.T
-                        dist = np.min(np.linalg.norm(e[:, :2] - bw[:2], axis=1))
-                        if best is None or dist < best[0]:
-                            best = (dist, float(e[:, 2].min()))
-                    rec["strike_h"] = best[1]
-            self.ball_buf.append(d.xpos[self.ball].copy())
-            self.update_kick_state()
-            self.command = self.walk_command()
-            t = (step + 1) * STEP_DT
-            bv = d.qvel[self.ball_v:self.ball_v + 3]
-            speed = float(np.linalg.norm(bv[:2]))
-            rec["min_base_z"] = min(rec["min_base_z"], float(d.qpos[2]))
-            if rec["kick_t"] is None and speed > 0.3 and np.linalg.norm(d.xpos[self.ball][:2] - ball0[:2]) > 0.02:
-                rec["kick_t"] = t
-                ball_at_kick = d.xpos[self.ball][:2].copy()
-                end_step = min(n_steps, step + int(round(after_kick / STEP_DT)))
-            if rec["kick_t"] is not None and t - rec["kick_t"] <= 0.4:
-                kick_window.append((speed, math.atan2(bv[1], bv[0])))
-            # 蹴った瞬間の速さは足に押された一瞬の値で、すぐ転がりに変わって落ちる。
-            # 「転がっていく速さ」として 0.3 秒後の速さと、1 秒間に進んだ距離も記録する。
-            if rec["kick_t"] is not None and "speed_0p3" not in rec and t - rec["kick_t"] >= 0.3 - 1e-6:
-                rec["speed_0p3"] = speed
-            if rec["kick_t"] is not None and "disp_1s" not in rec and t - rec["kick_t"] >= 1.0 - 1e-6:
-                rec["disp_1s"] = float(np.linalg.norm(d.xpos[self.ball][:2] - ball_at_kick))
-            if renderer is not None and step % max(1, int(round(1.0 / fps / STEP_DT))) == 0:
-                cam.lookat[:] = [(d.qpos[0] + d.xpos[self.ball][0]) / 2, (d.qpos[1] + d.xpos[self.ball][1]) / 2, 0.3]
-                renderer.update_scene(d, cam)
-                frames.append(renderer.render().copy())
-            if d.qpos[2] < 0.30:
-                rec.update(fell=True, fell_t=t, reason=f"base height {d.qpos[2]:.2f} < 0.30")
-                break
-            if self.trunk_floor_contact():
-                rec.update(fell=True, fell_t=t, reason="trunk touched ground")
-                break
-            if step + 1 >= end_step:
-                break
-        if kick_window:
-            sp, ang = max(kick_window, key=lambda x: x[0])
-            rec["kick_speed"] = sp
-            rec["kick_dir_err_deg"] = math.degrees(wrap(ang - self.global_dir0))
-        ball1 = d.xpos[self.ball].copy()
-        ref = ball_at_kick if ball_at_kick is not None else ball0[:2]
-        disp = ball1[:2] - ref
-        rec["ball_disp_m"] = float(np.linalg.norm(ball1[:2] - ball0[:2]))
-        rec["ball_disp_dir_err_deg"] = (
-            math.degrees(wrap(math.atan2(disp[1], disp[0]) - self.global_dir0)) if np.linalg.norm(disp) > 0.05 else None
-        )
-        rec["expected_kick_speed"] = exp_vel
-        rec["robot_disp_m"] = float(np.linalg.norm(d.qpos[0:2] - BASE_INIT[:2]))
-        rec["sim_time_s"] = (step + 1) * STEP_DT
-        if frames:
-            import imageio
-
-            imageio.mimsave(str(video), frames, fps=fps, macro_block_size=1)
-        return rec
-
-
-def fmt(sc: Scenario, r: dict) -> str:
-    kick = "no kick" if r["kick_t"] is None else (
-        f"kick at {r['kick_t']:.2f}s, ball {r['kick_speed']:.2f} m/s (target {r['expected_kick_speed']:.2f}), "
-        f"dir err {r['kick_dir_err_deg']:+.0f} deg"
-    )
-    fell = f"FELL at {r['fell_t']:.2f}s ({r['reason']})" if r["fell"] else "no fall"
-    disp_err = "" if r["ball_disp_dir_err_deg"] is None else f", disp dir err {r['ball_disp_dir_err_deg']:+.0f} deg"
-    return (f"{sc.name:18s} | {fell:34s} | {kick} | ball moved {r['ball_disp_m']:.2f} m{disp_err} | "
-            f"freq off max {r['max_abs_freq_offset']:.2f} Hz, min base z {r['min_base_z']:.2f}")
-
-
-def summarize(scenarios, results) -> dict:
-    kicked = [r for r in results.values() if r["kick_t"] is not None and not r["fell"]]
-    strong = [r for s, r in zip(scenarios, results.values()) if s.strong and r["kick_t"] is not None]
-    normal = [r for s, r in zip(scenarios, results.values()) if not s.strong and r["kick_t"] is not None]
-    errs = [abs(r["ball_disp_dir_err_deg"]) for r in kicked if r["ball_disp_dir_err_deg"] is not None]
-    return {
-        "n": len(results),
-        "falls": sum(r["fell"] for r in results.values()),
-        "kicked": len(kicked),
-        "strong_speed_mean": float(np.mean([r["kick_speed"] for r in strong])) if strong else None,
-        "strong_speed_0p3_mean": float(np.mean([r.get("speed_0p3", 0.0) for r in strong])) if strong else None,
-        "strong_disp_1s_mean": float(np.mean([r.get("disp_1s", 0.0) for r in strong])) if strong else None,
-        "strong_strike_h_mean": float(np.mean([r.get("strike_h", 0.0) for r in strong])) if strong else None,
-        "normal_speed_abs_err_mean": float(np.mean([abs(r["kick_speed"] - r["expected_kick_speed"]) for r in normal]))
-        if normal else None,
-        "dir_err_abs_mean_deg": float(np.mean(errs)) if errs else None,
-        "dir_err_abs_max_deg": float(np.max(errs)) if errs else None,
-    }
+        f = self.frame()
+        if self.history is None:  # CircularBuffer と同じく、最初のフレームで全履歴を埋める
+            self.history = np.repeat(f[None], HISTORY, axis=0)
+        else:
+            self.history = np.concatenate((self.history[1:], f[None]), axis=0)
+        a = self.sess.run(None, {"command": self.command[None].astype(np.float32),
+                                 "obs_history": self.history[None]})[0][0].astype(np.float64)
+        self.last_action = a.copy()
+        target_q = DEFAULT_Q + ACTION_SCALE * a[:12]
+        # 位相は「前ステップのコマンド + 今の周波数 action」で進む (学習: 報酬計算時に積分)
+        self.phase = math.fmod(self.phase + 2 * math.pi * self.phase_freq(self.command, a[12]) * STEP_DT, 2 * math.pi)
+        for i in range(DECIMATION):
+            self.target_buf.append(target_q)
+            d.ctrl[self.act] = self.target_buf[0]
+            self.w.ball_damping(d)
+            mujoco.mj_step(m, d)
+            if hook is not None:
+                hook((i + 1) * SIM_DT)
+        self.ball_buf.append(self.ball_w())
+        self.update_kick_state()
+        self.command = self.walk_command()
 
 
 def main(argv=None) -> int:
@@ -587,23 +416,28 @@ def main(argv=None) -> int:
     src.add_argument("--checkpoint", type=Path, help="rsl_rl の model_*.pt (ONNX に書き出してから使う)")
     src.add_argument("--onnx", type=Path)
     ap.add_argument("--export_only", action="store_true")
-    ap.add_argument("--duration", type=float, default=15.0, help="1 シナリオの上限 [s]")
-    ap.add_argument("--after_kick", type=float, default=1.5, help="蹴ってからこの時間で打ち切る [s]")
+    ap.add_argument("--duration", type=float, default=15.0, help="蹴るまでの上限 [s]")
+    ap.add_argument("--post_kick", type=float, default=3.0, help="蹴ってからこの時間で打ち切る [s]")
+    ap.add_argument("--next_ball_delay", type=float, default=0.4, help="蹴ってからこの時間で次のボールを置く [s]")
     ap.add_argument("--friction", type=float, default=0.7)
     ap.add_argument("--ball_friction", type=float, default=1.0, help="ボールと床の摩擦 (学習: 1.0)")
     ap.add_argument("--ball_foot_friction", type=float, default=0.8,
                     help="ボールとロボットの摩擦 (学習: 0.65〜1.0)。負なら pair を作らずボールの摩擦を使う")
+    ap.add_argument("--ball_radius", type=float, default=km.BALL_R_DEFAULT)
+    ap.add_argument("--ball_mass", type=float, default=km.BALL_M_DEFAULT)
     ap.add_argument("--delay", type=int, default=4, help="PD 目標の遅れ [物理ステップ] (学習: 2〜7)")
     ap.add_argument("--ball_delay", type=int, default=1, help="観測するボール位置の遅れ [制御ステップ] (学習: 1〜3)")
-    ap.add_argument("--scenarios", type=str, default=None, help="カンマ区切りで既定シナリオを絞る")
+    ap.add_argument("--scenarios", type=str, default=None, help="カンマ区切りで場面を絞る")
     ap.add_argument("--random", type=int, default=0,
-                    help="既定シナリオの代わりに N 個のランダムなシナリオ (ボール 0.5〜2 m・全方向、キック方向 全方向、強/距離指定 半々)")
+                    help="既定の 10 場面の代わりに N 個のランダムな場面 (kick_metrics.random_scenarios)")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--stage_cfg", type=str, default=None,
                     help='KCFG の上書き (JSON)。例: \'{"ball_distance_offset": 0.7, "ball_rotation_offset": 0.2}\'')
-    ap.add_argument("--kick_through_speed", type=float, default=0.5, help="学習の walk_command と合わせる (s1/s1b は 0)")
+    ap.add_argument("--kick_through_speed", type=float, default=0.0,
+                    help="学習の walk_command と合わせる (Stage 2 以降 0、s1c〜前回の s6b/s7 は 0.5)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
+    km.add_scene_args(ap)
     a = ap.parse_args(argv)
 
     WCFG["kick_through_speed"] = a.kick_through_speed
@@ -613,36 +447,32 @@ def main(argv=None) -> int:
     print(f"[sim2sim] policy: {onnx_path}")
     if a.export_only:
         return 0
+    bff = None if a.ball_foot_friction < 0 else a.ball_foot_friction
+    if a.view or a.view_seconds > 0:
+        sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
+        km.run_viewer(sim, km.scene_from_args(a), a.next_ball_delay, a.view_seconds, a.speed)
+        return 0
     if a.video_dir is not None:
         os.environ.setdefault("MUJOCO_GL", "egl")
         a.video_dir.mkdir(parents=True, exist_ok=True)
-    scenarios = DEFAULT_SCENARIOS
-    if a.random > 0:
-        rng = np.random.default_rng(a.seed)
-        scenarios = []
-        for i in range(a.random):
-            dist, ang = rng.uniform(0.5, 2.0), rng.uniform(-math.pi, math.pi)
-            kick = rng.uniform(-180.0, 180.0)
-            strong = bool(rng.random() < 0.5)
-            rng_m = float(np.exp(rng.uniform(math.log(1.0), math.log(8.0))))
-            scenarios.append(Scenario(f"rand{i:02d}_{'S' if strong else 'N'}{kick:+04.0f}",
-                                      (dist * math.cos(ang), dist * math.sin(ang)), kick, strong, rng_m))
+    scenarios = km.random_scenarios(a.random, a.seed) if a.random > 0 else km.DEFAULT_SCENARIOS
     if a.scenarios:
         names = set(a.scenarios.split(","))
         scenarios = [s for s in scenarios if s.name in names]
-    bff = None if a.ball_foot_friction < 0 else a.ball_foot_friction
-    sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff)
+    sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
     results = {}
     for sc in scenarios:
         video = a.video_dir / f"{sc.name}.mp4" if a.video_dir else None
-        r = sim.run(sc, a.duration, a.after_kick, video)
+        r = km.run_scene(sim, sc, a.duration, a.next_ball_delay, a.post_kick, video)
         results[sc.name] = r
-        print(fmt(sc, r), flush=True)
-    summ = summarize(scenarios, results)
-    print("[summary]", json.dumps(summ), flush=True)
+        print(km.fmt(sc, r), flush=True)
+    summ = km.summarize(scenarios, results)
+    print("[summary]", json.dumps(summ, ensure_ascii=False, default=float), flush=True)
+    print(km.spec_table(summ), flush=True)
     if a.json:
         a.json.parent.mkdir(parents=True, exist_ok=True)
-        a.json.write_text(json.dumps({"policy": str(onnx_path), "summary": summ, "results": results}, indent=2))
+        a.json.write_text(json.dumps({"policy": str(onnx_path), "args": {k: str(v) for k, v in vars(a).items()},
+                                      "summary": summ, "results": results}, indent=2, ensure_ascii=False, default=float))
     return 0
 
 

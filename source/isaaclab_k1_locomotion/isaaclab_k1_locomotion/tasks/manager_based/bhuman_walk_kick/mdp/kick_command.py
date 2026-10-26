@@ -113,6 +113,7 @@ class BHumanKickCommand(CommandTerm):
         self.feet_ids = self.robot.find_bodies(list(cfg.foot_body_names), preserve_order=True)[0]
         self.trunk_id = self.robot.find_bodies(cfg.base_body_name)[0][0]
         self.joint_ids = self.robot.find_joints(list(cfg.joint_names), preserve_order=True)[0]
+        self.hip_yaw_ids = self.robot.find_joints(["Left_Hip_Yaw", "Right_Hip_Yaw"], preserve_order=True)[0]
 
         n, dev = self.num_envs, self.device
         f = dict(device=dev, dtype=torch.float)
@@ -140,6 +141,7 @@ class BHumanKickCommand(CommandTerm):
         self.root_vel_w = torch.zeros(n, 6, **f)
         self.last_root_vel_w = torch.zeros(n, 6, **f)
         self.dof_vel = torch.zeros(n, len(self.joint_ids), **f)
+        self.hip_yaw = torch.zeros(n, 2, **f)
         self.last_dof_vel = torch.zeros_like(self.dof_vel)
 
         self.feet_pos = torch.zeros(n, 2, 3, **f)
@@ -249,7 +251,34 @@ class BHumanKickCommand(CommandTerm):
             "kick_dir_err_deg": 0.0,       # 目標方向とボールの進んだ向きのずれ [deg]
             "kick_dir_ok_rate": 0.0,       # ずれ 15° 以内の割合
             "kick_strike_height": 0.0,     # 当てた瞬間の蹴り足の足裏の一番低い点の高さ [m]
+            # 仕様 (docs/bhuman_walk_kick_spec.md) の項目。値は当たる直前 (キック判定の 1 制御ステップ前) のもの。
+            "kick_foot_yaw_in_deg": 0.0,   # 蹴り足の向き - キック方向 (左足 +、右足 - を掛ける。+90 でインサイド)
+            "kick_yaw_ok_rate": 0.0,       # |足の向き - キック方向| が 90±25° の割合
+            "kick_inside_rate": 0.0,       # ボール中心が蹴り足の足首から見て内側 (±45° の扇) にある割合
+            "kick_stop_rate": 0.0,         # 当たる前 1.5 秒に胴体の水平速度が 0.6 m/s 以下まで下がった割合
+            "kick_plant_rate": 0.0,        # 当たった瞬間、蹴っていない足が 0.1 秒以上前から接地している割合
+            "kick_swing_rate": 0.0,        # 蹴り足が浮いていて水平速度 1.0 m/s 以上の割合
+            "kick_walkoff_rate": 0.0,      # 蹴って 3 秒以内に胴体の水平速度 (0.2 秒平均) が 0.3 m/s を超えた割合
+            "kick_trunk_yaw_in_deg": 0.0,  # 胴体の向き - キック方向 (蹴り足の側へ回っていれば +。B-Human は約 30°)
+            "kick_hip_yaw_out_deg": 0.0,   # 蹴り足の股関節 yaw (足先を外へ開く向きが +。B-Human は約 45°)
         }
+        # 仕様の項目を測るための記録 (報酬には使わない)
+        self.speed_hist = torch.zeros(n, int(round(1.5 / self.dt)), **f)  # 胴体の水平速度 (古い → 新しい)
+        self.contact_streak = torch.zeros(n, 2, **f)  # 足が続けて接地している制御ステップ数
+        self.km_foot_yaw_abs = torch.zeros(n, **f)
+        self.km_foot_yaw_in = torch.zeros(n, **f)
+        self.km_ball_x = torch.zeros(n, **f)
+        self.km_ball_yin = torch.zeros(n, **f)
+        self.km_stop_s = torch.zeros(n, **f)
+        self.km_min_speed = torch.zeros(n, **f)
+        self.km_plant = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.km_foot_air = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.km_foot_hvel = torch.zeros(n, **f)
+        self.km_trunk_yaw_in = torch.zeros(n, **f)
+        self.km_hip_yaw_out = torch.zeros(n, **f)
+        self.since_kick = torch.full((n,), -1, dtype=torch.long, device=dev)
+        self.walkoff_max = torch.zeros(n, **f)
+        self.eval_walkoff: list | None = None
         self.kick_total = 0.0  # 学習開始からのキック回数 (全 env)
         self.kick_stats_alpha = 0.002
         self.eval_log: list | None = None
@@ -305,6 +334,9 @@ class BHumanKickCommand(CommandTerm):
             self._apply_push(env_ids)
 
         # 直前の位置のまま (足は前エピソードの位置) なので、ボール相対位置の原点はルートで代用する
+        self.speed_hist[env_ids] = 9.0  # エピソード開始直後 (立っているだけ) を「減速」に数えない
+        self.contact_streak[env_ids] = 0.0
+        self.since_kick[env_ids] = -1
         self._reset_ball_root_states(env_ids)
         self._reset_ball_idx(env_ids, episode_reset=True)
         self.reset_ball[env_ids] = False
@@ -344,6 +376,7 @@ class BHumanKickCommand(CommandTerm):
         self.feet_pos[ids] = r.data.body_pos_w[ids][:, self.feet_ids]
         self.feet_quat[ids] = r.data.body_quat_w[ids][:, self.feet_ids]
         self.feet_vel[ids] = r.data.body_lin_vel_w[ids][:, self.feet_ids]
+        self.hip_yaw[ids] = r.data.joint_pos[ids][:, self.hip_yaw_ids]
 
     def _feet_edges(self) -> torch.Tensor:
         """両足裏の 4 隅のワールド位置 (N, 2, 4, 3)。"""
@@ -389,6 +422,14 @@ class BHumanKickCommand(CommandTerm):
         self.last_ball_vel_w[:] = self.ball_vel_w[:, :3]
         self.last_root_vel_w[:] = self.root_vel_w
         self.last_dof_vel[:] = self.dof_vel
+        # 仕様の測定用: 当たる直前 (前の制御ステップ) の足とボール
+        prev = dict(
+            yaw=self.feet_yaw.clone(), pos=self.feet_pos[..., :2].clone(),
+            hvel=torch.norm(self.feet_vel[..., :2], dim=-1), contact=self.feet_contact.clone(),
+            streak=self.contact_streak.clone(), ball=self.ball_pos_w[:, :2].clone(),
+            l_dis=self.l_dis.clone(), r_dis=self.r_dis.clone(), trunk_yaw=self.yaw.clone(),
+            hip_yaw=self.hip_yaw.clone(),
+        )
 
         # ---- 物理ステップ後の状態を読む ----
         self._refresh_robot_state()
@@ -477,6 +518,7 @@ class BHumanKickCommand(CommandTerm):
         self.direction_angle_current[:] = wrap_to_pi(
             self.direction_angle * math.pi - (yaw - self.robot_direction_ref)
         )
+        self._measure_contact(prev, global_direction)
 
         # 5) 情報の記録とボールの減速
         ball_distance = torch.norm(self.ball_pos[:, :2], dim=-1)
@@ -603,6 +645,65 @@ class BHumanKickCommand(CommandTerm):
         self._update_odometry()
         self._check_termination(min_distance)
         self.ball_kick_direction_reward[:] = self._ball_kick_direction()
+        self._update_history_and_walkoff()
+
+    # ------------------------------------------------------------------ #
+    # 仕様 (docs/bhuman_walk_kick_spec.md) の項目の測定。報酬には使わない (ログと評価スクリプト用)。
+    # ------------------------------------------------------------------ #
+    def _measure_contact(self, prev: dict, global_direction: torch.Tensor):
+        """キックを検出したステップで、当たる直前 (1 制御ステップ前) の蹴り足の向き・ボールの位置などを記録する。"""
+        ids = (self.ball_kicked_counter == 1).nonzero(as_tuple=False).flatten()
+        if len(ids) == 0:
+            return
+        left = prev["l_dis"][ids] <= prev["r_dis"][ids]
+        k = (~left).long()
+        fy = prev["yaw"][ids].gather(1, k[:, None]).squeeze(1)
+        rel = wrap_to_pi(fy - global_direction[ids])
+        self.km_foot_yaw_abs[ids] = torch.rad2deg(rel.abs())
+        self.km_foot_yaw_in[ids] = torch.rad2deg(rel) * torch.where(left, 1.0, -1.0)
+        fp = prev["pos"][ids].gather(1, k[:, None, None].expand(-1, 1, 2)).squeeze(1)
+        b = rotate_2d(prev["ball"][ids] - fp, -fy)
+        self.km_ball_x[ids] = b[:, 0]
+        self.km_ball_yin[ids] = torch.where(left, -b[:, 1], b[:, 1])
+        # 止まる: 当たる前 1.5 秒の胴体の水平速度で 0.3 m/s 以下が続いた一番長い区間
+        low = (self.speed_hist[ids] <= 0.3).float()
+        c = torch.cumsum(low, dim=1)
+        base = torch.cummax(torch.where(low > 0, torch.zeros_like(c), c), dim=1).values
+        self.km_stop_s[ids] = (c - base).max(dim=1).values * self.dt
+        self.km_min_speed[ids] = self.speed_hist[ids].min(dim=1).values
+        sup = 1 - k
+        # 軸足: 0.1 秒以上前から接地 (B-Human K1_kick_inner の MuJoCo 測定で 0.10〜0.18 秒、仕様の較正値)
+        self.km_plant[ids] = prev["streak"][ids].gather(1, sup[:, None]).squeeze(1) >= round(0.1 / self.dt)
+        self.km_foot_air[ids] = ~prev["contact"][ids].gather(1, k[:, None]).squeeze(1)
+        self.km_foot_hvel[ids] = prev["hvel"][ids].gather(1, k[:, None]).squeeze(1)
+        # 胴体の向き - キック方向、蹴り足の股関節 yaw (蹴り足が左なら +、右なら - を掛ける。足先を外へ開く向きが +)
+        sgn = torch.where(left, 1.0, -1.0)
+        self.km_trunk_yaw_in[ids] = torch.rad2deg(wrap_to_pi(prev["trunk_yaw"][ids] - global_direction[ids])) * sgn
+        self.km_hip_yaw_out[ids] = torch.rad2deg(prev["hip_yaw"][ids].gather(1, k[:, None]).squeeze(1)) * sgn
+        self.since_kick[ids] = 0
+        self.walkoff_max[ids] = 0.0
+
+    def _update_history_and_walkoff(self):
+        speed = torch.norm(self.root_vel_w[:, :2], dim=-1)
+        self.speed_hist[:] = self.speed_hist.roll(shifts=-1, dims=1)
+        self.speed_hist[:, -1] = speed
+        self.contact_streak[:] = torch.where(self.feet_contact, self.contact_streak + 1, torch.zeros_like(self.contact_streak))
+        active = self.since_kick >= 0
+        self.since_kick[active] += 1
+        n_avg = max(1, int(round(0.2 / self.dt)))
+        after_reset = active & (self.since_kick > self.cfg.time_after_kick)
+        self.walkoff_max[:] = torch.where(
+            after_reset, torch.maximum(self.walkoff_max, self.speed_hist[:, -n_avg:].mean(dim=1)), self.walkoff_max
+        )
+        done = active & (self.since_kick >= int(round(3.0 / self.dt)))
+        ids = done.nonzero(as_tuple=False).flatten()
+        if len(ids) > 0:
+            ok = (self.walkoff_max[ids] >= 0.3).float()
+            a = 1.0 - (1.0 - self.kick_stats_alpha) ** len(ids)
+            self.kick_stats["kick_walkoff_rate"] += a * (ok.mean().item() - self.kick_stats["kick_walkoff_rate"])
+            if self.eval_walkoff is not None:
+                self.eval_walkoff.append(self.walkoff_max[ids].cpu())
+            self.since_kick[ids] = -1
 
     # ------------------------------------------------------------------ #
     def _push_robots(self):
@@ -704,6 +805,14 @@ class BHumanKickCommand(CommandTerm):
             "kick_dir_err_deg": torch.rad2deg(err),
             "kick_dir_ok_rate": (err < math.radians(15.0)).float(),
             "kick_strike_height": self.kick_strike_height[ids],
+            "kick_foot_yaw_in_deg": self.km_foot_yaw_in[ids],
+            "kick_yaw_ok_rate": ((self.km_foot_yaw_abs[ids] - 90.0).abs() <= 25.0).float(),
+            "kick_inside_rate": (self.km_ball_yin[ids] > self.km_ball_x[ids].abs()).float(),
+            "kick_stop_rate": (self.km_min_speed[ids] <= 0.6).float(),
+            "kick_plant_rate": self.km_plant[ids].float(),
+            "kick_swing_rate": (self.km_foot_air[ids] & (self.km_foot_hvel[ids] >= 1.0)).float(),
+            "kick_trunk_yaw_in_deg": self.km_trunk_yaw_in[ids],
+            "kick_hip_yaw_out_deg": self.km_hip_yaw_out[ids],
         }
         if self.eval_log is not None:  # 評価スクリプト (eval_bhuman_walk_kick.py) 用の生データ
             self.eval_log.append({
@@ -716,6 +825,17 @@ class BHumanKickCommand(CommandTerm):
                 "hspeed_now": torch.norm(self.ball_vel_w[ids, :2], dim=-1).cpu(),
                 "strike_h": self.kick_strike_height[ids].cpu(),
                 "strike_vz": self.kick_strike_vz[ids].cpu(),
+                "foot_yaw_abs": self.km_foot_yaw_abs[ids].cpu(),
+                "foot_yaw_in": self.km_foot_yaw_in[ids].cpu(),
+                "ball_x_foot": self.km_ball_x[ids].cpu(),
+                "ball_yin_foot": self.km_ball_yin[ids].cpu(),
+                "stop_s": self.km_stop_s[ids].cpu(),
+                "min_speed": self.km_min_speed[ids].cpu(),
+                "plant": self.km_plant[ids].cpu(),
+                "foot_air": self.km_foot_air[ids].cpu(),
+                "foot_hvel": self.km_foot_hvel[ids].cpu(),
+                "trunk_yaw_in": self.km_trunk_yaw_in[ids].cpu(),
+                "hip_yaw_out": self.km_hip_yaw_out[ids].cpu(),
             })
         for key, v in vals.items():
             if v.numel() == 0:
