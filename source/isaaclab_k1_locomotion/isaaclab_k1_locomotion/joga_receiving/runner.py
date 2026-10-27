@@ -8,6 +8,7 @@ import torch
 import yaml
 from rsl_rl.algorithms import PPO
 from tensordict import TensorDict
+from torch.utils.tensorboard import SummaryWriter
 
 from ..direct_kick.config import VISION_REVISION, PERCEPTION_SCHEMA
 from .model import ReceivingActorCritic
@@ -72,15 +73,27 @@ class ReceivingRunner:
     def train(self, max_iterations):
         self.model.train()
         csv_path = self.log_dir / "learning.csv"
-        with csv_path.open("a", newline="") as stream:
+        with SummaryWriter(log_dir=str(self.log_dir / "tensorboard")) as summary, \
+                csv_path.open("a", newline="") as stream:
             writer = None
             while self.iteration < max_iterations:
                 self.env.unwrapped.set_curriculum_iteration(self.iteration)
+                reward_sum = torch.zeros((), device=self.device)
+                reward_term_sums = {}
                 with torch.inference_mode():
                     for _ in range(self.cfg["runner"]["steps_per_env"]):
                         actions = self.ppo.act(self.observations)
                         observations, rewards, terminated, truncated, extras = self.env.step(
                             actions.to(self.env.unwrapped.device))
+                        reward_sum += rewards.detach().to(self.device).sum()
+                        # The environment already includes weights and dt in
+                        # rew_terms; keep the actual signed reward contributions.
+                        for name, values in extras.get("rew_terms", {}).items():
+                            term_sum = values.detach().to(self.device).sum()
+                            if name in reward_term_sums:
+                                reward_term_sums[name] += term_sum
+                            else:
+                                reward_term_sums[name] = term_sum
                         self.observations = tensor_observations(observations, self.device)
                         self.ppo.process_env_step(self.observations, rewards.to(self.device),
                                                   (terminated | truncated).to(self.device),
@@ -89,15 +102,26 @@ class ReceivingRunner:
                 losses = self.ppo.update()
                 self.iteration += 1
                 self.total_steps += self.cfg["runner"]["steps_per_env"] * self.env.unwrapped.num_envs
+                episode_metrics = self.env.unwrapped.drain_episode_metrics()
                 metrics = {"iteration": self.iteration, "total_steps": self.total_steps,
                            "learning_rate": self.ppo.learning_rate, **losses,
-                           **self.env.unwrapped.drain_episode_metrics()}
+                           **episode_metrics}
                 if writer is None:
                     writer = csv.DictWriter(stream, fieldnames=list(metrics))
                     if stream.tell() == 0:
                         writer.writeheader()
                 writer.writerow(metrics)
                 stream.flush()
+                for name, value in metrics.items():
+                    # No completed episodes means no measured episode statistic.
+                    if value != "":
+                        group = "Episode" if name in episode_metrics else "Train"
+                        summary.add_scalar(f"{group}/{name}", value, self.iteration)
+                samples = self.cfg["runner"]["steps_per_env"] * self.env.unwrapped.num_envs
+                summary.add_scalar("Reward/mean_step_total", (reward_sum / samples).item(), self.iteration)
+                for name, value in reward_term_sums.items():
+                    summary.add_scalar(f"Reward/mean_step/{name}", (value / samples).item(), self.iteration)
+                summary.flush()
                 print(f"Receiving iteration {self.iteration}/{max_iterations}: "
                       f"return={metrics['mean_return']} success={metrics['success_rate']} "
                       f"completed={metrics['episodes']} lr={self.ppo.learning_rate:.3g}", flush=True)

@@ -6,7 +6,7 @@
 
 ## 学習・再開・再生
 
-既存リポジトリと同じIsaacLab 2.3.2 / Isaac Sim 5.1、Python環境、K1メッシュを使う。新しい依存パッケージの追加は不要。GPU搭載環境で、最初に2環境・1iterationを確認する。
+既存リポジトリと同じIsaacLab 2.3.2 / Isaac Sim 5.1、Python環境、K1メッシュを使う。学習指標の記録にTensorBoardを使う（パッケージ依存に宣言済み）。GPU搭載環境で、最初に2環境・1iterationを確認する。
 
 ```bash
 .venv/bin/python scripts/joga_receiving/train.py \
@@ -17,7 +17,7 @@
   --headless --device cuda:0 --num_envs 16384 --max_iterations 30000
 ```
 
-既定はTable Iの16,384環境・24steps/environment/iteration。`--num_envs` で実行環境に合わせられる。30,000iterationsは本実装の設定値で、原論文の総学習回数を示さない。最終カリキュラム開始の20,000iterations以降も学習するための値である。自動でW&Bへ送信せず、学習情報はターミナルとCSVに出力する。
+既定はTable Iの16,384環境・24steps/environment/iteration。`--num_envs` で実行環境に合わせられる。30,000iterationsは本実装の設定値で、原論文の総学習回数を示さない。最終カリキュラム開始の20,000iterations以降も学習するための値である。自動でW&Bへ送信せず、学習情報はターミナル・CSV・TensorBoardに出力する。
 
 ```bash
 # max_iterationsは通算iteration数。同じ設定で学習を再開する。
@@ -35,6 +35,19 @@
 checkpointには設定、モデル・観測正規化、Adam、iteration、総step数を保存する。再開ではAdamの学習率をPPOの適応学習率へ復元し、保存iterationのカリキュラムで環境をresetする。設定・モデル契約が異なるcheckpointや、既存DirectKickのcheckpointは読み込まない。シミュレータ内部状態・乱数生成器の途中状態を復元する機能はなく、同一の物理軌道からの再開ではない。
 
 `learning.csv` はiterationごとのPPO損失・学習率と、そのiterationで完了したエピソードの成功率・転倒率・timeout率・平均return・長さ・最終球速を記録する。完了例がなければrateは空欄。初期resetや途中の手動resetは成績に含めない。成功・転倒・timeoutは重複計数しない。再生結果はcheckpoint隣の `evaluation/metrics.json` へ保存する。
+
+TensorBoardは追加オプションなしで有効になり、各runの`tensorboard/`へ記録する。横軸は通算iteration。各iterationでflushし、終了時にwriterを閉じる。既存CSVの列やcheckpoint・学習条件は変更しない。
+
+- `Episode/mean_return`: そのiterationで終了したエピソード全体の累積報酬の平均。`Episode/success_rate`、`Episode/episodes`なども同じ終了エピソード集合を集計する。終了例がないときは空欄の指標を0に置き換えず、記録を省略する。
+- `Reward/mean_step_total`: そのiterationで収集した全環境・全stepの実報酬の平均。エピソード終了の有無によらず記録する。
+- `Reward/mean_step/<項目名>`: 同じ全環境・全stepで平均した各報酬・ペナルティの寄与。報酬重みと設定に応じたdtスケールを適用済みで、負符号も保持する。各項目の和は`Reward/mean_step_total`と浮動小数点誤差の範囲で一致する。エピソード平均報酬とは集計範囲・単位が異なる。
+- `Train/*`: PPO損失、学習率、総収集step数など。
+
+```bash
+.venv/bin/tensorboard --logdir logs/joga_receiving --host 127.0.0.1 --port 8080
+```
+
+SSHサーバーでは`./run_python.sh -m tensorboard.main`で起動できる。`-L 8080:localhost:8080`で転送している場合は、手元の`http://localhost:8080`で表示する。改修前から動作中の学習プロセスには新しい記録処理は反映されない。既存CSVからは平均エピソード報酬等を変換できるが、未記録のstep平均報酬・項目別内訳は復元できない。
 
 ## 論文から適用した仕様
 
@@ -125,6 +138,8 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest \
 
 CPUテストはPhysXシミュレーション・学習収束・実機受球の成功を保証しない。原論文の最大5.2m/s実演との同等性能も主張しない。
 
-2026-10-27の検証では、既存DirectKickの回帰を含め66 tests / 262 subtestsが成功した。2環境・1iterationのnative起動も試したが、実行環境に `libcuda.so.1` がなく、PhysX tensors/fabric pluginの初期化が失敗し、学習ループには到達していない。GPU搭載環境での起動・接触sensor・材質・物理学習の確認は未完了。
+2026-10-27の検証では、既存DirectKickの回帰を含め66 tests / 262 subtestsが成功した。ローカル環境は `libcuda.so.1` がなくnative起動できなかったが、移植先のRTX 5090（32GB）・Isaac Sim 5.1・IsaacLab 2.3.2で、2環境1iteration、および32環境20iterationsのGPU学習・エピソード終了/reset・保存・TorchScript書出しを確認した。
+
+GPU起動時に、URDFのinstance proxy上ではcollision設定が反映されないことが判明したため、既存のinstance解除処理後に宣言済み設定を再適用した。設定値は変更していない。native検証では環境0の全20collision shapesのcontact offsetが0.005m、32環境の球massが0.43kg、慣性がhollow-shell値であることを確認した。本学習の収束・16,384環境での長時間実行・実機性能は未検証。
 
 ADR: not required。ADR保存規約がないため、新しいADRを作成せず、この文書にユーザー選択と再現範囲・補完判断を記録する。

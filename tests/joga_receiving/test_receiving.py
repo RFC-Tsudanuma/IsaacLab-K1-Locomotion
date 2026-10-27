@@ -469,3 +469,58 @@ def test_ppo_learning_resume_optimizer_and_export(tmp_path):
     torch.save(changed, bad)
     with pytest.raises(ValueError, match="contract differs"):
         incompatible.load(bad)
+
+
+def test_tensorboard_records_reward_contributions_and_skips_empty_episode_metrics(tmp_path):
+    import csv
+
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
+    class LoggedEnv(ReusedEnv):
+        def step(self, actions):
+            observations, rewards, terminated, truncated, extras = super().step(actions)
+            # These contributions already include each reward weight and dt.
+            extras["rew_terms"] = {
+                "ball_in_zone": torch.tensor([.3, .5]),
+                "action_rate": torch.tensor([-.2, -.3]),
+            }
+            return observations, rewards, terminated, truncated, extras
+
+        def drain_episode_metrics(self):
+            if self.stage == 0:
+                return {"episodes": 0, "mean_return": "", "success_rate": ""}
+            return {"episodes": 4, "mean_return": .6, "success_rate": .25}
+
+    torch.manual_seed(61)
+    with contextlib.redirect_stdout(io.StringIO()):
+        runner = ReceivingRunner(LoggedEnv(), small_config(), tmp_path)
+        runner.train(2)
+
+    events = EventAccumulator(str(tmp_path / "tensorboard")).Reload()
+    total = events.Scalars("Reward/mean_step_total")
+    positive = events.Scalars("Reward/mean_step/ball_in_zone")
+    penalty = events.Scalars("Reward/mean_step/action_rate")
+    assert [event.step for event in total] == [1, 2]
+    assert [event.value for event in total] == pytest.approx([.15, .15])
+    assert [event.value for event in positive] == pytest.approx([.4, .4])
+    assert [event.value for event in penalty] == pytest.approx([-.25, -.25])
+    for overall, reward, cost in zip(total, positive, penalty):
+        assert reward.value + cost.value == pytest.approx(overall.value)
+
+    completed = events.Scalars("Episode/episodes")
+    assert [(event.step, event.value) for event in completed] == [(1, 0.), (2, 4.)]
+    assert [(event.step, event.value) for event in events.Scalars("Episode/mean_return")] == [
+        (2, pytest.approx(.6))]
+    assert [(event.step, event.value) for event in events.Scalars("Episode/success_rate")] == [(2, .25)]
+    assert [event.value for event in events.Scalars("Train/total_steps")] == [8., 16.]
+    assert [event.step for event in events.Scalars("Train/learning_rate")] == [1, 2]
+
+    with (tmp_path / "learning.csv").open(newline="") as stream:
+        reader = csv.DictReader(stream)
+        rows = list(reader)
+        assert reader.fieldnames[:3] == ["iteration", "total_steps", "learning_rate"]
+        assert reader.fieldnames[-3:] == ["episodes", "mean_return", "success_rate"]
+        assert not any("ball_in_zone" in name or "action_rate" in name for name in reader.fieldnames)
+    assert len(rows) == 2
+    assert rows[0]["mean_return"] == rows[0]["success_rate"] == ""
+    assert float(rows[1]["mean_return"]) == .6

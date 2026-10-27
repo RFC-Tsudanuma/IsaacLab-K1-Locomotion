@@ -138,6 +138,9 @@ class JogaReceiveEnv(DirectRLEnv):
                 UsdPhysics.CollisionAPI(prim).GetCollisionEnabledAttr().Set(False)
                 UsdGeom.Imageable(prim).MakeInvisible()
             sim_utils.make_uninstanceable(root + "/Robot")
+            # The URDF spawner cannot modify collision properties on instance
+            # proxies. Apply the configured values after making colliders local.
+            sim_utils.modify_collision_properties(root + "/Robot", self.cfg.robot.spawn.collision_props)
             base = UsdPhysics.MassAPI.Apply(self.sim.stage.GetPrimAtPath(root + "/Robot/Trunk"))
             center = base.GetCenterOfMassAttr().Get()
             if center is None or not all(np.isfinite(float(value)) for value in center):

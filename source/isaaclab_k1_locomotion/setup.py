@@ -22,6 +22,7 @@ INSTALL_REQUIRES = [
     "rsl-rl-lib==3.0.1",
     "PyYAML",
     "wandb",
+    "tensorboard",
 ]
 
 # Installation operation
