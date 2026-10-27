@@ -466,10 +466,14 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         )
 
         # ドリブル報酬。Stage 1→2 のフェードインに合わせて weight=0 で登録する。
+        # 2026-10-27: 速さの上限。進んだ距離のクランプを既定の ±0.05 m/step (2.5 m/s 相当) から ±0.02 m/step
+        # (1.0 m/s 相当、step_dt=0.02s) に下げ、1.0 m/s より速く運んでも得にならないようにする。model_49996 の
+        # 評価で、転倒の多い L 字・Z 字は転倒 1 秒前に 1.1〜1.2 m/s 出ており、旋回中の転倒率も 1.0 m/s から
+        # 上がり始めていたため。robot_progress_to_target も同じ値にする。
         self.rewards.ball_progress_to_target = RewTerm(
             func=ball_progress_to_target,
             weight=0.0,
-            params={"command_name": "dribble_target"},
+            params={"command_name": "dribble_target", "max_progress_per_step": 0.02},
         )
         # 2026-10-12: 動画で確認した「その場足踏み」局所解への対策。base_velocity 固定
         # (定数ゼロ) + gait_phase 常時オンの組み合わせにより、ロボットは並進せずとも
@@ -481,7 +485,7 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         self.rewards.robot_progress_to_target = RewTerm(
             func=robot_progress_to_target,
             weight=0.0,
-            params={"command_name": "dribble_target"},
+            params={"command_name": "dribble_target", "max_progress_per_step": 0.02},
         )
         # 2026-10-09: 「強く蹴り飛ばして追いかける」局所解対策。safe_radius を2.0→0.6mに
         # 大幅縮小し、ボールから離れすぎることを強く罰する (メッシのような細かいタッチで
