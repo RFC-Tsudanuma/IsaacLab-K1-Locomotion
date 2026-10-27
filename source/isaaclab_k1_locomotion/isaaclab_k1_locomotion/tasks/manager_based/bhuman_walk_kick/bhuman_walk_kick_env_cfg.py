@@ -297,8 +297,9 @@ class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
 @configclass
 class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
     """README 6): ボールの置き直し・速度付与の確率を最終値へ (最初は最終値の 10% を学習コマンドで上書きして回す)。
-    heavy_ball (0.00001 → 0.0001 の確率でボールを 100 倍重くする) は移植していない: env を作る時に 1 回だけ決まる
-    値なので、1024 env では重いボールの env が 0.01〜0.1 個にしかならず、入れても入れなくても同じため。"""
+    heavy_ball (README: 0.00001 → 0.0001 の確率でボールを 100 倍重くする) は、B-Human では env を作る時に env ごとに 1 回
+    決まるが、1024 env × 0.0001 では重い env が 0.1 個 (ほぼ 0 個) になるので、新しいボールを出すたびに同じ確率で引き直す
+    (kick_command.BHumanKickCommand._resample_heavy_ball)。重いボールで蹴る回数の割合は B-Human と同じ。"""
 
     def __post_init__(self):
         super().__post_init__()
@@ -310,6 +311,7 @@ class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
         k.kick_pose_increase_value = 0.2
         k.ball_distance_offset = 0.7
         k.ball_rotation_offset = 0.2
+        k.heavy_ball = 0.0001
         self.rewards.ball_kick_direction.weight = 5.0
         self.rewards.ball_walk_speed.weight = 0.75
         # K1_Ball.yaml ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」
@@ -323,6 +325,7 @@ def _play(cfg):
     cfg.observations.policy.enable_corruption = False
     cfg.commands.kick.obs_noise = False
     cfg.events.push_robot = None
+    cfg.commands.kick.heavy_ball = 0.0  # 評価ではボールを重くしない (MuJoCo の確認と同じ 0.29 kg だけ)
 
 
 @configclass

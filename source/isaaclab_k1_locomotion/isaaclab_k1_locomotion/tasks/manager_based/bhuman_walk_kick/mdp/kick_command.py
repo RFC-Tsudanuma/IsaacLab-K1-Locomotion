@@ -192,6 +192,16 @@ class BHumanKickCommand(CommandTerm):
         self.flag_is_strong_kick = torch.zeros(n, dtype=torch.bool, device=dev)
         self.flag_is_inaccurate_kick = torch.zeros(n, **f)
         self.flag_allow_deviation = torch.zeros(n, dtype=torch.bool, device=dev)
+        # B-Human heavy_ball (t1_ball.py 157〜192, 926, 1097, 1433): ボールを 100 倍重くした env。
+        # B-Human は env を作る時に env ごとに確率 heavy_ball で決め、学習中ずっと同じ。こちらは新しいボールを出すたび
+        # (_reset_ball_idx) に確率 heavy_ball で引き直す (重いボールで蹴る回数の割合は同じ)。
+        # 理由: こちらは段ごとに --resume で env を作り直すので「作る時に 1 回」でも移植できるが、1024 env × 0.0001 では
+        # 重い env が 0.1 個 (ほぼ 0 個) になり、入れても入れなくても同じになるため。
+        self.heavy_ball = torch.zeros(n, dtype=torch.bool, device=dev)
+        self._heavy_active = False  # 重いボールの env が 1 つでもあるか (無ければ物理の値に触らない)
+        self._ball_mass_normal = None  # 重くする前の質量・慣性 (CPU。最初に重くする時に読む = 起動時の質量 DR の後)
+        self._ball_inertia_normal = None
+        self.heavy_ball_total = 0  # 学習開始から重いボールを出した回数 (確認用)
 
         # ---- キック姿勢 ----
         self.origin_pos = torch.zeros(n, 3, **f)
@@ -321,6 +331,7 @@ class BHumanKickCommand(CommandTerm):
         extras["kicks"] = torch.mean(self.ball_reset_counter[env_ids]).item()
         extras.update(self.kick_stats)
         extras["kick_total"] = self.kick_total
+        extras["heavy_ball_total"] = float(self.heavy_ball_total)
 
         self._refresh_robot_state(env_ids)
         self.filtered_lin_vel[env_ids] = 0.0
@@ -475,7 +486,8 @@ class BHumanKickCommand(CommandTerm):
         ) | (ep_len > 50)
         ball_still_allow_kick = (self.ball_still_counter > 10) & (ball_acc > 0.01)
         ball_moved_kick = (ball_acc > 0.1) & self.allow_ball_kick
-        ball_kicked_mask = (ball_still_allow_kick | ball_moved_kick) & (min_distance < self.touch_dist)
+        # 重いボールは動かないので、触れたらキックとみなす (B-Human t1_ball.py 1097)
+        ball_kicked_mask = (ball_still_allow_kick | ball_moved_kick | self.heavy_ball) & (min_distance < self.touch_dist)
         self.ball_kicked_counter += ((self.ball_kicked_counter > 0) | ball_kicked_mask).float()
 
         # キックした瞬間の蹴り足 (ボールに近い方) の足裏の一番低い点の高さ (B-Human に無い。strike_height_range 参照)
@@ -772,7 +784,9 @@ class BHumanKickCommand(CommandTerm):
         self.terminate_counter += ((self.terminate_counter > 0) | (self.base_pos[:, 2] < cfg.terminate_height)).float()
         self.terminated |= self.terminate_counter > cfg.terminate_time / self.dt
 
-        self.reset_ball |= self.ball_kicked_counter >= cfg.time_after_kick
+        # 重いボールは蹴ってから片付けるまでを 3 倍にする (B-Human t1_ball.py 1433)
+        tak = torch.where(self.heavy_ball, 3.0 * cfg.time_after_kick, float(cfg.time_after_kick))
+        self.reset_ball |= self.ball_kicked_counter >= tak
 
         rbr = cfg.random_ball_reset
         thr = torch.full((n,), rbr[0], device=self.device)
@@ -908,10 +922,38 @@ class BHumanKickCommand(CommandTerm):
         self.flag_is_strong_kick[ids] = torch.rand(k, device=self.device) < self.cfg.strong_kick_prob
         self.flag_is_inaccurate_kick[ids] = (torch.rand(k, device=self.device) < 0.3).float()
         self.flag_allow_deviation[ids] = torch.rand(k, device=self.device) < 0.5
+        self.flag_allow_deviation[ids] |= self.heavy_ball[ids]  # B-Human t1_ball.py 926
         if self.cfg.disable_deviation_flag:
             self.flag_allow_deviation[ids] = False
         if self.cfg.disable_extra_deviation_flag:
             self.flag_is_inaccurate_kick[ids] = 0.0
+
+    def _resample_heavy_ball(self, ids: torch.Tensor):
+        """B-Human heavy_ball: 確率 cfg.heavy_ball でボールの質量・慣性を cfg.heavy_ball_mass_scale 倍にする。"""
+        p = self.cfg.heavy_ball
+        if p <= 0.0 and not self._heavy_active:
+            return
+        new = torch.rand(len(ids), device=self.device) < p
+        changed = ids[new != self.heavy_ball[ids]]
+        self.heavy_ball[ids] = new
+        if len(changed) == 0:
+            return
+        view = self.ball.root_physx_view
+        if self._ball_mass_normal is None:
+            # 最初の変更は必ず「普通 → 重い」なので、この時点ではどのボールも普通の質量
+            self._ball_mass_normal = view.get_masses().clone()
+            self._ball_inertia_normal = view.get_inertias().clone()
+        c = changed.cpu()
+        heavy_c = self.heavy_ball[changed].cpu()
+        self.heavy_ball_total += int(heavy_c.sum())
+        scale = torch.where(heavy_c, self.cfg.heavy_ball_mass_scale, 1.0).unsqueeze(-1)
+        masses = view.get_masses()
+        masses[c] = self._ball_mass_normal[c] * scale
+        view.set_masses(masses, c)
+        inertias = view.get_inertias()
+        inertias[c] = self._ball_inertia_normal[c] * scale
+        view.set_inertias(inertias, c)
+        self._heavy_active = bool(self.heavy_ball.any())
 
     def _sample_range(self, ids: torch.Tensor) -> torch.Tensor:
         lo, hi = self.cfg.kick_normal_range
@@ -921,6 +963,7 @@ class BHumanKickCommand(CommandTerm):
     def _reset_ball_idx(self, ids: torch.Tensor, episode_reset: bool):
         """B-Human ``_reset_ball_idx``: 新しいキック課題を出す。"""
         cfg = self.cfg
+        self._resample_heavy_ball(ids)
         self._resample_input_flags(ids)
         self.ball_close_to_kick_pose[ids] = 1.0
         self.ball_kicked_counter[ids] = 0.0
@@ -1168,6 +1211,9 @@ class BHumanKickCommandCfg(CommandTermCfg):
     disable_sole_yaw_direction_penalty: bool = False
     disable_deviation_flag: bool = True
     disable_extra_deviation_flag: bool = True
+    heavy_ball: float = 0.0
+    """B-Human heavy_ball (0 initial, 0.0001 final)。新しいボールを出すたびに、この確率でボールを重くする。"""
+    heavy_ball_mass_scale: float = 100.0
     strike_height_range: tuple[float, float] | None = None
     """(B-Human に無い) キックした瞬間の蹴り足の足裏の一番低い点の高さが lo 以下なら 1、hi 以上なら 0 を
     キック方向の報酬 (正のとき) に掛ける。None で無効。"""
