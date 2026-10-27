@@ -282,6 +282,12 @@ class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
         k.random_ball_distance_reset = 0.0005
         self.rewards.ball_sole_yaw.weight = 0.0
         self.rewards.ball_walk_speed.weight = 1.0
+        # K1_Ball.yaml の ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」。
+        # 距離指定キックで「必要な初速とボールの速さの差」に払う報酬 exp(-差² / sigma_scale) の幅。README の段には
+        # いつ下げるか書いていないので、仕上げの段に入るここ (Stage 6) で 0.5 にする (2026-10-27 から。2026-10-26 までは
+        # Stage 7 で 0.5)。Stage 5 の終わり (model_7699) で MuJoCo の「必要な初速との差」が平均 0.91 m/s
+        # (合格 0.8 以下、B-Human 完成品 0.37) で、差 0.9 m/s のときの報酬は 幅 1 で 0.44、幅 0.5 で 0.20 と差がはっきり付く。
+        self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
 
 
 @configclass
@@ -302,8 +308,7 @@ class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
         k.ball_rotation_offset = 0.2
         self.rewards.ball_kick_direction.weight = 5.0
         self.rewards.ball_walk_speed.weight = 0.75
-        # K1_Ball.yaml ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」
-        self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
+        # ball_kick_velocity の sigma_scale 0.5 (K1_Ball.yaml「0.5 for final training」) は Stage 6 から入っている。
 
 
 def _play(cfg):
