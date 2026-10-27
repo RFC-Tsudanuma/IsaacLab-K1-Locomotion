@@ -33,6 +33,7 @@ parser.add_argument(
 )
 parser.add_argument("--seed", type=int, default=1)
 parser.add_argument("--json_out", type=str, default=None)
+parser.add_argument("--raw_out", type=str, default=None, help="キック 1 回ごとの生データ (torch.save の dict) の保存先")
 parser.add_argument("--keep_noise", action="store_true", help="観測ノイズと押しを学習のまま残す")
 parser.add_argument("--ball_max_depen", type=float, default=None, help="ボールの max_depenetration_velocity を上書き")
 cli_args.add_rsl_rl_args(parser)
@@ -113,6 +114,8 @@ def main(env_cfg, agent_cfg):
            "mean_abs_cmd": (cmd_abs / args_cli.steps).tolist()}
     if rec:
         cat = {key: torch.cat([r[key] for r in rec]) for key in rec[0]}
+        if args_cli.raw_out:
+            torch.save(cat, args_cli.raw_out)
         sp, tsp, st, err = cat["speed"], cat["target_speed"], cat["strong"], cat["dir_err_deg"]
         out.update({
             "kicks": int(sp.numel()),

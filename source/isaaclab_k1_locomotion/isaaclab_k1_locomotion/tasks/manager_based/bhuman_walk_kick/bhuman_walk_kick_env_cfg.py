@@ -282,12 +282,14 @@ class K1BHumanWalkKickStage6EnvCfg(K1BHumanWalkKickStage5EnvCfg):
         k.random_ball_distance_reset = 0.0005
         self.rewards.ball_sole_yaw.weight = 0.0
         self.rewards.ball_walk_speed.weight = 1.0
-        # K1_Ball.yaml の ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」。
-        # 距離指定キックで「必要な初速とボールの速さの差」に払う報酬 exp(-差² / sigma_scale) の幅。README の段には
-        # いつ下げるか書いていないので、仕上げの段に入るここ (Stage 6) で 0.5 にする (2026-10-27 から。2026-10-26 までは
-        # Stage 7 で 0.5)。Stage 5 の終わり (model_7699) で MuJoCo の「必要な初速との差」が平均 0.91 m/s
-        # (合格 0.8 以下、B-Human 完成品 0.37) で、差 0.9 m/s のときの報酬は 幅 1 で 0.44、幅 0.5 で 0.20 と差がはっきり付く。
-        self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
+        # ball_kick_velocity の sigma_scale (K1_Ball.yaml の ball_velocity_range_sigma_scale「1 for training from scratch,
+        # 0.5 for final training」) は Stage 6 では 1 のまま、Stage 7 で 0.5 にする。
+        # 2026-10-27 に Stage 6 から 0.5 にして 500 iteration 回した (run *_s6、s5 model_7699 → 8200) が、距離指定キックは
+        # 良くならなかった (MuJoCo の必要な初速との差 0.91 → 0.85〜1.00 m/s、IsaacLab 0.79 (s5 7500) → 0.90)。
+        # 報酬 exp(-差²/幅) の「差が縮むと報酬が増える度合い」は、差 1.5 m/s で 幅 1: 0.32 / 幅 0.5: 0.07、差 1.2 m/s で
+        # 0.57 / 0.27、差 0.6 m/s で 0.84 / 1.17。いまの方策は近い距離 (必要な初速 0.5〜1.5 m/s) で 1.3〜1.7 m/s 強すぎ、
+        # 遠い距離では差 0.5 m/s 前後なので、幅 0.5 は「遠い距離の速さを合わせる力」を強め「近い距離で弱く蹴る力」を
+        # 1/2〜1/5 にしてしまう。B-Human の言う「仕上げ」(差が十分小さくなってから) まで 1 のままにする。
 
 
 @configclass
@@ -308,7 +310,9 @@ class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
         k.ball_rotation_offset = 0.2
         self.rewards.ball_kick_direction.weight = 5.0
         self.rewards.ball_walk_speed.weight = 0.75
-        # ball_kick_velocity の sigma_scale 0.5 (K1_Ball.yaml「0.5 for final training」) は Stage 6 から入っている。
+        # K1_Ball.yaml ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」
+        # (Stage 6 で先に 0.5 にした結果は Stage 6 の class のコメント参照)
+        self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
 
 
 def _play(cfg):
