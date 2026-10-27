@@ -11,6 +11,8 @@ parser.add_argument('--max_iterations', type=int, default=200000)
 parser.add_argument('--seed', type=int, default=42)
 parser.add_argument('--rl_device', default=None)
 parser.add_argument('--checkpoint', default=None, help='Resume a checkpoint made by this port.')
+parser.add_argument('--encoder_type', choices=('mlp', 'lstm'), default=None,
+                    help='Forecast encoder; new runs default to mlp. Use lstm for legacy checkpoints.')
 parser.add_argument('--log_dir', default=None)
 parser.add_argument('--no_wandb', action='store_true')
 parser.add_argument('--no_csv', action='store_true', help='Disable environment-0 reward/debug CSV.')
@@ -35,6 +37,8 @@ def main():
     env = gym.make('Isaac-K1-DirectKick-v0', cfg=cfg)
     try:
         task_cfg = env.unwrapped.task_cfg
+        if args.encoder_type is not None:
+            task_cfg['direct_kicking']['observation']['encoder_type'] = args.encoder_type
         task_cfg['runner']['use_wandb'] = not args.no_wandb
         task_cfg['basic'].update(seed=args.seed, max_iterations=args.max_iterations,
                                  sim_device=args.device, rl_device=args.rl_device or args.device,

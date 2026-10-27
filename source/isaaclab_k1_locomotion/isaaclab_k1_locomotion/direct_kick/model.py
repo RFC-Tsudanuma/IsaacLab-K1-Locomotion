@@ -1,5 +1,5 @@
 # Ported from rl_humanoid_htwk 3af2acc97f1081b4cbfd9556efd39408dea92cc6: utils/models/DirectKickingAC.py
-"""DirectKicking actor-critic with stateless future-horizon LSTM encoders."""
+"""DirectKicking actor-critic with stateless future-horizon encoders."""
 
 from typing import Dict, Sequence, Tuple
 
@@ -22,18 +22,24 @@ from .direct_kicking_symmetry import (
 class DirectKickingObservationEncoder(torch.nn.Module):
     """Encode only the forecast-horizon axis and keep policy time stateless."""
 
+    __constants__ = ["use_lstm"]
+
     def __init__(
         self,
         num_observations: int,
         horizon_count: int,
         hidden_size: int,
         num_layers: int,
+        encoder_type: str = "lstm",
+        mlp_hidden_size: int = 128,
     ) -> None:
         super().__init__()
         self.num_observations = int(num_observations)
         self.horizon_count = int(horizon_count)
         self.horizon_token_size = int(HORIZON_TOKEN_SIZE)
         self.hidden_size = int(hidden_size)
+        self.encoder_type = encoder_type
+        self.use_lstm = encoder_type == "lstm"
         self.encoded_output_size = int(
             NON_FORECAST_OBSERVATION_SIZE + self.hidden_size
         )
@@ -41,12 +47,21 @@ class DirectKickingObservationEncoder(torch.nn.Module):
         self.forecast_end = (
             self.forecast_start + self.horizon_count * HORIZON_TOKEN_SIZE
         )
-        self.lstm = torch.nn.LSTM(
-            input_size=HORIZON_TOKEN_SIZE,
-            hidden_size=self.hidden_size,
-            num_layers=int(num_layers),
-            batch_first=True,
-        )
+        if self.use_lstm:
+            self.lstm = torch.nn.LSTM(
+                input_size=HORIZON_TOKEN_SIZE,
+                hidden_size=self.hidden_size,
+                num_layers=int(num_layers),
+                batch_first=True,
+            )
+        elif self.encoder_type == "mlp":
+            self.mlp = torch.nn.Sequential(
+                torch.nn.Linear(self.horizon_count * HORIZON_TOKEN_SIZE, mlp_hidden_size),
+                torch.nn.ELU(),
+                torch.nn.Linear(mlp_hidden_size, self.hidden_size),
+            )
+        else:
+            raise ValueError("Unknown DirectKicking encoder type: {}".format(encoder_type))
 
     @property
     def output_size(self) -> int:
@@ -59,13 +74,17 @@ class DirectKickingObservationEncoder(torch.nn.Module):
             raise ValueError("DirectKicking observation size does not match the model")
 
         forecast = flat_observation[:, self.forecast_start : self.forecast_end]
-        forecast = forecast.reshape(
-            flat_observation.shape[0],
-            self.horizon_count,
-            self.horizon_token_size,
-        )
-        # Omitting h_0/c_0 intentionally creates fresh zero state on every call.
-        _, (hidden, _) = self.lstm(forecast)
+        if self.use_lstm:
+            forecast = forecast.reshape(
+                flat_observation.shape[0],
+                self.horizon_count,
+                self.horizon_token_size,
+            )
+            # Omitting h_0/c_0 creates fresh zero state on every call.
+            _, (hidden, _) = self.lstm(forecast)
+            encoded_forecast = hidden[-1]
+        else:
+            encoded_forecast = self.mlp(forecast)
         non_forecast = torch.cat(
             (
                 flat_observation[:, : self.forecast_start],
@@ -73,7 +92,7 @@ class DirectKickingObservationEncoder(torch.nn.Module):
             ),
             dim=-1,
         )
-        return torch.cat((non_forecast, hidden[-1]), dim=-1)
+        return torch.cat((non_forecast, encoded_forecast), dim=-1)
 
 
 class DirectKickingActor(torch.nn.Module):
@@ -84,6 +103,8 @@ class DirectKickingActor(torch.nn.Module):
         horizon_count: int,
         hidden_size: int,
         num_layers: int,
+        encoder_type: str = "lstm",
+        mlp_hidden_size: int = 128,
     ) -> None:
         super().__init__()
         self.encoder = DirectKickingObservationEncoder(
@@ -91,6 +112,8 @@ class DirectKickingActor(torch.nn.Module):
             horizon_count,
             hidden_size,
             num_layers,
+            encoder_type,
+            mlp_hidden_size,
         )
         self.network = torch.nn.Sequential(
             torch.nn.Linear(self.encoder.output_size, 256),
@@ -137,6 +160,8 @@ class DirectKickingCritic(torch.nn.Module):
         horizon_count: int,
         hidden_size: int,
         num_layers: int,
+        encoder_type: str = "lstm",
+        mlp_hidden_size: int = 128,
     ) -> None:
         super().__init__()
         self.num_privileged_observations = int(num_privileged_observations)
@@ -145,6 +170,8 @@ class DirectKickingCritic(torch.nn.Module):
             horizon_count,
             hidden_size,
             num_layers,
+            encoder_type,
+            mlp_hidden_size,
         )
         self.network = torch.nn.Sequential(
             torch.nn.Linear(
@@ -178,7 +205,7 @@ class DirectKickingCritic(torch.nn.Module):
 
 
 class DirectKickingActorCritic(torch.nn.Module):
-    """Actor-critic whose LSTMs run across forecast horizons, never rollout time."""
+    """Actor-critic encoding forecast horizons independently on every call."""
 
     observation_schema = "direct_kicking_horizon_lstm_state_covariance_v3"
     policy_output_schema = "joint_action_12_post_kick_phase_probability_v1"
@@ -195,6 +222,9 @@ class DirectKickingActorCritic(torch.nn.Module):
         nominal_strike_point_m=(0.185, 0.096),
         ambiguity_cost_gap_m=(0.02, 0.10),
         ball_position_observation_scale: float = 1.0,
+        encoder_type: str = "lstm",
+        mlp_hidden_size: int = 128,
+        mlp_output_size: int = 64,
     ) -> None:
         super().__init__()
         horizons = tuple(float(value) for value in prediction_horizons_s)
@@ -204,11 +234,15 @@ class DirectKickingActorCritic(torch.nn.Module):
             raise ValueError("prediction_horizons_s must be strictly increasing")
         if lstm_hidden_size <= 0 or lstm_num_layers <= 0:
             raise ValueError("LSTM hidden size and layer count must be positive")
+        if encoder_type not in ("lstm", "mlp"):
+            raise ValueError("Unknown DirectKicking encoder type: {}".format(encoder_type))
+        if encoder_type == "mlp" and (mlp_hidden_size <= 0 or mlp_output_size <= 0):
+            raise ValueError("MLP hidden and output sizes must be positive")
 
         expected_observations = expected_direct_kicking_observation_size(len(horizons))
         if int(num_obs) != expected_observations:
             raise ValueError(
-                "DirectKicking LSTM expected {} observations, got {}".format(
+                "DirectKicking encoder expected {} observations, got {}".format(
                     expected_observations,
                     num_obs,
                 )
@@ -222,6 +256,11 @@ class DirectKickingActorCritic(torch.nn.Module):
         self.prediction_horizons_s = horizons
         self.lstm_hidden_size = int(lstm_hidden_size)
         self.lstm_num_layers = int(lstm_num_layers)
+        self.encoder_type = encoder_type
+        self.mlp_hidden_size = int(mlp_hidden_size)
+        self.mlp_output_size = int(mlp_output_size)
+        if self.encoder_type == "mlp":
+            self.observation_schema = "direct_kicking_horizon_mlp_state_covariance_v1"
         self.mirror_consistency_enabled = bool(mirror_consistency_enabled)
         self.nominal_strike_point_m = tuple(
             float(value) for value in nominal_strike_point_m
@@ -249,19 +288,26 @@ class DirectKickingActorCritic(torch.nn.Module):
         if self.ball_position_observation_scale <= 0.0:
             raise ValueError("ball position observation scale must be positive")
 
+        encoder_output_size = (
+            self.lstm_hidden_size if self.encoder_type == "lstm" else self.mlp_output_size
+        )
         self.actor = DirectKickingActor(
             self.num_actions,
             self.num_observations,
             len(horizons),
-            self.lstm_hidden_size,
+            encoder_output_size,
             self.lstm_num_layers,
+            self.encoder_type,
+            self.mlp_hidden_size,
         )
         self.critic = DirectKickingCritic(
             self.num_privileged_observations,
             self.num_observations,
             len(horizons),
-            self.lstm_hidden_size,
+            encoder_output_size,
             self.lstm_num_layers,
+            self.encoder_type,
+            self.mlp_hidden_size,
         )
         self.logstd = torch.nn.parameter.Parameter(
             torch.full((1, self.num_actions), fill_value=-2.0),
@@ -285,6 +331,10 @@ class DirectKickingActorCritic(torch.nn.Module):
             prediction_horizons_s=observation_cfg["prediction_horizons_s"],
             lstm_hidden_size=int(observation_cfg.get("lstm_hidden_size", 64)),
             lstm_num_layers=int(observation_cfg.get("lstm_num_layers", 1)),
+            # Saved configurations predating encoder selection describe LSTMs.
+            encoder_type=observation_cfg.get("encoder_type", "lstm"),
+            mlp_hidden_size=int(observation_cfg.get("mlp_hidden_size", 128)),
+            mlp_output_size=int(observation_cfg.get("mlp_output_size", 64)),
             mirror_consistency_enabled=bool(mirror_cfg.get("enabled", True)),
             nominal_strike_point_m=mirror_cfg.get(
                 "nominal_strike_point_m",
@@ -300,7 +350,7 @@ class DirectKickingActorCritic(torch.nn.Module):
         )
 
     def checkpoint_metadata(self) -> Dict:
-        return {
+        metadata = {
             "model_class": self.__class__.__name__,
             "observation_schema": self.observation_schema,
             "num_actions": self.num_actions,
@@ -308,12 +358,23 @@ class DirectKickingActorCritic(torch.nn.Module):
             "num_privileged_observations": self.num_privileged_observations,
             "prediction_horizons_s": list(self.prediction_horizons_s),
             "horizon_token_size": HORIZON_TOKEN_SIZE,
-            "lstm_hidden_size": self.lstm_hidden_size,
-            "lstm_num_layers": self.lstm_num_layers,
             "policy_output_schema": self.policy_output_schema,
             "num_policy_outputs": self.num_actions + 1,
             "post_kick_phase_output_index": self.num_actions,
         }
+        if self.encoder_type == "lstm":
+            # Keep the legacy metadata contract exactly, including its keys.
+            metadata.update(
+                lstm_hidden_size=self.lstm_hidden_size,
+                lstm_num_layers=self.lstm_num_layers,
+            )
+        else:
+            metadata.update(
+                encoder_type=self.encoder_type,
+                mlp_hidden_size=self.mlp_hidden_size,
+                mlp_output_size=self.mlp_output_size,
+            )
+        return metadata
 
     def initialize_from_checkpoint(self, checkpoint: Dict) -> None:
         """Load a current checkpoint or migrate the pre-phase policy once."""

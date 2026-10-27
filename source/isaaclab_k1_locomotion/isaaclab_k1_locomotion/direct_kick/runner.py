@@ -163,7 +163,7 @@ class DirectKickRunner:
         print('\n'.join(lines) + '\n', flush=True)
 
     def export(self, path):
-        """Stateless future-horizon LSTM; output = 12 actions + phase probability."""
+        """Stateless forecast encoder; output = 12 actions + phase probability."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         actor = self.model.actor.cpu().eval()

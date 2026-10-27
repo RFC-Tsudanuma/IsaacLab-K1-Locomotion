@@ -5,6 +5,8 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--checkpoint', required=True)
+parser.add_argument('--encoder_type', choices=('mlp', 'lstm'), default=None,
+                    help='Forecast encoder; use lstm for legacy LSTM checkpoints.')
 parser.add_argument('--num_envs', type=int, default=1)
 parser.add_argument('--steps', type=int, default=2000)
 parser.add_argument('--seed', type=int, default=42)
@@ -30,6 +32,8 @@ def main():
     cfg.enable_csv_logging = False
     env = gym.make('Isaac-K1-DirectKick-v0', cfg=cfg)
     try:
+        if args.encoder_type is not None:
+            env.unwrapped.task_cfg['direct_kicking']['observation']['encoder_type'] = args.encoder_type
         runner = DirectKickRunner(env, env.unwrapped.task_cfg, Path(args.checkpoint).parent / 'evaluation', args.device)
         runner.load(args.checkpoint, resume=False)
         if args.export:

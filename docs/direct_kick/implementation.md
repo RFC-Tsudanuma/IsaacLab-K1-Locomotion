@@ -37,9 +37,29 @@
   --export logs/direct_kick/RUN/policy.pt
 ```
 
-checkpoint は500 iterationsごとと終了時に保存する。学習終了時には `policy.pt` も出力する。TorchScript Actor の入力は `[N,325]`、出力は **12 action + phase確率の13要素**。環境に渡すのは先頭12要素。phaseは関節指令ではない。LSTM の hidden state は呼出間で持ち越さない。
+checkpoint は500 iterationsごとと終了時に保存する。学習終了時には `policy.pt` も出力する。TorchScript Actor の入力は `[N,325]`、出力は **12 action + phase確率の13要素**。環境に渡すのは先頭12要素。phaseは関節指令ではない。予測エンコーダは呼出間で状態を持ち越さない。
 
 位置だけを符号化する旧132次元の移植checkpointと旧Gym checkpointは、観測形状・意味が異なるため再開には使えない。新しい入力契約で学習し直す。`port_metadata` でモデル契約と認識 revision を照合する。既存歩行タスクの checkpoint も対象外。
+
+## 予測エンコーダと旧LSTM互換
+
+2026-10-27の合意により、新規学習の既定をLSTMから2段の全結合MLPへ変更した。13時刻×21成分を時刻順に平坦化し、`Linear(273,128) → ELU → Linear(128,64)` で符号化する。固定長の予測列を要約する用途に合わせた変更で、ActorとCriticはそれぞれ独立したエンコーダを持つ。MLPは各43,328パラメータ。観測325次元、特権20次元、方策出力13次元、後段ネットワークの形状、認識・報酬・PPOは維持する。
+
+実効設定は `direct_kicking.observation` の `encoder_type: mlp`、`mlp_hidden_size: 128`、`mlp_output_size: 64`。MLPへの置換は学習済みLSTMの重み変換ではなく、MLP構成での学習を必要とする。
+
+従来のLSTMも選択可能に残す。`encoder_type` のない保存済み設定と、既存のモデルコンストラクタ呼出しは従来どおりLSTMを生成する。LSTMのstate_dictキーとmetadataは維持し、325次元の旧LSTM checkpointは次の指定で再開・再生できる。
+
+```bash
+.venv/bin/python scripts/direct_kick/train.py \
+  --headless --device cuda:0 --num_envs 8192 --no_wandb \
+  --encoder_type lstm --checkpoint logs/direct_kick/LSTM_RUN/model_500.pth
+
+.venv/bin/python scripts/direct_kick/play.py \
+  --device cuda:0 --encoder_type lstm \
+  --checkpoint logs/direct_kick/LSTM_RUN/model_500.pth
+```
+
+MLPとLSTMはmetadataで区別し、異なる構造のcheckpointは既存の厳密な照合で拒否する。optimizerの暗黙のリセットや部分的な重み読込は行わない。
 
 ## ターミナルの学習表示
 
@@ -76,7 +96,7 @@ checkpoint再開ではAdamを読み込んだ直後、その学習率をPPOの適
 |---|---|
 | VisionFilter | ローカル `futbol_main/main` の `32ece6ee0676b1008d5bc58c3533d45613440568` を固定。stationary / rolling / high_speed / bounce の4仮説、MAP選択、bounce再初期化、confirmed/tentative 2観測取得を移植 |
 | NIS・欠測・再捕捉 | 元 DirectKick の単一KFを使わず、VisionFilterの NIS 9.21、strict `>3 s` timeout、再捕捉処理を使用 |
-| LSTM入力 | 2026-09-25の明示要求により、13時刻それぞれの位置・速度と4×4共分散全成分を入力。Actorのボール速度をMLPへ直接渡す経路を廃止。Critic特権の真値速度は維持 |
+| 予測エンコーダ入力 | 2026-09-25の明示要求により、13時刻それぞれの位置・速度と4×4共分散全成分を入力。Actorのボール速度を後段MLPへ直接渡す経路を廃止。Critic特権の真値速度は維持。2026-10-27から既定エンコーダを2段MLPへ置換 |
 | ボール初期条件 | 静止10%、移動90%。移動時は0〜6 m/s・最頻値3 m/sの対称三角分布で、接近方向のみ（`incoming_probability=1.0`）。軌道の符号付き最接近距離は±0.75 mの一様分布 |
 | 生成距離 | 移動時は最接近時間Tを1.0〜1.4秒で一様抽選し、速度v・通過ずれbから `d=max(1.5, sqrt((v*T)^2+b^2))` mで決定。静止時は1.5〜3 mの一様分布 |
 | 視認距離 | 高速時の最大生成距離約8.43 mに対応し、視認上限を6 mから9 mに拡大 |
@@ -103,7 +123,7 @@ VisionFilter内部はfloat64のSI単位。実機のcm内部計算と同等にな
 - ego poseは現在の観測からhorizon分だけ予測する。snapshotの経過時間を二重加算しない。
 - Actorは13×21 token、measurement age / updated / valid、目標方向を受け取る。特権20次元には元と同じ真値・ノイズを用いる。
 
-PowerPointの6・7枚目にある各時刻の「Σ・v・x → LSTM」に合わせ、1 tokenを次の順序で入力する。
+PowerPointの6・7枚目にある各時刻の「Σ・v・x → LSTM」に合わせたtoken形式を維持し、1 tokenを次の順序で入力する。既定のMLPでは13 tokenをそのまま平坦化する。
 
 ```text
 [x, y, vx, vy, P00, P01, P02, P03, P10, ..., P33, horizon / 3.0]
@@ -114,18 +134,18 @@ PowerPointの6・7枚目にある各時刻の「Σ・v・x → LSTM」に合わ�
 | Actor入力 | 次元 | 経路 |
 |---|---:|---|
 | 従来の歩行観測 | 47 | MLPへ直接 |
-| 13時刻の位置・速度・全共分散・時刻 | 273 | 21入力のLSTM → 最終hidden 64 |
+| 13時刻の位置・速度・全共分散・時刻 | 273 | 既定はMLP 273→128→64。旧LSTMは21入力→最終hidden 64 |
 | measurement age / updated / valid | 3 | MLPへ直接 |
 | 目標方向 | 2 | MLPへ直接 |
 | 合計 | 325 | 符号化後のActor MLP入力は116 |
 
-Actorのボール位置・速度・共分散はすべてLSTM経由。Criticにも同じ形式の観測を専用LSTMで符号化して渡し、特権20次元を加える（MLP入力136）。特権のボール速度2成分は引き続き世界座標系のシミュレータ真値。LSTMは未来horizonを処理し、制御stepをまたいでhidden/cell stateを持ち越さない。
+Actorのボール位置・速度・共分散はすべて予測エンコーダ経由。Criticにも同じ形式の観測を専用エンコーダで符号化して渡し、特権20次元を加える（後段MLP入力136）。特権のボール速度2成分は引き続き世界座標系のシミュレータ真値。旧LSTMは未来horizonを処理し、制御stepをまたいでhidden/cell stateを持ち越さない。
 
 共分散の座標変換も速度の定義と揃える。Rをworld→local回転、Jを90度回転行列、ωを自機yaw rateとすると、p=R(p_ball−p_ego)、v=R v_ball−v_ego−ωJp。ball側のヤコビアンは `A=[[R,0],[-ωJR,R]]`。ego側は位置・yaw・並進速度・yaw rateのヤコビアンBを使い、`P_local=A P_ball Aᵀ+B P_ego Bᵀ` とする。
 
 自機誤差は元の独立XY軸・積分random walk近似を維持し、位置↔速度、yaw↔yaw rateの共分散を加えて全状態へ伝播する。従来の位置2×2共分散は変わらない。これは旋回軌道の厳密な誤差積分ではなく、yaw等の変換にも一次近似を使う。ball/ego誤差間は従来同様に独立と仮定する。
 
-LOST時の無効マスクとstatusは維持。無効tokenは推定分布ではなくプレースホルダーであり、状態4成分をゼロ、位置分散を従来の最大log-std表示に対応する値 `(0.01 exp(4))²`、追加した速度分散・相互共分散をゼロとする。ゼロ速度分散を高信頼な推定値と解釈せず、valid=0と合わせて扱う。元YAMLは出典資料として132次元のまま保存し、`load_config()`で実効観測数325を設定する。モデル契約は `direct_kicking_horizon_lstm_state_covariance_v3`。
+LOST時の無効マスクとstatusは維持。無効tokenは推定分布ではなくプレースホルダーであり、状態4成分をゼロ、位置分散を従来の最大log-std表示に対応する値 `(0.01 exp(4))²`、追加した速度分散・相互共分散をゼロとする。ゼロ速度分散を高信頼な推定値と解釈せず、valid=0と合わせて扱う。元YAMLは出典資料として132次元のまま保存し、`load_config()`で実効観測数325を設定する。MLPのモデル契約は `direct_kicking_horizon_mlp_state_covariance_v1`。旧LSTMの `direct_kicking_horizon_lstm_state_covariance_v3` も維持する。
 
 この処理はROS nodeの起動を必要としない。実機側のROS通信・policy切替への組込みはこのリポジトリの変更には含まない。
 
@@ -156,7 +176,7 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
 - 固定元Runnerの独立AST oracle：同じ新モデルの複製を両学習器へ渡し、full-batch／不均等chunkで損失、全重み、Adam、timeout、KL、学習率を比較。旧モデルと新モデルの数値同値を主張するテストではない。
 - 固定元VisionFilter C++から生成したoracle：stationary共分散、MAP／bounce、取得・欠測・再捕捉、3秒境界、複数環境を比較。rollingとhigh_speedは同じ運動モデルのため、状態・共分散が一致する数値的同率だけ選択ラベル差を許容。
 - tensor backend：Actor325／特権20、報酬・終端、phase、action delay、reset、実perception処理と13 horizonの共分散を確認。
-- 独立な有限差分ヤコビアンで4×4共分散変換を照合。全16成分の左右反射、13時刻の位置・速度・共分散の実入力とD P Dᵀ正規化、LSTM以外へのボール入力経路がないことを確認。
+- 独立な有限差分ヤコビアンで4×4共分散変換を照合。全16成分の左右反射、13時刻の位置・速度・共分散の実入力とD P Dᵀ正規化、予測エンコーダを迂回するボール入力経路がないことを確認。
 - ボールreset：128環境×2回、異なるロボット位置・yawで静止／接近方向、通過ずれ、最接近時間を確認。8192回の生成結果から静止約10%・三角分布の累積確率・通過ずれの分布を確認。0 / 0.1 / 1 / 3 / 6 m/sの境界例で距離下限・速度連動・最大距離・回転速度も検証。
 - fake環境でのrollout→PPO→checkpoint再開→13出力TorchScript保存・再loadを確認。適応学習率が変わったcheckpointから同一rolloutを2回更新し、中断なしの場合との全重み・Adam・学習率の一致を確認。
 - 完了エピソードの集計：生成条件の保持、カテゴリ境界、空欄と0%の区別、集計後も継続するエピソード、初期／手動reset除外、二重計上防止、キック後2秒終了時の成立数、CSV出力を確認。native backendの実resetメソッドを使い、Labがepisode lengthをクリアする前に集計されることも確認。
@@ -164,4 +184,6 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest -q tests/direct_kick
 
 これらはGPU物理のテストを代替しない。再現用C++driverと固定入力は `tests/direct_kick/fixtures/vision_filter`、元PPOのfixtureは `tests/direct_kick/reference` に保存している。
 
-ADR: not required。対象のADR保存規約は確認できず、今回合意した認識・物理の変更はこの文書に記録する。
+2026-10-27のエンコーダ変更後は、`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/python -m pytest tests/direct_kick -q` で52 tests / 262 subtestsが成功。MLPの入力経路と勾配、Actor/Critic双方の学習更新、保存・再開、両エンコーダのTorchScript書出し、構造不一致checkpointの拒否を確認した。自動読込されるROS用pytest pluginの依存不足を避けるため、上記コマンドでは外部pluginの自動読込を無効にしている。変更前に保存した325次元LSTM checkpointについても、旧保存設定と明示的なLSTM指定の双方で、方策出力・価値推定・Adam状態が変更前と完全一致することを別途確認した。GPU物理・学習性能はこの変更では未検証。
+
+ADR: not required。対象のADR保存規約は確認できず、合意した認識・物理・予測エンコーダの変更はこの文書に記録する。
