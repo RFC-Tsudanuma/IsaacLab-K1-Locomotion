@@ -199,6 +199,8 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
         self.rewards.ball_walk_speed = RewTerm(func=mdp.ball_walk_speed, weight=2.0)
         self.rewards.ball_walk_target_overshoot = RewTerm(func=mdp.ball_walk_target_overshoot, weight=-100.0)
         self.rewards.ball_sole_yaw = RewTerm(func=mdp.ball_sole_yaw, weight=0.0)
+        # B-Human に無い (mdp/rewards.py kick_foot_speed)。既定は 0 (使わない)。2026-10-27 の Stage 6 の試し (s6d) で学習コマンドから重みを入れる。
+        self.rewards.kick_foot_speed = RewTerm(func=mdp.kick_foot_speed, weight=0.0)
         self.rewards.gait_phase_factor = RewTerm(func=mdp.gait_phase_factor, weight=-0.1)
 
         # ---- terminations: 歩行の転倒判定 + B-Human のエピソード区切り ----

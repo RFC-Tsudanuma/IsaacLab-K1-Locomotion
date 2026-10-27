@@ -86,6 +86,28 @@ def ball_kick_velocity(env: ManagerBasedRLEnv, sigma_scale: float = 1.0, command
     return torch.where(d < 0, d * 0.1 * k.ball_velocity_norm_at_kick, reward * d)
 
 
+def kick_foot_speed(
+    env: ManagerBasedRLEnv, sigma_scale: float = 1.0, ball_per_foot: float = 0.83, command_name: str = "kick"
+) -> torch.Tensor:
+    """B-Human に無い (2026-10-27 から試す)。距離指定キックで、当たる直前の蹴り足の水平の速さを必要な初速に合わせる。
+
+    ball_kick_velocity (B-Human) と同じ形・同じ時間 (キックの検出から ball_kicked_clipped_counter ステップ) で払い、
+    ボールの速さの代わりに「蹴り足の速さ × ball_per_foot」を使う。ball_per_foot は IsaacLab で測った
+    距離指定キックのボールの速さ / 蹴り足の速さ (0.82〜0.86、s5 7500 と s6 8200 の 1124 / 1128 回)。
+    うちの方策は距離指定でも蹴り足を振りの一番速い所 (当たる時 2.6〜3.0 m/s) でボールに当て、近い距離 (1〜3 m) で
+    必要な初速より 1 m/s 前後強く蹴る。B-Human の完成品は当てる前に蹴り足を減速させる (MuJoCo、1 m で 2.7 → 2.1 m/s)。
+    ボールの速さは当たり方で ±0.2〜0.3 m/s ばらつくので、方策が直接決めている蹴り足の速さで同じ合わせ方をさせる。
+    向きの報酬 (d) が負のとき (外れたキック) と強キックでは 0。
+    """
+    k = _kick(env, command_name)
+    vel_diff = k.expected_vel() - k.km_foot_hvel * ball_per_foot
+    reward = torch.exp(-torch.square(vel_diff) / sigma_scale) * (
+        k.ball_kicked_counter > k.cfg.ball_kicked_start_counter
+    ).float()
+    d = k.ball_kick_direction_reward
+    return reward * d.clip(min=0.0) * (~k.flag_is_strong_kick).float()
+
+
 def ball_kick_velocity_strong(env: ManagerBasedRLEnv, command_name: str = "kick") -> torch.Tensor:
     k = _kick(env, command_name)
     d = k.ball_kick_direction_reward
