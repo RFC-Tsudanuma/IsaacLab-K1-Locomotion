@@ -62,6 +62,13 @@ from .history_actor_critic import HistoryActorCritic, RslRlHistoryActorCriticCfg
 
 # expert の並び順 = モード値 (0: walk, 1: turn)
 EXPERT_MODES: tuple[int, ...] = (MODE_WALK, MODE_TURN)
+
+TRANSITION_DECAY: float = 0.999
+"""``Gate/transition_steps`` の移動平均の減衰率 (毎 step)。"""
+
+TRANSITION_DONE: float = 0.1
+"""``Gate/transition_steps`` の判定しきい値: モード切替から ``|w - target| < この値`` に
+入るまでの step 数を遷移所要時間として記録する (50 Hz なので × 0.02 s が秒)。"""
 COMMAND_TERM_NAME = "velocity_commands"
 
 
@@ -369,6 +376,12 @@ class GatingPPO(PPO):
             self._prev_w = w.clone()
             self._prev_valid = torch.ones(n, dtype=torch.bool, device=self.device)
             self._since_switch = torch.full((n,), self.consistency_grace_steps, dtype=torch.long, device=self.device)
+            # 遷移所要時間の計測 (切替から |w - target| < TRANSITION_DONE まで何 step か)。
+            # これが「pivot 後に止まって待つ時間」の実体なので直接ログに出す。
+            self._transition_pending = torch.zeros(n, dtype=torch.bool, device=self.device)
+            self._transition_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+            self._transition_sum = torch.zeros((), device=self.device)
+            self._transition_cnt = torch.zeros((), device=self.device)
 
         zero = torch.zeros_like(w)
         # 平滑化は 2 乗差分: Σ|Δw| は単調な遷移なら所要時間に関係なく 1 (望遠鏡和) で
@@ -379,6 +392,20 @@ class GatingPPO(PPO):
         after_grace = self._since_switch >= self.consistency_grace_steps
         deviation = (w - target).abs()
         consistency_pen = torch.where(after_grace, deviation, zero)
+        # 切替直後 (_since_switch == 0) から計測を始め、目標に十分近づいた step 数を記録する
+        started = self._since_switch == 0
+        self._transition_pending |= started
+        self._transition_steps = torch.where(started, torch.zeros_like(self._transition_steps),
+                                             self._transition_steps + 1)
+        # 累積のままだと run 全体の平均になって改善が見えないので毎 step 減衰させる
+        # (0.999^1000 ≈ 0.37 なので実効窓は直近 ~1000 step)。
+        self._transition_sum *= TRANSITION_DECAY
+        self._transition_cnt *= TRANSITION_DECAY
+        reached = self._transition_pending & (deviation < TRANSITION_DONE)
+        if bool(reached.any()):
+            self._transition_sum += self._transition_steps[reached].sum().to(self._transition_sum.dtype)
+            self._transition_cnt += reached.sum().to(self._transition_cnt.dtype)
+            self._transition_pending &= ~reached
         rewards = rewards - self.gate_smooth_coef * smooth_pen - self.gate_consistency_coef * consistency_pen
 
         # 次 step 用の状態更新 (obs は step 後の観測)
@@ -388,6 +415,7 @@ class GatingPPO(PPO):
             mode_next != mode, torch.zeros_like(self._since_switch), self._since_switch + 1
         )
         self._since_switch[done_mask] = self.consistency_grace_steps
+        self._transition_pending &= ~done_mask
         self._prev_w = w.clone()
         self._prev_valid = ~done_mask
 
@@ -400,6 +428,9 @@ class GatingPPO(PPO):
         log["Gate/smooth_penalty"] = smooth_pen.mean()
         log["Gate/consistency_penalty"] = consistency_pen.mean()
         log["Gate/mismatch_frac"] = torch.where(after_grace, (deviation > 0.5).to(w.dtype), zero).mean()
+        if float(self._transition_cnt) > 0.0:
+            log["Gate/transition_steps"] = self._transition_sum / self._transition_cnt
+            log["Gate/transition_s"] = self._transition_sum / self._transition_cnt * 0.02
 
         super().process_env_step(obs, rewards, dones, extras)
 
