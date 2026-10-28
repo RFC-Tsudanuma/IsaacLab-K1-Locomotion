@@ -90,6 +90,7 @@ from .mdp.rewards import (
     push_ball_toward_target,
     robot_facing_ball,
     robot_progress_to_target,
+    robot_speed_over_limit,
     touch_ball,
 )
 from .mdp.terminations import ball_reached_target, ball_too_far, dribble_time_out
@@ -486,6 +487,15 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             func=robot_progress_to_target,
             weight=0.0,
             params={"command_name": "dribble_target", "max_progress_per_step": 0.02},
+        )
+        # 2026-10-28: 速さの上限の 2 段目。クランプだけでは成功時のピーク (0.5 秒平均) の p90 が Isaac 1.33 /
+        # MuJoCo 1.71 m/s 残り、MuJoCo の転倒は 1.28〜1.34 m/s に集中していた。ならした水平速度が 1.0 m/s を
+        # 超えた分の 2 乗を弱く罰する (1.3 m/s で 1 ステップ 0.27、1.0 m/s での robot_progress_to_target の
+        # 最大 3.0 の 1 割弱)。フェードインはしない (成熟済みの checkpoint から始めるため)。
+        self.rewards.robot_speed_over_limit = RewTerm(
+            func=robot_speed_over_limit,
+            weight=-3.0,
+            params={"limit": 1.0, "tau": 0.25},
         )
         # 2026-10-09: 「強く蹴り飛ばして追いかける」局所解対策。safe_radius を2.0→0.6mに
         # 大幅縮小し、ボールから離れすぎることを強く罰する (メッシのような細かいタッチで
@@ -1106,6 +1116,7 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         # ドリブル関連報酬・終了条件・カリキュラムを無効化する。
         self.rewards.ball_progress_to_target = None
         self.rewards.robot_progress_to_target = None
+        self.rewards.robot_speed_over_limit = None
         self.rewards.ball_control_radius_penalty = None
         self.rewards.approach_ball_progress = None
         self.rewards.touch_ball = None

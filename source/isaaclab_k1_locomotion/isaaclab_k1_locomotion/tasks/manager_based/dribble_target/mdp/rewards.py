@@ -1949,6 +1949,31 @@ def robot_progress_to_target(
     return _potential_progress(env, "_dribble_prev_robot_target_dist", dist, max_progress_per_step)
 
 
+def robot_speed_over_limit(
+    env: ManagerBasedRLEnv,
+    limit: float = 1.0,
+    tau: float = 0.25,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """ならした水平速度が ``limit`` [m/s] を超えた分の 2 乗 (weight を負にしてペナルティにする)。
+
+    2026-10-28: 速さの上限。progress 報酬のクランプ (±0.02 m/step) では平均は下がったがピークが残り、
+    MuJoCo では転倒 1.0〜0.5 秒前の速さが 1.28〜1.34 m/s に集中していた。歩行の 1 歩ごとの揺れで
+    罰しないよう、水平速度ベクトルを時定数 ``tau`` [s] の指数移動平均でならしてから大きさを見る
+    (評価の「0.5 秒平均の速さ」に近い量)。エピソードの最初のステップは今の速度で初期化する。
+    """
+    robot = env.scene[asset_cfg.name]
+    v = robot.data.root_lin_vel_w[:, :2]
+    ema = env.__dict__.get("_dribble_speed_ema")
+    if ema is None or ema.shape != v.shape:
+        ema = v.clone()
+    alpha = min(1.0, env.step_dt / tau)
+    fresh = (env.episode_length_buf < 2).unsqueeze(1)
+    ema = torch.where(fresh, v, ema + alpha * (v - ema))
+    env.__dict__["_dribble_speed_ema"] = ema
+    return torch.clamp(torch.norm(ema, dim=1) - limit, min=0.0) ** 2
+
+
 def ball_control_radius_penalty(
     env: ManagerBasedRLEnv,
     safe_radius: float = 1.0,
