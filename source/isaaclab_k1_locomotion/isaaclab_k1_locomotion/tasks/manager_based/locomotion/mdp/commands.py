@@ -756,6 +756,7 @@ class TransitionCommand(CommandTerm):
         self._turn_settled = torch.zeros(n, dtype=torch.bool, device=dev)
         self._turn_hold_left = torch.zeros(n, device=dev)
         self._turn_interrupt_at = torch.full((n,), float("inf"), device=dev)
+        self._yaw_assist_left = torch.zeros(n, device=dev)   # 早期打ち切り後の ωz 上乗せ残り時間 [s]
 
         # --- メトリクス (エピソード単位、reset で平均を取って 0 に戻す) ---
         # 内部生成器のメトリクスは逆モード中の値で汚れるので使わず、ここで
@@ -780,6 +781,7 @@ class TransitionCommand(CommandTerm):
         self._settle_sum = torch.zeros(n, device=dev)
         self._settle_cnt = torch.zeros(n, device=dev)
         self._num_switches = torch.zeros(n, device=dev)
+        self._yaw_assist_steps = torch.zeros(n, device=dev)
 
     def __str__(self) -> str:
         msg = "TransitionCommand:\n"
@@ -895,7 +897,12 @@ class TransitionCommand(CommandTerm):
         # 3) turn 区間: 到達検出 → 保持 → 復帰 / 割り込み / タイムアウト
         self._turn_elapsed = torch.where(turn, self._turn_elapsed + dt, self._turn_elapsed)
         in_target = self.turn.heading_error.abs() < float(self.turn.cfg.success_threshold)
-        newly_settled = turn & in_target & ~self._turn_settled
+        # 早期打ち切り (turn_early_exit_rad > 0): 残り角がそこまで詰まったら回り切るのを
+        # 待たずに walk へ。到達扱いにしてメトリクスにも載せる (settle_time = ここまでの時間)。
+        exit_rad = float(self.cfg.turn_early_exit_rad)
+        early_exit = (turn & (self.turn.heading_error.abs() <= exit_rad)) if exit_rad > 0.0 \
+            else torch.zeros_like(turn)
+        newly_settled = turn & (in_target | early_exit) & ~self._turn_settled
         if newly_settled.any():
             self._turn_settled |= newly_settled
             hold = torch.empty(int(newly_settled.sum().item()), device=self.device).uniform_(
@@ -907,7 +914,8 @@ class TransitionCommand(CommandTerm):
         holding = turn & self._turn_settled
         self._turn_hold_left = torch.where(holding, self._turn_hold_left - dt, self._turn_hold_left)
         to_walk = turn & (
-            (self._turn_settled & (self._turn_hold_left <= 0.0))
+            early_exit
+            | (self._turn_settled & (self._turn_hold_left <= 0.0))
             | (self._turn_elapsed >= self._turn_interrupt_at)
             | (self._turn_elapsed >= float(self.cfg.turn_max_duration))
         )
@@ -917,11 +925,19 @@ class TransitionCommand(CommandTerm):
             self._enter_turn(to_turn.nonzero(as_tuple=False).flatten(), count_switch=True)
         if to_walk.any():
             self._enter_walk(to_walk.nonzero(as_tuple=False).flatten(), count_switch=True)
+            # 早期打ち切りで戻った env だけ ωz 上乗せを armed にする
+            armed = to_walk & early_exit
+            if bool(armed.any()):
+                self._yaw_assist_left = torch.where(
+                    armed, torch.full_like(self._yaw_assist_left, float(self.cfg.yaw_assist_s)),
+                    self._yaw_assist_left)
 
         # 5) 内部生成器の毎 step 更新 (歩行: heading P 則 / standing ゼロ化、回転: Δψ 再計算)
         self.walk._update_command()
         self.turn._update_command()
         self._update_command()
+        if float(self.cfg.turn_early_exit_rad) > 0.0:
+            self._apply_yaw_assist(dt)
 
         # 6) 切替 env の履歴バッファのコマンド枠をゼロ埋め
         if self.cfg.zero_command_history_on_switch and self.switched.any():
@@ -953,6 +969,7 @@ class TransitionCommand(CommandTerm):
         self.metrics["turn_success_rate"] = self._settle_cnt / self._turn_issued.clamp(min=1.0)
         self.metrics["turn_frac"] = self._turn_steps / self._steps.clamp(min=1.0)
         self.metrics["num_switches"] = self._num_switches
+        self.metrics["yaw_assist_frac"] = self._yaw_assist_steps / self._steps.clamp(min=1.0)
 
     def _resample_command(self, env_ids: Sequence[int]):
         """エピソード開始時の初期化 (``reset`` → ``_resample`` 経由でのみ呼ばれる)。"""
@@ -971,12 +988,14 @@ class TransitionCommand(CommandTerm):
             self._settle_sum,
             self._settle_cnt,
             self._num_switches,
+            self._yaw_assist_steps,
         ):
             buf[ids] = 0.0
         # 内部生成器のエピソード初期化 (メトリクス零化 + コマンド再サンプル)。extras は捨てる。
         self.walk.reset(ids)
         self.turn.reset(ids)
         # 初期モード
+        self._yaw_assist_left[ids] = 0.0
         self._enter_walk(ids, count_switch=False, resample_walk=False)
         start_turn = torch.rand(ids.numel(), device=self.device) < float(self.cfg.initial_turn_prob)
         if start_turn.any():
@@ -1002,6 +1021,7 @@ class TransitionCommand(CommandTerm):
         self._turn_elapsed[ids] = 0.0
         self._turn_settled[ids] = False
         self._turn_hold_left[ids] = 0.0
+        self._yaw_assist_left[ids] = 0.0
         m = ids.numel()
         interrupt = torch.rand(m, device=self.device) < float(self.cfg.turn_interrupt_prob)
         t_int = torch.empty(m, device=self.device).uniform_(*self.cfg.turn_interrupt_time_range)
@@ -1025,6 +1045,31 @@ class TransitionCommand(CommandTerm):
             self.switched[ids] = True
             self.command_counter[ids] += 1
             self._num_switches[ids] += 1.0
+
+    def _apply_yaw_assist(self, dt: float):
+        """早期打ち切り後の walk 区間で、残り角を ωz として歩行コマンドに上乗せする。
+
+        デプロイ側 (rl_policy_isaaclab_node.cpp の yaw_assist_ticks_) と同じ式:
+        歩行コマンドの vx / vy はそのまま、``ωz = clamp(ωz + clamp(gain * 残り角, ±max), ±max)``。
+        残り角が ``success_threshold`` 以内に入るか ``yaw_assist_s`` を使い切ると終了する。
+        ``_command_b`` は毎 step ``_update_command`` が作り直すので、ここでの書き換えは
+        次 step に漏れない (歩行生成器の内部状態は触らない)。
+        """
+        err = self.turn.heading_error
+        done = err.abs() <= float(self.turn.cfg.success_threshold)
+        counting = self.is_walk & (self._yaw_assist_left > 0.0)
+        active = counting & ~done
+        self._yaw_assist_left = torch.where(
+            counting, (self._yaw_assist_left - dt).clamp(min=0.0), self._yaw_assist_left)
+        self._yaw_assist_left = torch.where(done, torch.zeros_like(self._yaw_assist_left),
+                                            self._yaw_assist_left)
+        self._yaw_assist_steps += active.float()
+        if not bool(active.any()):
+            return
+        limit = float(self.cfg.yaw_assist_max)
+        assist = (float(self.cfg.yaw_assist_gain) * err).clamp(-limit, limit)
+        self._command_b[:, 2] = torch.where(
+            active, (self._command_b[:, 2] + assist).clamp(-limit, limit), self._command_b[:, 2])
 
     def _zero_command_history(self, ids: torch.Tensor):
         """観測履歴バッファ内のコマンド枠 (全ステップ) を 0 にする。
@@ -1100,6 +1145,23 @@ class TransitionCommandCfg(CommandTermCfg):
 
     turn_max_duration: float = 4.0
     """turn 区間の上限 [s]。到達できなくてもこれを超えたら walk へ戻す。"""
+
+    turn_early_exit_rad: float = 0.0
+    """``> 0`` で「早期打ち切り」を有効にする。残り角がこの値まで詰まった時点で (回り切るのを
+    待たずに) walk へ戻し、残り角は歩行コマンドの ωz 上乗せ (下記) で詰めさせる。
+    デプロイ側 (rl_policy_isaaclab_node.cpp) の ``PIVOT_EARLY_EXIT_RAD`` と揃えること。
+    ゲート網 (turn→walk) の重みが振り切るまでの時間を「停止して待つ時間」ではなく
+    「回りながら歩き出す時間」にするための措置で、その状態分布をゲートに学習させる。"""
+
+    yaw_assist_gain: float = 4.0
+    """早期打ち切り後の ωz 上乗せのゲイン [1/s]。``ωz += clamp(gain * 残り角, ±yaw_assist_max)``。"""
+
+    yaw_assist_max: float = 3.0
+    """上乗せ後の ωz の絶対値上限 [rad/s]。学習の command range (±1.0) より大きいが、
+    実機で 3.0 rad/s まで追従できることを確認済み (2026-10-29)。"""
+
+    yaw_assist_s: float = 0.6
+    """上乗せを続ける上限時間 [s]。残り角が ``turn_cfg.success_threshold`` 以内に入れば即終了。"""
 
     zero_command_history_on_switch: bool = True
     """切替時に観測履歴バッファのコマンド枠を 0 にするか (デプロイ側の契約と一致させる)。"""

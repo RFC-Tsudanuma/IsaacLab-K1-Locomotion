@@ -2083,6 +2083,15 @@ class K1FlatGatingCfg(K1FlatTransitionCfg):
         cmd.initial_turn_prob = 0.5
         cmd.walk_duration_range = (1.5, 4.0)
         cmd.turn_hold_range = (0.2, 0.8)
+        # デプロイ側 (rl_policy_isaaclab_node.cpp, 2026-10-29) の「早期打ち切り + 歩行側の
+        # ヨー上乗せ」と同じ切替にする。残り 15 度で walk に倒し、残りは ωz = 4.0 * 残り角
+        # (±3.0 rad/s, 0.6 s) として歩行コマンドに乗せる。ゲートはこの状態分布
+        # (回りながら歩き出す) で遷移を学習することになる。C++ 側の定数を変えたら
+        # ここも合わせる。
+        cmd.turn_early_exit_rad = 15.0 * math.pi / 180.0
+        cmd.yaw_assist_gain = 4.0
+        cmd.yaw_assist_max = 3.0
+        cmd.yaw_assist_s = 0.6
 
 
 @configclass

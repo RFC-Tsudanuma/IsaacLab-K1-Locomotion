@@ -326,8 +326,8 @@ class GatingPPO(PPO):
         self,
         policy: GatingActorCritic,
         gate_smooth_coef: float = 5.0,
-        gate_consistency_coef: float = 2.0,
-        consistency_grace_steps: int = 25,
+        gate_consistency_coef: float = 5.0,
+        consistency_grace_steps: int = 15,
         mode_obs_group: str = "expert_mode",
         **kwargs,
     ):
@@ -457,12 +457,19 @@ class RslRlGatingPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     """``-coef * (w_t - w_{t-1})^2`` (ゲート重みの時間平滑化)。ハード切替 1 回 ≈ 0.9*coef、
     5 step のクロスフェード ≈ 0.2*coef。"""
 
-    gate_consistency_coef: float = 2.0
-    """``-coef * |w_t - target|`` (猶予後のモード整合)。無いとゲートは切替を無限に先延ばしにできる。"""
+    gate_consistency_coef: float = 5.0
+    """``-coef * |w_t - target|`` (猶予後のモード整合)。無いとゲートは切替を無限に先延ばしにできる。
+    2026-10-29: 2.0 → 5.0。猶予を 0.5 s → 0.3 s に詰めるのに合わせ、猶予後の居残りを高くつく
+    ようにした (平滑化 -5(Δw)^2 は N step のクロスフェードで 5/N しかかからないので、
+    整合側を強くしないとゲートは遅い遷移に留まる)。"""
 
-    consistency_grace_steps: int = 25
-    """モード切替からこの step 数 (0.02 s 刻み、既定 0.5 s) はモード整合ペナルティを免除する
-    (= クロスフェードに使える時間)。"""
+    consistency_grace_steps: int = 15
+    """モード切替からこの step 数 (0.02 s 刻み、既定 15 = 0.3 s) はモード整合ペナルティを
+    免除する (= クロスフェードに使える時間)。
+    2026-10-29: 25 (0.5 s) → 15 (0.3 s)。gate_v1 は turn→walk の振り切りに 0.3 s 使っており、
+    その間ロボットが止まって待つのが MuJoCo で問題になった (デプロイ側の早期打ち切りで
+    歩きながら回るようにした上で、遷移自体も速くする)。0.1 s は急すぎて転倒が怖いという
+    判断で 0.3 s。"""
 
     mode_obs_group: str = "expert_mode"
 
