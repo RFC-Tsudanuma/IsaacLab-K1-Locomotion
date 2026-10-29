@@ -64,6 +64,7 @@ from .mdp.commands import WaypointPose2dCommandCfg
 from .mdp.events import (
     apply_ball_damping,
     randomize_ball_damping,
+    randomize_joint_velocity_limits,
     randomize_observation_delays,
     replan_dribble_path,
     track_ball_front_ratio,
@@ -90,7 +91,6 @@ from .mdp.rewards import (
     push_ball_toward_target,
     robot_facing_ball,
     robot_progress_to_target,
-    robot_speed_over_limit,
     touch_ball,
 )
 from .mdp.terminations import ball_reached_target, ball_too_far, dribble_time_out
@@ -456,6 +456,16 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             params={"ball_delay_range_s": (0.0, 0.15), "localization_delay_range_s": (0.0, 0.25)},
         )
 
+        # 2026-10-29: PhysX の関節速度の上限 (URDF の velocity: 股ピッチ 7.1、膝 12.5 rad/s) をエピソードごとに
+        # 引き直す (mdp/events.py)。MuJoCo には上限がなく、model_59994 の転倒した試行では股ピッチが 7.1 rad/s を
+        # 大きく超えていた (最大の中央値 11〜12 rad/s)。上限が高い環境で速く振りすぎると転ぶことを経験させ、
+        # 上限 7.1 の環境でも動けることも保つ。他の関節は URDF の値のまま。
+        self.events.randomize_joint_velocity_limits = EventTerm(
+            func=randomize_joint_velocity_limits,
+            mode="reset",
+            params={"limit_ranges": {".*_Hip_Pitch": (7.1, 15.0), ".*_Knee_Pitch": (12.5, 19.0)}},
+        )
+
         # 2026-10-22: エピソードの途中の経路の引き直し。実機の戦略は毎周期経路を計画し直すので、ウェイポイントが
         # 途中で動くことがある。env ごとに 2〜5 秒間隔で、確率 0.3 で未通過の途中のウェイポイントを横に 0.2〜0.8m ずらす
         # (最終目標は動かさない。mdp/commands.py の WaypointPose2dCommand.replan)。
@@ -488,15 +498,8 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
             weight=0.0,
             params={"command_name": "dribble_target", "max_progress_per_step": 0.02},
         )
-        # 2026-10-28: 速さの上限の 2 段目。クランプだけでは成功時のピーク (0.5 秒平均) の p90 が Isaac 1.33 /
-        # MuJoCo 1.71 m/s 残り、MuJoCo の転倒は 1.28〜1.34 m/s に集中していた。ならした水平速度が 1.0 m/s を
-        # 超えた分の 2 乗を弱く罰する (1.3 m/s で 1 ステップ 0.27、1.0 m/s での robot_progress_to_target の
-        # 最大 3.0 の 1 割弱)。フェードインはしない (成熟済みの checkpoint から始めるため)。
-        self.rewards.robot_speed_over_limit = RewTerm(
-            func=robot_speed_over_limit,
-            weight=-3.0,
-            params={"limit": 1.0, "tau": 0.25},
-        )
+        # 2026-10-28: 速さの上限の 2 段目として robot_speed_over_limit (1.0 m/s を超えた分の 2 乗、weight -3) を
+        # 足したが (model_59994)、Isaac ではほぼ効かず、MuJoCo では time_out が 0.07 → 0.40 に増えたので 2026-10-29 に外した。
         # 2026-10-09: 「強く蹴り飛ばして追いかける」局所解対策。safe_radius を2.0→0.6mに
         # 大幅縮小し、ボールから離れすぎることを強く罰する (メッシのような細かいタッチで
         # 足元に置き続けるドリブルを促す狙い)。
@@ -1045,6 +1048,7 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         self.events.randomize_ball_damping = None
         self.events.apply_ball_damping = None
         self.events.randomize_observation_delays = None
+        self.events.randomize_joint_velocity_limits = None
         self.events.track_ball_front_ratio = None
         self.curriculum.ball_front_ratio = None
         # ボールが存在しないので目標座標コマンドも不要 (計算コスト削減)。
@@ -1116,7 +1120,6 @@ class K1DribbleTargetWalkPhaseEnvCfg(K1DribbleTargetEnvCfg):
         # ドリブル関連報酬・終了条件・カリキュラムを無効化する。
         self.rewards.ball_progress_to_target = None
         self.rewards.robot_progress_to_target = None
-        self.rewards.robot_speed_over_limit = None
         self.rewards.ball_control_radius_penalty = None
         self.rewards.approach_ball_progress = None
         self.rewards.touch_ball = None

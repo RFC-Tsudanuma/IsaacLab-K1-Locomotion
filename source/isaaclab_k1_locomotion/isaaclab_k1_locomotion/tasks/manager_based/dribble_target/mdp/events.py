@@ -420,3 +420,31 @@ def randomize_observation_delays(
     n = len(env_ids)
     env._obs_delay_s[env_ids, 0] = torch.empty(n, device=env.device).uniform_(*ball_delay_range_s)
     env._obs_delay_s[env_ids, 1] = torch.empty(n, device=env.device).uniform_(*localization_delay_range_s)
+
+
+# ---------------------------------------------------------------------------
+# 関節速度の上限のランダム化 (2026-10-29)
+# ---------------------------------------------------------------------------
+# PhysX の関節速度の上限は URDF の velocity (股ピッチ 7.1、膝 12.5 rad/s) がそのまま入っており、学習中は
+# これで頭打ちになっていた。MuJoCo には関節速度の上限がなく、転倒した試行では股ピッチが 7.1 rad/s を大きく
+# 超えていた。上限をエピソードごとに引き直し、上限が高い環境で速く振りすぎると転ぶことを学習中に経験させる。
+
+
+def randomize_joint_velocity_limits(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor | None,
+    limit_ranges: dict[str, tuple[float, float]],
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+):
+    """reset イベント: PhysX の関節速度の上限 [rad/s] を env ごとに U(limit_ranges[pattern]) で引き直す。
+
+    1 つの pattern に当たる関節 (左右) には同じ値を入れる。limit_ranges にない関節は URDF の値のまま。
+    """
+    asset = env.scene[asset_cfg.name]
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device)
+    n = len(env_ids)
+    for pattern, (lo, hi) in limit_ranges.items():
+        joint_ids, _ = asset.find_joints(pattern)
+        lim = torch.empty(n, 1, device=env.device).uniform_(lo, hi).expand(n, len(joint_ids))
+        asset.write_joint_velocity_limit_to_sim(lim, joint_ids=joint_ids, env_ids=env_ids)

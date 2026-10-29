@@ -49,6 +49,9 @@ parser.add_argument("--ball_delay_mode", choices=["current", "capture"], default
                     help="ボールの遅れの作り方 (既定: cfg のまま)。capture = 実機と同じ「撮影時刻のロボット座標で見た撮影時刻のボール」")
 parser.add_argument("--loc_delay_ms", type=float, default=None,
                     help="自己位置の遅れを固定する [ms] (既定: 学習と同じランダム化。0 で遅れなし)")
+parser.add_argument("--joint_vel_limit", choices=["train", "urdf", "none"], default="train",
+                    help="PhysX の関節速度の上限: train = 学習と同じランダム化、urdf = URDF の値 (股ピッチ 7.1、膝 12.5 rad/s)、"
+                         "none = 全関節 1000 rad/s (MuJoCo と同じく実質なし)")
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.headless = True
@@ -101,6 +104,13 @@ def main():
         if args_cli.loc_delay_ms is not None:
             d = args_cli.loc_delay_ms / 1000.0
             delay_ev.params["localization_delay_range_s"] = (d, d)
+    vel_ev = getattr(env_cfg.events, "randomize_joint_velocity_limits", None)
+    if args_cli.joint_vel_limit == "urdf":
+        env_cfg.events.randomize_joint_velocity_limits = None
+    elif args_cli.joint_vel_limit == "none":
+        if vel_ev is None:
+            raise ValueError("randomize_joint_velocity_limits が cfg にない")
+        vel_ev.params["limit_ranges"] = {".*": (1000.0, 1000.0)}
     # 報酬のフェードイン・gait_phase の閾値は学習の最後の状態 (フェード済み) にする
     for term in vars(env_cfg.curriculum).values():
         p = getattr(term, "params", None)
