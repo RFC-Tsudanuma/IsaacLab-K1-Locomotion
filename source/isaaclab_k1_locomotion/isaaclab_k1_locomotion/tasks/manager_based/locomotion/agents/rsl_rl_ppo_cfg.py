@@ -20,6 +20,7 @@ from ..rough_env_cfg import _USE_RECURRENT_POLICY
 from .history_actor_critic import RslRlHistoryActorCriticCfg
 from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
 from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
+from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgorithmCfg
 
 
 @configclass
@@ -263,3 +264,35 @@ class K1GatingPPORunnerCfg(K1FlatPPORunnerCfg):
             if f.name not in ("class_name", "symmetry_cfg")
         }
         self.algorithm = RslRlGatingPpoAlgorithmCfg(**values, symmetry_cfg=None)
+
+
+@configclass
+class K1WaypointPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """凍結歩行 expert に歩行コマンドを出す経由点追従方策の学習 (Isaac-Waypoint-K1-v0)。
+
+    環境は `K1WaypointEnvCfg`。方策は WaypointActorCritic (小 MLP、出力 = 3 次元歩行コマンド、
+    凍結 expert を内包)、アルゴリズムは WaypointPPO (storage には nav_* グループのみ保存)。
+    上位は 50 Hz (expert と同じ制御周期) で判断するので、割引は歩行より長い地平 (γ=0.995 ≈ 4 s) にする。
+    mirror loss は無効 (コマンド 3 次元は関節反転の対象ではない)。スクラッチ学習。
+    """
+
+    num_steps_per_env = 48
+    max_iterations = 3000
+    save_interval = 100
+    experiment_name = "k1_waypoint"
+    obs_groups = {"policy": ["nav_policy"], "critic": ["nav_critic"]}
+    policy = RslRlWaypointActorCriticCfg()
+    algorithm = RslRlWaypointPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.005,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=1.0e-3,
+        schedule="adaptive",
+        gamma=0.995,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )

@@ -216,6 +216,54 @@ def setup_viser(env, urdf_path: str, port: int):
         })
         print("[INFO] Viser: turn-task visualization enabled (target/current heading rays + dpsi arc).")
 
+    # ------------------------------------------------------------------
+    # Waypoint task (Isaac-Waypoint-K1) specific GUI. Scene objects are (re)drawn
+    # every frame in _update_waypoint_viser.
+    # ------------------------------------------------------------------
+    if _is_waypoint_task(env):
+        wp_cfg = env.unwrapped.command_manager.get_term("waypoints").cfg
+        with server.gui.add_folder("Waypoint Task"):
+            gui_wp_mode = server.gui.add_dropdown(
+                "mode", options=("random", "fast", "strict"), initial_value="random",
+                hint=f"fast: pass radius {wp_cfg.loose_radius} m (may cut corners), strict: {wp_cfg.strict_radius} m."
+                " random: the env samples the mode at every reset (training distribution).",
+            )
+            gui_wp_new = server.gui.add_button("new random path", hint="Resample the path now, keeping the robot pose.")
+            gui_wp_next = server.gui.add_number("next point idx", initial_value=0, disabled=True)
+            gui_wp_n = server.gui.add_number("num waypoints", initial_value=0, disabled=True)
+            gui_wp_rem = server.gui.add_number("remaining path [m]", initial_value=0.0, disabled=True)
+            gui_wp_gd = server.gui.add_number("goal dist [m]", initial_value=0.0, disabled=True)
+            gui_wp_gy = server.gui.add_number("goal yaw err [deg]", initial_value=0.0, disabled=True)
+            gui_wp_reached = server.gui.add_checkbox("reached goal", initial_value=False, disabled=True)
+            gui_wp_t = server.gui.add_number("time to goal [s]", initial_value=0.0, disabled=True)
+            gui_wp_ep = server.gui.add_number("episode time [s]", initial_value=0.0, disabled=True)
+            gui_wp_cmd = server.gui.add_text("command vx, vy, wz", initial_value="+0.00, +0.00, +0.00", disabled=True)
+
+        pending_wp = {"resample": False}
+
+        @gui_wp_new.on_click
+        def _(_):
+            pending_wp["resample"] = True
+
+        gui.update({
+            "waypoint": True,
+            "wp_mode": gui_wp_mode,
+            "wp_pending": pending_wp,
+            "wp_next": gui_wp_next,
+            "wp_n": gui_wp_n,
+            "wp_rem": gui_wp_rem,
+            "wp_gd": gui_wp_gd,
+            "wp_gy": gui_wp_gy,
+            "wp_reached": gui_wp_reached,
+            "wp_t": gui_wp_t,
+            "wp_ep": gui_wp_ep,
+            "wp_cmd": gui_wp_cmd,
+            "wp_trail": [],  # robot xy trace of the current episode
+            "wp_spheres": {},  # name -> handle, so stale waypoint spheres can be removed
+        })
+        print("[INFO] Viser: waypoint-task visualization enabled (path / waypoints / goal pose / trail)."
+              " The velocity sliders are ignored: base_velocity is driven by the policy.")
+
     # NOTE: viser falls back to the next free port when the requested one is taken
     # (e.g. a previous play.py still holding it), so report the port the server
     # actually bound rather than the requested one.
@@ -309,6 +357,95 @@ def _update_turn_viser(env, server, gui, env_idx: int = 0):
         gui["elapsed"].value = round(float(elapsed[env_idx]), 2)
 
 
+def _add_polyline(server, name: str, pts: np.ndarray, color, line_width: float):
+    """Straight polyline through ``pts`` (N, 3). viser 0.2.7 has no add_line_segments, so use a
+    cubic Bezier whose control points sit on the chord of each segment (= straight lines)."""
+    pts = np.asarray(pts, dtype=np.float32)
+    ctrl = np.stack([pts[:-1] * 2 / 3 + pts[1:] / 3, pts[:-1] / 3 + pts[1:] * 2 / 3], axis=1).reshape(-1, 3)
+    return server.scene.add_spline_cubic_bezier(name, positions=pts, control_points=ctrl, line_width=line_width, color=color)
+
+
+def _is_waypoint_task(env) -> bool:
+    """True when the env has a ``waypoints`` command term (``WaypointCommand``)."""
+    try:
+        return hasattr(env.unwrapped.command_manager.get_term("waypoints"), "points_w")
+    except Exception:
+        return False
+
+
+def _update_waypoint_viser(env, server, gui, env_idx: int = 0):
+    """Draw the waypoint task state for one env.
+
+    Scene contents:
+      * orange spheres / polyline = remaining waypoints and the path robot -> next -> ... -> goal
+      * grey spheres              = already passed waypoints
+      * green sphere + ray        = goal position and goal heading
+      * thin circle               = pass radius around the next waypoint (goal tolerance at the goal)
+      * blue trace                = robot xy trajectory of the current episode
+    """
+    wp = env.unwrapped.command_manager.get_term("waypoints")
+    robot = env.unwrapped.scene["robot"]
+    z = 0.05
+    n_wp = int(wp.num_waypoints[env_idx])
+    tgt = int(wp.target_idx[env_idx])
+    pts = wp.points_w[env_idx, : n_wp + 1].detach().cpu().numpy()  # (n_wp + 1, 2); last row = goal
+    pts3 = np.concatenate([pts, np.full((len(pts), 1), z)], axis=1).astype(np.float32)
+    base = robot.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    here = np.array([base[0], base[1], z], dtype=np.float32)
+
+    # -- waypoint spheres (re-added by name = replaced in place; extra ones from a longer path removed)
+    spheres = gui["wp_spheres"]
+    for i, p in enumerate(pts3):
+        color = (0, 220, 60) if i == n_wp else ((140, 140, 140) if i < tgt else (255, 160, 0))
+        spheres[f"/waypoint/pt_{i}"] = server.scene.add_icosphere(f"/waypoint/pt_{i}", radius=0.06, color=color, position=p)
+    for name in [k for k in spheres if int(k.rsplit("_", 1)[1]) > n_wp]:
+        spheres.pop(name).remove()
+
+    # -- remaining path: robot -> next waypoint -> ... -> goal
+    chain = np.concatenate([here[None], pts3[tgt:]], axis=0)
+    _add_polyline(server, "/waypoint/path", chain, (255, 160, 0), 4.0)
+
+    # -- goal heading ray
+    yaw = float(wp.goal_yaw_w[env_idx])
+    tip = pts3[-1] + np.array([math.cos(yaw) * 0.4, math.sin(yaw) * 0.4, 0.0], dtype=np.float32)
+    _add_polyline(server, "/waypoint/goal_yaw", np.stack([pts3[-1], tip]), (0, 220, 60), 5.0)
+
+    # -- pass radius circle around the next waypoint (goal tolerance once all waypoints are passed)
+    r = float(wp.pass_radius[env_idx]) if tgt < n_wp else float(wp.cfg.goal_pos_tolerance)
+    ang = np.linspace(0.0, 2.0 * np.pi, 33)
+    circ = pts3[tgt] + np.stack([np.cos(ang) * r, np.sin(ang) * r, np.zeros_like(ang)], axis=-1).astype(np.float32)
+    _add_polyline(server, "/waypoint/pass_radius", circ, (255, 160, 0) if tgt < n_wp else (0, 220, 60), 2.0)
+
+    # -- trail of the current episode
+    trail = gui["wp_trail"]
+    if int(env.unwrapped.episode_length_buf[env_idx]) <= 1:
+        trail.clear()
+    trail.append(here)
+    if len(trail) > 1500:
+        del trail[0]
+    if len(trail) >= 2:
+        _add_polyline(server, "/waypoint/trail", np.stack(trail), (60, 130, 255), 3.0)
+
+    # -- readouts
+    mode = "strict" if float(wp.pass_radius[env_idx]) < 0.5 * (wp.cfg.strict_radius + wp.cfg.loose_radius) else "fast"
+    rem = float(wp.path_length()[env_idx])
+    server.scene.add_label(
+        "/waypoint/label",
+        f"{mode} (r={float(wp.pass_radius[env_idx]):.2f}) | remaining {rem:.2f} m",
+        position=np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32),
+    )
+    gui["wp_next"].value = tgt
+    gui["wp_n"].value = n_wp
+    gui["wp_rem"].value = round(rem, 2)
+    gui["wp_gd"].value = round(float(wp.goal_dist()[env_idx]), 2)
+    gui["wp_gy"].value = round(math.degrees(float(wp.goal_yaw_err()[env_idx])), 1)
+    gui["wp_reached"].value = bool(wp.reached_goal[env_idx])
+    gui["wp_t"].value = round(float(wp.time_to_goal[env_idx]), 2)
+    gui["wp_ep"].value = round(float(env.unwrapped.episode_length_buf[env_idx]) * env.unwrapped.step_dt, 2)
+    cmd = env.unwrapped.command_manager.get_command("base_velocity")[env_idx].tolist()
+    gui["wp_cmd"].value = f"{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}"
+
+
 def override_command_from_viser(env, gui):
     """Overwrite the ``base_velocity`` command tensor with viser GUI values.
 
@@ -316,6 +453,20 @@ def override_command_from_viser(env, gui):
     zeroing so the GUI values survive the next ``_update_command`` call.
     """
     cmd_term = env.unwrapped.command_manager.get_term("base_velocity")
+
+    # WaypointCommand (Isaac-Waypoint-K1): base_velocity is the policy output (walk_command
+    # action), so the sliders must not touch it. Only the path / mode are driven from the GUI.
+    if gui.get("waypoint"):
+        wp = env.unwrapped.command_manager.get_term("waypoints")
+        if gui["wp_pending"]["resample"]:
+            gui["wp_pending"]["resample"] = False
+            wp.time_left[:] = 0.0  # resampled on the next command_manager.compute()
+            gui["wp_trail"].clear()
+        mode = gui["wp_mode"].value
+        if mode != "random":
+            # pinned every step: _resample_command re-randomizes pass_radius at reset
+            wp.pass_radius[:] = wp.cfg.loose_radius if mode == "fast" else wp.cfg.strict_radius
+        return
 
     # TargetHeadingCommand (Isaac-Velocity-Flat-Turn): the command is the remaining
     # angle Δψ, recomputed from ``heading_target`` every step. Writing vel_command_b
@@ -386,6 +537,8 @@ def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0, s
 
     if server is not None and gui is not None and gui.get("turn"):
         _update_turn_viser(env, server, gui, env_idx=env_idx)
+    if server is not None and gui is not None and gui.get("waypoint"):
+        _update_waypoint_viser(env, server, gui, env_idx=env_idx)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
@@ -504,6 +657,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if getattr(policy_nn, "is_gating", False):
         # ゲート方策 (凍結 expert 2 本 + ゲート MLP) の ONNX 化は未対応。
         print("[INFO] Gating policy: skipping JIT/ONNX export (not supported yet).")
+    elif getattr(policy_nn, "is_hierarchical", False):
+        # 上位コマンド方策 (凍結歩行 expert を内包) の ONNX 化は未対応。
+        print("[INFO] Hierarchical (waypoint) policy: skipping JIT/ONNX export (not supported yet).")
     elif is_history_policy(policy_nn):
         # 履歴 + CNN 構成 (K1 Flat): 入力は command(N,3) + obs_history(N,H,C)。
         # 詳細は agents/history_policy_exporter.py の docstring を参照。
