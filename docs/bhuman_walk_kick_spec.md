@@ -89,3 +89,33 @@ B-Human が配っている K1 のキックは `K1_kick_inner` = **インサイ�
 - 各段の終わりに、上の表の全項目の数字を進捗ログ (`/home/akira/workspace/claude_tmp/bhuman_walk_kick_progress.md`) に書く。
 - B-Human から変えた点は、理由・測定値つきで列挙する。変えずに済む方法がないか先に試す。
 - 合格条件を満たせないまま終えるときは、どの項目がいくつ足りないかを書く。
+
+## 実機のキック側で作る速度指令 (2026-10-31、Stage 9 以降)
+
+キック方策の入力の速度指令 (vx, vy, wz) は実機のキック側のプログラムが毎制御周期 (50 Hz) 作る。式は学習
+(`mdp/walk_command.py`、`mdp/rewards.py` の `_walk_target`、`mdp/kick_command.py` の 6〜8)) と MuJoCo
+(`scripts/mujoco/sim2sim_bhuman_walk_kick.py` の `Sim.update_kick_state` / `walk_target` / `walk_command`) が同じで、
+実機はこの MuJoCo の 3 関数をそのまま移せばよい。値は学習した段と同じにする (違うと MuJoCo でも大きく崩れる。
+Stage 1 の値で指令を作ると s7b model_9400 の細かい格子の失敗が 13 → 32)。
+
+記号: ボール b (世界。MuJoCo は 1.〜3. で観測と同じ 1 周期遅れ、4.〜5. で今の位置。実機は推定値 1 つでよい)、ロボットの胴体の位置 p・向き ψ、両足裏の中点 o、キック方向 g (世界)、
+dac = wrap(g - ψ)、ball_pos = R(-ψ)(b - o)、rot(v, a) は 2 次元の回転。
+
+1. キック方向に回したボール位置 bik = rot(ball_pos, -dac)、距離 dist = |ball_pos|。
+2. キック姿勢 (B-Human): y_ratio = clip((|bik_y| - 2·0.06) / (2·0.095), 0, 1)、tr = clip((|atan2(bik_y, bik_x)| - 0.3) / 1.2, 0, 1)、
+   d_ratio = clip((dist - 0.7) / 0.4, 0, 1)、r_ratio = clip((|dac| - 0.2) / 0.4, 0, 1)、mr = max(y_ratio, tr, d_ratio, r_ratio)、
+   close = clip(-1 + 2·mr, close_prev - 0.04, close_prev + 0.04) (新しいボールで 1 から始める)。
+3. filtered = (1 - l)·filtered + l·bik (l = 0.9 if mr == 1 else 0.2、新しいボールで filtered = bik)。
+   回り込む側 side: |filtered_y| > 0.05 m のときだけ side = (+1 if filtered_y < 0 else -1) に更新 (Stage 9 のしきい値。B-Human は 0)。
+4. 立ち位置: kp = -0.35·max(close, 0)、kick_pose = b + kp·(cos g, sin g) をロボットの向きで見た kpr = R(-ψ)(kick_pose - p)。
+   extra = max((tr - 0.5) / 0.5, 0)·(0.095 + 0.1)、off = max(0.06 + extra, **min_side_off = 0.15**)、
+   wt = kpr + side·off·(-sin dac, cos dac)。
+5. 回り込み点 (ロボットがボールより前にいるとき、B-Human): bir = R(-g)(b - p)、ratio = 0 if close < 1 else clip(-bir_x / 0.3, 0, 1)、
+   bir_x += clip(|bir_y| / 0.3, 0, 1)·(-0.2) + clip(max(-bir_x, 1 - |bir_y| / 0.3), 0, 1)·0.3、bir_y += side·0.55、
+   st = R(-ψ)R(g)·bir。目標 t = wt·(1 - ratio) + st·ratio。
+6. 指令: head_far = atan2(t_y, t_x)、head_near = wrap(dac - side·**near_yaw_off = 20°**)、
+   w = clip((dist - 0.6) / 0.4, 0, 1)、err = wrap(head_near + w·wrap(head_far - head_near))、
+   vx = clip(1.5·t_x, -0.5, 1.0)·((1 - w) + w·max(cos head_far, 0))、vy = clip(1.5·t_y, -0.5, 0.5)、wz = clip(1.5·err, -1, 1)。
+
+太字の 2 つと 3. のしきい値 0.05 が Stage 9 で足したもの (B-Human に無い。理由と測定値は walk_command.py の
+min_side_off / near_yaw_off_deg と kick_command.py の walk_side_hysteresis の説明)。Stage 8 までの checkpoint はこの 3 つを 0 にする。

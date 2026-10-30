@@ -78,10 +78,15 @@ STEP_DIM = sum(TERM_DIMS)
 PH_LOW_SPEED, PH_HIGH_SPEED, PH_LOW_F, PH_HIGH_F = 1.0, 1.8, 1.8, 2.0
 CMD_THRESHOLD = 0.05
 GAIT_LIMIT = (-0.5, 0.5)
-# kick_command.BHumanKickCommandCfg (Stage 1 の値。--stage_cfg で上書き)
+# kick_command.BHumanKickCommandCfg (Stage 7 の値。--stage_cfg で上書き)
+# 2026-10-31 に ball_distance_offset 0.3 → 0.7、ball_rotation_offset 0.1 → 0.2 (Stage 7 の README の最終値) に変えた。
+# Stage 7 以降の方策はこの値で作った速度指令とキック姿勢で学習しているのに、それまでの MuJoCo は Stage 1 の値で指令を作っていた
+# (実機も学習と同じ値で指令を作る必要がある)。s7b model_9400 の細かい格子 (rel -30〜+60、1824 場面) で、
+# Stage 1 の値: 10° 超 88・失敗 32、Stage 7 の値: 10° 超 92・失敗 13 (右足側 rel +15〜+60 の失敗 16 → 0)。
+# Stage 1〜6 の checkpoint を見るときは --stage_cfg '{"ball_distance_offset": 0.3, "ball_rotation_offset": 0.1}'。
 KCFG = dict(
     ball_friction=0.3, kick_strong_range=20.0, kick_pose_x=(0.0, -0.35), kick_pose_y_off=0.06,
-    ball_y_dis_ratio=(2.0, 2.0), ball_distance_offset=0.3, ball_rotation_offset=0.1, ball_avoidance_range=0.55,
+    ball_y_dis_ratio=(2.0, 2.0), ball_distance_offset=0.7, ball_rotation_offset=0.2, ball_avoidance_range=0.55,
 )
 # walk_command.BallWalkVelocityCommandCfg
 WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4,
@@ -339,8 +344,9 @@ class Sim:
         ball_w = self.ball_w()
         kpir = rot2(self.ball_kick_pose - base[:2], -yaw)
         extra = max((self.kick_pose_translation_ratio - 0.5) / 0.5, 0.0) * (self.ball_r + 0.1)
-        x_off = -math.sin(self.dac) * (k["kick_pose_y_off"] + extra)
-        y_off = math.cos(self.dac) * (k["kick_pose_y_off"] + extra)
+        off = max(k["kick_pose_y_off"] + extra, WCFG.get("min_side_off", 0.0))
+        x_off = -math.sin(self.dac) * off
+        y_off = math.cos(self.dac) * off
         if self.walk_side > 0:
             wt = kpir + np.array([x_off, y_off])
         else:
@@ -359,7 +365,7 @@ class Sim:
         w = WCFG
         t = self.walk_target()
         head_far = math.atan2(t[1], t[0])
-        head_near = wrap(self.dac)
+        head_near = wrap(self.dac - self.walk_side * math.radians(w.get("near_yaw_off_deg", 0.0)))
         bd = float(np.linalg.norm(self.ball_pos))
         bl = float(np.clip((bd - w["near_dist"]) / w["blend_dist"], 0.0, 1.0))
         err = wrap(head_near + bl * wrap(head_far - head_near))
@@ -480,6 +486,10 @@ def main(argv=None) -> int:
     ap.add_argument("--no_clip_targets", action="store_true", help="関節の目標を関節の範囲で切らない (2026-10-26 までの動き)")
     ap.add_argument("--walk_side_hysteresis", type=float, default=0.0,
                     help="回り込む側を切り替える横位置のしきい値 [m] (学習の walk_side_hysteresis と同じ値にする。既定 0 = B-Human どおり。2026-10-31 の 0.05 の試し s8h05 は不採用)")
+    ap.add_argument("--min_side_off", type=float, default=0.0,
+                    help="速度指令の目標点の横ずれの下限 [m] (学習の walk_command の min_side_off と同じ値にする)")
+    ap.add_argument("--near_yaw_off_deg", type=float, default=0.0,
+                    help="ボールの近くで向く方向を、キック方向から蹴り足の側へこの角度 [deg] 回す (学習の walk_command と同じ値にする)")
     ap.add_argument("--obs_noise", action="store_true", help="学習と同じ大きさの観測ノイズを入れる (frame() の説明)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
@@ -487,6 +497,8 @@ def main(argv=None) -> int:
     a = ap.parse_args(argv)
 
     WCFG["kick_through_speed"] = a.kick_through_speed
+    WCFG["min_side_off"] = a.min_side_off
+    WCFG["near_yaw_off_deg"] = a.near_yaw_off_deg
     KCFG["walk_side_hysteresis"] = a.walk_side_hysteresis
     if a.stage_cfg:
         KCFG.update(json.loads(a.stage_cfg))

@@ -40,13 +40,18 @@ def gait_phase_factor(env: ManagerBasedRLEnv, limit: tuple[float, float] = (-0.5
 # --------------------------------------------------------------------------- #
 # ボール
 # --------------------------------------------------------------------------- #
-def _walk_target(k: BHumanKickCommand) -> torch.Tensor:
-    """B-Human ``_helper_walk_target``: キック立ち位置 (蹴り足側にずらす) と回り込み点の混合。"""
+def _walk_target(k: BHumanKickCommand, min_side_off: float = 0.0) -> torch.Tensor:
+    """B-Human ``_helper_walk_target``: キック立ち位置 (蹴り足側にずらす) と回り込み点の混合。
+
+    min_side_off (B-Human に無い、既定 0 = B-Human どおり。報酬 ball_walk_speed は常に 0): 立ち位置の横ずれ
+    (kick_pose_y_off + extra) の下限 [m]。速度指令 (walk_command.BallWalkVelocityCommandCfg.min_side_off) だけが使う。
+    """
     cfg = k.cfg
     kick_pose_in_robot = quat_apply_inverse(k.base_quat_z, k.ball_kick_pose - k.base_pos)
     extra = ((k.kick_pose_translation_ratio - 0.5) / 0.5).clip(min=0.0) * (cfg.ball_radius + 0.1)
-    x_off = -torch.sin(k.direction_angle_current) * (cfg.kick_pose_y_off + extra)
-    y_off = torch.cos(k.direction_angle_current) * (cfg.kick_pose_y_off + extra)
+    off = (cfg.kick_pose_y_off + extra).clip(min=min_side_off)
+    x_off = -torch.sin(k.direction_angle_current) * off
+    y_off = torch.cos(k.direction_angle_current) * off
     left = kick_pose_in_robot.clone()
     right = kick_pose_in_robot.clone()
     left[:, 0] += x_off

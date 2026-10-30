@@ -22,6 +22,7 @@ B-Human の報酬 (ball_walk_speed など) と walk の報酬で決まる。学�
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -67,9 +68,10 @@ class BallWalkVelocityCommand(CommandTerm):
         cfg = self.cfg
         k = self._env.command_manager.get_term(cfg.kick_command_name)
         k.ensure_updated()
-        target = _walk_target(k)[:, :2]
+        target = _walk_target(k, cfg.min_side_off)[:, :2]
         head_far = torch.atan2(target[:, 1], target[:, 0])
-        head_near = wrap_to_pi(k.direction_angle_current)
+        # near_yaw_off_deg (既定 0): 近くでは キック方向 - walk_side * near_yaw_off を向く (cfg の説明)
+        head_near = wrap_to_pi(k.direction_angle_current - k.walk_side * math.radians(cfg.near_yaw_off_deg))
         ball_dist = torch.norm(k.ball_pos[:, :2], dim=-1)
         w = ((ball_dist - cfg.near_dist) / cfg.blend_dist).clamp(0.0, 1.0)  # 1 = 遠い
         err = wrap_to_pi(head_near + w * wrap_to_pi(head_far - head_near))
@@ -103,3 +105,19 @@ class BallWalkVelocityCommandCfg(CommandTermCfg):
     """near_dist からこの距離かけて「目標点を向く」へ切り替える [m]。"""
     kick_through_speed: float = 0.0
     """キック姿勢に入った後の最低前進速度 [m/s] (0 で無効 = s1 まで)。"""
+    min_side_off: float = 0.0
+    """(既定 0 = 今までどおり) 目標点 (キック立ち位置) の横ずれ kick_pose_y_off + extra の下限 [m]。
+    報酬 (B-Human ball_walk_speed) の目標点は変えない。near_yaw_off_deg と合わせて 2026-10-31 Stage 9 で使う。
+
+    理由 (2026-10-31、s7b model_9400、MuJoCo、学習と同じ Stage 7 の指令): うまく蹴れた 132 場面 (向きのずれ 5° 以下) では
+    胴体 (両足の中点) がボールとキック方向の線から 0.6 秒前 0.16〜0.18 m・当たる時 0.13〜0.15 m 横にいる。指令の目標は
+    kick_pose_y_off 0.06 m (ロボットがボールの真後ろにいると extra = 0) で、真後ろから来た場面ではロボットが指令どおり
+    0.05〜0.08 m に寄り、内側の足 (蹴り足) がボールの真後ろを前向きのまま歩いてつま先・すねで先にボールを押す
+    (rel -10〜+10 の 10°超・失敗 82 場面のうち約 35)。"""
+    near_yaw_off_deg: float = 0.0
+    """(既定 0 = 今までどおり) ボールの近く (near_dist 以内) で向く方向を、キック方向から蹴り足の側へこの角度 [deg] 回す
+    (walk_side > 0 = ボールの左に立って右足で蹴る → 右へ回す)。
+
+    理由: 上と同じ 132 場面で、胴体の向きは当たる 0.6 秒前・0.3 秒前ともキック方向から蹴り足の側へ 18〜20°、当たる時 37〜39°
+    (仕様の B-Human の姿勢「胴体をキック方向から蹴り足の側へ約 30° 回す」と同じ向き)。今までの指令は 0° を向かせるので、
+    うまく蹴れた場面では方策が指令に逆らっていて、真後ろから来た場面では指令どおり 0° のまま歩いてつま先で押していた。"""
