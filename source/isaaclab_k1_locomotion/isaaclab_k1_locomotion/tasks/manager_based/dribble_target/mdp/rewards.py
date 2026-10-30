@@ -1938,14 +1938,34 @@ def robot_progress_to_target(
     env: ManagerBasedRLEnv,
     command_name: str = "dribble_target",
     max_progress_per_step: float | None = 0.05,
+    behind_offset: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
     """ロボット→目標点の距離の 1 ステップ減少量 [m] (ball_progress_to_target と同じポテンシャル形式)。
 
     2026-10-12: 「その場足踏み」局所解対策。ロボット自身の並進を直接評価する報酬が無かった。
+
+    2026-10-30: ``behind_offset`` > 0 のとき、距離を「ロボット → ボールの裏 → 目標」の道のり
+    ``|r - s| + |s - g|`` にする (``s = b - u * behind_offset``、``u`` はボール→目標の単位ベクトル)。
+    ロボットがボールの後ろにいる普段のドリブルでは ``|r - g|`` とほぼ同じ値。ボールが目標を越えて
+    ロボットがボールと目標の間に挟まったとき (time_out の全件がこの形で、ボールの手前 1.0 m で
+    止まっていた) だけ、ボールの裏へ回り込むことが得になる。状態だけで決まる量の差分なので、
+    往復で稼ぐことはできない。
     """
     robot = env.scene[asset_cfg.name]
-    dist = torch.norm(_dribble_target_w(env, command_name) - robot.data.root_pos_w[:, :2], dim=1)
+    target = _dribble_target_w(env, command_name)
+    robot_xy = robot.data.root_pos_w[:, :2]
+    if behind_offset == 0.0:
+        dist = torch.norm(target - robot_xy, dim=1)
+    else:
+        ball_xy = env.scene[ball_cfg.name].data.root_pos_w[:, :2]
+        to_target = target - ball_xy
+        ball_target = torch.norm(to_target, dim=1)
+        u = to_target / ball_target.clamp(min=1e-6).unsqueeze(1)
+        u = torch.where((ball_target > 1e-3).unsqueeze(1), u, torch.zeros_like(u))
+        staging = ball_xy - u * behind_offset
+        dist = torch.norm(staging - robot_xy, dim=1) + torch.norm(target - staging, dim=1)
     return _potential_progress(env, "_dribble_prev_robot_target_dist", dist, max_progress_per_step)
 
 

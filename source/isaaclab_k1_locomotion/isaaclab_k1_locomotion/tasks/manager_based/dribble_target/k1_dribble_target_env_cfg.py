@@ -493,10 +493,14 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
         # いずれもボールに関する量で、ロボットの並進そのものは見ていない)。
         # ball_progress_to_target と全く同じポテンシャル形式をロボット自身→目標座標の
         # 距離に適用する (mdp/rewards.py 参照)。
+        # 2026-10-30: 距離を「ロボット → ボールの裏 0.3 m → 目標」の道のりにする (behind_offset)。
+        # time_out は Isaac・MuJoCo とも、ボールが目標を越えてロボットがボールと目標の間に挟まり、
+        # ボールの手前 1.0 m (ball_control_radius_penalty の safe_radius) で止まる形だった。ロボット→目標の
+        # 直線距離では、ボールの裏へ回り込むと進捗が大きく負になるため、この位置で報酬が釣り合っていた。
         self.rewards.robot_progress_to_target = RewTerm(
             func=robot_progress_to_target,
             weight=0.0,
-            params={"command_name": "dribble_target", "max_progress_per_step": 0.02},
+            params={"command_name": "dribble_target", "max_progress_per_step": 0.02, "behind_offset": 0.3},
         )
         # 2026-10-28: 速さの上限の 2 段目として robot_speed_over_limit (1.0 m/s を超えた分の 2 乗、weight -3) を
         # 足したが (model_59994)、Isaac ではほぼ効かず、MuJoCo では time_out が 0.07 → 0.40 に増えたので 2026-10-29 に外した。
