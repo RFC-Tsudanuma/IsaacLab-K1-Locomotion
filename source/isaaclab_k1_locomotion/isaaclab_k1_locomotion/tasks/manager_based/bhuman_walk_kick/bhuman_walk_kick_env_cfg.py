@@ -31,6 +31,7 @@ from __future__ import annotations
 import isaaclab.sim as sim_utils
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as loco_mdp
 from isaaclab.assets import RigidObjectCfg
+import isaaclab.envs.mdp as mdp_isaac
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -202,6 +203,10 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
         # B-Human に無い (mdp/rewards.py kick_foot_speed)。既定は 0 (使わない)。2026-10-27 の Stage 6 の試し (s6d) で学習コマンドから重みを入れる。
         self.rewards.kick_foot_speed = RewTerm(func=mdp.kick_foot_speed, weight=0.0)
         self.rewards.gait_phase_factor = RewTerm(func=mdp.gait_phase_factor, weight=-0.1)
+        # B-Human に無い (mdp/rewards.py ball_bad_touch)。既定は 0 (使わない)。2026-10-31 Stage 8 で学習コマンドから重みを入れる。
+        # 理由: s7b model_9400 の MuJoCo 格子 (rel = キック方向 - ボール方位 が -10〜+5° の 384 場面) で、10° 超・失敗の
+        # 50 場面のうち約 15 がつま先やすねで近づく途中にボールを押したもの (当たった瞬間の足の向き 0〜35°、ボールが足の前)。
+        self.rewards.ball_bad_touch = RewTerm(func=mdp.ball_bad_touch, weight=0.0)
 
         # ---- terminations: 歩行の転倒判定 + B-Human のエピソード区切り ----
         self.terminations.kicks_done = DoneTerm(func=mdp.kicks_done, time_out=True)
@@ -317,6 +322,39 @@ class K1BHumanWalkKickStage7EnvCfg(K1BHumanWalkKickStage6EnvCfg):
         # K1_Ball.yaml ball_velocity_range_sigma_scale: 「1 for training from scratch, 0.5 for final training」
         # (Stage 6 で先に 0.5 にした結果は Stage 6 の class のコメント参照)
         self.rewards.ball_kick_velocity.params["sigma_scale"] = 0.5
+
+
+@configclass
+class K1BHumanWalkKickStage8EnvCfg(K1BHumanWalkKickStage7EnvCfg):
+    """(B-Human の段に無い) Stage 7b の設定 (sigma_range 0.2 = s7b) のまま、MuJoCo の格子で見つけた苦手な場面を直す追加学習。
+
+    - ボールの大きさのランダム化 (B-Human K1_Ball.yaml の ball_radius DR、上限 +0.01 m = ball_radius_margin) を戻す。
+      今までは 0.095 m 固定だった。s7b model_9400 を MuJoCo の細かい格子 (rel -30〜+60、1824 場面) で、ボールだけ
+      0.085 m にすると 失敗 32 → 68、10° 超 88 → 123 と大きく崩れ、ボールの大きさに合わせ込みすぎている。B-Human の完成品は
+      同じ格子で 失敗 6・10° 超 36。
+    - 苦手な向き (weak_rel_prob 0.25、kick_command の説明)。
+
+    結果 (2026-10-31、run s8r): 9500〜9900 で細かい格子の失敗 67/49/52/62/42 (s7b 9400 は 32) → 不採用。試しの記録として残す。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.kick.kick_direction_sigma_range = 0.2
+        self.commands.kick.weak_rel_prob = 0.25
+        self.scene.replicate_physics = False  # env ごとに違う大きさのボールを PhysX に読ませるため (IsaacLab の説明どおり)
+        self.events.ball_scale = EventTerm(
+            func=mdp_isaac.randomize_rigid_body_scale,
+            mode="prestartup",
+            params={"asset_cfg": SceneEntityCfg("soccer_ball"), "scale_range": (1.0, (BALL_RADIUS + 0.01) / BALL_RADIUS)},
+        )
+
+
+@configclass
+class K1BHumanWalkKickStage8EnvCfg_PLAY(K1BHumanWalkKickStage8EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+        self.events.ball_scale = None  # 再生・評価は MuJoCo と同じ 0.095 m
 
 
 def _play(cfg):

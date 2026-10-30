@@ -83,6 +83,8 @@ class Scenario:
     strong: bool
     range_m: float = 3.0  # 距離指定キックの距離 [m] (strong のときは 20 m)
     seed: int = 0  # 次のボールの置き場所の乱数
+    base_vel: tuple[float, float] = (0.0, 0.0)  # 最初の胴体の水平速度 [m/s] (前, 左)。歩行方策から切り替えた直後を真似る
+    ball_vel: tuple[float, float] = (0.0, 0.0)  # 最初のボールの水平速度 [m/s] (ロボットの初期向き基準)
 
 
 DEFAULT_SCENARIOS = [
@@ -381,6 +383,7 @@ def run_scene(sim, sc: Scenario, duration: float = 15.0, next_ball_delay: float 
     kick_window = []
     t = 0.0
     step = 0
+    prev_bv = np.array(sc.ball_vel, dtype=float)
     for step in range(n_steps):
         t0 = step * ctrl_dt
 
@@ -393,7 +396,11 @@ def run_scene(sim, sc: Scenario, duration: float = 15.0, next_ball_delay: float 
         bv = d.qvel[w.ball_v[0]:w.ball_v[0] + 3]
         speed = float(np.linalg.norm(bv[:2]))
         out["min_base_z"] = min(out["min_base_z"], float(d.qpos[2]))
-        if out["kick_t"] is None and speed > 0.3 and np.linalg.norm(d.xpos[w.balls[0]][:2] - ball0[:2]) > 0.02:
+        # 最初から転がっている場面 (sc.ball_vel) では、速さ 0.3 m/s 超だけだと最初から「蹴った」になるので、
+        # 1 制御周期で速度が 0.15 m/s 以上変わったこと (何かが当たった) も条件にする。止まったボールは今までと同じ。
+        hit = not any(sc.ball_vel) or float(np.linalg.norm(bv[:2] - prev_bv)) > 0.15
+        prev_bv = bv[:2].copy()
+        if out["kick_t"] is None and speed > 0.3 and hit and np.linalg.norm(d.xpos[w.balls[0]][:2] - ball0[:2]) > 0.02:
             out["kick_t"] = t
             ball_at_kick = d.xpos[w.balls[0]][:2].copy()
             end_step = min(n_steps + int(round(post_kick / ctrl_dt)), step + int(round(post_kick / ctrl_dt)))

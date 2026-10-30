@@ -209,6 +209,7 @@ class BHumanKickCommand(CommandTerm):
         self.inside_kick_pose_counter = torch.zeros(n, **f)
         self.kick_pose_translation_ratio = torch.zeros(n, **f)
         self.filtered_ball_pos = torch.zeros(n, 3, **f)
+        self.walk_side = torch.ones(n, **f)  # +1: filtered_ball_pos[1] < 0 側 (rewards._walk_target の left) へ回り込む
         self.kick_leg_was_obvious = torch.zeros(n, **f)
         self.ball_walk_target_overshoot = torch.zeros(n, **f)
         self.kick_sole_yaw_ratio = torch.zeros(n, **f)
@@ -603,6 +604,7 @@ class BHumanKickCommand(CommandTerm):
         )
         lowpass = torch.where(min_kick_pose_ratio == 1.0, 0.9, 0.2).unsqueeze(-1)
         self.filtered_ball_pos[:] = (1.0 - lowpass) * self.filtered_ball_pos + lowpass * ball_in_kick_angle
+        self._update_walk_side()
         kp0, kp1 = cfg.kick_pose_x
         kp = kp0 + (kp1 - kp0) * self.ball_close_to_kick_pose.clip(min=0.0)
         self.ball_kick_pose[:, 0] = self.ball_pos_w[:, 0] + cos_dir * kp
@@ -667,6 +669,16 @@ class BHumanKickCommand(CommandTerm):
     # ------------------------------------------------------------------ #
     # 仕様 (docs/bhuman_walk_kick_spec.md) の項目の測定。報酬には使わない (ログと評価スクリプト用)。
     # ------------------------------------------------------------------ #
+    def _update_walk_side(self):
+        """回り込む側 (B-Human は毎ステップ filtered_ball_pos[1] の符号で決める)。cfg.walk_side_hysteresis を参照。"""
+        y = self.filtered_ball_pos[:, 1]
+        want = torch.where(y < 0, 1.0, -1.0)
+        h = self.cfg.walk_side_hysteresis
+        if h <= 0.0:
+            self.walk_side[:] = want
+        else:
+            self.walk_side[:] = torch.where(torch.abs(y) > h, want, self.walk_side)
+
     def _measure_contact(self, prev: dict, global_direction: torch.Tensor):
         """キックを検出したステップで、当たる直前 (1 制御ステップ前) の蹴り足の向き・ボールの位置などを記録する。"""
         ids = (self.ball_kicked_counter == 1).nonzero(as_tuple=False).flatten()
@@ -1060,6 +1072,19 @@ class BHumanKickCommand(CommandTerm):
         self.ball_vel[ids] = bv
 
         self.direction_angle[ids] = torch.rand(len(ids), device=self.device) * 2.0 - 1.0
+        if cfg.weak_rel_prob > 0.0:
+            # (B-Human に無い) 苦手な向きの組み合わせを多めに出す。cfg.weak_rel_prob の説明を参照。
+            k = len(ids)
+            pick = torch.rand(k, device=self.device) < cfg.weak_rel_prob
+            if pick.any():
+                to_ball = rotate_2d(ball_w[:, :2] - self.robot.data.root_pos_w[ids, :2], -yaw)
+                bearing = torch.atan2(to_ball[:, 1], to_ball[:, 0])
+                (a_lo, a_hi), (b_lo, b_hi) = cfg.weak_rel_ranges
+                first = torch.rand(k, device=self.device) < cfg.weak_rel_first_frac
+                u = torch.rand(k, device=self.device)
+                rel_deg = torch.where(first, a_lo + u * (a_hi - a_lo), b_lo + u * (b_hi - b_lo))
+                da = wrap_to_pi(bearing + torch.deg2rad(rel_deg)) / math.pi
+                self.direction_angle[ids] = torch.where(pick, da, self.direction_angle[ids])
         self.robot_direction_ref[ids] = yaw
         dac = wrap_to_pi(self.direction_angle[ids] * math.pi)
         self.direction_angle_current[ids] = dac
@@ -1081,6 +1106,7 @@ class BHumanKickCommand(CommandTerm):
         fb = bp.clone()
         fb[:, :2] = rotate_2d(bp[:, :2], -dac)
         self.filtered_ball_pos[ids] = fb
+        self.walk_side[ids] = torch.where(fb[:, 1] < 0, 1.0, -1.0)
         self.last_ball_vel_w[ids] = self.ball_vel_w[ids, :3]
         self._obs_cache_step = -1
 
@@ -1214,6 +1240,26 @@ class BHumanKickCommandCfg(CommandTermCfg):
     heavy_ball: float = 0.0
     """B-Human heavy_ball (0 initial, 0.0001 final)。新しいボールを出すたびに、この確率でボールを重くする。"""
     heavy_ball_mass_scale: float = 100.0
+    walk_side_hysteresis: float = 0.0
+    """(B-Human に無い、既定 0 = B-Human どおり毎ステップ符号で決める) 回り込む側 (rewards._walk_target の left/right) を、
+    キック方向に回したボールの横位置 filtered_ball_pos[1] の大きさがこの値 [m] を超えたときだけ切り替える。
+
+    理由 (2026-10-30、s7b model_9400、MuJoCo、rel -10〜+5 の 384 場面): ボールがキック方向に対してロボットの真正面にあると
+    横位置が 0 付近で、歩く揺れで符号が変わり、立ち位置と速度指令が左右に跳ぶ。蹴るまでに側が 1 回以上変わった場面は
+    10° 超・失敗が 26/118 = 22%、変わらなかった場面は 24/266 = 9%。"""
+    weak_rel_prob: float = 0.0
+    """(B-Human に無い、既定 0 = 無効で Stage 1〜7 は変わらない) 新しいキック課題を出すとき、この確率でキック方向を
+    「ロボットから見たボールの方位 + rel」(rel は weak_rel_ranges から一様) にする。残りは B-Human どおり一様。
+
+    理由 (2026-10-30、s7b model_9400 を MuJoCo で格子状に測定、/home/akira/workspace/claude_tmp/grid/):
+    rel = キック方向 - ボール方位 を -30〜+60° の 5° 刻みで 1824 場面 (rel ごとに 96 場面) 測ると、rel<0 で左足・
+    rel>0 で右足を選び、切り替わる rel -10〜+5 で 10° を超えるずれが 96 場面中 9〜16、失敗 (転倒・蹴らない・30° 超) が
+    3〜4 (平均ずれ 5.7〜8.1°)。rel -30〜-20 は 10° 超 0〜2・失敗 0〜1。右足側 (rel +15〜+60) にも失敗 0〜4
+    (+30 で平均 8.1°) が散らばり、左右対称の左側はきれい。B-Human の一様な向き (360°) ではこの帯は 1 割強しか出ない。"""
+    weak_rel_ranges: tuple[tuple[float, float], tuple[float, float]] = ((-15.0, 15.0), (15.0, 60.0))
+    """weak_rel_prob で選んだときの rel の範囲 [deg]: (足の選び方が迷う帯, 右足側の帯)。"""
+    weak_rel_first_frac: float = 0.7
+    """weak_rel_prob で選んだうち、weak_rel_ranges[0] (迷う帯) から出す割合。"""
     strike_height_range: tuple[float, float] | None = None
     """(B-Human に無い) キックした瞬間の蹴り足の足裏の一番低い点の高さが lo 以下なら 1、hi 以上なら 0 を
     キック方向の報酬 (正のとき) に掛ける。None で無効。"""

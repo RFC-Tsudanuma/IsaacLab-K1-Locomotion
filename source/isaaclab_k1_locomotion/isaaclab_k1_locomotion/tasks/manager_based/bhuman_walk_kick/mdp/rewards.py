@@ -53,7 +53,7 @@ def _walk_target(k: BHumanKickCommand) -> torch.Tensor:
     left[:, 1] += y_off
     right[:, 0] -= x_off
     right[:, 1] -= y_off
-    walk_target = torch.where((k.filtered_ball_pos[:, 1] < 0).unsqueeze(-1), left, right)
+    walk_target = torch.where((k.walk_side > 0).unsqueeze(-1), left, right)
 
     gdir = k.robot_direction_ref + k.direction_angle * torch.pi
     dq = _yaw_quat(gdir)
@@ -62,7 +62,7 @@ def _walk_target(k: BHumanKickCommand) -> torch.Tensor:
     bir[:, 0] += (torch.abs(bir[:, 1]) / 0.3).clip(0.0, 1.0) * -0.2 + torch.max(
         -bir[:, 0], 1.0 - torch.abs(bir[:, 1]) / 0.3
     ).clip(0.0, 1.0) * 0.3
-    bir[:, 1] += torch.where(k.filtered_ball_pos[:, 1] < 0, 1.0, -1.0) * cfg.ball_avoidance_range
+    bir[:, 1] += k.walk_side * cfg.ball_avoidance_range
     side_target = quat_apply_inverse(k.base_quat_z, quat_apply(dq, bir))
     return walk_target * (1.0 - ratio).unsqueeze(-1) + side_target * ratio.unsqueeze(-1)
 
@@ -74,6 +74,20 @@ def _ball_vision_cone(k: BHumanKickCommand, sigma: float) -> torch.Tensor:
 
 def ball_kick_direction(env: ManagerBasedRLEnv, command_name: str = "kick") -> torch.Tensor:
     return _kick(env, command_name).ball_kick_direction_reward
+
+
+def ball_bad_touch(env: ManagerBasedRLEnv, yaw_tol_deg: float = 35.0, min_inside: float = 0.05,
+                   command_name: str = "kick") -> torch.Tensor:
+    """(B-Human に無い) ボールが最初に動いたステップで、それが蹴り足の内側での当たりでなければ 1。
+
+    「内側での当たり」= 一番近い足の向きとキック方向のなす角が 90° ± yaw_tol_deg、かつボール中心が足首から内側へ
+    min_inside [m] 以上 (仕様の「蹴り方」「当て方」と同じ測り方、kick_command._measure_contact)。つま先・すね・反対の足で
+    近づく途中に押した場合がこれに当たる。理由は bhuman_walk_kick_env_cfg の ball_bad_touch の説明。
+    """
+    k = _kick(env, command_name)
+    first = k.ball_kicked_counter == 1
+    good = (torch.abs(k.km_foot_yaw_abs - 90.0) <= yaw_tol_deg) & (k.km_ball_yin >= min_inside)
+    return (first & ~good).float()
 
 
 def ball_kick_velocity(env: ManagerBasedRLEnv, sigma_scale: float = 1.0, command_name: str = "kick") -> torch.Tensor:

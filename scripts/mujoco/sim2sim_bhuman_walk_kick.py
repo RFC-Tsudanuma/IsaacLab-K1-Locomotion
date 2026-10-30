@@ -216,6 +216,8 @@ class Sim:
         self.act = np.array([self.m.actuator(n).id for n in JOINTS])
         self.jrange = np.array([self.m.jnt_range[self.m.joint(n).id] for n in JOINTS])
         self.clip_targets = True
+        self.obs_noise = False
+        self.noise_rng = np.random.default_rng(0)
         self.trunk = self.w.trunk
         self.feet = self.w.feet
         self.delay = int(delay)
@@ -240,6 +242,11 @@ class Sim:
         d.qpos[self.qadr] = DEFAULT_Q
         self.w.place_ball(d, 0, sc.ball_xy, self.ball_r)
         self.w.place_ball(d, 1, km.PARK_XY[1], self.ball_r)
+        # 最初から歩いている / 転がっている場面 (Scenario.base_vel / ball_vel、既定 0 で今までと同じ)
+        d.qvel[0:2] = sc.base_vel
+        bv = self.w.ball_v[0]
+        d.qvel[bv:bv + 2] = sc.ball_vel
+        self.noise_rng = np.random.default_rng(sc.seed + 777)
         mujoco.mj_forward(m, d)
         self.last_action = np.zeros(13)
         self.phase = 0.0
@@ -263,6 +270,7 @@ class Sim:
         self.ball_pos = self.ball_rel(bp)
         dac = wrap(gdir - self.yaw())
         self.filtered_ball_pos = rot2(self.ball_pos, -dac)
+        self.walk_side = 1.0 if self.filtered_ball_pos[1] < 0 else -1.0
         self.kick_pose_translation_ratio = 0.0
         self.ball_kick_pose = bp[:2] + np.array([math.cos(gdir), math.sin(gdir)]) * KCFG["kick_pose_x"][1]
         self.update_kick_state()
@@ -314,6 +322,10 @@ class Sim:
                                                      self.ball_close_to_kick_pose + STEP_DT * 2))
         lp = 0.9 if mr == 1.0 else 0.2
         self.filtered_ball_pos = (1.0 - lp) * self.filtered_ball_pos + lp * bik
+        # 回り込む側 (学習の kick_command._update_walk_side、walk_side_hysteresis が 0 なら B-Human どおり毎回符号で決める)
+        fy = self.filtered_ball_pos[1]
+        if abs(fy) > k.get("walk_side_hysteresis", 0.0):
+            self.walk_side = 1.0 if fy < 0 else -1.0
         kp0, kp1 = k["kick_pose_x"]
         kp = kp0 + (kp1 - kp0) * max(self.ball_close_to_kick_pose, 0.0)
         self.ball_kick_pose = ball_w[:2] + np.array([math.cos(self.gdir), math.sin(self.gdir)]) * kp
@@ -329,7 +341,7 @@ class Sim:
         extra = max((self.kick_pose_translation_ratio - 0.5) / 0.5, 0.0) * (self.ball_r + 0.1)
         x_off = -math.sin(self.dac) * (k["kick_pose_y_off"] + extra)
         y_off = math.cos(self.dac) * (k["kick_pose_y_off"] + extra)
-        if self.filtered_ball_pos[1] < 0:
+        if self.walk_side > 0:
             wt = kpir + np.array([x_off, y_off])
         else:
             wt = kpir - np.array([x_off, y_off])
@@ -338,7 +350,7 @@ class Sim:
         ratio = 0.0 if self.ball_close_to_kick_pose < 1 else float(np.clip(-bir[0] / 0.3, 0.0, 1.0))
         bir = bir.copy()
         bir[0] += np.clip(abs(bir[1]) / 0.3, 0.0, 1.0) * -0.2 + np.clip(max(-bir[0], 1.0 - abs(bir[1]) / 0.3), 0.0, 1.0) * 0.3
-        bir[1] += (1.0 if self.filtered_ball_pos[1] < 0 else -1.0) * k["ball_avoidance_range"]
+        bir[1] += self.walk_side * k["ball_avoidance_range"]
         side = rot2(rot2(bir, gdir), -yaw)
         return wt * (1.0 - ratio) + side * ratio
 
@@ -375,19 +387,34 @@ class Sim:
         if np.linalg.norm(cmd) < CMD_THRESHOLD:
             ph[:] = 0.0
         exp_v = math.sqrt(2.0) * math.sqrt(KCFG["ball_friction"] * self.range)
+        ang, grav = d.qvel[3:6].copy(), R.T @ np.array([0.0, 0.0, -1.0])
+        jp, jv = d.qpos[self.qadr] - DEFAULT_Q, d.qvel[self.dadr].copy()
+        bpos, dac, bvel = self.ball_pos.copy(), self.dac, self.ball_vel.copy()
+        if self.obs_noise:
+            # --obs_noise: 学習 (Stage 7 の params/env.yaml) と同じ大きさの観測ノイズ。体は一様ノイズ (角速度 ±0.2、重力 ±0.05、
+            # 関節角 ±0.03、関節速度 ±1.5)。ボールは kick_command.obs_cache の式 (位置: 0.03 m から距離で増える正規、
+            # 方向 0.01 rad、速度 0.01 + 0..2 倍、必要な初速 0.05)。学習の「値を保持する」不具合の真似と odometry のずれは入れない。
+            g = self.noise_rng
+            ang += g.uniform(-0.2, 0.2, 3); grav += g.uniform(-0.05, 0.05, 3)
+            jp += g.uniform(-0.03, 0.03, jp.shape); jv += g.uniform(-1.5, 1.5, jv.shape)
+            r = np.clip((np.abs(bpos) - 0.5) / 9.5, 0.0, 1.0)
+            bpos = bpos + g.standard_normal(2) * (np.array([1.97, 0.32]) * r + 0.03)
+            dac = dac + g.standard_normal() * 0.01
+            bvel = (bvel + g.standard_normal(2) * 0.01) * g.uniform(0.0, 2.0, 2)
+            exp_v = exp_v + g.standard_normal() * 0.05
         return np.concatenate([
-            d.qvel[3:6],  # free joint の角速度は胴体フレーム
-            R.T @ np.array([0.0, 0.0, -1.0]),
+            ang,  # free joint の角速度は胴体フレーム
+            grav,
             cmd,
-            d.qpos[self.qadr] - DEFAULT_Q,
-            d.qvel[self.dadr],
+            jp,
+            jv,
             self.last_action[:12],
             ph,
-            self.ball_pos * 0.1,
-            [self.dac / math.pi],
-            [math.sin(self.dac), math.cos(self.dac)],
+            bpos * 0.1,
+            [dac / math.pi],
+            [math.sin(dac), math.cos(dac)],
             [1.0 if self.strong else 0.0, 0.0, 0.0],
-            self.ball_vel * 0.1,
+            bvel * 0.1,
             [exp_v * 0.1],
             [float(np.clip(self.last_action[12], -2.0, 2.0))],
         ]).astype(np.float32)
@@ -451,12 +478,16 @@ def main(argv=None) -> int:
     ap.add_argument("--kick_through_speed", type=float, default=0.0,
                     help="学習の walk_command と合わせる (Stage 2 以降 0、s1c〜前回の s6b/s7 は 0.5)")
     ap.add_argument("--no_clip_targets", action="store_true", help="関節の目標を関節の範囲で切らない (2026-10-26 までの動き)")
+    ap.add_argument("--walk_side_hysteresis", type=float, default=0.0,
+                    help="回り込む側を切り替える横位置のしきい値 [m] (学習の walk_side_hysteresis と同じ値にする。既定 0 = B-Human どおり。2026-10-31 の 0.05 の試し s8h05 は不採用)")
+    ap.add_argument("--obs_noise", action="store_true", help="学習と同じ大きさの観測ノイズを入れる (frame() の説明)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
     km.add_scene_args(ap)
     a = ap.parse_args(argv)
 
     WCFG["kick_through_speed"] = a.kick_through_speed
+    KCFG["walk_side_hysteresis"] = a.walk_side_hysteresis
     if a.stage_cfg:
         KCFG.update(json.loads(a.stage_cfg))
     onnx_path = a.onnx or export_onnx(a.checkpoint)
@@ -478,6 +509,7 @@ def main(argv=None) -> int:
         scenarios = [s for s in scenarios if s.name in names]
     sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
     sim.clip_targets = not a.no_clip_targets
+    sim.obs_noise = a.obs_noise
     results = {}
     for sc in scenarios:
         video = a.video_dir / f"{sc.name}.mp4" if a.video_dir else None
