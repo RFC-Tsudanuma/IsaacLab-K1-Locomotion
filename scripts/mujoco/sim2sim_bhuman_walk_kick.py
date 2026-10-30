@@ -467,7 +467,7 @@ def main(argv=None) -> int:
     if a.view or a.view_seconds > 0:
         sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
         sim.clip_targets = not a.no_clip_targets
-        km.run_viewer(sim, km.scene_from_args(a), a.next_ball_delay, a.view_seconds, a.speed)
+        km.run_viewer(sim, km.scene_from_args(a), a.next_ball_delay, a.view_seconds, a.speed, a.front_only)
         return 0
     if a.video_dir is not None:
         os.environ.setdefault("MUJOCO_GL", "egl")

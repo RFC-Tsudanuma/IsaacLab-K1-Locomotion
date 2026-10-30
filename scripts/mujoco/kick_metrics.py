@@ -568,6 +568,8 @@ def add_scene_args(ap):
     ap.add_argument("--view_seconds", type=float, default=0.0,
                     help="--view を画面なしで指定秒数だけ回す (動作確認用)。0 なら画面を開く")
     ap.add_argument("--speed", type=float, default=1.0, help="--view の再生速度 (1.0 = 実時間)")
+    ap.add_argument("--front_only", action="store_true",
+                    help="--view: 次のボールも胴体の真正面 (0.5〜2.0 m) に置き、キック方向も胴体の向きにする")
 
 
 def scene_from_args(a) -> Scenario:
@@ -582,7 +584,8 @@ def scene_from_args(a) -> Scenario:
     return pool[name]
 
 
-def run_viewer(sim, sc: Scenario, next_ball_delay: float = 0.4, seconds: float = 0.0, speed: float = 1.0):
+def run_viewer(sim, sc: Scenario, next_ball_delay: float = 0.4, seconds: float = 0.0, speed: float = 1.0,
+               front_only: bool = False):
     """画面を開いて実時間で動かす。蹴ったら next_ball_delay 秒後に、もう 1 つのボールをロボットの前方
     (胴体の向き ±60°、1.0〜1.5 m) に置いて新しいキック方向を指令する (学習環境でボールを置き直すのと同じ)。
     蹴るたびに、当たった瞬間の蹴り足の向きなどを 1 行表示する。転倒したら 2 秒後に場面の最初からやり直す。"""
@@ -647,14 +650,17 @@ def run_viewer(sim, sc: Scenario, next_ball_delay: float = 0.4, seconds: float =
             print(line, flush=True)
             nxt = 1 - cur
             yaw = body_yaw(d, w.trunk)
-            dist = rng.uniform(1.0, 1.5)
-            ang = yaw + rng.uniform(-math.radians(60), math.radians(60))
+            if front_only:  # 胴体の真正面に置き、胴体の向きへ蹴らせる
+                dist, ang = rng.uniform(0.5, 2.0), yaw
+            else:
+                dist = rng.uniform(1.0, 1.5)
+                ang = yaw + rng.uniform(-math.radians(60), math.radians(60))
             xy = d.qpos[0:2] + dist * np.array([math.cos(ang), math.sin(ang)])
             w.place_ball(d, nxt, xy, sim.ball_r)
             mujoco.mj_forward(w.m, d)
             strong = bool(rng.random() < 0.5)
             rng_m = 20.0 if strong else float(np.exp(rng.uniform(0.0, math.log(8.0))))
-            sim.set_task(nxt, rng.uniform(-math.pi, math.pi), strong, rng_m)
+            sim.set_task(nxt, yaw if front_only else rng.uniform(-math.pi, math.pi), strong, rng_m)
             expected = math.sqrt(2.0 * 0.3 * min(rng_m, 20.0))
             rec.ball_idx = nxt
             rec._touch = False
