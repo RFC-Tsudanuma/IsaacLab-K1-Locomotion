@@ -2088,6 +2088,13 @@ class K1FlatGatingCfg(K1FlatTransitionCfg):
         # (±3.0 rad/s, 0.6 s) として歩行コマンドに乗せる。ゲートはこの状態分布
         # (回りながら歩き出す) で遷移を学習することになる。C++ 側の定数を変えたら
         # ここも合わせる。
+        # 実機の指令域に合わせる (2026-10-31 ユーザー指示): x は ±2.0 で既に一致、y は
+        # best_walk 由来の ±0.9 では足りず実機は 1.2 m/s まで出す。高速域から pivot に入る
+        # 遷移の密度も上げる (extreme = |v| が max の 0.7 倍以上を引く確率)。
+        # 注意: best_walk 自体は y ±0.9 で学習しているので 1.2 は expert にとって分布外。
+        # 横 1.2 の追従が悪い場合はゲートではなく best_walk 側の追加学習が必要。
+        cmd.walk_cfg.ranges.lin_vel_y = (-1.2, 1.2)
+        cmd.walk_cfg.extreme_prob = 0.6
         cmd.turn_early_exit_rad = 15.0 * math.pi / 180.0
         cmd.yaw_assist_gain = 4.0
         cmd.yaw_assist_max = 3.0

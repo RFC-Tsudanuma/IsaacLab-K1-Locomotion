@@ -675,6 +675,12 @@ class TargetHeadingCommandCfg(UniformVelocityCommandCfg):
 ##
 
 
+TURN_ENTRY_FAST_MPS: float = 1.5
+"""``turn_entry_fast_frac`` のしきい値: walk → turn の瞬間の実速度がこれ以上なら「高速域からの遷移」。"""
+
+TURN_ENTRY_VFAST_MPS: float = 1.8
+"""``turn_entry_vfast_frac`` のしきい値: ほぼ全速力 (実機の x 上限 2.0 m/s) からの遷移。"""
+
 MODE_WALK: int = 0
 """`TransitionCommand` のモード値: 歩行 expert が担当 (コマンド枠 = (vx, vy, ωz))。"""
 
@@ -782,6 +788,13 @@ class TransitionCommand(CommandTerm):
         self._settle_cnt = torch.zeros(n, device=dev)
         self._num_switches = torch.zeros(n, device=dev)
         self._yaw_assist_steps = torch.zeros(n, device=dev)
+        # walk → turn に入った瞬間の「実速度 / 指令速度」(高速域からの遷移がどれだけ
+        # 学習に含まれているかを見る。2026-10-31 ユーザー質問)
+        self._entry_cnt = torch.zeros(n, device=dev)
+        self._entry_speed_sum = torch.zeros(n, device=dev)
+        self._entry_cmd_sum = torch.zeros(n, device=dev)
+        self._entry_fast_cnt = torch.zeros(n, device=dev)
+        self._entry_vfast_cnt = torch.zeros(n, device=dev)
 
     def __str__(self) -> str:
         msg = "TransitionCommand:\n"
@@ -970,6 +983,11 @@ class TransitionCommand(CommandTerm):
         self.metrics["turn_frac"] = self._turn_steps / self._steps.clamp(min=1.0)
         self.metrics["num_switches"] = self._num_switches
         self.metrics["yaw_assist_frac"] = self._yaw_assist_steps / self._steps.clamp(min=1.0)
+        denom = self._entry_cnt.clamp(min=1.0)
+        self.metrics["turn_entry_speed"] = self._entry_speed_sum / denom
+        self.metrics["turn_entry_cmd"] = self._entry_cmd_sum / denom
+        self.metrics["turn_entry_fast_frac"] = self._entry_fast_cnt / denom
+        self.metrics["turn_entry_vfast_frac"] = self._entry_vfast_cnt / denom
 
     def _resample_command(self, env_ids: Sequence[int]):
         """エピソード開始時の初期化 (``reset`` → ``_resample`` 経由でのみ呼ばれる)。"""
@@ -989,6 +1007,11 @@ class TransitionCommand(CommandTerm):
             self._settle_cnt,
             self._num_switches,
             self._yaw_assist_steps,
+            self._entry_cnt,
+            self._entry_speed_sum,
+            self._entry_cmd_sum,
+            self._entry_fast_cnt,
+            self._entry_vfast_cnt,
         ):
             buf[ids] = 0.0
         # 内部生成器のエピソード初期化 (メトリクス零化 + コマンド再サンプル)。extras は捨てる。
@@ -1028,6 +1051,13 @@ class TransitionCommand(CommandTerm):
         self._turn_interrupt_at[ids] = torch.where(interrupt, t_int, torch.full_like(t_int, float("inf")))
         self._turn_issued[ids] += 1.0
         if count_switch:
+            speed = self.robot.data.root_lin_vel_b[ids, :2].norm(dim=-1)
+            cmd = self.walk.vel_command_b[ids, :2].norm(dim=-1)
+            self._entry_cnt[ids] += 1.0
+            self._entry_speed_sum[ids] += speed
+            self._entry_cmd_sum[ids] += cmd
+            self._entry_fast_cnt[ids] += (speed >= TURN_ENTRY_FAST_MPS).float()
+            self._entry_vfast_cnt[ids] += (speed >= TURN_ENTRY_VFAST_MPS).float()
             self.switched[ids] = True
             self.command_counter[ids] += 1
             self._num_switches[ids] += 1.0
