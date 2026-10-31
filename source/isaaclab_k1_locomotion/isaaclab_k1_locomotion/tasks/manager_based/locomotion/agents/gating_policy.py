@@ -264,6 +264,32 @@ class GatingActorCritic(ActorCritic):
             self._expert_cache = None
         return actions
 
+    # ── 凍結 expert は checkpoint に含めない ────────────────────────────────
+    # experts は nn.ModuleDict なので既定では state_dict に入り、checkpoint が 9MB 級に
+    # なるだけでなく **expert を差し替えて resume すると古い expert が復元される**
+    # (model_4698.pt は 87 キー中 66 キーが experts.*)。expert は常にパス
+    # (DEFAULT_EXPERT_CHECKPOINTS / --frozen_ckpt) から読むものなので、保存・読込の
+    # 両方で除外する。古い checkpoint (experts.* を含む) もそのまま読める (2026-11-01)。
+    _EXPERT_PREFIX = "experts."
+
+    def state_dict(self, *args, **kwargs):
+        sd = super().state_dict(*args, **kwargs)
+        for k in [k for k in sd if self._EXPERT_PREFIX in k]:
+            del sd[k]
+        return sd
+
+    def load_state_dict(self, state_dict, strict=True):
+        filtered = {k: v for k, v in state_dict.items() if self._EXPERT_PREFIX not in k}
+        dropped = len(state_dict) - len(filtered)
+        if dropped:
+            print(f"[GatingActorCritic] checkpoint の experts.* {dropped} キーを無視 "
+                  f"(凍結 expert はパスから読み込む)")
+        missing = [k for k in self.state_dict() if k not in filtered]
+        if missing:
+            print(f"[GatingActorCritic] WARNING: ゲート側の {len(missing)} キーが "
+                  f"checkpoint に無い: {missing[:4]}")
+        return super().load_state_dict(filtered, strict=False)
+
     @staticmethod
     def blend(turn_weight: torch.Tensor, expert_actions: torch.Tensor) -> torch.Tensor:
         """``a = (1 - w) * a_walk + w * a_turn``。turn_weight: (N, 1)。"""
