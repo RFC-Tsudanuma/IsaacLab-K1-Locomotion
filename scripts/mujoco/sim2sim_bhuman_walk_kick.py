@@ -484,12 +484,14 @@ def main(argv=None) -> int:
     ap.add_argument("--kick_through_speed", type=float, default=0.0,
                     help="学習の walk_command と合わせる (Stage 2 以降 0、s1c〜前回の s6b/s7 は 0.5)")
     ap.add_argument("--no_clip_targets", action="store_true", help="関節の目標を関節の範囲で切らない (2026-10-26 までの動き)")
-    ap.add_argument("--walk_side_hysteresis", type=float, default=0.0,
-                    help="回り込む側を切り替える横位置のしきい値 [m] (学習の walk_side_hysteresis と同じ値にする。既定 0 = B-Human どおり。2026-10-31 の 0.05 の試し s8h05 は不採用)")
-    ap.add_argument("--min_side_off", type=float, default=0.0,
-                    help="速度指令の目標点の横ずれの下限 [m] (学習の walk_command の min_side_off と同じ値にする)")
-    ap.add_argument("--near_yaw_off_deg", type=float, default=0.0,
-                    help="ボールの近くで向く方向を、キック方向から蹴り足の側へこの角度 [deg] 回す (学習の walk_command と同じ値にする)")
+    # 速度指令の 3 つの値の既定は Stage 9 (2026-10-31 の最良 s9c model_11400) の学習の値。Stage 8 以前の checkpoint は 3 つとも 0 にする
+    # (docs/bhuman_walk_kick_spec.md「実機のキック側で作る速度指令」)。
+    ap.add_argument("--walk_side_hysteresis", type=float, default=0.05,
+                    help="回り込む側を切り替える横位置のしきい値 [m] (学習の walk_side_hysteresis と同じ値。Stage 9 は 0.05、Stage 8 以前は 0)")
+    ap.add_argument("--min_side_off", type=float, default=0.15,
+                    help="速度指令の目標点の横ずれの下限 [m] (学習の walk_command の min_side_off。Stage 9 は 0.15、Stage 8 以前は 0)")
+    ap.add_argument("--near_yaw_off_deg", type=float, default=20.0,
+                    help="ボールの近くで向く方向を、キック方向から蹴り足の側へこの角度 [deg] 回す (学習の walk_command。Stage 9 は 20、Stage 8 以前は 0)")
     ap.add_argument("--obs_noise", action="store_true", help="学習と同じ大きさの観測ノイズを入れる (frame() の説明)")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)

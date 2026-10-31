@@ -357,6 +357,44 @@ class K1BHumanWalkKickStage8EnvCfg_PLAY(K1BHumanWalkKickStage8EnvCfg):
         self.events.ball_scale = None  # 再生・評価は MuJoCo と同じ 0.095 m
 
 
+@configclass
+class K1BHumanWalkKickStage9EnvCfg(K1BHumanWalkKickStage7EnvCfg):
+    """(B-Human の段に無い) Stage 7b + 速度指令の作り直し + 苦手な向き + 蹴り足の速さ合わせ。2026-10-31 の最良 s9c model_11400。
+
+    学習の順: s7b model_9400 → s9a (下の指令・苦手な向き・回り込む側のしきい値) 9400〜10100 → s9b (+ kick_foot_speed 4)
+    10100〜10300 → s9c (kick_foot_speed 20) 10300〜11400。この class は s9c の値 (学習は hydra の上書きで回した。
+    claude_tmp/bwk2/train_s9*.sh)。
+    - 速度指令 (walk_command): min_side_off 0.15 m、near_yaw_off_deg 20°。理由と測定値は walk_command.py の cfg の説明。
+      実機で作る式は docs/bhuman_walk_kick_spec.md「実機のキック側で作る速度指令」。
+    - 回り込む側のしきい値 walk_side_hysteresis 0.05 m (kick_command の説明)。目標点の横ずれを 0.15 m にすると側が変わるたびに
+      目標点が 0.3 m 跳ぶので入れた。
+    - weak_rel_prob 0.25 (kick_command の説明)。
+    - kick_foot_speed 20 (rewards.kick_foot_speed の説明)。理由 (MuJoCo、s9b model_10300、距離指定 51 場面): 新しい指令では
+      蹴り足が必要な初速によらず 2.98 / 2.99 / 3.15 m/s (近い / 中 / 遠い) で当たり、弱キックの差 0.92〜1.01 m/s (≤0.8 未達)。
+      重み 4 は 1 回のキックで 0.5 程度しか払わず強キックの報酬 (約 5) に負けていた。20 にして s9c 11400 で
+      近い距離の蹴り足 2.6 m/s 前後・弱キックの差 0.67〜0.79 (5 通り)。
+    結果 (MuJoCo、学習と同じ指令): 細かい格子 (1824) 10° 超 4・失敗 2 (s7b 9400 は 92・13、B-Human 完成品 36・6)、
+    粗い格子 (1152) 失敗 0.1%、追加条件 最大 0.8%、仕様 5 通りすべて 10/10。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        k = self.commands.kick
+        k.kick_direction_sigma_range = 0.2
+        k.weak_rel_prob = 0.25
+        k.walk_side_hysteresis = 0.05
+        self.commands.base_velocity.min_side_off = 0.15
+        self.commands.base_velocity.near_yaw_off_deg = 20.0
+        self.rewards.kick_foot_speed.weight = 20.0
+
+
+@configclass
+class K1BHumanWalkKickStage9EnvCfg_PLAY(K1BHumanWalkKickStage9EnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        _play(self)
+
+
 def _play(cfg):
     """再生・評価用: env 16、観測ノイズ・ボール観測ノイズ・押しなし。"""
     cfg.scene.num_envs = 16

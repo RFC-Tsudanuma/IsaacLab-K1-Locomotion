@@ -29,7 +29,7 @@ gym.register(
     },
 )
 
-for _i in range(2, 9):
+for _i in range(2, 10):
     for _suffix, _cls in (("", ""), ("-Play", "_PLAY")):
         gym.register(
             id=f"Isaac-K1-BHuman-Walk-Kick-Stage{_i}{_suffix}-v0",
