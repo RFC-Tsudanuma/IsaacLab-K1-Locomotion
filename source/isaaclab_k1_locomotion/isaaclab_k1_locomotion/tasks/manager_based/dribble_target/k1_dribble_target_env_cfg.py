@@ -430,10 +430,12 @@ class K1DribbleTargetEnvCfg(_WALK_BASE_CFG):
                 "make_consistent": True,
             },
         )
+        # 2026-10-31: 速度比例の減衰に加えて、転がりの一定の減速度 U(0.3, 0.9) m/s^2 をランダム化する
+        # (MuJoCo の約 0.57 m/s^2 を範囲に入れる)。減衰だけでは、ドリブルの速さで MuJoCo の 2.6〜10 倍転がっていた。
         self.events.randomize_ball_damping = EventTerm(
             func=randomize_ball_damping,
             mode="reset",
-            params={"linear_range": (0.2, 0.8), "angular_range": (0.2, 0.8)},
+            params={"linear_range": (0.2, 0.8), "angular_range": (0.2, 0.8), "rolling_decel_range": (0.3, 0.9)},
         )
         self.events.apply_ball_damping = EventTerm(
             func=apply_ball_damping,

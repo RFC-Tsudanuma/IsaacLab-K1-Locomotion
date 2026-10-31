@@ -368,25 +368,36 @@ def randomize_ball_damping(
     env_ids: torch.Tensor | None,
     linear_range: tuple[float, float] = (0.2, 0.8),
     angular_range: tuple[float, float] = (0.2, 0.8),
+    rolling_decel_range: tuple[float, float] = (0.0, 0.0),
 ):
-    """reset イベント: ボールの linear / angular damping の係数を env ごとに引き直す。"""
+    """reset イベント: ボールの linear / angular damping の係数と、転がりの一定の減速度 [m/s^2] を env ごとに引き直す。"""
     if not hasattr(env, "_ball_damping"):
         env._ball_damping = torch.zeros(env.num_envs, 2, device=env.device)
         env._ball_damping[:, 0] = 0.5 * (linear_range[0] + linear_range[1])
         env._ball_damping[:, 1] = 0.5 * (angular_range[0] + angular_range[1])
+        env._ball_rolling_decel = torch.full((env.num_envs,), 0.5 * sum(rolling_decel_range), device=env.device)
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device)
     n = len(env_ids)
     env._ball_damping[env_ids, 0] = torch.empty(n, device=env.device).uniform_(*linear_range)
     env._ball_damping[env_ids, 1] = torch.empty(n, device=env.device).uniform_(*angular_range)
+    env._ball_rolling_decel[env_ids] = torch.empty(n, device=env.device).uniform_(*rolling_decel_range)
 
 
 def apply_ball_damping(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor | None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
+    ground_margin: float = 0.02,
 ):
-    """interval イベント (毎制御周期): ボールの速度・角速度に exp(-c × step_dt) を掛ける。"""
+    """interval イベント (毎制御周期): ボールの速度・角速度に exp(-c × step_dt) を掛ける。
+
+    2026-10-31: そのあと、地面に接している (中心の高さ < 半径 + ``ground_margin``) ボールの水平の速さを
+    一定の減速度 ``env._ball_rolling_decel`` × step_dt だけ減らす (転がり摩擦。0 で止まる)。MuJoCo のボールは
+    ほぼ一定の減速度 (約 0.57 m/s^2) で止まり、速度比例の減衰だけの Isaac は 2.6〜10 倍遠くまで転がっていた。
+    滑らずに転がっている状態を保つため、角速度にも同じ比率を掛ける (線速度だけ減らすと、地面の摩擦で
+    回転から線速度が戻ってしまう)。
+    """
     if not hasattr(env, "_ball_damping"):
         randomize_ball_damping(env, None)
     ball = env.scene[asset_cfg.name]
@@ -394,6 +405,13 @@ def apply_ball_damping(
     vel = ball.data.root_vel_w.clone()  # (N, 6): 線速度, 角速度 (ワールド)
     vel[:, :3] *= decay[:, 0:1]
     vel[:, 3:] *= decay[:, 1:2]
+    radius = ball.cfg.spawn.radius
+    height = ball.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    speed = torch.norm(vel[:, :2], dim=1)
+    ratio = torch.clamp(speed - env._ball_rolling_decel * env.step_dt, min=0.0) / speed.clamp(min=1e-6)
+    ratio = torch.where(height < radius + ground_margin, ratio, torch.ones_like(ratio))
+    vel[:, :2] *= ratio.unsqueeze(1)
+    vel[:, 3:] *= ratio.unsqueeze(1)
     ball.write_root_velocity_to_sim(vel)
 
 
