@@ -104,6 +104,22 @@ from .mdp.terminations import ball_reached_target, ball_too_far, dribble_time_ou
 # ---------------------------------------------------------------------------
 # 末尾に追加する項の並び順は history_layout.py の DRIBBLE_TARGET_POLICY_TERM_SPECS /
 # DRIBBLE_TARGET_CRITIC_TERM_SPECS と正確に一致させること。
+# 2026-11-01: vision_filter の模倣の設定 (ボールの観測 3 つで同じものを使う)。値は mdp.BALL_FILTER_DEFAULTS と同じで、
+# 実機 config/vision_filter.yaml と推論ノードに合わせたもの。検出のノイズ (det_noise_scale_range) と
+# 取りこぼし (near/far_drop_prob) は今回 0。
+_BALL_FILTER_PARAMS = {
+    "period_steps": 2,  # 25 Hz
+    "sigma_a": 0.8,
+    "r_cm2": ((477.7, -4.1), (-4.1, 153.1)),
+    "p0_pos": 0.25, "p0_vel": 2.5,
+    "gate": 9.21,
+    "stay_prob": 0.95, "switch_prob": 0.0167,
+    "lost_s": 3.0,
+    "det_noise_scale_range": (0.0, 0.0),
+    "near_distance": 0.35, "far_distance": 2.0, "near_drop_prob": 0.0, "far_drop_prob": 0.0,
+}
+
+
 @configclass
 class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     """K1FlatPolicyHistoryCfg (歩行履歴観測) + 目標座標相対位置・ボール相対位置・ボール速度 (末尾)。
@@ -158,25 +174,32 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # 距離に応じて near_distance〜far_distance の間を線形補間する。値は env.yaml で追えるよう全て明示する。
     # TODO: near_distance=0.35m / far_distance=2.0m は仮の値 (元の値が失われたため 2026-10-18 に確定扱い)。
     #       実機 vision_filter のログ (ボール距離ごとの mask / vel_valid の割合) が取れたら合わせ込むこと。
+    # 2026-11-01: ボールの位置・速度・足→ボールの観測を、vision_filter と推論ノードの模倣 (ball_delay_mode="filter"、
+    # mdp/observations.py の _BallVisionFilter) に置き換える。上のノイズ・ホールド・速度の欠損・足→ボールのノイズは
+    # vision_filter を真似るためのものだったので 0 にする (フィルタの模倣で置き換え)。検出の遅れ U(0, 150)ms と
+    # 自己位置の遅れ U(0, 250)ms は残す。検出のノイズ・取りこぼしは今回は入れない (_BALL_FILTER_PARAMS で後から足せる)。
+    # 座標変換の姿勢は撮影時刻ではなく、その制御周期に見えている遅れた自己位置 (target_pos_rel と同じ)。
     ball_pos_rel = ObsTerm(
         func=ball_pos_rel_vision,
         params={
             "near_distance": 0.35, "far_distance": 2.0,
-            "near_hold_prob": 0.6, "far_hold_prob": 0.05,
-            "noise_range": 0.05,
+            "near_hold_prob": 0.0, "far_hold_prob": 0.0,  # 2026-11-01: 0.6 / 0.05 → 0 (フィルタの模倣で置き換え)
+            "noise_range": 0.0,  # 2026-11-01: 0.05 → 0
             "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(0, 150)ms
-            "ball_delay_mode": "capture",  # 実機と同じ: 撮影時刻のロボット座標で見た撮影時刻のボール
+            "ball_delay_mode": "filter",  # 2026-11-01: "capture" → "filter"
+            "filter_params": _BALL_FILTER_PARAMS,
         },
     )
     ball_vel = ObsTerm(
         func=ball_vel_rel_vision,
         params={
             "near_distance": 0.35, "far_distance": 2.0,
-            "near_hold_prob": 0.6, "far_hold_prob": 0.05,
-            "near_invalid_prob": 0.4, "far_invalid_prob": 0.02,
-            "noise_range": 0.1,
+            "near_hold_prob": 0.0, "far_hold_prob": 0.0,  # 2026-11-01: 0.6 / 0.05 → 0
+            "near_invalid_prob": 0.0, "far_invalid_prob": 0.0,  # 2026-11-01: 0.4 / 0.02 → 0
+            "noise_range": 0.0,  # 2026-11-01: 0.1 → 0
             "ball_delay": True,  # 2026-10-26: ボール検出の遅れ U(0, 150)ms
-            "ball_delay_mode": "capture",  # 実機と同じ: 撮影時刻のロボット座標で見た撮影時刻のボール
+            "ball_delay_mode": "filter",  # 2026-11-01: "capture" → "filter"
+            "filter_params": _BALL_FILTER_PARAMS,
         },
     )
     # 2026-10-06: obstacle_pos_rel は Policy から削除した (Critic専用に戻す)。
@@ -188,13 +211,15 @@ class K1DribbleTargetPolicyHistoryCfg(K1FlatPolicyHistoryCfg):
     # 2026-10-26: 実機と同じく「(撮影時刻のロボット座標で見たボール) - (今の足の位置)」(ball_delay_mode="capture")。
     foot_left_ball_pos_rel = ObsTerm(
         func=foot_to_ball_pos_rel,
-        params={"foot_body_name": "left_foot_link", "ball_delay": True, "ball_delay_mode": "capture"},
-        noise=Unoise(n_min=-0.05, n_max=0.05),
+        params={"foot_body_name": "left_foot_link", "ball_delay": True, "ball_delay_mode": "filter",  # 2026-11-01: "capture" → "filter"
+                "filter_params": _BALL_FILTER_PARAMS},
+        noise=None,  # 2026-11-01: ±0.05 → なし (フィルタの模倣で置き換え)
     )
     foot_right_ball_pos_rel = ObsTerm(
         func=foot_to_ball_pos_rel,
-        params={"foot_body_name": "right_foot_link", "ball_delay": True, "ball_delay_mode": "capture"},
-        noise=Unoise(n_min=-0.05, n_max=0.05),
+        params={"foot_body_name": "right_foot_link", "ball_delay": True, "ball_delay_mode": "filter",  # 2026-11-01: "capture" → "filter"
+                "filter_params": _BALL_FILTER_PARAMS},
+        noise=None,  # 2026-11-01: ±0.05 → なし (フィルタの模倣で置き換え)
     )
 
 @configclass

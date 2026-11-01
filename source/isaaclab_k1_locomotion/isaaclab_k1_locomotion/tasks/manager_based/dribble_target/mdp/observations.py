@@ -230,6 +230,240 @@ def ball_rel_capture(env: ManagerBasedRLEnv, what: str = "pos") -> torch.Tensor:
     return _rotate_to_yaw(vec, past[:, 6:8])
 
 
+# ---------------------------------------------------------------------------
+# vision_filter のボールのフィルタと推論ノードの模倣 (2026-11-01、ball_delay_mode="filter")
+# ---------------------------------------------------------------------------
+# 実機・MuJoCo の vision_filter (config/vision_filter.yaml) と推論ノードのコードで確認した仕様:
+# - 状態はフィールド座標の [x, y, vx, vy]。観測は検出の位置だけ。検出が届くたび (25 Hz = 2 制御周期に 1 回、
+#   env ごとに位相はランダム) に、撮影時刻の差を dt として予測・補正する。出力は撮影時刻の推定 (今の時刻へは外挿しない)。
+# - 等速モデル。4 仮説: 停止 (v=0 固定) / 転がり / 高速 (転がりと同じ計算) / 反発 (MAP でない間は MAP 状態から v' = -v
+#   で作り直す)。出力は「事前確率 × 補正時の尤度」が最大の 1 つ (MAP)。遷移確率は対角 0.95、他 0.0167。
+# - Q: 白色加速度 σa。R = d[m] × R_cm2 [cm²] (フィールド座標)。初期化は位置 = 観測値、速度 0、σ 0.25 m / 2.5 m/s。
+# - 座標変換の姿勢: 撮影時刻ではなく、検出が届いた制御周期に見えている遅れた自己位置 (target_pos_rel の
+#   localization_delay と同じもの)。実機では自己位置の遅れがボールの遅れより大きく、撮影時刻の自己位置はまだ届いて
+#   いないため、その時点で最新の自己位置が使われる。検出 → フィールド座標も、出力 → ロボット座標も同じ姿勢 (速度は回転だけ)。
+# - NIS ゲート (全仮説で超えたら捨てる)。公開中の推定があれば、捨てた回は予測だけ進めて、その予測 (位置・速度) を出す。
+#   並行して捨てた観測から新しい推定を作り、2 回続けてゲートを通ったら入れ替えて公開する。
+# - lost_s 受け入れなければ LOST。公開中の推定が無い間は、推論ノードは生の検出の位置を使い、速度は 0。
+# - 推論ノードは次のメッセージまで最後の値を使い続ける。エピソードの開始では、その時のボールで初期化してすぐ公開する
+#   (MuJoCo は 1.5 s 静止させてから始めるので同じ)。
+# 後から足す予定の 2 つ (既定は 0 で切ってある):
+# - 検出の位置のノイズ: 共分散 s² · d · R、s は env ごとに U(det_noise_scale_range)
+# - 距離に応じた検出の取りこぼし: 確率は near_drop_prob (d <= near_distance) → far_drop_prob (d >= far_distance) を線形補間
+# critic は真値のまま。policy の enable_corruption=False (PLAY など) では使わない。
+
+BALL_FILTER_DEFAULTS = {
+    "period_steps": 2,  # 25 Hz
+    "sigma_a": 0.8,
+    "r_cm2": ((477.7, -4.1), (-4.1, 153.1)),
+    "p0_pos": 0.25, "p0_vel": 2.5,
+    "gate": 9.21,
+    "stay_prob": 0.95, "switch_prob": 0.0167,
+    "lost_s": 3.0,
+    "det_noise_scale_range": (0.0, 0.0),
+    "near_distance": 0.35, "far_distance": 2.0, "near_drop_prob": 0.0, "far_drop_prob": 0.0,
+}
+_KF_STOP, _KF_ROLL, _KF_FAST, _KF_BOUNCE = 0, 1, 2, 3
+_KF_H = 4
+
+
+def _from_yaw(vec_xy: torch.Tensor, cos_sin: torch.Tensor) -> torch.Tensor:
+    """body yaw 座標の xy をワールドに回す (_rotate_to_yaw の逆)。"""
+    c, s_ = cos_sin[:, 0], cos_sin[:, 1]
+    norm = torch.sqrt(c * c + s_ * s_).clamp(min=1e-6)
+    c, s_ = c / norm, s_ / norm
+    return torch.stack([c * vec_xy[:, 0] - s_ * vec_xy[:, 1], s_ * vec_xy[:, 0] + c * vec_xy[:, 1]], 1)
+
+
+class _BallKFBank:
+    """4 仮説のフィルタ 1 つ分 (env ごと)。"""
+
+    def __init__(self, n: int, dev, p: dict):
+        self.n, self.dev, self.p = n, dev, p
+        self.x = torch.zeros(n, _KF_H, 4, device=dev)
+        self.P = torch.zeros(n, _KF_H, 4, 4, device=dev)
+        self.logp = torch.full((n, _KF_H), -math.log(_KF_H), device=dev)
+        self.map = torch.full((n,), _KF_ROLL, dtype=torch.long, device=dev)
+        self.t = torch.zeros(n, device=dev)  # 状態の時刻 (撮影時刻) [s]
+        T = torch.full((_KF_H, _KF_H), p["switch_prob"], device=dev)
+        T.fill_diagonal_(p["stay_prob"])
+        self.logT = torch.log(T / T.sum(1, keepdim=True))
+        self.P0 = torch.diag(torch.tensor([p["p0_pos"] ** 2] * 2 + [p["p0_vel"] ** 2] * 2, device=dev))
+        self.idx = torch.arange(n, device=dev)
+
+    def init(self, m: torch.Tensor, z: torch.Tensor, t: torch.Tensor):
+        mx = m.view(-1, 1, 1)
+        x0 = torch.zeros_like(self.x)
+        x0[..., 0:2] = z.unsqueeze(1)
+        self.x = torch.where(mx, x0, self.x)
+        self.P = torch.where(mx.unsqueeze(-1), self.P0.expand_as(self.P), self.P)
+        self.logp = torch.where(m.unsqueeze(1), torch.full_like(self.logp, -math.log(_KF_H)), self.logp)
+        self.map = torch.where(m, torch.full_like(self.map, _KF_ROLL), self.map)
+        self.t = torch.where(m, t, self.t)
+        self._clamp_stop()
+
+    def copy_from(self, other: "_BallKFBank", m: torch.Tensor):
+        mx = m.view(-1, 1, 1)
+        self.x = torch.where(mx, other.x, self.x)
+        self.P = torch.where(mx.unsqueeze(-1), other.P, self.P)
+        self.logp = torch.where(m.unsqueeze(1), other.logp, self.logp)
+        self.map = torch.where(m, other.map, self.map)
+        self.t = torch.where(m, other.t, self.t)
+
+    def _clamp_stop(self):
+        self.x[:, _KF_STOP, 2:] = 0.0
+        self.P[:, _KF_STOP, 2:, :] = 0.0
+        self.P[:, _KF_STOP, :, 2:] = 0.0
+
+    def map_state(self) -> torch.Tensor:
+        return self.x[self.idx, self.map]
+
+    def predict(self, m: torch.Tensor, t: torch.Tensor):
+        """m の env を時刻 t まで予測する。反発の仮説は MAP でなければ MAP 状態から v' = -v で作り直す。"""
+        dt = torch.where(m, t - self.t, torch.zeros_like(t)).clamp(min=0.0)
+        rb = (m & (self.map != _KF_BOUNCE)).view(-1, 1)
+        xb = self.map_state().clone()
+        xb[:, 2:] *= -1.0
+        self.x[:, _KF_BOUNCE] = torch.where(rb, xb, self.x[:, _KF_BOUNCE])
+        self.P[:, _KF_BOUNCE] = torch.where(rb.unsqueeze(-1), self.P[self.idx, self.map], self.P[:, _KF_BOUNCE])
+        F = torch.eye(4, device=self.dev).repeat(self.n, 1, 1)
+        F[:, 0, 2] = dt
+        F[:, 1, 3] = dt
+        q = self.p["sigma_a"] ** 2
+        Q = torch.zeros(self.n, 4, 4, device=self.dev)
+        for a in (0, 1):
+            Q[:, a, a] = dt ** 4 / 4 * q
+            Q[:, a, a + 2] = dt ** 3 / 2 * q
+            Q[:, a + 2, a] = dt ** 3 / 2 * q
+            Q[:, a + 2, a + 2] = dt ** 2 * q
+        self.x = torch.einsum("nij,nhj->nhi", F, self.x)
+        self.P = F.unsqueeze(1) @ self.P @ F.transpose(1, 2).unsqueeze(1) + Q.unsqueeze(1)
+        self.t = torch.where(m, t, self.t)
+        self._clamp_stop()
+
+    def correct(self, m: torch.Tensor, z: torch.Tensor, R: torch.Tensor) -> torch.Tensor:
+        """m の env を補正する。ゲートを通らなかった env は変えない。戻り値: 受け入れたか (N,)。"""
+        y = z.unsqueeze(1) - self.x[..., 0:2]
+        S = self.P[..., 0:2, 0:2] + R.unsqueeze(1)
+        Si = torch.linalg.inv(S)
+        nis = torch.einsum("nhi,nhij,nhj->nh", y, Si, y)
+        ok = (nis <= self.p["gate"]).any(1) & m
+        loglik = -0.5 * nis - 0.5 * torch.logdet(S)
+        prior = torch.logsumexp(self.logp.unsqueeze(2) + self.logT.unsqueeze(0), dim=1)
+        post = prior + loglik
+        post = post - torch.logsumexp(post, dim=1, keepdim=True)
+        K = self.P[..., :, 0:2] @ Si
+        o = ok.view(-1, 1, 1)
+        self.x = torch.where(o, self.x + torch.einsum("nhij,nhj->nhi", K, y), self.x)
+        self.P = torch.where(o.unsqueeze(-1), self.P - K @ self.P[..., 0:2, :], self.P)
+        self.logp = torch.where(ok.unsqueeze(1), post, self.logp)
+        self.map = torch.where(ok, post.argmax(1), self.map)
+        self._clamp_stop()
+        return ok
+
+
+class _BallVisionFilter:
+    """検出 → vision_filter → 推論ノードが使う値 (ロボット座標のボールの位置・速度) を、1 制御周期に 1 回作る。"""
+
+    def __init__(self, env: ManagerBasedRLEnv, params: dict | None):
+        p = dict(BALL_FILTER_DEFAULTS)
+        p.update(params or {})
+        n, dev = env.num_envs, env.device
+        self.p, self.n, self.dev = p, n, dev
+        self.main, self.cand = _BallKFBank(n, dev, p), _BallKFBank(n, dev, p)
+        self.has_main = torch.zeros(n, dtype=torch.bool, device=dev)  # 公開中の推定がある
+        self.has_cand = torch.zeros(n, dtype=torch.bool, device=dev)
+        self.cand_n = torch.zeros(n, dtype=torch.long, device=dev)  # 新しい推定がゲートを続けて通った回数
+        self.t_seen = torch.zeros(n, device=dev)
+        self.phase = torch.randint(0, p["period_steps"], (n,), device=dev)
+        self.noise_scale = torch.zeros(n, device=dev)
+        self.R_cm2 = torch.tensor(p["r_cm2"], device=dev) * 1e-4  # m²
+        self.out_pos = torch.zeros(n, 2, device=dev)
+        self.out_vel = torch.zeros(n, 2, device=dev)
+        self.step = -1
+
+    def update(self, env: ManagerBasedRLEnv):
+        step = int(env.common_step_counter)
+        fresh = env.episode_length_buf == 0
+        # 同じ制御周期の 2 回目以降は、エピソードの開始の初期化だけ行う (観測の次元を調べる呼び出しと
+        # 最初のリセットが同じ common_step_counter で来るため、ここで飛ばすと古いボールで始まる)
+        same_step = step == self.step
+        if same_step and not bool(fresh.any()):
+            return
+        self.step = step
+        p = self.p
+        hist = _obs_history(env)
+        delays = _obs_delays(env)
+        cap = hist.delayed(delays[:, 0], env.step_dt)  # 撮影時刻
+        rel_c = _rotate_to_yaw(cap[:, 0:2] - cap[:, 4:6], cap[:, 6:8])  # 検出 (撮影時刻のロボット座標)
+        d = torch.norm(rel_c, dim=1)
+        t_cap = env.episode_length_buf.float() * env.step_dt - delays[:, 0]
+        loc = hist.delayed(delays[:, 1], env.step_dt)  # その時点で最新の自己位置
+        p_l, cs_l = loc[:, 4:6], loc[:, 6:8]
+        R = self.R_cm2.unsqueeze(0) * d.clamp(min=0.05).view(-1, 1, 1)  # (N, 2, 2) フィールド座標
+        lo, hi = p["det_noise_scale_range"]
+        self.phase = torch.where(fresh, torch.randint_like(self.phase, 0, p["period_steps"]), self.phase)
+        self.noise_scale = torch.where(fresh, torch.empty_like(self.noise_scale).uniform_(lo, hi), self.noise_scale)
+        z = p_l + _from_yaw(rel_c, cs_l)  # フィールド座標の検出
+        if hi > 0.0:  # 検出の位置のノイズ: 共分散 s² · d · R
+            L = torch.linalg.cholesky(R)
+            z = z + self.noise_scale.unsqueeze(1) * (L @ torch.randn_like(z).unsqueeze(-1)).squeeze(-1)
+        det = ((env.episode_length_buf + self.phase) % p["period_steps"] == 0) & ~fresh & ~torch.full_like(fresh, same_step)
+        if p["near_drop_prob"] > 0.0 or p["far_drop_prob"] > 0.0:  # 距離に応じた取りこぼし
+            alpha = ((d - p["near_distance"]) / max(p["far_distance"] - p["near_distance"], 1e-6)).clamp(0.0, 1.0)
+            drop = torch.rand_like(d) < p["near_drop_prob"] + alpha * (p["far_drop_prob"] - p["near_drop_prob"])
+            det = det & ~drop
+        # エピソードの開始: その時のボールで初期化して、すぐ公開する
+        self.main.init(fresh, z, t_cap)
+        self.has_main |= fresh
+        self.has_cand &= ~fresh
+        self.t_seen = torch.where(fresh, t_cap, self.t_seen)
+        # 公開中の推定: 予測して補正 (ゲートで捨てた回は予測のまま)
+        live = det & self.has_main
+        self.main.predict(live, t_cap)
+        ok_m = self.main.correct(live, z, R)
+        self.t_seen = torch.where(ok_m, t_cap, self.t_seen)
+        # 新しい推定: 公開中の推定が受け入れなかった検出で作る・育てる
+        need = det & ~ok_m
+        c_live = need & self.has_cand
+        self.cand.predict(c_live, t_cap)
+        ok_c = self.cand.correct(c_live, z, R)
+        self.cand_n = torch.where(ok_c, self.cand_n + 1, self.cand_n)
+        restart = need & ~ok_c
+        self.cand.init(restart, z, t_cap)
+        self.has_cand |= restart
+        self.cand_n = torch.where(restart, torch.zeros_like(self.cand_n), self.cand_n)
+        swap = need & ok_c & (self.cand_n >= 2)
+        self.main.copy_from(self.cand, swap)
+        self.has_main |= swap
+        self.t_seen = torch.where(swap, t_cap, self.t_seen)
+        clear = ok_m | swap
+        self.has_cand &= ~clear
+        self.cand_n = torch.where(clear, torch.zeros_like(self.cand_n), self.cand_n)
+        lost = det & self.has_main & (t_cap - self.t_seen > p["lost_s"])
+        self.has_main &= ~lost
+        # 推論ノードが使う値 (次の検出まで保つ)。公開中の推定が無ければ、生の検出の位置と速度 0
+        new = det | fresh
+        xm = self.main.map_state()
+        use_kf = (new & self.has_main).unsqueeze(1)
+        use_raw = (new & ~self.has_main).unsqueeze(1)
+        pos_kf = _rotate_to_yaw(xm[:, 0:2] - p_l, cs_l)
+        vel_kf = _rotate_to_yaw(xm[:, 2:4], cs_l)
+        pos_raw = _rotate_to_yaw(z - p_l, cs_l)
+        self.out_pos = torch.where(use_kf, pos_kf, torch.where(use_raw, pos_raw, self.out_pos))
+        self.out_vel = torch.where(use_kf, vel_kf, torch.where(use_raw, torch.zeros_like(vel_kf), self.out_vel))
+
+
+def ball_rel_filtered(env: ManagerBasedRLEnv, what: str = "pos", filter_params: dict | None = None) -> torch.Tensor:
+    """vision_filter と推論ノードを通したボールの位置 / 速度 (body yaw 座標の xy)。filter は env に 1 つだけ作る。"""
+    filt = env.__dict__.get("_ball_vision_filter")
+    if filt is None:
+        filt = _BallVisionFilter(env, filter_params)
+        env.__dict__["_ball_vision_filter"] = filt
+    filt.update(env)
+    return filt.out_pos if what == "pos" else filt.out_vel
+
+
 def robot_yaw_cos_sin(env: ManagerBasedRLEnv) -> torch.Tensor:
     return _obs_history(env).buf[:, 0, 6:8]
 
@@ -269,6 +503,7 @@ def foot_to_ball_pos_rel(
     foot_body_name: str,
     ball_delay: bool = False,
     ball_delay_mode: str = "current",
+    filter_params: dict | None = None,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
 ) -> torch.Tensor:
@@ -291,6 +526,9 @@ def foot_to_ball_pos_rel(
         cache[foot_body_name] = ids[0]
     foot_pos_w = robot.data.body_pos_w[:, cache[foot_body_name], :2]
     if ball_delay and _corruption_enabled(env):
+        if ball_delay_mode == "filter":  # 実機と同じ: (vision_filter のボール) - (今のロボット座標で見た今の足)
+            foot_b = _to_body_yaw_xy(robot, foot_pos_w - robot.data.root_pos_w[:, :2])
+            return ball_rel_filtered(env, "pos", filter_params) - foot_b
         if ball_delay_mode == "capture":
             # 実機と同じ: (撮影時刻のロボット座標で見たボール) - (今のロボット座標で見た今の足)
             foot_b = _to_body_yaw_xy(robot, foot_pos_w - robot.data.root_pos_w[:, :2])
@@ -383,13 +621,17 @@ class ball_pos_rel_vision(_BallVisionTerm):
         noise_range: float = 0.05,
         ball_delay: bool = False,
         ball_delay_mode: str = "current",
+        filter_params: dict | None = None,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     ) -> torch.Tensor:
         robot, _, offset_w, dist = self._ball_dist_and_robot(env, asset_cfg, ball_cfg)
         if not self._corruption_enabled(env):
             return _to_body_yaw_xy(robot, offset_w)
-        if ball_delay and ball_delay_mode == "capture":  # 撮影時刻のロボット座標で見た、撮影時刻のボール
+        if ball_delay and ball_delay_mode == "filter":  # vision_filter と推論ノードの模倣
+            out = ball_rel_filtered(env, "pos", filter_params)
+            dist = torch.norm(out, dim=1)
+        elif ball_delay and ball_delay_mode == "capture":  # 撮影時刻のロボット座標で見た、撮影時刻のボール
             out = ball_rel_capture(env, "pos")
             dist = torch.norm(out, dim=1)
         elif ball_delay:  # d_ball 前のボール位置を、今のロボットの姿勢で見る
@@ -422,13 +664,17 @@ class ball_vel_rel_vision(_BallVisionTerm):
         noise_range: float = 0.1,
         ball_delay: bool = False,
         ball_delay_mode: str = "current",
+        filter_params: dict | None = None,
         asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
         ball_cfg: SceneEntityCfg = SceneEntityCfg("soccer_ball"),
     ) -> torch.Tensor:
         robot, ball, _, dist = self._ball_dist_and_robot(env, asset_cfg, ball_cfg)
         if not self._corruption_enabled(env):
             return _to_body_yaw_xy(robot, ball.data.root_com_vel_w[:, :2])
-        if ball_delay and ball_delay_mode == "capture":  # 撮影時刻のロボットの向きで回した、撮影時刻の速度
+        if ball_delay and ball_delay_mode == "filter":  # vision_filter と推論ノードの模倣
+            out = ball_rel_filtered(env, "vel", filter_params)
+            dist = torch.norm(ball_rel_filtered(env, "pos", filter_params), dim=1)
+        elif ball_delay and ball_delay_mode == "capture":  # 撮影時刻のロボットの向きで回した、撮影時刻の速度
             out = ball_rel_capture(env, "vel")
             dist = torch.norm(ball_rel_capture(env, "pos"), dim=1)
         elif ball_delay:  # d_ball 前のボール速度を、今のロボットの向きで見る
