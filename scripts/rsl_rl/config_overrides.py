@@ -26,6 +26,12 @@ def apply_overrides_from_file(json_path: str, *, env_cfg: Any, agent_cfg: Any) -
 def apply_overrides(data: dict, *, env_cfg: Any, agent_cfg: Any) -> None:
     env_overrides = data.get("env", {})
     agent_overrides = data.get("agent", {})
+    unknown = set(data) - {"env", "agent"}
+    if unknown:
+        raise KeyError(
+            f"override keys must be nested under 'env' or 'agent' (got top-level {sorted(unknown)}); "
+            "bare dot-paths would be silently ignored"
+        )
 
     for path, value in env_overrides.items():
         _set_dotted(env_cfg, path, value, scope="env")
@@ -39,22 +45,36 @@ def apply_overrides(data: dict, *, env_cfg: Any, agent_cfg: Any) -> None:
 
 
 def _set_dotted(root: Any, path: str, value: Any, *, scope: str) -> None:
+    """dot-path で属性を辿って値を設定する。dict の中のキー (例: rewards.X.params.gate_low_speed)
+    にも対応する: 属性として見つからない場合は dict キーとして解決を試みる。"""
     parts = path.split(".")
     obj = root
     for p in parts[:-1]:
-        if not hasattr(obj, p):
+        if hasattr(obj, p):
+            obj = getattr(obj, p)
+        elif isinstance(obj, dict) and p in obj:
+            obj = obj[p]
+        else:
             raise AttributeError(
                 f"[override] {scope}.{path}: intermediate attribute '{p}' missing on {type(obj).__name__}"
             )
-        obj = getattr(obj, p)
     last = parts[-1]
-    if not hasattr(obj, last):
-        raise AttributeError(
-            f"[override] {scope}.{path}: leaf attribute '{last}' missing on {type(obj).__name__}"
-        )
-    current = getattr(obj, last)
-    coerced = _coerce(current, value)
-    setattr(obj, last, coerced)
+    if isinstance(obj, dict):
+        if last not in obj:
+            raise AttributeError(
+                f"[override] {scope}.{path}: key '{last}' missing in dict"
+            )
+        current = obj[last]
+        coerced = _coerce(current, value)
+        obj[last] = coerced
+    else:
+        if not hasattr(obj, last):
+            raise AttributeError(
+                f"[override] {scope}.{path}: leaf attribute '{last}' missing on {type(obj).__name__}"
+            )
+        current = getattr(obj, last)
+        coerced = _coerce(current, value)
+        setattr(obj, last, coerced)
     print(f"[override] {scope}.{path}: {current!r} -> {coerced!r}")
 
 
