@@ -35,6 +35,16 @@ ONNX の入出力 (歩行 policy.onnx と同じ形で、1 ステップの観測�
   ``--ball_delay`` ステップ前の位置 (学習: 1〜3 ステップの一様乱数)。
 * ``--kick_through_speed``: 歩行コマンドの「キック姿勢に入った後の最低前進速度」。Stage 2 以降は 0 (既定)。
   Stage 1 (s1c) 〜 前回の s6b/s7 は 0.5 で学習したので、それらを回すときは 0.5 を渡す。
+* ``--handoff``: 実機と同じ「歩行方策で近づいてからキック方策へ切り替える」場面を、(ボールの最初の距離, 歩行の速度指令,
+  受け渡し距離) の格子で回す。歩行は ``--walk_onnx`` (既定 frozen_policies/best_walk_52700/policy.onnx)。歩行が動いている
+  間もキックの履歴は毎周期積み (歩行の 49 項は歩行が見ているのと同じ: 速度指令の欄 = 歩行の速度指令、位相 = 歩行の位相、
+  前の action = 歩行の脚 12、13 番目は 0)、キックの状態も進める。胴体の中心からボールまでが受け渡し距離以下になったら
+  履歴・位相・前の action をそのまま引き継いでキック方策に切り替える (deploy の observe_walk_tick / on_enter と同じ)。
+  歩行の速度指令は学習の受け渡し (bhuman_walk_kick/mdp/walk_handoff.py) と同じ: vx = 速さ × max(cos(ボールの方位), 0)、
+  vy = 0、wz = clip(1.5 × ボールの方位, ±1)。
+
+      ~/k1_deploy_env/bin/python scripts/mujoco/sim2sim_bhuman_walk_kick.py --onnx <kick.onnx> --handoff \
+          --handoff_start 2.5,4.0 --handoff_speed 0.5,1.0,1.5,2.0 --handoff_entry 0.8,1.2,1.6,2.0 --handoff_n 8 --jobs 8
 """
 
 from __future__ import annotations
@@ -92,6 +102,8 @@ KCFG = dict(
 WCFG = dict(gain_xy=1.5, vx_range=(-0.5, 1.0), max_vy=0.5, gain_yaw=1.5, max_wz=1.0, near_dist=0.6, blend_dist=0.4,
             kick_through_speed=0.0)
 BASE_INIT = np.array([0.0, 0.0, 0.6])
+WALK_ONNX_DEFAULT = REPO / "frozen_policies/best_walk_52700/policy.onnx"
+WALK_STEP_DIM = 49  # 歩行の 1 ステップの観測 (キックの観測の先頭 49 個と同じ並び)
 wrap, rot2 = km.wrap, km.rot2
 
 
@@ -206,13 +218,17 @@ def build_model(friction: float, ball_friction: float, ball_foot_friction: float
 class Sim:
     def __init__(self, onnx_path: Path, friction: float, delay: int, ball_delay: int, ball_friction: float = 1.0,
                  ball_foot_friction: float | None = None, ball_r: float = km.BALL_R_DEFAULT,
-                 ball_m: float = km.BALL_M_DEFAULT):
+                 ball_m: float = km.BALL_M_DEFAULT, walk_onnx: Path | None = None):
         import onnxruntime as ort
 
         so = ort.SessionOptions()
         so.intra_op_num_threads = 1
         so.inter_op_num_threads = 1
         self.sess = ort.InferenceSession(str(onnx_path), sess_options=so, providers=["CPUExecutionProvider"])
+        # 受け渡しの場面 (Scenario.walk_speed) で、切り替えまで動かす歩行方策
+        self.walk_sess = None if walk_onnx is None else ort.InferenceSession(
+            str(walk_onnx), sess_options=so, providers=["CPUExecutionProvider"])
+        self.walk_mode = False
         self.m = build_model(friction, ball_friction, ball_foot_friction, ball_r, ball_m)
         self.d = mujoco.MjData(self.m)
         self.w = km.World(self.m)
@@ -261,6 +277,13 @@ class Sim:
         self.set_task(0, gdir, sc.strong, range0)
         self.expected_vel0 = math.sqrt(2.0 * KCFG["ball_friction"] * range0)
         self.history = None
+        self.t = 0.0
+        self.walk_mode = sc.walk_speed is not None
+        if self.walk_mode:
+            assert self.walk_sess is not None, "受け渡しの場面には歩行の ONNX (walk_onnx) が要る"
+            self.walk_speed, self.entry_dist = float(sc.walk_speed), float(sc.entry_dist)
+            self.handoff_t = self.handoff_speed = self.handoff_dist = None
+            self.command = self.handoff_command()
 
     def set_task(self, idx: int, gdir: float, strong: bool, range_m: float):
         """学習の _reset_ball_idx / _resample_kick_ball: 見るボールとキック指令を変える。"""
@@ -378,6 +401,12 @@ class Sim:
         wz = float(np.clip(w["gain_yaw"] * err, -w["max_wz"], w["max_wz"]))
         return np.array([vx, vy, wz])
 
+    def handoff_command(self):
+        """受け渡しまで歩行に渡す速度指令 (学習の walk_handoff.WalkHandoff.walk_command と同じ式)。"""
+        rel = rot2(self.ball_w()[:2] - self.d.qpos[0:2], -self.yaw())
+        err = math.atan2(rel[1], rel[0])
+        return np.array([self.walk_speed * max(math.cos(err), 0.0), 0.0, float(np.clip(1.5 * err, -1.0, 1.0))])
+
     def phase_freq(self, cmd, freq_action):
         s = float(np.linalg.norm(cmd[:2]))
         slope = (PH_HIGH_F - PH_LOW_F) / (PH_HIGH_SPEED - PH_LOW_SPEED)
@@ -434,8 +463,14 @@ class Sim:
             self.history = np.repeat(f[None], HISTORY, axis=0)
         else:
             self.history = np.concatenate((self.history[1:], f[None]), axis=0)
-        a = self.sess.run(None, {"command": self.command[None].astype(np.float32),
-                                 "obs_history": self.history[None]})[0][0].astype(np.float64)
+        if self.walk_mode:
+            # 歩行方策: 入力はキックの履歴の先頭 49 項 (同じ値・同じ並び)。13 番目 (歩行周波数のずらし) は 0
+            a12 = self.walk_sess.run(None, {"command": self.command[None].astype(np.float32),
+                                            "obs_history": np.ascontiguousarray(self.history[None, :, :WALK_STEP_DIM])})[0][0]
+            a = np.concatenate([a12.astype(np.float64), [0.0]])
+        else:
+            a = self.sess.run(None, {"command": self.command[None].astype(np.float32),
+                                     "obs_history": self.history[None]})[0][0].astype(np.float64)
         self.last_action = a.copy()
         target_q = DEFAULT_Q + ACTION_SCALE * a[:12]
         if self.clip_targets:
@@ -454,8 +489,68 @@ class Sim:
             if hook is not None:
                 hook((i + 1) * SIM_DT)
         self.ball_buf.append(self.ball_w())
+        self.t += STEP_DT
         self.update_kick_state()
-        self.command = self.walk_command()
+        if self.walk_mode:
+            dist = float(np.linalg.norm(self.ball_w()[:2] - d.qpos[0:2]))
+            if dist <= self.entry_dist:
+                # キック方策へ切り替え: 履歴・位相・前の action (脚 12 = 歩行、13 番目 = 0) はそのまま
+                self.walk_mode = False
+                self.handoff_t = self.t
+                self.handoff_speed = float(np.linalg.norm(d.qvel[0:2]))
+                self.handoff_dist = dist
+        self.command = self.handoff_command() if self.walk_mode else self.walk_command()
+
+
+# --------------------------------------------------------------------------- #
+# 歩行方策からの受け渡し (--handoff)
+# --------------------------------------------------------------------------- #
+def handoff_scenarios(starts, speeds, entries, n: int, seed: int) -> list[km.Scenario]:
+    """(ボールの最初の距離, 歩行の速度指令, 受け渡し距離) ごとに n 場面。ボールはほぼ正面 (方位 ±15°)、キック方向は全方向、
+    強キック / 距離指定 (1〜8 m の対数一様) 半々。どの組も同じ n 個の (方位, キック方向, 強さ) を使う。"""
+    rng = np.random.default_rng(seed)
+    base = [(rng.uniform(-15.0, 15.0), rng.uniform(-180.0, 180.0), bool(rng.random() < 0.5),
+             float(np.exp(rng.uniform(0.0, math.log(8.0))))) for _ in range(n)]
+    out = []
+    for st in starts:
+        for v in speeds:
+            for e in entries:
+                for i, (bear, kick, strong, rng_m) in enumerate(base):
+                    b = math.radians(bear)
+                    out.append(km.Scenario(f"h_d{st:g}_v{v:g}_e{e:g}_{i:02d}", (st * math.cos(b), st * math.sin(b)), kick,
+                                           strong, rng_m, seed=seed * 1000 + i, walk_speed=v, entry_dist=e))
+    return out
+
+
+def _handoff_worker(job):
+    onnx_path, walk_onnx, sim_args, scs, duration, nbd, post = job
+    sim = Sim(onnx_path, *sim_args, walk_onnx=walk_onnx)
+    res = []
+    for sc in scs:
+        r = km.run_scene(sim, sc, duration, nbd, post, None)
+        res.append((sc.name, r))
+    return res
+
+
+def handoff_table(scenarios, results) -> str:
+    """(最初の距離, 速度指令, 受け渡し距離) ごとの表。"""
+    groups = {}
+    for sc in scenarios:
+        groups.setdefault((round(math.hypot(*sc.ball_xy), 3), sc.walk_speed, sc.entry_dist), []).append(results[sc.name])
+    rows = ["| 最初の距離 | 速度指令 | 受け渡し距離 | n | 成功 | bump | 転倒 | 蹴らない | 向きのずれ 平均 | 渡した時の速さ | "
+            "渡した後の最低速度 | 渡して→接触 [s] |", "|" + "---|" * 12]
+    for (dist, v, e), rs in groups.items():
+        n = len(rs)
+
+        def mean(key):
+            xs = [r[key] for r in rs if r.get(key) is not None]
+            return f"{np.mean(xs):.2f}" if xs else "-"
+
+        rows.append(f"| {dist:.1f} | {v:.1f} | {e:.1f} | {n} | {sum(r['success'] for r in rs)} | "
+                    f"{sum(r['bump'] for r in rs)} | {sum(r['fell'] for r in rs)} | {sum(r['kick_t'] is None for r in rs)} | "
+                    f"{mean('dir_err_abs_deg')} | {mean('handoff_speed')} | {mean('min_speed_after_handoff')} | "
+                    f"{mean('handoff_to_touch_s')} |")
+    return "\n".join(rows)
 
 
 def main(argv=None) -> int:
@@ -493,6 +588,14 @@ def main(argv=None) -> int:
     ap.add_argument("--near_yaw_off_deg", type=float, default=20.0,
                     help="ボールの近くで向く方向を、キック方向から蹴り足の側へこの角度 [deg] 回す (学習の walk_command。Stage 9 は 20、Stage 8 以前は 0)")
     ap.add_argument("--obs_noise", action="store_true", help="学習と同じ大きさの観測ノイズを入れる (frame() の説明)")
+    ap.add_argument("--handoff", action="store_true",
+                    help="歩行方策で近づいてからキック方策へ切り替える場面の格子を回す (モジュールの説明)")
+    ap.add_argument("--walk_onnx", type=Path, default=WALK_ONNX_DEFAULT, help="--handoff で切り替えまで動かす歩行の ONNX")
+    ap.add_argument("--handoff_start", type=str, default="2.5,4.0", help="ボールの最初の距離 [m] (カンマ区切り)")
+    ap.add_argument("--handoff_speed", type=str, default="0.5,1.0,1.5,2.0", help="歩行の前進の速度指令 [m/s] (カンマ区切り)")
+    ap.add_argument("--handoff_entry", type=str, default="0.8,1.2,1.6,2.0", help="受け渡し距離 [m] (カンマ区切り)")
+    ap.add_argument("--handoff_n", type=int, default=8, help="組ごとの場面数")
+    ap.add_argument("--jobs", type=int, default=1, help="--handoff で並列に回すプロセス数")
     ap.add_argument("--video_dir", type=Path)
     ap.add_argument("--json", type=Path)
     km.add_scene_args(ap)
@@ -513,6 +616,37 @@ def main(argv=None) -> int:
         sim = Sim(onnx_path, a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
         sim.clip_targets = not a.no_clip_targets
         km.run_viewer(sim, km.scene_from_args(a), a.next_ball_delay, a.view_seconds, a.speed, a.front_only)
+        return 0
+    if a.handoff:
+        fl = lambda x: [float(v) for v in x.split(",")]  # noqa: E731
+        scenarios = handoff_scenarios(fl(a.handoff_start), fl(a.handoff_speed), fl(a.handoff_entry), a.handoff_n, a.seed)
+        if a.scenarios:
+            names = set(a.scenarios.split(","))
+            scenarios = [s for s in scenarios if s.name in names]
+        sim_args = (a.friction, a.delay, a.ball_delay, a.ball_friction, bff, a.ball_radius, a.ball_mass)
+        # 歩いて近づく時間の分だけ長くする (0.5 m/s で 4 m なら 8 秒)
+        dur = a.duration + max(math.hypot(*sc.ball_xy) / max(sc.walk_speed, 0.3) for sc in scenarios)
+        jobs = max(1, a.jobs)
+        chunks = [scenarios[i::jobs] for i in range(jobs)]
+        work = [(onnx_path, a.walk_onnx, sim_args, c, dur, a.next_ball_delay, a.post_kick) for c in chunks if c]
+        if jobs > 1:
+            import multiprocessing as mp
+
+            with mp.get_context("fork").Pool(len(work)) as pool:
+                parts = pool.map(_handoff_worker, work)
+        else:
+            parts = [_handoff_worker(w) for w in work]
+        results = {name: r for part in parts for name, r in part}
+        for sc in scenarios:
+            r = results[sc.name]
+            print(f"{km.fmt(sc, r)} | handoff {r['handoff_speed'] if r['handoff_speed'] is None else round(r['handoff_speed'], 2)} m/s"
+                  f" bump={r['bump']} first_touch={r['first_touch_bodies']} ok={r['success']}", flush=True)
+        print(handoff_table(scenarios, results), flush=True)
+        if a.json:
+            a.json.parent.mkdir(parents=True, exist_ok=True)
+            a.json.write_text(json.dumps({"policy": str(onnx_path), "walk": str(a.walk_onnx),
+                                          "args": {k: str(v) for k, v in vars(a).items()}, "results": results},
+                                         indent=2, ensure_ascii=False, default=float))
         return 0
     if a.video_dir is not None:
         os.environ.setdefault("MUJOCO_GL", "egl")

@@ -85,6 +85,9 @@ class Scenario:
     seed: int = 0  # 次のボールの置き場所の乱数
     base_vel: tuple[float, float] = (0.0, 0.0)  # 最初の胴体の水平速度 [m/s] (前, 左)。歩行方策から切り替えた直後を真似る
     ball_vel: tuple[float, float] = (0.0, 0.0)  # 最初のボールの水平速度 [m/s] (ロボットの初期向き基準)
+    # 歩行方策からの受け渡し (sim2sim_bhuman_walk_kick.py --handoff)。None なら今までどおり最初からキック方策。
+    walk_speed: float | None = None  # 歩行に渡す前進の速度指令 [m/s]
+    entry_dist: float = 1.2  # 胴体の中心からボールまでがこの距離 [m] 以下になったらキック方策へ切り替える
 
 
 DEFAULT_SCENARIOS = [
@@ -333,6 +336,52 @@ def contact_metrics(rec: Recorder, kick_t: float, ctrl_dt: float) -> dict:
     )
 
 
+def touch_quality(o: dict) -> dict:
+    """接触の始まりのスナップショット 1 つで、蹴り足の向きと当て方 (contact_metrics と同じ測り方) を見る。"""
+    S = SPEC
+    k = 0 if o["feet"][0]["edge_dist"] <= o["feet"][1]["edge_dist"] else 1
+    f = o["feet"][k]
+    yaw_abs = abs(math.degrees(wrap(f["yaw"] - o["kick_dir"])))
+    b = rot2(o["ball"][:2] - f["pos"][:2], -f["yaw"])
+    x_f, y_in = float(b[0]), float(-b[1] if k == 0 else b[1])
+    return dict(yaw_abs=yaw_abs, yaw_ok=abs(yaw_abs - S["yaw_center_deg"]) <= S["yaw_tol_deg"], inside_ok=y_in > abs(x_f),
+                bodies=o["bodies"])
+
+
+def handoff_metrics(rec: Recorder, sim, out: dict) -> dict:
+    """歩行方策からの受け渡しの場面 (Scenario.walk_speed) の値。
+
+    - bump: ボールへの最初の接触が、受け渡しの前 (歩行のまま) か、キックの姿勢になっていない (蹴り足の向き 90±25° と
+      当て方 (内側) のどちらかが外れる) 当たり。つま先・すね・反対の足でボールを押した・突っ込んだ場合。
+    - min_speed_after_handoff: 受け渡しから最初の接触 (無ければ場面の終わり) までの胴体の水平速度の最小値。
+    - handoff_to_touch_s: 受け渡しから最初の接触までの時間。
+    - success: 蹴った・転ばない・bump でない・ボールの進んだ向きとキック方向のずれ 30° 以内。
+    """
+    ht = getattr(sim, "handoff_t", None)
+    first = rec.onsets[0] if rec.onsets else None
+    r = dict(handoff_t=ht, handoff_speed=getattr(sim, "handoff_speed", None), handoff_dist=getattr(sim, "handoff_dist", None),
+             first_touch_t=None, first_touch_bodies=None, first_touch_yaw_deg=None, bump=False,
+             min_speed_after_handoff=None, handoff_to_touch_s=None)
+    if first is not None:
+        q = touch_quality(first)
+        r.update(first_touch_t=first["t"], first_touch_bodies=q["bodies"], first_touch_yaw_deg=q["yaw_abs"],
+                 bump=bool(ht is None or first["t"] < ht or not (q["yaw_ok"] and q["inside_ok"])))
+        if ht is not None:
+            r["handoff_to_touch_s"] = first["t"] - ht
+    if ht is not None:
+        ts, sp = np.array(rec.ts), np.array(rec.speed)
+        end = first["t"] if first is not None else ts[-1]
+        m = (ts >= ht - 1e-9) & (ts <= end + 1e-9)
+        if m.any():
+            r["min_speed_after_handoff"] = float(sp[m].min())
+    err = out.get("disp_dir_err_deg")
+    if err is None:
+        err = out.get("kick_dir_err_deg")
+    r["dir_err_abs_deg"] = None if err is None else abs(err)
+    r["success"] = bool(out["kick_t"] is not None and not out["fell"] and not r["bump"] and err is not None and abs(err) <= 30.0)
+    return r
+
+
 def walkoff_metrics(rec: Recorder, kick_t: float, place_t: float | None, ball1_xy, ctrl_dt: float, fell: bool) -> dict:
     S = SPEC
     if place_t is None or ball1_xy is None:
@@ -451,6 +500,8 @@ def run_scene(sim, sc: Scenario, duration: float = 15.0, next_ball_delay: float 
     if out["kick_t"] is not None:
         out.update(contact_metrics(rec, out["kick_t"], ctrl_dt))
         out.update(walkoff_metrics(rec, out["kick_t"], place_t, ball1_xy, ctrl_dt, out["fell"]))
+    if sc.walk_speed is not None:
+        out.update(handoff_metrics(rec, sim, out))
     out["ball_disp_m"] = float(np.linalg.norm(d.xpos[w.balls[0]][:2] - ball0[:2]))
     out["robot_disp_m"] = float(np.linalg.norm(d.qpos[0:2]))
     out["sim_time_s"] = t
