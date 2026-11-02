@@ -57,7 +57,7 @@ class WaypointActorCritic(ActorCritic):
         num_actions,  # 環境のアクション次元 (12 + 3)。上位の出力次元ではない。
         expert_checkpoint: str = "",
         expert_policy: dict | None = None,
-        command_limits=(1.8, 0.9, 1.0),
+        command_limits=(2.0, 0.9, 2.0),
         command_deadzone: float = 0.1,
         **kwargs,
     ):
@@ -164,8 +164,9 @@ class RslRlWaypointActorCriticCfg(RslRlPpoActorCriticCfg):
     )
     """歩行 expert (HistoryActorCritic) のアーキテクチャ。checkpoint と一致させること。"""
 
-    command_limits: tuple[float, float, float] = (1.8, 0.9, 1.0)
-    """コマンドのクランプ (|vx|, |vy|, |ωz|)。歩行 expert の学習レンジ (2.0 / 0.9 / 1.0) 以内にする。"""
+    command_limits: tuple[float, float, float] = (2.0, 0.9, 2.0)
+    """コマンドのクランプ (|vx|, |vy|, |ωz|)。vx / vy は歩行 expert の学習レンジ (2.0 / 0.9)。
+    ωz は学習レンジ 1.0 の外だが実機で 2.0 rad/s 程度まで耐えることを確認済み (2026-11-01 ユーザー指示)。"""
 
     command_deadzone: float = 0.1
     """||cmd|| がこれ未満なら 0 (停止指令) にする。"""

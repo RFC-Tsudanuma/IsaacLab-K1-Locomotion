@@ -21,6 +21,7 @@ from .history_actor_critic import RslRlHistoryActorCriticCfg
 from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
 from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
 from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgorithmCfg
+from .block_policy import RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
 
 
 @configclass
@@ -286,12 +287,45 @@ class K1WaypointPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        entropy_coef=0.0,  # クランプ付き連続コマンドでは std が際限なく膨らむ (v1 の教訓)
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=1.0e-3,
         schedule="adaptive",
         gamma=0.995,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class K1BlockPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """凍結歩行 expert を事前分布にした飛来ボール阻止方策の学習 (Isaac-Block-K1-v0)。
+
+    環境は `K1BlockEnvCfg`。方策は BlockActorCritic (歩行コマンド 3 + 関節残差 12、causal transformer の
+    ボール encoder ×2、凍結 expert を内包)、アルゴリズムは BlockPPO (PPO 更新後にノイズ付き encoder を
+    真値 encoder へ latent 蒸留)。obs_groups は各セットの **末尾** をボール履歴グループにすること
+    (BlockActorCritic がそこを encoder に流す)。
+    コマンドはクランプされるので entropy_coef は 0 (waypoint v1 の教訓)。mirror loss なし。スクラッチ学習。
+    """
+
+    num_steps_per_env = 48
+    max_iterations = 3000
+    save_interval = 100
+    experiment_name = "k1_block"
+    obs_groups = {"policy": ["block_policy", "ball_noisy"], "critic": ["block_critic", "ball_true"]}
+    policy = RslRlBlockActorCriticCfg()
+    algorithm = RslRlBlockPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.0,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=5.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
         lam=0.95,
         desired_kl=0.01,
         max_grad_norm=1.0,

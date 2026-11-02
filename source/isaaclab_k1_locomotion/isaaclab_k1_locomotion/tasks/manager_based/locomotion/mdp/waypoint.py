@@ -50,18 +50,22 @@ COMMAND_DIM = 3
 # action 項: 上位方策の歩行コマンド
 # ---------------------------------------------------------------------------
 class WalkCommandAction(ActionTerm):
-    """上位方策が出す歩行コマンド (vx, vy, ωz) を保持するだけの action 項 (物理には何もしない)。"""
+    """上位方策が出す歩行コマンド (vx, vy, ωz) を保持するだけの action 項 (物理には何もしない)。
+
+    ``cfg.dim`` を変えれば任意次元の「値を保持するだけの action 項」として使える
+    (block_env_cfg の関節残差 ``joint_residual`` 等)。
+    """
 
     cfg: "WalkCommandActionCfg"
 
     def __init__(self, cfg: "WalkCommandActionCfg", env: "ManagerBasedRLEnv"):
         super().__init__(cfg, env)
-        self._raw = torch.zeros(self.num_envs, COMMAND_DIM, device=self.device)
+        self._raw = torch.zeros(self.num_envs, cfg.dim, device=self.device)
         self._prev = torch.zeros_like(self._raw)
 
     @property
     def action_dim(self) -> int:
-        return COMMAND_DIM
+        return self.cfg.dim
 
     @property
     def raw_actions(self) -> torch.Tensor:
@@ -94,6 +98,9 @@ class WalkCommandAction(ActionTerm):
 @configclass
 class WalkCommandActionCfg(ActionTermCfg):
     class_type: type = WalkCommandAction
+
+    dim: int = COMMAND_DIM
+    """保持する値の次元 (既定は歩行コマンドの 3)。"""
 
 
 # ---------------------------------------------------------------------------
