@@ -105,8 +105,12 @@ from .mdp.terminations import ball_reached_target, ball_too_far, dribble_time_ou
 # 末尾に追加する項の並び順は history_layout.py の DRIBBLE_TARGET_POLICY_TERM_SPECS /
 # DRIBBLE_TARGET_CRITIC_TERM_SPECS と正確に一致させること。
 # 2026-11-01: vision_filter の模倣の設定 (ボールの観測 3 つで同じものを使う)。値は mdp.BALL_FILTER_DEFAULTS と同じで、
-# 実機 config/vision_filter.yaml と推論ノードに合わせたもの。検出のノイズ (det_noise_scale_range) と
-# 取りこぼし (near/far_drop_prob) は今回 0。
+# 実機 config/vision_filter.yaml と推論ノードに合わせたもの。
+# 2026-11-02: 検出のノイズと取りこぼしを入れる (フィルタの手前、検出の段階)。
+#   - ノイズ: 共分散 s² · d · R。s は env ごとに U(0, 1)。R は実機の検出から推定した値 (1 m で σx 0.22 m・σy 0.12 m)
+#     なので、s = 1 が実機相当、s = 0 がノイズなし (MuJoCo のテスト) にあたる
+#   - 取りこぼし: 足元のボールがカメラの視野から外れる分。近距離 0.6 → 遠距離 0.05 は、フィルタの模倣に
+#     置き換える前のボール観測のホールド確率と同じ値 (実機のログで合わせ込むまでの仮の値)
 _BALL_FILTER_PARAMS = {
     "period_steps": 2,  # 25 Hz
     "sigma_a": 0.8,
@@ -115,8 +119,8 @@ _BALL_FILTER_PARAMS = {
     "gate": 9.21,
     "stay_prob": 0.95, "switch_prob": 0.0167,
     "lost_s": 3.0,
-    "det_noise_scale_range": (0.0, 0.0),
-    "near_distance": 0.35, "far_distance": 2.0, "near_drop_prob": 0.0, "far_drop_prob": 0.0,
+    "det_noise_scale_range": (0.0, 1.0),
+    "near_distance": 0.35, "far_distance": 2.0, "near_drop_prob": 0.6, "far_drop_prob": 0.05,
 }
 
 
