@@ -46,6 +46,7 @@ from ..locomotion.flat_env_cfg import (
     K1FlatEnvCfg,
     K1FlatPolicyHistoryCfg,
 )
+from ..locomotion.mdp import rewards as loco_rewards
 from ..locomotion.velocity_env_cfg import JOINT_NAMES_K1
 from . import mdp
 
@@ -207,6 +208,18 @@ class K1BHumanWalkKickEnvCfg(K1FlatEnvCfg):
         # 理由: s7b model_9400 の MuJoCo 格子 (rel = キック方向 - ボール方位 が -10〜+5° の 384 場面) で、10° 超・失敗の
         # 50 場面のうち約 15 がつま先やすねで近づく途中にボールを押したもの (当たった瞬間の足の向き 0〜35°、ボールが足の前)。
         self.rewards.ball_bad_touch = RewTerm(func=mdp.ball_bad_touch, weight=0.0)
+
+        # ---- 新しい歩行 model_52700 (frozen_policies/best_walk_52700) の学習にあって、model_34995 の K1FlatEnvCfg に無い報酬 ----
+        # 既定は 0 (使わない)。model_52700 の上でキックを学習し直すときに学習コマンドから重みを入れる
+        # (値は best_walk_52700/env.yaml: no_fly 4.0、joint_power_l2 -1.5e-5。上書きのまとめは train_bhuman_walk_kick.sh)。
+        self.rewards.no_fly = RewTerm(
+            func=loco_rewards.both_feet_not_in_contact,
+            weight=0.0,
+            params={"sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link")},
+        )
+        self.rewards.joint_power_l2 = RewTerm(
+            func=loco_rewards.joint_power_l2, weight=0.0, params={"asset_cfg": SceneEntityCfg("robot")}
+        )
 
         # ---- terminations: 歩行の転倒判定 + B-Human のエピソード区切り ----
         self.terminations.kicks_done = DoneTerm(func=mdp.kicks_done, time_out=True)

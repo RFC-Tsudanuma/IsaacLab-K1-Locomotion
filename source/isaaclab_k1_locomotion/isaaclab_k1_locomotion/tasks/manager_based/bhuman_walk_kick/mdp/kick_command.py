@@ -299,6 +299,13 @@ class BHumanKickCommand(CommandTerm):
         self.kick_stats_alpha = 0.002
         self.eval_log: list | None = None
 
+        # (B-Human に無い、既定は無効) 歩行方策で近づいてから渡す受け渡し (walk_handoff.py、cfg.handoff_prob)
+        self.handoff = None
+        if cfg.handoff_prob > 0.0:
+            from .walk_handoff import WalkHandoff
+
+            self.handoff = WalkHandoff(self)
+
     def __str__(self) -> str:
         return "BHumanKickCommand: B-Human walk-kick の状態 (キック方向・距離、ボール、キック姿勢)"
 
@@ -333,6 +340,9 @@ class BHumanKickCommand(CommandTerm):
         extras.update(self.kick_stats)
         extras["kick_total"] = self.kick_total
         extras["heavy_ball_total"] = float(self.heavy_ball_total)
+        if self.handoff is not None:
+            self.handoff.install()
+            extras.update(self.handoff.stats)
 
         self._refresh_robot_state(env_ids)
         self.filtered_lin_vel[env_ids] = 0.0
@@ -364,6 +374,8 @@ class BHumanKickCommand(CommandTerm):
 
     def compute(self, dt: float):
         """リセット後・観測前。終了判定で立てたボール再配置フラグを処理する。"""
+        if self.handoff is not None:
+            self.handoff.install()
         ids = self.reset_ball.nonzero(as_tuple=False).flatten()
         if len(ids) > 0:
             self._reset_ball_idx(ids, episode_reset=False)
@@ -652,6 +664,8 @@ class BHumanKickCommand(CommandTerm):
             self.ball_kicked_counter <= 1, ratio, torch.min(ratio, self.kick_sole_yaw_ratio)
         )
         # ================= end _update_kick_tensors ================= #
+        if self.handoff is not None:
+            self.handoff.update()
 
         # ボールの再配置要求 (キック姿勢に入りかけた所で目標だけ変える)
         cand = (self.ball_close_to_kick_pose < 1.0) & (min_distance < 0.5) & (min_distance > 0.25) & (~kicked)
@@ -821,6 +835,9 @@ class BHumanKickCommand(CommandTerm):
         )
         self.reset_ball |= dcand & (torch.rand(n, device=self.device) < cfg.random_ball_distance_reset)
 
+        if self.handoff is not None:
+            # 歩行が動かしている間はボールを置き直さない (キック方策の課題の途中で使う確率なので)
+            self.reset_ball &= ~self.handoff.walk_mode
         self.ball_reset_counter += (self.reset_ball & (self.ball_kicked_counter > 0)).float()
         self._record_kick_stats(self.reset_ball & (self.ball_kicked_counter > 0))
         self.kicks_done[:] = (self.ball_reset_counter > cfg.episode_number_of_kicks) & self.reset_ball
@@ -975,6 +992,7 @@ class BHumanKickCommand(CommandTerm):
     def _reset_ball_idx(self, ids: torch.Tensor, episode_reset: bool):
         """B-Human ``_reset_ball_idx``: 新しいキック課題を出す。"""
         cfg = self.cfg
+        after_kick = self.ball_kicked_counter[ids] > 0
         self._resample_heavy_ball(ids)
         self._resample_input_flags(ids)
         self.ball_close_to_kick_pose[ids] = 1.0
@@ -988,6 +1006,11 @@ class BHumanKickCommand(CommandTerm):
             replace = ids[torch.rand(len(ids), device=self.device) > cfg.keep_old_ball_when_reset]
             if len(replace) > 0:
                 self._reset_ball_root_states(replace)
+        if self.handoff is not None:
+            # 受け渡しはエピソード開始とキックの後の新しいボールだけ (ランダムな置き直しは今までどおり)
+            self.handoff.on_new_ball(ids if episode_reset else ids[after_kick])
+            if not episode_reset:
+                self.handoff.walk_mode[ids[~after_kick]] = False
         self._resample_kick_ball(ids, use_root_origin=episode_reset)
         # B-Human はここで episode_length_buf を 0 に戻すが、歩行の位相が飛ぶので代わりに ball_steps を戻す
         self.ball_steps[ids] = 0
@@ -1260,6 +1283,25 @@ class BHumanKickCommandCfg(CommandTermCfg):
     """weak_rel_prob で選んだときの rel の範囲 [deg]: (足の選び方が迷う帯, 右足側の帯)。"""
     weak_rel_first_frac: float = 0.7
     """weak_rel_prob で選んだうち、weak_rel_ranges[0] (迷う帯) から出す割合。"""
+    handoff_prob: float = 0.0
+    """(B-Human に無い、既定 0 = 無効で今までと同じ) 新しいボール (エピソード開始・キックの後) のうちこの割合を
+    handoff_ball_dist に置き、凍結した歩行方策で近づいてから受け渡し距離でキック方策へ渡す (walk_handoff.py)。
+
+    理由: 実機では歩行方策で 2 m/s 前後で歩いて来て、ボールが 1.2 m 以内でキック方策へ切り替えるが、学習には
+    この受け渡しが無く (キック方策は vx ≤ 1.0 で自分で歩く、リセット時の速さ ±0.5 m/s、ボールは 0.4〜1.5 m)、
+    実機でキック方策がボールへ突っ込んだ。近いボール (残りの 1 - handoff_prob、force_ball_close を含む) は今までどおり。"""
+    handoff_ball_dist: tuple[float, float] = (1.5, 4.0)
+    """受け渡しをするボールを置く距離 [m] (胴体の中心から、向きは一様)。止まったボール。"""
+    handoff_entry_dist: tuple[float, float] = (0.8, 2.0)
+    """受け渡し距離 [m] (受け渡し 1 回ごとに一様に引く)。ボールがこれより内側から始まればすぐキック方策。"""
+    handoff_speed_range: tuple[float, float] = (0.0, 2.0)
+    """歩行に渡す前進の速度指令 [m/s] (受け渡し 1 回ごとに一様に引く。歩行の学習の範囲は ±2.0)。"""
+    handoff_yaw_gain: float = 1.5
+    """歩行に渡す旋回の指令 = clip(gain × ボールの方位, ±1.0) [rad/s]。"""
+    handoff_max_walk_s: float = 8.0
+    """歩行で近づく時間の上限 [s]。速さを 0 付近に引くと着かないので、これを超えたら距離によらず渡す。"""
+    handoff_walk_checkpoint: str = "frozen_policies/best_walk_52700/model_52700.pt"
+    """受け渡しまで動かす歩行方策 (rsl_rl の checkpoint、1 ステップ 49 の HistoryActorCritic)。相対パスはリポジトリの一番上から。"""
     strike_height_range: tuple[float, float] | None = None
     """(B-Human に無い) キックした瞬間の蹴り足の足裏の一番低い点の高さが lo 以下なら 1、hi 以上なら 0 を
     キック方向の報酬 (正のとき) に掛ける。None で無効。"""

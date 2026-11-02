@@ -74,3 +74,46 @@ $T --task Isaac-K1-BHuman-Walk-Kick-Stage2-v0 --max_iterations 3000 --resume \
 #   --task Isaac-K1-BHuman-Walk-Kick-Stage7-v0 ... env.commands.kick.kick_direction_sigma_range=0.15 \
 #   env.commands.kick.random_ball_reset=[0.001,0.002,0.002] env.commands.kick.reset_ball_request=0.0005 \
 #   env.commands.kick.add_ball_vel=0.00001 env.commands.kick.add_ball_vel_in_direction=0.00001   (7a、その後 7b は既定値)
+
+# ==== 新しい歩行 model_52700 (frozen_policies/best_walk_52700) の上でやり直すとき (2026-11-02 から、既定ではどれも無効) ====
+# 0') 歩行の重みをキック用の形に移す:
+#    python scripts/rsl_rl/convert_walk_to_bhuman_kick.py --walk frozen_policies/best_walk_52700/model_52700.pt \
+#        --out $EXP/walk52700/model_0.pt
+#    Stage 1 は --resume --load_run walk52700 --checkpoint model_0.pt で始める。
+#
+# (a) 歩行の学習の設定に合わせる上書き (値は frozen_policies/best_walk_52700/env.yaml と同じ。今の K1FlatEnvCfg (model_34995)
+#     との違いだけ。小数は "4.0" のように書く (hydra は 4 を int にして型違いで止まる)):
+NEW_WALK_OVERRIDES="env.rewards.feet_phase.params.stance_ratio=0.6 \
+  env.rewards.no_fly.weight=4.0 \
+  env.rewards.joint_power_l2.weight=-1.5e-5 \
+  env.rewards.flat_orientation_l2.weight=-40.0 \
+  env.rewards.ang_vel_xy_l2.weight=-0.65 \
+  env.rewards.base_ang_acc_l2.weight=-2.0e-5 \
+  env.events.physics_material.params.static_friction_range=[0.6,1.0] \
+  env.events.physics_material.params.dynamic_friction_range=[0.6,1.0] \
+  env.events.push_robot.interval_range_s=[0.5,8.0] \
+  env.events.push_robot.params.velocity_range.x=[-0.7,0.7] env.events.push_robot.params.velocity_range.y=[-0.7,0.7] \
+  env.events.push_robot.params.velocity_range.roll=[-0.06,0.06] env.events.push_robot.params.velocity_range.pitch=[-0.06,0.06]"
+#     - feet_phase の重みは歩行の 1.5 のまま (Stage 4 で B-Human どおり 1/4 にする所は変えない)。stance_ratio だけ合わせる。
+#     - 押し (push_robot) は今の env が「歩行の最終段に固定」しているので、新しい歩行の最終段 (Polish) の値にした。
+#     - 歩行の学習にあったが、上書きしない・できないもの:
+#       * 関節の初期角 ±30° (reset_joints_by_offset): 上書きはできる
+#         (env.events.reset_robot_joints.func=isaaclab.envs.mdp.events:reset_joints_by_offset
+#          env.events.reset_robot_joints.params.position_range=[-0.5236,0.5236]) が、キックの学習には入れていない。
+#       * base_height_penalty / feet_parallel_to_ground の高速時の緩め (min_height_high 0.48、gate 1.5〜1.8 m/s): 今の
+#         params に無いキーなので hydra では足せない。速度指令 1.5 m/s 以上でしか効かず、キック方策の速度指令は
+#         |(vx, vy)| ≤ 1.12 m/s (vx ≤ 1.0、vy ≤ 0.5)、受け渡し前の歩行のステップは報酬 0 なので、入れても変わらない。
+#       * 地面 (歩行: 平面 0.7 + 軽い凹凸 0.3): キックは B-Human どおり平面 (足裏・ボールの高さ 0 が前提) のまま。
+#       * 速度追従の報酬・速度指令の範囲: キックには無い (速度指令はボールから作る)。
+#
+# (b) 歩行で近づいてからキック方策へ渡す受け渡し (bhuman_walk_kick/mdp/walk_handoff.py):
+HANDOFF_OVERRIDES="env.commands.kick.handoff_prob=0.5"
+#     新しいボール (エピソード開始・キックの後) の 50% を 1.5〜4 m に置き、凍結した model_52700 で 0〜2.0 m/s で近づいて、
+#     0.8〜2.0 m (1 回ごとに引く) でキック方策に渡す。残りは今までどおり (0.4〜1.5 m、force_ball_close 10%)。
+#     範囲は env.commands.kick.handoff_ball_dist / handoff_entry_dist / handoff_speed_range / handoff_max_walk_s で変える。
+#     歩行が動かしたステップは報酬 0・PPO の標本から外す (agents/ppo_actor_freeze.py、ログの Loss/walk_masked_frac)。
+#     受け渡しの様子は Metrics/kick/handoff_speed (渡した瞬間の胴体の速さ)・handoff_dist (渡した距離)・handoff_count。
+#
+# 例 (Stage 1、確認用の短い回し):
+# $T --task Isaac-K1-BHuman-Walk-Kick-v0 --max_iterations 2300 --resume --load_run walk52700 --checkpoint model_0.pt \
+#    --reset_noise_std 0.2 --run_name s1_w52700 agent.algorithm.std_range=[0.2,1.0] $NEW_WALK_OVERRIDES $HANDOFF_OVERRIDES

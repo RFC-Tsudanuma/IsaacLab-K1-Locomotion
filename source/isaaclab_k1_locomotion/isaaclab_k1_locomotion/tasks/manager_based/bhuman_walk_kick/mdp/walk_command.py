@@ -87,6 +87,11 @@ class BallWalkVelocityCommand(CommandTerm):
         vy = (cfg.gain_xy * target[:, 1]).clamp(-cfg.max_vy, cfg.max_vy)
         wz = (cfg.gain_yaw * err).clamp(-cfg.max_wz, cfg.max_wz)
         self.vel_command_b[:] = torch.stack((vx, vy, wz), dim=-1)
+        if k.handoff is not None:
+            # 受け渡し前 (歩行方策が動かしている env) は歩行の速度指令。観測の速度指令の欄と位相の周波数もこれになる
+            # (実機の observe_walk_tick と同じ。kick_command.handoff_prob、walk_handoff.py)。
+            wm = k.handoff.walk_mode
+            self.vel_command_b[:] = torch.where(wm.unsqueeze(-1), k.handoff.walk_command(), self.vel_command_b)
 
 
 @configclass
