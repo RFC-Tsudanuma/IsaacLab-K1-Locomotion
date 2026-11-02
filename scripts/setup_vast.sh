@@ -164,10 +164,12 @@ if [[ "$HERE" -eq 1 ]]; then
     # uv sync が pyproject の [tool.uv.sources] で editable に入れている
     echo "[setup] isaaclab_k1_locomotion は uv sync で editable に入っています"
   else
-    # rsl-rl-lib はここで pyproject の固定版 (3.0.1) に揃う。
-    # イメージに別バージョンが入っていても上書きされる。
     echo "[setup] pip install -e source/isaaclab_k1_locomotion"
     $LAB_PY -m pip install -e "$DEST/source/isaaclab_k1_locomotion" --root-user-action=ignore </dev/null
+    # 拡張の依存には rsl-rl-lib が無く、固定版 (3.0.1) は root の pyproject.toml / uv.lock にしか無いので、ここで揃える。
+    # (vast の IsaacLab イメージには 3.1.2 が入っている)
+    echo "[setup] pip install rsl-rl-lib==3.0.1"
+    $LAB_PY -m pip install "rsl-rl-lib==3.0.1" --root-user-action=ignore </dev/null
   fi
 
   # --- 動作確認 (Isaac Sim は起動しない) ----------------------------------------
