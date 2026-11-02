@@ -1,0 +1,690 @@
+{
+  "task": "Isaac-Velocity-Flat-K1-Dribble-Target-v0",
+  "run": "2026-11-01_12-04-42",
+  "checkpoint_iteration": 74991,
+  "curriculum_state": {
+    "dribble_target_range": {
+      "level": 9,
+      "failure_ema": 0.19207214539958944,
+      "level_entry_step": 3359616,
+      "level_stats": {
+        "1": {
+          "episodes": 970496,
+          "success": 0.9910607824950931,
+          "fall": 0.008939103863785863,
+          "timeout": 7.594623264754909e-11
+        },
+        "2": {
+          "episodes": 211515,
+          "success": 0.9860652548673356,
+          "fall": 0.013229071676949894,
+          "timeout": 3.217714552035664e-28
+        },
+        "3": {
+          "episodes": 330526,
+          "success": 0.9481980733804055,
+          "fall": 0.05069732570385021,
+          "timeout": 3.971614778427939e-08
+        },
+        "4": {
+          "episodes": 425200,
+          "success": 0.8363708294452533,
+          "fall": 0.05218275662781625,
+          "timeout": 0.10739699164165979
+        },
+        "5": {
+          "episodes": 154833,
+          "success": 0.957204091179752,
+          "fall": 0.0241957105138019,
+          "timeout": 0.018447044468248405
+        },
+        "6": {
+          "episodes": 139880,
+          "success": 0.807079760044858,
+          "fall": 0.18626779724788256,
+          "timeout": 0.0011854271336171828
+        },
+        "7": {
+          "episodes": 132099,
+          "success": 0.9506180854533929,
+          "fall": 0.045528841465576536,
+          "timeout": 2.955734417306442e-25
+        },
+        "8": {
+          "episodes": 133942,
+          "success": 0.9553406082008129,
+          "fall": 0.04059007716229837,
+          "timeout": 0.0019333720814984176
+        },
+        "9": {
+          "episodes": 132776,
+          "success": 0.8706076527656107,
+          "fall": 0.12228753574116945,
+          "timeout": 0.0009923325348317766
+        },
+        "10": {
+          "episodes": 2661421,
+          "success": 0.8022016604992197,
+          "fall": 0.058246119472696145,
+          "timeout": 0.1384777735019837
+        }
+      },
+      "fall_context": {
+        "replan": 0.0055799813876479375,
+        "corner": 0.029770248690454755,
+        "overshoot": 0.004771215803959411,
+        "other": 0.013855799609311138
+      }
+    }
+  },
+  "control_rate_hz": 50.0,
+  "inputs": [
+    {
+      "name": "command",
+      "shape": [
+        1,
+        3
+      ],
+      "note": "Stage2 では常にゼロを入れる"
+    },
+    {
+      "name": "obs_history",
+      "shape": [
+        1,
+        100,
+        59
+      ],
+      "note": "各行 = 1 ステップ分のフレーム (古い → 新しい)"
+    }
+  ],
+  "output": {
+    "name": "actions",
+    "shape": [
+      1,
+      12
+    ],
+    "note": "scale を掛ける前の生の値。clip しない"
+  },
+  "normalizer": "グラフに含む (生の観測をそのまま入れる)",
+  "history": {
+    "H": 100,
+    "order": "old_to_new",
+    "init": "ドリブル開始時 (リセット直後と同じ) は現在のフレームで履歴全体を埋める"
+  },
+  "frame_layout": [
+    {
+      "name": "base_ang_vel",
+      "dim": 3,
+      "channels": [
+        0,
+        3
+      ],
+      "description": "IMU 角速度 (body 座標)",
+      "unit": "rad/s",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.2,
+          0.2
+        ],
+        "delay_range_s": [
+          0.0,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "projected_gravity",
+      "dim": 3,
+      "channels": [
+        3,
+        6
+      ],
+      "description": "重力方向の単位ベクトル (body 座標)",
+      "unit": "-",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.05,
+          0.05
+        ],
+        "delay_range_s": [
+          0.0,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "velocity_commands",
+      "dim": 3,
+      "channels": [
+        6,
+        9
+      ],
+      "description": "歩行の速度コマンド [vx, vy, wz]。Stage2 では常にゼロ",
+      "unit": "m/s, m/s, rad/s",
+      "training_noise": {}
+    },
+    {
+      "name": "joint_pos",
+      "dim": 12,
+      "channels": [
+        9,
+        21
+      ],
+      "description": "関節角 - default_joint_pos (joint_order の順)",
+      "unit": "rad",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.03,
+          0.03
+        ],
+        "delay_range_s": [
+          0.0,
+          0.02
+        ]
+      }
+    },
+    {
+      "name": "joint_vel",
+      "dim": 12,
+      "channels": [
+        21,
+        33
+      ],
+      "description": "関節角速度 (joint_order の順)",
+      "unit": "rad/s",
+      "training_noise": {
+        "white_noise_uniform": [
+          -1.5,
+          1.5
+        ]
+      }
+    },
+    {
+      "name": "actions",
+      "dim": 12,
+      "channels": [
+        33,
+        45
+      ],
+      "description": "前回の出力 actions (scale を掛ける前)",
+      "unit": "-",
+      "training_noise": {}
+    },
+    {
+      "name": "gait_phase",
+      "dim": 4,
+      "channels": [
+        45,
+        49
+      ],
+      "description": "[sin φL, cos φL, sin φR, cos φR]、φR = φL + π。1.8Hz で常に回す (ゼロにしない)",
+      "unit": "-",
+      "training_noise": {}
+    },
+    {
+      "name": "target_pos_rel",
+      "dim": 2,
+      "channels": [
+        49,
+        51
+      ],
+      "description": "目標点 - ロボット位置 の xy (body yaw 座標)。/localization_result から変換",
+      "unit": "m",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.05,
+          0.05
+        ],
+        "hold_prob_range": [
+          0.6,
+          0.8
+        ]
+      }
+    },
+    {
+      "name": "ball_pos_rel",
+      "dim": 2,
+      "channels": [
+        51,
+        53
+      ],
+      "description": "ボール中心 - ロボット位置 の xy (body yaw 座標)。vision_filter から",
+      "unit": "m",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.0,
+          0.0
+        ],
+        "near_distance": 0.35,
+        "far_distance": 2.0,
+        "near_hold_prob": 0.0,
+        "far_hold_prob": 0.0,
+        "note": "ボール距離に応じて near〜far を線形補間。ホールドは前回の値をそのまま出す (毎ステップ評価)"
+      }
+    },
+    {
+      "name": "ball_vel",
+      "dim": 2,
+      "channels": [
+        53,
+        55
+      ],
+      "description": "ボールのワールド速度を body yaw 座標に回した xy。推定できないときは厳密に 0",
+      "unit": "m/s",
+      "training_noise": {
+        "white_noise_uniform": [
+          -0.0,
+          0.0
+        ],
+        "near_distance": 0.35,
+        "far_distance": 2.0,
+        "near_hold_prob": 0.0,
+        "far_hold_prob": 0.0,
+        "near_invalid_prob": 0.0,
+        "far_invalid_prob": 0.0,
+        "note": "ボール距離に応じて near〜far を線形補間。ホールドは前回の値をそのまま出す (毎ステップ評価)"
+      }
+    },
+    {
+      "name": "foot_left_ball_pos_rel",
+      "dim": 2,
+      "channels": [
+        55,
+        57
+      ],
+      "description": "ボール中心 - 左 foot_link 原点 の xy (body yaw 座標)",
+      "unit": "m",
+      "training_noise": {}
+    },
+    {
+      "name": "foot_right_ball_pos_rel",
+      "dim": 2,
+      "channels": [
+        57,
+        59
+      ],
+      "description": "ボール中心 - 右 foot_link 原点 の xy (body yaw 座標)",
+      "unit": "m",
+      "training_noise": {}
+    }
+  ],
+  "frame_dim": 59,
+  "joint_order": [
+    "Left_Hip_Pitch",
+    "Left_Hip_Roll",
+    "Left_Hip_Yaw",
+    "Left_Knee_Pitch",
+    "Left_Ankle_Pitch",
+    "Left_Ankle_Roll",
+    "Right_Hip_Pitch",
+    "Right_Hip_Roll",
+    "Right_Hip_Yaw",
+    "Right_Knee_Pitch",
+    "Right_Ankle_Pitch",
+    "Right_Ankle_Roll"
+  ],
+  "action_scale": 0.5,
+  "q_target": "default_joint_pos + action_scale * action",
+  "default_joint_pos": {
+    ".*_Hip_Pitch": -0.26,
+    ".*_Hip_Roll": 0.0,
+    ".*_Hip_Yaw": 0.0,
+    ".*_Knee_Pitch": 0.52,
+    ".*_Ankle_Pitch": -0.26,
+    ".*_Ankle_Roll": 0.0
+  },
+  "gait_phase": {
+    "frequency_hz": 1.8,
+    "always_on": true,
+    "note": "Stage2 ではコマンドがゼロでも位相をゼロにしない (学習の最初の 500 iteration で cmd_threshold を 0.05 → -1.0 に移した)。位相はリセットせず、歩行から 1.8Hz のまま引き継ぐ",
+    "training_freq_offset_dr_hz": [
+      -0.05,
+      0.05
+    ]
+  },
+  "commands": {
+    "base_velocity": "Stage2 では常にゼロ (command 入力と velocity_commands の 3 次元)",
+    "dribble_target": {
+      "frame": "ワールド (フィールド) 座標の目標点 (x, y)。観測は body yaw 座標の相対位置に直して入れる",
+      "resampling_time_s": [
+        1000000.0,
+        1000000.0
+      ],
+      "training_ranges_at_export": {
+        "pos_x": [
+          2.0,
+          2.5
+        ],
+        "pos_y": [
+          0.0,
+          0.0
+        ]
+      },
+      "training_path_shape_at_export": "straight",
+      "omni_prob": 0.25,
+      "far_prob": 0.1,
+      "waypoint_reach_radius_m": 0.3
+    }
+  },
+  "actuators": {
+    "legs": {
+      "joints": [
+        ".*_Hip_Pitch",
+        ".*_Hip_Roll",
+        ".*_Hip_Yaw",
+        ".*_Knee_Pitch"
+      ],
+      "stiffness": {
+        ".*_Hip_.*": 160.0,
+        ".*_Knee_Pitch": 160.0
+      },
+      "damping": {
+        ".*_Hip_.*": 4.0,
+        ".*_Knee_Pitch": 4.0
+      },
+      "effort_limit_Nm": {
+        ".*_Hip_Pitch": 68.0,
+        ".*_Hip_Roll": 76.0,
+        ".*_Hip_Yaw": 38.3,
+        ".*_Knee_Pitch": 112.0
+      },
+      "action_delay_steps_dr": [
+        2,
+        7
+      ]
+    },
+    "feet": {
+      "joints": [
+        ".*_Ankle_Pitch",
+        ".*_Ankle_Roll"
+      ],
+      "stiffness": 50.0,
+      "damping": 2.5,
+      "effort_limit_Nm": 38.3,
+      "action_delay_steps_dr": [
+        2,
+        7
+      ]
+    }
+  },
+  "actuator_gain_dr": [
+    0.8,
+    1.2
+  ],
+  "ball_reset": {
+    "frame": "env 原点基準のワールド座標オフセット (ロボットの向きには合わせない)。既定位置 (0.30, 0, 0.11) に加算",
+    "pose_range": {
+      "x": [
+        0.4,
+        0.6
+      ],
+      "y": [
+        -0.1,
+        0.1
+      ]
+    },
+    "robot_pose_range": {
+      "x": [
+        -0.1,
+        0.1
+      ],
+      "y": [
+        -0.1,
+        0.1
+      ],
+      "yaw": [
+        -0.2,
+        0.2
+      ]
+    },
+    "ball_relative_to_robot_body_yaw": {
+      "forward_x_m": {
+        "min": 0.56,
+        "max": 1.01,
+        "p1": 0.62,
+        "p99": 0.97
+      },
+      "lateral_y_m": {
+        "min": -0.38,
+        "max": 0.38,
+        "p1": -0.27,
+        "p99": 0.27
+      },
+      "azimuth_deg": {
+        "min": -28,
+        "max": 28,
+        "p1": -19,
+        "p99": 19
+      },
+      "ball_velocity": "0 (静止)",
+      "note": "env の値 (ボール x 0.70〜0.90 / y ±0.1、ロボット ±0.1m・yaw ±0.2rad) から計算"
+    },
+    "joint_pos_reset": "既定姿勢のまま (reset_joints_by_scale (1.0, 1.0)、ランダム化なし。best_walk の系の値)",
+    "robot_velocity_reset": "各軸 ±0.5 (m/s, rad/s)"
+  },
+  "terminations": {
+    "time_out": {
+      "command_name": "dribble_target"
+    },
+    "base_contact": "base_contact",
+    "base_height": {
+      "minimum_height": 0.35
+    },
+    "ball_reached_target": {
+      "command_name": "dribble_target",
+      "distance_threshold": 1.0
+    },
+    "ball_too_far": {
+      "max_distance": 4.0
+    }
+  },
+  "waypoints": {
+    "source": "実機では戦略の経路計画 (pathplan_lib) が、ボールを始点に障害物を避けるウェイポイント列を出す。今のウェイポイントを target_pos_rel として入れる",
+    "pass_rule": {
+      "evaluate_at": "50Hz (毎制御周期)。最終ウェイポイントでは進まない (成功判定は ball_reached_target)",
+      "definitions": "W = 今のウェイポイント、P = 1 つ前の点 (最初のウェイポイントでは経路の始点 = 経路を受け取ったときのボール位置)、B = ボール中心 (xy、ワールド)、u = (W - P) / |W - P|",
+      "rule": "|B - W| < r  または  (B - W)・u >= 0  なら次のウェイポイントへ (1 周期に 1 つだけ進める)",
+      "r_m": 0.3,
+      "note": "(B - W)・u >= 0 は「W を通り、入ってきた区間に垂直な直線を、進行方向に越えた」。二等分線ではないので、V 字・U ターンでも角まで行かないと通過しない"
+    },
+    "replan_in_training": "2〜5 秒ごとに確率 0.3 で、未通過の途中のウェイポイントを入ってきた区間に垂直に 0.2〜0.8m ずらす (最終目標は固定)"
+  },
+  "curriculum_levels": [
+    {
+      "pos_x": [
+        2.0,
+        2.5
+      ],
+      "pos_y": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "pos_x": [
+        2.5,
+        4.0
+      ],
+      "pos_y": [
+        -0.5,
+        0.5
+      ]
+    },
+    {
+      "pos_x": [
+        4.0,
+        6.0
+      ],
+      "pos_y": [
+        -1.0,
+        1.0
+      ],
+      "path_shape": "curve"
+    },
+    {
+      "path_shape": "oval",
+      "shape_params": {
+        "a": [
+          2.0,
+          3.0
+        ],
+        "b": [
+          1.5,
+          2.5
+        ],
+        "n_points": 16
+      }
+    },
+    {
+      "path_shape": "s_curve",
+      "shape_params": {
+        "amplitude": [
+          0.5,
+          1.0
+        ],
+        "wavelength": [
+          3.0,
+          4.0
+        ],
+        "periods": [
+          1.5,
+          2.0
+        ],
+        "n_points": 12
+      }
+    },
+    {
+      "pos_x": [
+        6.0,
+        8.0
+      ],
+      "pos_y": [
+        -1.5,
+        1.5
+      ],
+      "path_shape": "l_shape"
+    },
+    {
+      "path_shape": "v_turn",
+      "shape_params": {
+        "leg1": [
+          2.0,
+          4.0
+        ],
+        "leg2": [
+          2.0,
+          4.0
+        ],
+        "turn_deg": [
+          120.0,
+          150.0
+        ]
+      }
+    },
+    {
+      "path_shape": "u_turn",
+      "shape_params": {
+        "leg1": [
+          2.0,
+          4.0
+        ],
+        "leg2": [
+          2.0,
+          4.0
+        ],
+        "width": [
+          1.0,
+          2.0
+        ]
+      }
+    },
+    {
+      "pos_x": [
+        8.0,
+        10.0
+      ],
+      "pos_y": [
+        -2.0,
+        2.0
+      ],
+      "path_shape": "z_shape"
+    },
+    {
+      "path_shape": "figure8",
+      "shape_params": {
+        "radius": [
+          1.2,
+          1.8
+        ],
+        "n_points_per_loop": 12
+      }
+    }
+  ],
+  "ball_physics_training": {
+    "radius_m": 0.11,
+    "mass_kg": 0.45,
+    "physx_damping": [
+      0.0,
+      0.0
+    ],
+    "friction_static_range": [
+      0.4,
+      1.0
+    ],
+    "friction_dynamic_range": [
+      0.4,
+      1.0
+    ],
+    "restitution_range": [
+      0.3,
+      0.7
+    ],
+    "material_note": "env ごとに固定 (64 通り)。反発の合成モードはボール・地面とも max (ボールの値がそのまま効く)",
+    "damping_linear_range": [
+      0.2,
+      0.8
+    ],
+    "damping_angular_range": [
+      0.2,
+      0.8
+    ],
+    "damping_note": "エピソードごとに引き直し。制御周期ごとに速度・角速度に exp(-c × 0.02) を掛ける"
+  },
+  "observation_delays_training": {
+    "ball_detection_delay_range_s": [
+      0.0,
+      0.15
+    ],
+    "localization_delay_range_s": [
+      0.0,
+      0.25
+    ],
+    "note": "エピソードごとに抽選。実機と同じ作り方: ボールは撮影時刻 (d_ball 前) のロボット座標で見た撮影時刻のボール位置・速度 (foot_*_ball_pos_rel はそこから今の足の位置を引く)。目標点は今の目標点を d_loc 前のロボットの位置・向きで body yaw 座標に直す"
+  },
+  "agent": {
+    "num_envs": 2048,
+    "num_steps_per_env": 48,
+    "num_mini_batches": 16
+  },
+  "onnx": {
+    "file": "k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx",
+    "opset": 18,
+    "shapes": {
+      "command": [
+        1,
+        3
+      ],
+      "obs_history": [
+        1,
+        100,
+        59
+      ],
+      "actions": [
+        1,
+        12
+      ]
+    },
+    "verified_max_abs_diff_torch_vs_onnx": 2.8312206268310547e-07,
+    "verified_max_abs_diff_exporter_vs_env_layout": 0.0
+  }
+}

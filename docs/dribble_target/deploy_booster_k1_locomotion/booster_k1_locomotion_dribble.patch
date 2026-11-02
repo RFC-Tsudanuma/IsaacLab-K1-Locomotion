@@ -1,0 +1,1745 @@
+From 1d315dcc86c0d81997e5e6b5dc7e2b219b1d20f1 Mon Sep 17 00:00:00 2001
+From: HarukiOgawa1 <azarashirobot@gmail.com>
+Date: Mon, 2 Nov 2026 19:14:37 +0900
+Subject: [PATCH] =?UTF-8?q?feat:=20=E3=83=89=E3=83=AA=E3=83=96=E3=83=AB?=
+ =?UTF-8?q?=E3=81=AE=E3=83=9D=E3=83=AA=E3=82=B7=E3=83=BC=20(dribble=5Ftarg?=
+ =?UTF-8?q?et)=20=E3=82=92=E6=8E=A8=E8=AB=96=E3=83=8E=E3=83=BC=E3=83=89?=
+ =?UTF-8?q?=E3=81=AB=E5=85=A5=E3=82=8C=E3=82=8B?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- DribbleBehavior: /soccer_dribble_cmd (nav_msgs/Path、フィールド座標のウェイポイント列) を受けて
+  IsaacLab の dribble_target ポリシーで運ぶ。開始は学習の開始窓 (k1_kick_params.yaml の dribble_ball_*) のときだけ。
+  ウェイポイントの通過判定・終了条件 (最後のウェイポイントでボールとロボットが 1 m 以内、ボールが 4 m 超、見失い、時間切れ) は学習に合わせる
+- モデル: assets/k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx (ボールの観測に vision_filter の模倣を入れたラン)
+- launch: dribble_model_path / dribble_cmd_topic / dribble_ball_world_source を追加 (既定は空 = ドリブル無効)
+- MuJoCo sim: 足とボールの接触の記録 (log_ball_contacts、既定 false)
+- scripts: MuJoCo でコースをドリブルさせるテスト一式 (run_dribble_mujoco_test.sh、8 の字は --shapes figure8)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ launch/k1_isaaclab_deploy.launch.py    |  21 +
+ launch/k1_isaaclab_sim.launch.py       |  33 ++
+ resource/k1_kick_params.yaml           |  10 +
+ scripts/analyze_dribble_pass_timing.py |  66 +++
+ scripts/dribble_test_sim.launch.py     |  40 ++
+ scripts/run_dribble_mujoco_test.sh     |  32 ++
+ scripts/test_dribble_mujoco.py         | 333 ++++++++++++++
+ src/k1_dribble_constants.hpp           |  72 +++
+ src/mujoco_sim_node.cpp                | 128 ++++++
+ src/rl_policy_isaaclab_node.cpp        | 588 ++++++++++++++++++++++++-
+ 10 files changed, 1313 insertions(+), 10 deletions(-)
+ create mode 100644 scripts/analyze_dribble_pass_timing.py
+ create mode 100644 scripts/dribble_test_sim.launch.py
+ create mode 100755 scripts/run_dribble_mujoco_test.sh
+ create mode 100755 scripts/test_dribble_mujoco.py
+ create mode 100644 src/k1_dribble_constants.hpp
+
+diff --git a/launch/k1_isaaclab_deploy.launch.py b/launch/k1_isaaclab_deploy.launch.py
+index 3a62738..4f1fcc4 100644
+--- a/launch/k1_isaaclab_deploy.launch.py
++++ b/launch/k1_isaaclab_deploy.launch.py
+@@ -84,6 +84,10 @@ def generate_launch_description():
+                    "kick_model_path_pass":LaunchConfiguration("kick_model_path_pass"),
+                    "amp_kick_model_path": LaunchConfiguration("amp_kick_model_path"),
+                    "amp_kick_cmd_topic": LaunchConfiguration("amp_kick_cmd_topic"),
++                   "dribble_model_path": LaunchConfiguration("dribble_model_path"),
++                   "dribble_cmd_topic": LaunchConfiguration("dribble_cmd_topic"),
++                   "dribble_ball_world_source":
++                       LaunchConfiguration("dribble_ball_world_source"),
+                    "amp_kick_entry_mode": LaunchConfiguration("amp_kick_entry_mode"),
+                    "odom_topic": LaunchConfiguration("odom_topic"),
+                    "kick_odom_correction":
+@@ -135,6 +139,23 @@ def generate_launch_description():
+                         "static (既定): 静止フレーム (last_action=0, 歩容停止, ボール位置入り) で "
+                         "全履歴を埋め直す = 学習の stand 開始と同じ. inherit: walk の履歴・"
+                         "last_action・歩容クロックをそのまま引き継ぐ = 学習の gait 開始と同じ."),
++        DeclareLaunchArgument(
++            "dribble_model_path", default_value="",
++            description="C++ node only: IsaacLab dribble_target ONNX. Opt-in: pass "
++                        "dribble_model_path:=<pkg>/assets/k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx. "
++                        "Requests on dribble_cmd_topic use it; Walk→Dribble fires only inside "
++                        "the training's start window (dribble_ball_* in k1_kick_params.yaml)."),
++        DeclareLaunchArgument(
++            "dribble_cmd_topic", default_value="/soccer_dribble_cmd",
++            description="C++ node only: nav_msgs/Path topic that requests the dribble. "
++                        "poses = field-frame waypoints (same frame as /localization_result), "
++                        "the last one is the goal; the ball's own position is not included. "
++                        "An empty path cancels the dribble."),
++        DeclareLaunchArgument(
++            "dribble_ball_world_source", default_value="filter",
++            description="C++ node only: ball position for the dribble's waypoint / goal checks. "
++                        "filter (default) = vision_filter's field-frame estimate (time-consistent); "
++                        "localization = latest /localization_result + body-frame ball (old, for A/B)."),
+         DeclareLaunchArgument(
+             "amp_kick_cmd_topic", default_value="/soccer_quick_kick_cmd",
+             description="C++ node only: geometry_msgs/Point topic that requests the AMP quick "
+diff --git a/launch/k1_isaaclab_sim.launch.py b/launch/k1_isaaclab_sim.launch.py
+index dbd03a1..4f027d7 100644
+--- a/launch/k1_isaaclab_sim.launch.py
++++ b/launch/k1_isaaclab_sim.launch.py
+@@ -256,6 +256,10 @@ def _build_actions(context, *_):
+     # (geometry_msgs/Point, ワールド座標の目標位置) で要求されたキックに使う. 空文字なら無効.
+     amp_kick_model_path = LaunchConfiguration("amp_kick_model_path").perform(context)
+     amp_kick_entry_mode = LaunchConfiguration("amp_kick_entry_mode").perform(context)
++    # ドリブル (C++ ノードのみ). /soccer_dribble_cmd_<idx> (nav_msgs/Path, ワールド座標の
++    # ウェイポイント列, 最後が目標) で要求する. 空文字なら無効.
++    dribble_model_path = LaunchConfiguration("dribble_model_path").perform(context)
++    dribble_ball_world_source = LaunchConfiguration("dribble_ball_world_source").perform(context)
+     # UFO get-up (転倒復帰). model/z_bank の両方が空なら無効 (実機 launch と同じ既定).
+     # その場回転ポリシー (C++ ノードのみ). 空文字なら無効.
+     pivot_model_path = LaunchConfiguration("pivot_model_path").perform(context)
+@@ -293,6 +297,7 @@ def _build_actions(context, *_):
+         publish_selfpos = LaunchConfiguration("publish_self_position").perform(context)
+         selfpos_delay_ms = LaunchConfiguration("self_position_delay_ms").perform(context)
+         detection_delay_ms = LaunchConfiguration("detection_delay_ms").perform(context)
++        log_ball_contacts = LaunchConfiguration("log_ball_contacts").perform(context)
+         action_delay_ticks   = LaunchConfiguration("action_delay_ticks").perform(context)
+         physics_500hz        = LaunchConfiguration("physics_500hz").perform(context)
+         stream_camera_image  = LaunchConfiguration("stream_camera_image").perform(context)
+@@ -364,6 +369,7 @@ def _build_actions(context, *_):
+                 "publish_self_position": publish_selfpos.lower() == "true",
+                 "self_position_delay_ms": float(selfpos_delay_ms),
+                 "detection_delay_ms": float(detection_delay_ms),
++                "log_ball_contacts": log_ball_contacts.lower() == "true",
+                 "large_field": large,
+                 "action_delay_ticks":  int(action_delay_ticks),
+                 "physics_500hz": physics_500hz.lower() == "true",
+@@ -430,6 +436,8 @@ def _build_actions(context, *_):
+                 ("/soccer_kick_cmd", f"/soccer_kick_cmd_{idx}"),
+                 # AMP quick kick の要求 (geometry_msgs/Point, ワールド座標の目標位置).
+                 ("/soccer_quick_kick_cmd", f"/soccer_quick_kick_cmd_{idx}"),
++                # ドリブルの経路 (nav_msgs/Path, ワールド座標のウェイポイント列).
++                ("/soccer_dribble_cmd", f"/soccer_dribble_cmd_{idx}"),
+                 ("/pivot_turn_cmd", f"/pivot_turn_cmd_{idx}"),
+                 # 手動キック版のトリガ. 戦略版は購読しないので remap しても無害.
+                 ("/soccer_kick_trigger", f"/soccer_kick_trigger_{idx}"),
+@@ -481,6 +489,8 @@ def _build_actions(context, *_):
+             if use_cpp_policy and not use_manual_kick:
+                 policy_param["amp_kick_model_path"] = amp_kick_model_path
+                 policy_param["amp_kick_entry_mode"] = amp_kick_entry_mode
++                policy_param["dribble_model_path"] = dribble_model_path
++                policy_param["dribble_ball_world_source"] = dribble_ball_world_source
+                 policy_param["pivot_model_path"] = pivot_model_path
+                 policy_param["ufo_model_path"] = ufo_model_path
+                 policy_param["ufo_z_bank_path"] = ufo_z_bank_path
+@@ -546,6 +556,8 @@ def _build_actions(context, *_):
+     if use_cpp_policy and not use_manual_kick:
+         policy_param["amp_kick_model_path"] = amp_kick_model_path
+         policy_param["amp_kick_entry_mode"] = amp_kick_entry_mode
++        policy_param["dribble_model_path"] = dribble_model_path
++        policy_param["dribble_ball_world_source"] = dribble_ball_world_source
+         policy_param["pivot_model_path"] = pivot_model_path
+         policy_param["ufo_model_path"] = ufo_model_path
+         policy_param["ufo_z_bank_path"] = ufo_z_bank_path
+@@ -568,6 +580,7 @@ def _build_actions(context, *_):
+             ("/booster_vision/detection", "/booster_vision/detection_1"),
+             ("/soccer_kick_cmd", "/soccer_kick_cmd_1"),
+             ("/soccer_quick_kick_cmd", "/soccer_quick_kick_cmd_1"),
++            ("/soccer_dribble_cmd", "/soccer_dribble_cmd_1"),
+             ("/pivot_turn_cmd", "/pivot_turn_cmd_1"),
+             ("/LocoApiTopicReq", "/LocoApiTopicReq_1"),  # 起き上がり要求 (52149)
+             ("/soccer_kick_trigger", "/soccer_kick_trigger_1"),
+@@ -647,6 +660,26 @@ def generate_launch_description():
+                         "static (既定): 静止フレームで全履歴を埋め直す (学習の stand 開始). "
+                         "inherit: walk の履歴をそのまま引き継ぐ (学習の gait 開始).",
+         ),
++        DeclareLaunchArgument(
++            "dribble_model_path", default_value="",
++            description="C++ node only (use_manual_kick では未対応): IsaacLab dribble_target "
++                        "ONNX (例: <pkg>/assets/k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx). "
++                        "/soccer_dribble_cmd_<idx> (nav_msgs/Path: ワールド座標のウェイポイント列, "
++                        "最後が目標, /localization_result と同じ系) で要求されたドリブルに使う. "
++                        "Walk→Dribble は学習の開始窓 (k1_kick_params.yaml dribble_ball_*) でのみ発火. "
++                        "'' で無効.",
++        ),
++        DeclareLaunchArgument(
++            "log_ball_contacts", default_value="false",
++            description="C++ sim only: 足とボールの接触ごとに、離れた直後のボールの速さ ÷ "
++                        "触れている間の足の最大の速さをログに出す (sim2sim 調査用).",
++        ),
++        DeclareLaunchArgument(
++            "dribble_ball_world_source", default_value="filter",
++            description="C++ node only: ドリブルのウェイポイント通過・目標到達の判定に使うボール位置. "
++                        "filter (既定): vision_filter のフィールド座標 (検出時刻の自己位置で計算済み). "
++                        "localization: 最新の自己位置 + ボールの相対位置 (時刻がずれる旧方式, 比較用)",
++        ),
+         DeclareLaunchArgument(
+             "pivot_model_path", default_value="",
+             description="C++ node only: pivot-turn ONNX policy (walk obs layout, "
+diff --git a/resource/k1_kick_params.yaml b/resource/k1_kick_params.yaml
+index f8ef1cc..ad459b9 100644
+--- a/resource/k1_kick_params.yaml
++++ b/resource/k1_kick_params.yaml
+@@ -36,6 +36,16 @@ k1_kick_params:
+   amp_post_contact_steps: 75    # 蹴り検出（kick_ball_speed_mps）後に続ける tick 数（学習 T_post = 1.5 s: 足を戻して静止するまで）
+   amp_timeout_steps: 75         # 蹴り検出が無いまま「蹴り損ね」と判定する tick 数（学習 T_max = 1.5 s）。その後 amp_post_contact_steps だけ足を戻してから Walk へ
+ 
++  # ── ドリブル（dribble_model_path 指定時のみ使用。k1_dribble_constants.hpp 参照）──
++  # Walk→Dribble は学習のリセット分布と同じ窓（body yaw 座標のボール中心、仕様 JSON の ball_reset の p1〜p99）で判定する。
++  # 窓の外なら戦略が歩行でボールの後ろに回り込み、正対してから入る。
++  dribble_ball_x_min_m: 0.6
++  dribble_ball_x_max_m: 1.0
++  dribble_ball_azimuth_max_deg: 19.0
++  dribble_ball_speed_max_mps: 0.3   # 学習は静止したボールから始まる（速度推定が無い tick は判定しない）
++  dribble_ball_lost_s: 1.0          # ボールをこの秒数見失ったら Walk へ
++  dribble_timeout_s: 60.0           # 学習の最長エピソード（8 の字）と同じ
++
+ 
+ # 戦略向け調整した方が良さそうなリスト
+ # ball_approach_m: この距離以内じゃないとキックできない。戦略側の閾値を変更したらこっちも変更した方が良い
+diff --git a/scripts/analyze_dribble_pass_timing.py b/scripts/analyze_dribble_pass_timing.py
+new file mode 100644
+index 0000000..26cfc6a
+--- /dev/null
++++ b/scripts/analyze_dribble_pass_timing.py
+@@ -0,0 +1,66 @@
++#!/usr/bin/env python3
++"""ドリブルのウェイポイントを推論ノードが進めた瞬間に、ボールが本当はどこにいたかを集計する。
++
++test_dribble_mujoco.py --dump で書き出した経路・ボールの真値と、推論ノードのログ
++(sim.log の "[Dribble] waypoint k/n passed") を UNIX 時刻で突き合わせる。
++
++    python3 analyze_dribble_pass_timing.py <LOG_DIR>   # LOG_DIR に sim.log と trials.jsonl
++
++指標 (ウェイポイント W、1 つ前の点 P、入ってきた区間の向き u = (W - P)/|W - P|、ボールの真値 B):
++  along = (B - W)・u   … 負なら「まだ垂直な線の手前」= 早めに進めた、正なら越えてから進めた
++  dist  = |B - W|
++学習では真値で判定するので、along が負に大きいほど / 正に大きいほど学習とずれている。
++"""
++import bisect
++import json
++import math
++import re
++import sys
++
++PASS_RE = re.compile(r'\[(\d+\.\d+)\] \[rl_policy_isaaclab_node\]: \[Dribble\] waypoint (\d+)/(\d+) passed \((\w+)')
++
++
++def main():
++    log_dir = sys.argv[1]
++    trials = [json.loads(line) for line in open(f'{log_dir}/trials.jsonl')]
++    passes = [(float(m[1]), int(m[2]), int(m[3]), m[4])
++              for m in (PASS_RE.search(line) for line in open(f'{log_dir}/sim.log', errors='replace')) if m]
++    rows = []
++    for tr in trials:
++        track = tr['ball_track']
++        if not track:
++            continue
++        times = [t for t, _, _ in track]
++        t_lo, t_hi = times[0], times[-1]
++        points = [tuple(tr['ball_start'])] + [tuple(p) for p in tr['path']]
++        for t, k, n, kind in passes:
++            if not (t_lo <= t <= t_hi) or n != len(tr['path']):
++                continue
++            i = min(bisect.bisect_left(times, t), len(track) - 1)
++            _, bx, by = track[i]
++            px, py = points[k - 1]
++            wx, wy = points[k]
++            seg = math.hypot(wx - px, wy - py)
++            ux, uy = (wx - px) / seg, (wy - py) / seg
++            rows.append(dict(shape=tr['shape'], kind=kind,
++                             along=(bx - wx) * ux + (by - wy) * uy, dist=math.hypot(bx - wx, by - wy)))
++    if not rows:
++        print('no waypoint passes found')
++        return
++
++    def q(vals, p):
++        vals = sorted(vals)
++        return round(vals[min(len(vals) - 1, int(p * len(vals)))], 2)
++
++    for kind in ('reached', 'crossed', None):
++        sel = [r for r in rows if kind is None or r['kind'] == kind]
++        if not sel:
++            continue
++        al = [r['along'] for r in sel]
++        print('%-8s n=%3d  along p10/p50/p90 = %5s / %5s / %5s m  dist p50 = %s m  before_line(along<0) = %.2f' % (
++            kind or 'all', len(sel), q(al, .1), q(al, .5), q(al, .9), q([r['dist'] for r in sel], .5),
++            sum(a < 0 for a in al) / len(al)))
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/scripts/dribble_test_sim.launch.py b/scripts/dribble_test_sim.launch.py
+new file mode 100644
+index 0000000..997008a
+--- /dev/null
++++ b/scripts/dribble_test_sim.launch.py
+@@ -0,0 +1,40 @@
++"""ドリブルテスト用: k1_isaaclab_sim.launch.py を UFO 起き上がり無効 (ufo_*_path='') で起動する.
++ros2 launch の CLI は空文字の引数 (name:=) を受け付けないため, include 側で空文字を渡す.
++使い方: ros2 launch <this file> dribble_model_path:=<onnx> [他は k1_isaaclab_sim.launch.py と同じ]
++
++既定ではボール検出の視野制限と位置ノイズを切る (AMP キックのテストと同じ). まずポリシー自体が
++経路をたどれるかを見るため. 実機寄りの条件で見るときは
++    ball_detection_only_in_camera_fov:=true detection_position_noise:=true
++を付ける (足元のボールが視野から外れると 1 秒で Walk に戻る).
++"""
++import os
++from ament_index_python.packages import get_package_share_directory
++from launch import LaunchDescription
++from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
++from launch.launch_description_sources import PythonLaunchDescriptionSource
++from launch.substitutions import LaunchConfiguration
++
++
++def generate_launch_description():
++    sim_launch = os.path.join(get_package_share_directory("booster_k1_locomotion"),
++                              "launch", "k1_isaaclab_sim.launch.py")
++    # xml_path: 空なら既定のフィールド. ボールの物理などを変えた XML で A/B するときに渡す.
++    # self_position_delay_ms / detection_delay_ms: 自己位置・ボール検出の遅れ [ms] (既定 0)。
++    # 5v5_game.sh の試合構成は 170 / 100。
++    forwarded = ["dribble_model_path", "action_delay_ticks", "headless", "xml_path",
++                 "ball_detection_only_in_camera_fov", "detection_position_noise",
++                 "self_position_delay_ms", "detection_delay_ms", "dribble_ball_world_source",
++                 "log_ball_contacts"]
++    defaults = {"action_delay_ticks": "1", "headless": "true",
++                "ball_detection_only_in_camera_fov": "false", "detection_position_noise": "false",
++                "self_position_delay_ms": "0.0", "detection_delay_ms": "0.0",
++                "dribble_ball_world_source": "filter", "log_ball_contacts": "false"}
++    return LaunchDescription(
++        [DeclareLaunchArgument(a, default_value=defaults.get(a, "")) for a in forwarded]
++        + [IncludeLaunchDescription(
++            PythonLaunchDescriptionSource(sim_launch),
++            launch_arguments={
++                "use_cpp_sim": "true", "use_cpp_policy": "true", "start_active": "true",
++                "ufo_model_path": "", "ufo_z_bank_path": "",
++                **{a: LaunchConfiguration(a) for a in forwarded},
++            }.items())])
+diff --git a/scripts/run_dribble_mujoco_test.sh b/scripts/run_dribble_mujoco_test.sh
+new file mode 100755
+index 0000000..68cfe3b
+--- /dev/null
++++ b/scripts/run_dribble_mujoco_test.sh
+@@ -0,0 +1,32 @@
++#!/usr/bin/env bash
++# ドリブルの MuJoCo テスト一式:
++#   MuJoCo sim (headless, C++ policy, dribble) + vision_filter (id 1) を上げ、
++#   test_dribble_mujoco.py でいくつかの経路をドリブルさせ、集計を出す。
++# 使い方: run_dribble_mujoco_test.sh [<dribble_model.onnx>] [test_dribble_mujoco.py の追加引数...]
++#   モデル省略時はパッケージの assets にある既定のモデルを使う。
++#   SIM_ARGS で dribble_test_sim.launch.py に引数を足せる
++#   (例: SIM_ARGS="ball_detection_only_in_camera_fov:=true detection_position_noise:=true")。
++set -o pipefail  # -u は ROS の setup.bash と相性が悪い
++SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
++WS="$(cd "$SCRIPT_DIR/../../.." && pwd)"
++MODEL="$SCRIPT_DIR/../assets/k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx"
++if [[ $# -gt 0 && "$1" == *.onnx ]]; then MODEL="$1"; shift; fi
++MODEL="$(realpath "$MODEL")"
++LOG="${LOG_DIR:-/tmp/dribble_test}"; mkdir -p "$LOG"
++source /opt/ros/humble/setup.bash
++source "$WS/install/setup.bash"
++
++pkill -f mujoco_sim_node_cpp 2>/dev/null; pkill -f rl_policy_isaaclab_node_cpp 2>/dev/null; pkill -f vision_filter_node 2>/dev/null; sleep 1
++
++ros2 launch "$SCRIPT_DIR/dribble_test_sim.launch.py" dribble_model_path:="$MODEL" ${SIM_ARGS:-} > "$LOG/sim.log" 2>&1 &
++SIM_PID=$!
++sleep 6
++ros2 launch vision_filter vision_filter.launch.py sim_robot_id:=1 > "$LOG/vision_filter.log" 2>&1 &
++VF_PID=$!
++sleep 4
++python3 "$SCRIPT_DIR/test_dribble_mujoco.py" "$@" 2>&1 | tee "$LOG/test.log"
++RC=${PIPESTATUS[0]}
++kill $VF_PID $SIM_PID 2>/dev/null; sleep 2
++pkill -f mujoco_sim_node_cpp 2>/dev/null; pkill -f rl_policy_isaaclab_node_cpp 2>/dev/null; pkill -f vision_filter_node 2>/dev/null
++echo "TEST_EXIT=$RC (logs in $LOG; policy log: grep Dribble $LOG/sim.log)"
++exit $RC
+diff --git a/scripts/test_dribble_mujoco.py b/scripts/test_dribble_mujoco.py
+new file mode 100755
+index 0000000..e69b69e
+--- /dev/null
++++ b/scripts/test_dribble_mujoco.py
+@@ -0,0 +1,333 @@
++#!/usr/bin/env python3
++"""ドリブルポリシーを MuJoCo sim (mujoco_sim_node_cpp + rl_policy_isaaclab_node_cpp + vision_filter)
++でいくつかの経路について試し、成功・転倒・所要時間を集計する。
++
++前提: dribble_test_sim.launch.py (headless 可) と vision_filter (sim_robot_id:=1) が動いていること。
++    python3 test_dribble_mujoco.py --shapes "straight l_shape s_curve" --repeats 2
++
++各試行: ロボットを初期姿勢に戻す → 静止を待つ → ボールをロボット正面 ball_ahead [m] に置く →
++/soccer_dribble_cmd_1 にワールド座標のウェイポイント列 (ボール基準の形をロボットの向きに回したもの) を送る
++→ 成功・転倒・時間切れまで観測 → 空の経路を送って Walk に戻す。
++判定は /mujoco_sim/world_state の真値だけで行う (成功 = 学習と同じく、最終目標から
++ボールとロボットの両方が 1.0 m 以内)。
++"""
++import argparse
++import json
++import math
++import sys
++import time
++
++import rclpy
++from geometry_msgs.msg import Point, PoseStamped, Twist
++from nav_msgs.msg import Path
++from sensor_msgs.msg import JointState
++from rclpy.node import Node
++
++from futbol_msgs.msg import SimSetRobotPose, SimWorldState
++
++# ボール位置を原点、ロボットの正面を +x とした経路 (最後が目標) [m]。
++# 学習のレベルに近い形を、曲がりの小さいものから並べている。
++SHAPES = {
++    'straight': [(3.0, 0.0)],
++    'curve': [(1.5, 0.2), (3.0, 0.8), (4.2, 1.8)],
++    'l_shape': [(3.0, 0.0), (3.0, 2.5)],
++    's_curve': [(1.5, 0.6), (3.0, -0.6), (4.5, 0.6), (6.0, 0.0)],
++    'polyline': [(1.5, 0.0), (2.8, 0.7), (3.6, 1.9)],
++    'v_turn': [(3.0, 0.0), (1.0, 1.4)],
++}
++
++
++def _figure8(radius, n_per_loop=12):
++    """学習の Level10 (commands.py の figure8) と同じ: 半径 R の円を始点から左回り → 右回りで 1 周ずつ。終点 = 始点。"""
++    ts = [2 * math.pi * k / n_per_loop for k in range(1, n_per_loop + 1)]
++    loop1 = [(radius * math.sin(t), radius - radius * math.cos(t)) for t in ts]
++    loop2 = [(radius * math.sin(t), -(radius - radius * math.cos(t))) for t in ts]
++    return loop1 + loop2
++
++
++# 学習の半径は U(1.2, 1.8) m。真ん中の 1.5 m (周長 約 19 m) にする。--shapes で明示したときだけ使う
++# (既定の全コースには入れない。時間がかかるので --timeout を 60 秒程度にする)。
++EXTRA_SHAPES = {'figure8': _figure8(1.5)}
++WAYPOINT_REACH_M = 0.3   # 学習の通過判定 (k1_dribble_constants.hpp と同じ)
++PASS_LINE_MAX_M = 1.0
++SUCCESS_RADIUS_M = 1.0
++SPEED_WINDOW_S = 0.5  # 速さは 0.5 秒平均の水平速度 (学習側の評価と同じ定義)
++# 関節速度を見る関節と、Isaac の学習で PhysX にかかっている上限 [rad/s] (Booster 公式 URDF の velocity)
++WATCHED_JOINTS = {'Hip_Pitch': 7.1, 'Knee_Pitch': 12.5}
++
++
++def speed_series(samples):
++    """(t, x, y) の列から、各時刻の 0.5 秒平均の速さ (t, v) の列を作る。"""
++    out = []
++    j = 0
++    for t, x, y in samples:
++        while j + 1 < len(samples) and samples[j + 1][0] <= t - SPEED_WINDOW_S:
++            j += 1
++        tj, xj, yj = samples[j]
++        if t - tj >= SPEED_WINDOW_S * 0.8:
++            out.append((t, math.hypot(x - xj, y - yj) / (t - tj)))
++    return out
++
++
++def speed_stats(samples, t_start, t_end, outcome):
++    """ドリブル中 (ボールが動き出してから終わるまで) の速さの指標。"""
++    series = [(t, v) for t, v in speed_series(samples) if t_start is not None and t_start <= t <= t_end]
++    if not series:
++        return {}
++    vs = [v for _, v in series]
++    stats = dict(v_mean=sum(vs) / len(vs), v_peak=max(vs),
++                 over_1_0=sum(v > 1.0 for v in vs) / len(vs), over_1_2=sum(v > 1.2 for v in vs) / len(vs))
++    if outcome == 'fall':
++        pre = [v for t, v in series if t_end - 1.0 <= t <= t_end - 0.5]
++        last2 = [v for t, v in series if t >= t_end - 2.0]
++        stats['v_fall_pre'] = sum(pre) / len(pre) if pre else None
++        stats['v_fall_peak2s'] = max(last2) if last2 else None
++    return stats
++FALL_TRUNK_HEIGHT_M = 0.35
++STANDING_TRUNK_HEIGHT_M = 0.42  # 試行を始めてよい胴体の高さ (立位は約 0.5 m、歩行中も 0.44 m 以上)
++
++
++class DribbleTester(Node):
++    def __init__(self):
++        super().__init__('dribble_tester')
++        self.ws = None
++        self.create_subscription(SimWorldState, '/mujoco_sim/world_state', self._on_ws, 10)
++        self.pub_ball = self.create_publisher(Point, '/mujoco_sim/set_ball_pose', 10)
++        self.pub_robot = self.create_publisher(SimSetRobotPose, '/mujoco_sim/set_robot_pose', 10)
++        self.pub_path = self.create_publisher(Path, '/soccer_dribble_cmd_1', 10)
++        self.pub_cmd = self.create_publisher(Twist, '/cmd_vel_1', 10)
++        self.joint_samples = None  # 試行中だけ (t, {関節名: |dq|}) を貯める
++        self.create_subscription(JointState, '/booster/joint_states', self._on_joints, 50)
++
++    def _on_joints(self, msg):
++        if self.joint_samples is None:
++            return
++        speeds = {}
++        for name, vel in zip(msg.name, msg.velocity):
++            for joint in WATCHED_JOINTS:
++                if name.endswith(joint):
++                    speeds.setdefault(joint, []).append(abs(vel))
++        if speeds:
++            self.joint_samples.append((time.monotonic(), {j: max(v) for j, v in speeds.items()}))
++
++    def _on_ws(self, msg):
++        self.ws = msg
++
++    def wait(self, seconds):
++        end = time.monotonic() + seconds
++        while time.monotonic() < end:
++            rclpy.spin_once(self, timeout_sec=0.02)
++
++    def robot(self):
++        return self.ws.robots[0] if self.ws and self.ws.robots else None
++
++    def send_path(self, points):
++        msg = Path()
++        msg.header.frame_id = 'field'
++        msg.header.stamp = self.get_clock().now().to_msg()
++        for x, y in points:
++            ps = PoseStamped()
++            ps.header = msg.header
++            ps.pose.position.x = x
++            ps.pose.position.y = y
++            ps.pose.orientation.w = 1.0
++            msg.poses.append(ps)
++        self.pub_path.publish(msg)
++
++    def trial(self, shape, ball_ahead, timeout_s, resend_hz, dump=None):
++        # 1) 経路を取り消し、ロボットを初期姿勢へ戻して静止を待つ。
++        #    前の試行で転倒した直後はリセット後にまた倒れることがあるので、立っているのを
++        #    確かめてから始める (倒れたままだと開始直後に「転倒」と数えてしまう)。
++        self.send_path([])
++        r = None
++        for _ in range(3):
++            rp = SimSetRobotPose(); rp.robot_id = 1; rp.to_initial_pose = True
++            self.pub_robot.publish(rp)
++            self.pub_cmd.publish(Twist())
++            far = Point(); far.x = 5.0; far.y = 5.0; far.z = 0.0
++            self.pub_ball.publish(far)
++            self.wait(3.0)
++            r = self.robot()
++            if r is not None and r.trunk_height > STANDING_TRUNK_HEIGHT_M:
++                break
++        if r is None:
++            return dict(shape=shape, error='no world_state')
++        if r.trunk_height <= STANDING_TRUNK_HEIGHT_M:
++            return dict(shape=shape, error='robot not standing after reset')
++        c, s = math.cos(r.theta), math.sin(r.theta)
++        # 2) ボールをロボット正面に置く
++        bx, by = r.x + c * ball_ahead, r.y + s * ball_ahead
++        p = Point(); p.x = bx; p.y = by; p.z = 0.0
++        self.pub_ball.publish(p)
++        self.wait(1.5)  # vision_filter が追従するのを待つ
++        # 3) ボール基準の形をワールド座標へ
++        path = [(bx + c * fx - s * fy, by + s * fx + c * fy) for fx, fy in SHAPES[shape]]
++        goal = path[-1]
++        # 4) 経路を送り続けながら観測 (戦略と同じく毎周期送る。中身は同じなので再始点化はされない)
++        t0 = time.monotonic(); next_send = t0
++        min_trunk = 9.9; first_move = None; outcome = 'timeout'; t_end = None
++        samples = []  # (t, x, y) ロボットの水平位置
++        ball_track = []  # (UNIX 時刻, x, y) ボールの真値。推論ノードのログと時刻で突き合わせる
++        ball_robot_dist = []  # (t, ロボットとボールの水平距離) キープの指標
++        start_ball_goal = math.hypot(bx - goal[0], by - goal[1])
++        # 学習と同じく、最後のウェイポイントに進んでから成功を判定する (8 の字は終点 = 始点のため)。
++        # 進め方は推論ノード・学習と同じ通過判定をボールの真値で行う。
++        points = [(bx, by)] + path
++        wp = 0
++        max_ball_goal = start_ball_goal
++        self.joint_samples = []
++        while time.monotonic() - t0 < timeout_s:
++            now = time.monotonic()
++            if now >= next_send:
++                self.send_path(path)
++                next_send = now + 1.0 / resend_hz
++            rclpy.spin_once(self, timeout_sec=0.02)
++            rr = self.robot()
++            if self.ws is None or rr is None:
++                continue
++            bp = self.ws.ball_position
++            min_trunk = min(min_trunk, rr.trunk_height)
++            samples.append((now - t0, rr.x, rr.y))
++            ball_track.append((time.time(), bp.x, bp.y))
++            ball_robot_dist.append((now - t0, math.hypot(bp.x - rr.x, bp.y - rr.y)))
++            max_ball_goal = max(max_ball_goal, math.hypot(bp.x - goal[0], bp.y - goal[1]))
++            if first_move is None and math.hypot(bp.x - bx, bp.y - by) > 0.1:
++                first_move = now - t0
++            if rr.trunk_height < FALL_TRUNK_HEIGHT_M:
++                outcome = 'fall'; t_end = now - t0
++                break
++            if wp < len(path) - 1:
++                (px, py), (wx, wy) = points[wp], points[wp + 1]
++                seg = math.hypot(wx - px, wy - py)
++                dist_w = math.hypot(bp.x - wx, bp.y - wy)
++                along = ((bp.x - wx) * (wx - px) + (bp.y - wy) * (wy - py)) / seg if seg > 1e-6 else 0.0
++                if dist_w < WAYPOINT_REACH_M or (along >= 0.0 and dist_w < PASS_LINE_MAX_M):
++                    wp += 1
++            if (wp == len(path) - 1 and math.hypot(bp.x - goal[0], bp.y - goal[1]) < SUCCESS_RADIUS_M and
++                    math.hypot(rr.x - goal[0], rr.y - goal[1]) < SUCCESS_RADIUS_M):
++                outcome = 'success'; t_end = now - t0
++                break
++        bp = self.ws.ball_position
++        self.send_path([])
++        stats = speed_stats(samples, first_move, t_end if t_end is not None else timeout_s, outcome)
++        stats.update(joint_stats(self.joint_samples, t0, first_move,
++                                 t_end if t_end is not None else timeout_s))
++        self.joint_samples = None
++        # キープ: ドリブル中 (ボールが動き出してから終わるまで) のロボットとボールの距離
++        t_stop = t_end if t_end is not None else timeout_s
++        stats['keep_dists'] = [round(dd, 3) for tt, dd in ball_robot_dist
++                               if first_move is not None and first_move <= tt <= t_stop][::5]
++        # 押し戻し: ボール→目標の距離が、途中で開始時より (0.1 m の余裕を超えて) 大きくなった
++        stats['pushed_back'] = max_ball_goal > start_ball_goal + 0.1
++        if dump is not None:
++            dump.write(json.dumps(dict(shape=shape, outcome=outcome, path=path, ball_start=(bx, by),
++                                       ball_track=ball_track[::2])) + '\n')
++            dump.flush()
++        return dict(shape=shape, outcome=outcome, wp=f"{wp}/{len(path) - 1}", t_end=t_end, t_first_move=first_move,
++                    ball_goal=math.hypot(bp.x - goal[0], bp.y - goal[1]), min_trunk=min_trunk, **stats)
++
++
++def joint_stats(joint_samples, t0, t_start, t_end):
++    """ドリブル中の関節速度 (左右の大きい方) の最大値と、Isaac の上限を超えた割合。"""
++    if t_start is None:
++        return {}
++    window = [js for t, js in joint_samples if t_start <= t - t0 <= t_end]
++    out = {}
++    for joint, cap in WATCHED_JOINTS.items():
++        vals = [js[joint] for js in window if joint in js]
++        if vals:
++            key = joint.lower()
++            out[f'{key}_max'] = max(vals)
++            out[f'{key}_over_cap'] = sum(v > cap for v in vals) / len(vals)
++            out[f'{key}_n'] = len(vals)
++            # 転倒の 1 秒前までに区切った値 (倒れていく最中の脚の振りを除く)
++            pre = [js[joint] for t, js in joint_samples
++                   if t_start <= t - t0 <= t_end - 1.0 and joint in js]
++            if pre:
++                out[f'{key}_max_pre1s'] = max(pre)
++                out[f'{key}_over_cap_pre1s'] = sum(v > cap for v in pre) / len(pre)
++    return out
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('--shapes', default=' '.join(SHAPES), help='試す形 (空白区切り): ' + ' '.join(SHAPES))
++    ap.add_argument('--repeats', type=int, default=2)
++    ap.add_argument('--ball-ahead', type=float, default=0.8, help='ボールを置くロボット正面の距離 [m] (開始窓 0.6〜1.0)')
++    ap.add_argument('--timeout', type=float, default=40.0)
++    ap.add_argument('--resend-hz', type=float, default=10.0, help='経路を送り直す頻度 (戦略の周期を模す)')
++    ap.add_argument('--warmup', type=float, default=8.0, help='起動直後に policy が Walk に入るまで待つ秒数')
++    ap.add_argument('--dump', default=None, help='各試行の経路とボールの真値の軌跡を JSON Lines で書き出す先')
++    args = ap.parse_args()
++    shapes = args.shapes.split()
++    SHAPES.update({k: v for k, v in EXTRA_SHAPES.items() if k in shapes})
++    unknown = [s for s in shapes if s not in SHAPES]
++    if unknown:
++        print('ERROR: unknown shapes', unknown, flush=True)
++        sys.exit(2)
++    rclpy.init()
++    node = DribbleTester()
++    node.wait(args.warmup)
++    if node.ws is None:
++        print('ERROR: /mujoco_sim/world_state not received', flush=True)
++        sys.exit(2)
++    rows = []
++    dump = open(args.dump, 'w') if args.dump else None
++    for rep in range(args.repeats):
++        for shape in shapes:
++            res = node.trial(shape, args.ball_ahead, args.timeout, args.resend_hz, dump)
++            rows.append(res)
++            print('TRIAL', rep, {k: (round(v, 2) if isinstance(v, float) else v)
++                                 for k, v in res.items() if k != 'keep_dists'}, flush=True)
++    ok = [r for r in rows if 'error' not in r]
++    n = max(1, len(ok))
++    print('SUMMARY n=%d success=%.2f fall=%.2f timeout=%.2f pushed_back=%.2f' % (
++        len(ok), sum(r['outcome'] == 'success' for r in ok) / n,
++        sum(r['outcome'] == 'fall' for r in ok) / n,
++        sum(r['outcome'] == 'timeout' for r in ok) / n,
++        sum(bool(r.get('pushed_back')) for r in ok) / n), flush=True)
++    for shape in shapes:
++        sel = [r for r in ok if r['shape'] == shape]
++        times = sorted(r['t_end'] for r in sel if r['outcome'] == 'success')
++        print('  %-9s success %d/%d fall %d  t_success_med=%s' % (
++            shape, sum(r['outcome'] == 'success' for r in sel), len(sel),
++            sum(r['outcome'] == 'fall' for r in sel),
++            round(times[len(times) // 2], 1) if times else None), flush=True)
++    print_speed_summary(ok)
++    dists = sorted(d for r in ok for d in r.get('keep_dists', []))
++    if dists:
++        print('KEEP ball-robot distance p10/p50/p90 = %s / %s / %s m, >=1.0 m: %.3f' % (
++            _quantile(dists, .1), _quantile(dists, .5), _quantile(dists, .9),
++            sum(d >= 1.0 for d in dists) / len(dists)), flush=True)
++    node.destroy_node(); rclpy.shutdown()
++
++
++def _quantile(values, q):
++    values = sorted(v for v in values if v is not None)
++    return round(values[min(len(values) - 1, int(q * len(values)))], 2) if values else None
++
++
++def print_speed_summary(rows):
++    """学習側の評価と同じ指標で、速さをまとめる。"""
++    succ = [r for r in rows if r['outcome'] == 'success' and 'v_mean' in r]
++    falls = [r for r in rows if r['outcome'] == 'fall' and 'v_mean' in r]
++    print('SPEED success(n=%d): mean_med=%s peak_p50=%s peak_p90=%s over1.0=%s over1.2=%s' % (
++        len(succ), _quantile([r['v_mean'] for r in succ], 0.5),
++        _quantile([r['v_peak'] for r in succ], 0.5), _quantile([r['v_peak'] for r in succ], 0.9),
++        _quantile([r['over_1_0'] for r in succ], 0.5), _quantile([r['over_1_2'] for r in succ], 0.5)), flush=True)
++    for joint, cap in WATCHED_JOINTS.items():
++        key = joint.lower()
++        sel = [r for r in rows if f'{key}_n' in r]
++        n_total = sum(r[f'{key}_n'] for r in sel)
++        over = sum(r[f'{key}_over_cap'] * r[f'{key}_n'] for r in sel)
++        print('JOINT %s: max_med=%s max_p90=%s over_%.1f=%.3f (all samples) | fall trials max_med=%s' % (
++            joint, _quantile([r[f'{key}_max'] for r in sel], 0.5), _quantile([r[f'{key}_max'] for r in sel], 0.9),
++            cap, over / max(n_total, 1),
++            _quantile([r[f'{key}_max'] for r in sel if r['outcome'] == 'fall'], 0.5)), flush=True)
++    print('SPEED fall(n=%d): peak_2s_before_med=%s mean_1.0-0.5s_before_med=%s' % (
++        len(falls), _quantile([r.get('v_fall_peak2s') for r in falls], 0.5),
++        _quantile([r.get('v_fall_pre') for r in falls], 0.5)), flush=True)
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/k1_dribble_constants.hpp b/src/k1_dribble_constants.hpp
+new file mode 100644
+index 0000000..3548985
+--- /dev/null
++++ b/src/k1_dribble_constants.hpp
+@@ -0,0 +1,72 @@
++#pragma once
++/**
++ * K1 dribble policy constants
++ * (IsaacLab-K1-Locomotion, tasks/manager_based/dribble_target, Stage2).
++ * Source of assets/k1_dribble_target_2026-11-01_12-04-42_model_74991.onnx: branch
++ * feat/dribble_target_rebuild, run logs/rsl_rl/k1_dribble_target/2026-11-01_12-04-42
++ * (the ball observations go through an imitation of vision_filter's ball filter).
++ * (The kick policies in assets/ are trained elsewhere, not in that repository.)
++ *
++ * The policy is the walk policy fine-tuned on dribbling, so the first 49
++ * channels of a frame are exactly the walk frame (k1_constants_isaaclab.hpp);
++ * 10 dribble channels follow. Values mirror the exported spec JSON
++ * (assets/k1_dribble_target_*_spec.json).
++ *
++ * ONNX I/O (history_policy_exporter, batch 1, all axes fixed):
++ *   command     (1, 3)        always 0 (the walk velocity command is fixed to
++ *                             zero in Stage2)
++ *   obs_history (1, H, 59)    rows = frames, oldest -> newest
++ *   actions     (1, 12)       q_target = q_default + 0.5 * action
++ *
++ * Frame layout (59 = 49 walk + 10 dribble):
++ *   [ 0: 3]  base_ang_vel          gyro, body frame
++ *   [ 3: 6]  projected_gravity
++ *   [ 6: 9]  velocity_commands     always 0
++ *   [ 9:21]  joint_pos_rel         12 legs, relative to default
++ *   [21:33]  joint_vel             12 legs
++ *   [33:45]  last_action           12 legs, previous raw output
++ *   [45:49]  gait_phase            sin/cos left, sin/cos right; 1.8 Hz, never
++ *                                  zeroed (unlike the walk's stand-still gate)
++ *   [49:51]  target_pos_rel        current waypoint - robot, body yaw frame
++ *   [51:53]  ball_pos_rel          ball centre - robot, body yaw frame
++ *   [53:55]  ball_vel              ball world velocity in body yaw frame, 0
++ *                                  when vision_filter has no estimate
++ *   [55:57]  foot_left_ball        ball centre - left foot_link origin, body yaw
++ *   [57:59]  foot_right_ball       ball centre - right foot_link origin, body yaw
++ */
++
++namespace k1_dribble {
++
++constexpr int OBS_DIM = 59;
++constexpr int WALK_FRAME_DIM = 49;
++constexpr int CMD_DIM = 3;
++
++constexpr double ACTION_SCALE = 0.5;
++// The training applies no clip. Same safety bound as the walk policy.
++constexpr double ACTION_CLIP = 10.0;
++
++// Gait clock: fixed frequency, always on (spec "gait_phase").
++constexpr double GAIT_FREQ_HZ = 1.8;
++
++// Waypoint pass rule (spec "waypoints.pass_rule"). W = current waypoint,
++// P = previous point (the ball position when the path was received, for the
++// first waypoint), B = ball, u = (W - P) / |W - P|. Advance (one per tick, never
++// past the last waypoint) when
++//     |B - W| < REACH_M   or   ((B - W)·u >= 0  and  |B - W| < PASS_LINE_MAX_M)
++constexpr double WAYPOINT_REACH_M = 0.3;
++constexpr double PASS_LINE_MAX_M = 1.0;
++
++// Termination conditions of the training, used here to hand back to Walk.
++constexpr double SUCCESS_RADIUS_M = 1.0;   // ball AND robot within this of the goal
++constexpr double BALL_TOO_FAR_M = 4.0;     // robot-ball distance
++
++// The training caps a path at 32 waypoints.
++constexpr int MAX_WAYPOINTS = 32;
++
++// A new path from the strategy replaces the running one only if it differs
++// "materially": different number of points, or any point moved more than this.
++// Re-anchoring P on every identical republish would make the pass-line test
++// (B - W)·u >= 0 unreachable (B would always sit at P).
++constexpr double PATH_CHANGE_TOL_M = 0.2;
++
++}  // namespace k1_dribble
+diff --git a/src/mujoco_sim_node.cpp b/src/mujoco_sim_node.cpp
+index 64da1da..c7032af 100644
+--- a/src/mujoco_sim_node.cpp
++++ b/src/mujoco_sim_node.cpp
+@@ -2439,6 +2439,9 @@ public:
+         // world_state_rate_hz で頭打ちにする (<= 0 でスナップショット毎).
+         declare_parameter("world_state_rate_hz", 100.0);
+         declare_parameter("publish_robot_states", true);
++        // 足とボールの接触ごとに「離れた直後のボールの速さ ÷ 触れている間の足の最大の速さ」を
++        // ログに出す (ドリブルの sim2sim 調査用). 物理レートで見るので既定は無効.
++        declare_parameter("log_ball_contacts", false);
+         // 検出位置 (x,y) に相対距離依存のガウス観測誤差を付与するか. false で無効.
+         declare_parameter("detection_position_noise", true);
+         // カメラ視野判定に加える最大検出距離 [m]. カメラ (頭部) 原点からの直線距離が
+@@ -2878,6 +2881,20 @@ public:
+             }
+         }
+         publish_robot_states_ = get_parameter("publish_robot_states").as_bool();
++        if (get_parameter("log_ball_contacts").as_bool() && ball_body_id_ >= 0) {
++            for (int b = 0; b < model_->nbody; ++b) {
++                const char* name = mj_id2name(model_, mjOBJ_BODY, b);
++                if (!name) continue;
++                const std::string n(name);
++                for (const char* suffix : {"left_foot_link", "right_foot_link"}) {
++                    const std::string sfx(suffix);
++                    if (n.size() >= sfx.size() && n.compare(n.size() - sfx.size(), sfx.size(), sfx) == 0) {
++                        foot_contacts_.push_back(FootContact{b, n});
++                    }
++                }
++            }
++            RCLCPP_INFO(get_logger(), "log_ball_contacts: watching %zu foot bodies", foot_contacts_.size());
++        }
+         {
+             const double hz = get_parameter("world_state_rate_hz").as_double();
+             world_state_gate_.period_sec = (hz > 0.0) ? (1.0 / hz) : 0.0;
+@@ -3676,6 +3693,8 @@ private:
+                 if (idx > 0) { last_touch_ = TouchRecord{idx, data_->time}; }
+             }
+         }
++        // 3.6) 足とボールの接触の記録 (log_ball_contacts).
++        if (!foot_contacts_.empty()) log_foot_ball_contacts();
+         // 4) コマンド未受信機の root を固定
+         for (auto& r : robots_) r->hold_root_if_no_cmd();
+         // 4.5) T / Shift+数字でピン留めされた, または E で吊り上げ中のロボットの
+@@ -4235,6 +4254,115 @@ private:
+         double sim_time    = -1.0;  // その接触が起きた mjData.time
+     };
+     TouchRecord last_touch_;      // 物理スレッド専有
++    // log_ball_contacts: 足 1 つぶんの接触の状態 (物理スレッド専有).
++    struct FootContact {
++        int body_id;
++        std::string name;
++        bool touching = false;
++        double max_foot_speed = 0.0;  // 触れている間の足の水平速度の最大 [m/s]
++        double start_time = 0.0;
++        double start_robot_ball = 0.0;   // 触れ始めのロボット (胴体) とボールの水平距離 [m]
++        double start_robot_speed = 0.0;  // 触れ始めのロボットの水平速度 [m/s]
++    };
++    std::vector<FootContact> foot_contacts_;
++    // 離れたあと 0.5 秒間のボール中心の最大の高さ (浮いて弾んでいるかを見る).
++    double ball_air_until_ = -1.0;
++    double ball_air_release_time_ = 0.0;
++    double ball_air_max_z_ = 0.0;
++    double next_ball_state_log_ = 0.0;  // [ball_state] を 10 Hz で出す
++    std::vector<int> other_touching_;   // 足以外でボールに触れているロボットのボディ
++
++    // ロボット 1 台目の胴体の水平位置と水平速度.
++    void robot1_xy_speed(double& x, double& y, double& speed) const {
++        const int b = world_ctx_.robot_trunks.empty() ? -1 : world_ctx_.robot_trunks.front().body_id;
++        if (b < 0) { x = y = speed = 0.0; return; }
++        x = data_->xpos[3 * b]; y = data_->xpos[3 * b + 1];
++        mjtNum vel[6];
++        mj_objectVelocity(model_, data_, mjOBJ_BODY, b, vel, 0);
++        speed = std::hypot(vel[3], vel[4]);
++    }
++
++    // 足がボールから離れた最初のステップで、ボールの水平速度と比をログに出す.
++    void log_foot_ball_contacts() {
++        const double t = data_->time;
++        const double ball_x = data_->xpos[3 * ball_body_id_];
++        const double ball_y = data_->xpos[3 * ball_body_id_ + 1];
++        const double ball_z = data_->xpos[3 * ball_body_id_ + 2];
++        double rx, ry, rspeed;
++        robot1_xy_speed(rx, ry, rspeed);
++        const double robot_ball = std::hypot(ball_x - rx, ball_y - ry);
++        if (ball_air_until_ >= 0.0) {
++            ball_air_max_z_ = std::max(ball_air_max_z_, ball_z);
++            if (t >= ball_air_until_) {
++                RCLCPP_INFO(get_logger(), "[ball_air] t=%.3f max_z=%.3f", ball_air_release_time_, ball_air_max_z_);
++                ball_air_until_ = -1.0;
++            }
++        }
++        if (t >= next_ball_state_log_) {
++            const int trunk = world_ctx_.robot_trunks.empty() ? -1 : world_ctx_.robot_trunks.front().body_id;
++            RCLCPP_INFO(get_logger(), "[ball_state] t=%.3f d=%.3f rv=%.3f bz=%.3f tz=%.3f", t, robot_ball, rspeed,
++                        ball_z, trunk >= 0 ? data_->xpos[3 * trunk + 2] : 0.0);
++            next_ball_state_log_ = t + 0.1;
++        }
++        // 足以外のロボットのボディ (すね・胴体など) がボールに触れ始めたらログに出す.
++        std::vector<int> others;
++        for (int i = 0; i < data_->ncon; ++i) {
++            const mjContact& c = data_->contact[i];
++            const int b1 = model_->geom_bodyid[c.geom1];
++            const int b2 = model_->geom_bodyid[c.geom2];
++            const int other = b1 == ball_body_id_ ? b2 : (b2 == ball_body_id_ ? b1 : -1);
++            if (other <= 0 || root_to_robot_index_[model_->body_rootid[other]] <= 0) continue;
++            bool is_foot = false;
++            for (const auto& fc : foot_contacts_) is_foot = is_foot || fc.body_id == other;
++            if (!is_foot) others.push_back(other);
++        }
++        for (int b : others) {
++            if (std::find(other_touching_.begin(), other_touching_.end(), b) == other_touching_.end()) {
++                RCLCPP_INFO(get_logger(), "[ball_contact_other] body=%s t=%.3f", mj_id2name(model_, mjOBJ_BODY, b), t);
++            }
++        }
++        other_touching_ = others;
++        for (auto& fc : foot_contacts_) {
++            bool now_touching = false;
++            for (int i = 0; i < data_->ncon && !now_touching; ++i) {
++                const mjContact& c = data_->contact[i];
++                const int b1 = model_->geom_bodyid[c.geom1];
++                const int b2 = model_->geom_bodyid[c.geom2];
++                now_touching = (b1 == fc.body_id && b2 == ball_body_id_) ||
++                               (b2 == fc.body_id && b1 == ball_body_id_);
++            }
++            if (now_touching) {
++                // Isaac と同じく foot_link の原点の水平速度. mj_objectVelocity は body の重心
++                // (xipos) の速度なので, ω × (原点 - 重心) で原点へ移す.
++                mjtNum vel[6];
++                mj_objectVelocity(model_, data_, mjOBJ_BODY, fc.body_id, vel, 0);  // [ang, lin] world
++                const mjtNum* o = data_->xpos + 3 * fc.body_id;
++                const mjtNum* com = data_->xipos + 3 * fc.body_id;
++                const double rx_ = o[0] - com[0], ry_ = o[1] - com[1], rz_ = o[2] - com[2];
++                const double vx = vel[3] + vel[1] * rz_ - vel[2] * ry_;
++                const double vy = vel[4] + vel[2] * rx_ - vel[0] * rz_;
++                const double foot_speed = std::hypot(vx, vy);
++                if (!fc.touching) {
++                    fc.max_foot_speed = 0.0; fc.start_time = t;
++                    fc.start_robot_ball = robot_ball; fc.start_robot_speed = rspeed;
++                }
++                fc.max_foot_speed = std::max(fc.max_foot_speed, foot_speed);
++            } else if (fc.touching) {
++                const int dof = model_->body_dofadr[ball_body_id_];
++                const double ball_speed = std::hypot(data_->qvel[dof], data_->qvel[dof + 1]);
++                RCLCPP_INFO(get_logger(),
++                    "[ball_contact] foot=%s foot_max=%.3f ball=%.3f ratio=%.3f dur=%.3f t=%.3f d0=%.3f rv0=%.3f",
++                    fc.name.c_str(), fc.max_foot_speed, ball_speed,
++                    fc.max_foot_speed > 1e-3 ? ball_speed / fc.max_foot_speed : 0.0,
++                    t - fc.start_time, t, fc.start_robot_ball, fc.start_robot_speed);
++                if (ball_air_until_ >= 0.0) {
++                    RCLCPP_INFO(get_logger(), "[ball_air] t=%.3f max_z=%.3f", ball_air_release_time_, ball_air_max_z_);
++                }
++                ball_air_release_time_ = t; ball_air_until_ = t + 0.5; ball_air_max_z_ = ball_z;
++            }
++            fc.touching = now_touching;
++        }
++    }
+     TouchRecord pub_last_touch_;  // pub_data_mutex_ で保護
+     // body_rootid -> 1-indexed ロボット番号. ロボット以外 (地面/ゴール/ボール) は 0.
+     std::vector<int> root_to_robot_index_;
+diff --git a/src/rl_policy_isaaclab_node.cpp b/src/rl_policy_isaaclab_node.cpp
+index e76c543..0fae673 100644
+--- a/src/rl_policy_isaaclab_node.cpp
++++ b/src/rl_policy_isaaclab_node.cpp
+@@ -157,6 +157,7 @@
+ #include <geometry_msgs/msg/point.hpp>
+ #include <geometry_msgs/msg/twist.hpp>
+ #include <nav_msgs/msg/odometry.hpp>
++#include <nav_msgs/msg/path.hpp>
+ #include <std_msgs/msg/bool.hpp>
+ #include <std_msgs/msg/float64.hpp>
+ 
+@@ -186,6 +187,7 @@
+ #include "k1_soccer_kick_constants.hpp"
+ #include "k1_walk_kick_constants.hpp"
+ #include "k1_quick_kick_constants.hpp"
++#include "k1_dribble_constants.hpp"
+ #include "booster_bridge.hpp"
+ #include "getup_walk_supervisor.hpp"
+ 
+@@ -194,6 +196,7 @@
+ namespace sc = soccer_kick;
+ namespace wk = k1_walk_kick;
+ namespace qk = k1_quick_kick;
++namespace db = k1_dribble;
+ 
+ namespace {
+ 
+@@ -237,6 +240,15 @@ struct KickThresholds {
+     double amp_ball_y_max_m       = qk::BALL_Y_MAX_M;  // |y| within this
+     int    amp_post_contact_steps = qk::POST_CONTACT_STEPS;  // Kick→Walk: ticks kept after the strike
+     int    amp_timeout_steps      = qk::TIMEOUT_STEPS;       // Kick→Walk: ticks without a strike
++    // ── Dribble (dribble_model_path; see k1_dribble_constants.hpp) ──
++    // Walk→Dribble window = the training's reset distribution (spec ball_reset,
++    // p1..p99): ball ahead 0.6–1.0 m, azimuth within ±19°, ball at rest.
++    double dribble_ball_x_min_m       = 0.6;
++    double dribble_ball_x_max_m       = 1.0;
++    double dribble_ball_azimuth_max_deg = 19.0;
++    double dribble_ball_speed_max_mps = 0.3;   // ignored while vision has no velocity estimate
++    double dribble_ball_lost_s        = 1.0;   // Dribble→Walk: ball not tracked this long
++    double dribble_timeout_s          = 60.0;  // Dribble→Walk: longest training episode
+ };
+ 
+ // ────────────────────────────────────────────────────────────────────────
+@@ -323,6 +335,12 @@ KickThresholds load_kick_thresholds_from_yaml(std::string& path_out) {
+     get_d("amp_ball_y_max_m",       th.amp_ball_y_max_m);
+     get_i("amp_post_contact_steps", th.amp_post_contact_steps);
+     get_i("amp_timeout_steps",      th.amp_timeout_steps);
++    get_d("dribble_ball_x_min_m",         th.dribble_ball_x_min_m);
++    get_d("dribble_ball_x_max_m",         th.dribble_ball_x_max_m);
++    get_d("dribble_ball_azimuth_max_deg", th.dribble_ball_azimuth_max_deg);
++    get_d("dribble_ball_speed_max_mps",   th.dribble_ball_speed_max_mps);
++    get_d("dribble_ball_lost_s",          th.dribble_ball_lost_s);
++    get_d("dribble_timeout_s",            th.dribble_timeout_s);
+     return th;
+ }
+ 
+@@ -551,6 +569,49 @@ static AmpKickPolicyIO discover_amp_kick_io(Ort::Session& session, const std::st
+     return io;
+ }
+ 
++// ────────────────────────────────────────────────────────────────────────
++// Dribble policy I/O: inputs "command" (1, 3) + "obs_history" (1, H, 59)
++// — the walk frame plus 10 dribble channels — output "actions" (1, 12).
++// See k1_dribble_constants.hpp.
++// ────────────────────────────────────────────────────────────────────────
++struct DribblePolicyIO {
++    int64_t history_len = 0;  // H
++};
++
++static DribblePolicyIO discover_dribble_io(Ort::Session& session, const std::string& path) {
++    Ort::AllocatorWithDefaultOptions alloc;
++    int hist_idx = -1, cmd_idx = -1;
++    for (size_t i = 0; i < session.GetInputCount(); ++i) {
++        const std::string name(session.GetInputNameAllocated(i, alloc).get());
++        if (name == "obs_history") hist_idx = static_cast<int>(i);
++        if (name == "command") cmd_idx = static_cast<int>(i);
++    }
++    if (hist_idx < 0 || cmd_idx < 0) {
++        throw std::runtime_error(
++            "dribble model " + path + " must have inputs command + obs_history "
++            "(export with scripts/rsl_rl/export_dribble_target.py)");
++    }
++    const auto shape = session.GetInputTypeInfo(hist_idx)
++                           .GetTensorTypeAndShapeInfo().GetShape();
++    if (shape.size() != 3 || shape[1] <= 0 || shape[2] != db::OBS_DIM) {
++        throw std::runtime_error(
++            "dribble model " + path + ": obs_history must be (1, H, " +
++            std::to_string(db::OBS_DIM) + ") with fixed H");
++    }
++    const auto cshape = session.GetInputTypeInfo(cmd_idx)
++                            .GetTensorTypeAndShapeInfo().GetShape();
++    if (cshape.size() != 2 || cshape[1] != db::CMD_DIM) {
++        throw std::runtime_error("dribble model " + path + ": command must be (1, 3)");
++    }
++    const auto oshape = session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
++    if (oshape.empty() || oshape.back() != POLICY_NUM_DOF) {
++        throw std::runtime_error("dribble model " + path + ": actions must be (1, 12)");
++    }
++    DribblePolicyIO io;
++    io.history_len = shape[1];
++    return io;
++}
++
+ // ────────────────────────────────────────────────────────────────────────
+ // Behavior I/O
+ // ────────────────────────────────────────────────────────────────────────
+@@ -613,6 +674,13 @@ struct BallObs {
+     bool   vel_valid = false;      // false → vx/vy are zero, not estimated
+     float  mask = 0.0f;            // 1.0 = tracked (observed or predicted)
+     double last_seen_dt_norm = 1.0;
++    // vision_filter's field-frame estimate (same frame as /localization_result).
++    // It was computed with the pose matched to the detection time, so unlike
++    // "latest localization + x/y" its two halves are not from different times.
++    // false when only the raw detection was available.
++    double gx = 0.0;
++    double gy = 0.0;
++    bool   global_valid = false;
+ 
+     double dist() const { return std::sqrt(x * x + y * y); }
+ };
+@@ -630,6 +698,14 @@ struct KickParams {
+     // to (amp_kick_cmd_topic). target_angle_world / target_speed are unused then.
+     double target_world_x     = 0.0;
+     double target_world_y     = 0.0;
++    // Dribble (dribble_cmd_topic) instead of a kick. `amp` is false then.
++    bool   dribble            = false;
++    // Dribble only: field-frame waypoints (same frame as /localization_result),
++    // the last one being the goal. `dribble_path_seq` is bumped only when the
++    // strategy's path changes materially (db::PATH_CHANGE_TOL_M), which is what
++    // tells DribbleBehavior to restart from the first waypoint.
++    std::vector<std::array<double, 2>> dribble_path;
++    uint32_t dribble_path_seq = 0;
+     // Same direction expressed in the robot's body yaw frame [rad], i.e.
+     // target_angle_world − (robot heading). Computed by the node so the heading
+     // can come from the 500 Hz odometry integration rather than the 10 Hz
+@@ -1821,7 +1897,9 @@ public:
+         if (kick_cooldown_remaining_ > 0) {
+             --kick_cooldown_remaining_;
+             approach_confirm_count_ = 0;
+-        } else if (in.kick.enabled && visible && ball_in_kick_range(ball, in.kick.amp)) {
++        } else if (in.kick.enabled && visible && ball_in_kick_range(ball, in.kick) &&
++                   (!in.kick.dribble ||
++                    (!in.kick.dribble_path.empty() && state.field_yaw_valid))) {
+             if (++approach_confirm_count_ >= kick_th_.approach_confirm_steps) {
+                 RCLCPP_INFO(logger_, "Ball close (%.2fm, x=%.2f y=%.2f) — switching to KICK",
+                             ball_dist, ball.x, ball.y);
+@@ -1861,8 +1939,18 @@ public:
+     // Walk→Kick の距離条件。walk_kick policy は自分でボールまで歩くので距離だけ
+     // (ball_approach_m)、AMP quick kick は学習したボール位置の窓 (足を出さずに届く
+     // 範囲) に入っているときだけ発火する。窓の外なら戦略の cmd_vel で寄せ続ける。
+-    bool ball_in_kick_range(const BallObs& ball, bool amp) const {
+-        if (!amp) return ball.dist() < kick_th_.ball_approach_m;
++    // ドリブルは学習のリセット分布 (正面 0.6〜1.0 m・方位 ±19°・静止) と同じ窓。
++    bool ball_in_kick_range(const BallObs& ball, const KickParams& kick) const {
++        if (kick.dribble) {
++            const double azimuth_deg = std::atan2(ball.y, ball.x) * 180.0 / M_PI;
++            const double speed =
++                ball.vel_valid ? std::sqrt(ball.vx * ball.vx + ball.vy * ball.vy) : 0.0;
++            return ball.x >= kick_th_.dribble_ball_x_min_m &&
++                   ball.x <= kick_th_.dribble_ball_x_max_m &&
++                   std::fabs(azimuth_deg) <= kick_th_.dribble_ball_azimuth_max_deg &&
++                   speed <= kick_th_.dribble_ball_speed_max_mps;
++        }
++        if (!kick.amp) return ball.dist() < kick_th_.ball_approach_m;
+         return ball.x >= kick_th_.amp_ball_x_min_m && ball.x <= kick_th_.amp_ball_x_max_m &&
+                std::fabs(ball.y) <= kick_th_.amp_ball_y_max_m;
+     }
+@@ -2912,6 +3000,324 @@ private:
+     bool finished_ = false;
+ };
+ 
++// ────────────────────────────────────────────────────────────────────────
++// DribbleBehavior: IsaacLab dribble_target policy (k1_dribble_constants.hpp).
++// It is the walk policy fine-tuned to push the ball along a waypoint path, so
++// a frame is the walk frame (velocity command fixed at 0, gait clock always on
++// at 1.8 Hz) followed by 10 dribble channels. The strategy plans the path
++// (obstacle avoidance lives there, not in the policy) and sends it on
++// dribble_cmd_topic; this behavior advances the waypoints with the training's
++// pass rule every tick and feeds the current one as target_pos_rel.
++//
++// Entered only inside the training's reset window
++// (WalkRLPolicyBehavior::ball_in_kick_range). The history is filled with the
++// first frame, as at an episode reset; the gait clock carries over from the
++// walk (only its frequency becomes 1.8 Hz). Hands back to Walk on the
++// training's terminations — goal reached (ball AND robot within 1 m of the last
++// waypoint), ball more than 4 m away — and on ball lost / timeout.
++// ────────────────────────────────────────────────────────────────────────
++class DribbleBehavior : public KickBehaviorBase {
++public:
++    DribbleBehavior(Ort::Session* session, const DribblePolicyIO& io,
++                    std::shared_ptr<WalkRLPolicyBehavior> walk,
++                    const JointArray& default_angles, double step_dt,
++                    const KickThresholds& kick_th,
++                    const JointArray& relux_kp, const JointArray& relux_kd,
++                    rclcpp::Logger logger)
++        : session_(session), io_(io), walk_(std::move(walk)),
++          default_angles_(default_angles), step_dt_(step_dt), kick_th_(kick_th),
++          relux_kp_(relux_kp), relux_kd_(relux_kd), logger_(logger) {
++        static_assert(db::WALK_FRAME_DIM == POLICY_OBS_DIM,
++                      "dribble frame must start with the walk frame");
++        static_assert(db::ACTION_SCALE == POLICY_ACTION_SCALE,
++                      "dribble action scale must match walk");
++        for (int i = 0; i < POLICY_NUM_DOF; ++i) {
++            default_angles_legs_[i] = default_angles_[LEG_INDEX_BEGIN + i];
++        }
++        history_.assign(static_cast<size_t>(io_.history_len) * db::OBS_DIM, 0.0f);
++    }
++
++    // true: judge waypoints / goal with vision_filter's field-frame ball (times
++    // match). false: latest localization + body-frame ball (the two are from
++    // different times, ~200 ms apart; kept for A/B).
++    void set_ball_world_from_filter(bool v) { ball_world_from_filter_ = v; }
++
++    void on_enter(const RobotState& state) override {
++        step_count_ = 0;
++        lost_ticks_ = 0;
++        finished_ = false;
++        history_primed_ = false;
++        have_path_ = false;
++        path_.clear();
++        wp_idx_ = 0;
++        // The walk's last command is what the robot is executing right now; it
++        // becomes the first last_action channel.
++        prev_actions_ = walk_ ? walk_->last_action() : LegArray{};
++        const auto gait = walk_ ? walk_->gait_phase_state()
++                                : WalkRLPolicyBehavior::GaitPhaseState{};
++        phase_rad_ = gait.active ? gait.phase_rad : 0.0;
++        RCLCPP_INFO(logger_,
++            "[Dribble] enter: gait clock %s (phase %.2f rad), robot field (%.2f, %.2f, %.1f°)",
++            gait.active ? "inherited from Walk" : "started at 0", phase_rad_,
++            state.field_x, state.field_y, state.field_yaw * 180.0 / M_PI);
++    }
++
++    // The history starts from the entry frame (episode-reset convention), so
++    // nothing has to be collected while walking.
++    void observe_walk_tick(const RobotState&, const ControlInput&, const LegArray&) override {}
++    void invalidate_history() override {}
++
++    std::optional<MotorCommand> step(const RobotState& state,
++                                     const ControlInput& in) override {
++        ++step_count_;
++        const BallObs& ball = in.ball;
++
++        if (trunk_tilted(state)) {
++            prev_actions_.fill(0.0);
++            history_primed_ = false;
++            MotorCommand fall_cmd;
++            fall_cmd.q = state.joint_pos;
++            fall_cmd.kp = relux_kp_;
++            fall_cmd.kd = relux_kd_;
++            fall_cmd.use_default_gains = false;
++            return fall_cmd;
++        }
++
++        // The training judges waypoints with the true ball position; the closest
++        // thing here is the filter's field-frame estimate.
++        const std::array<double, 2> ball_w =
++            (ball_world_from_filter_ && ball.global_valid)
++                ? std::array<double, 2>{ball.gx, ball.gy}
++                : body_to_field(state, ball.x, ball.y);
++
++        // ── Path (re)start: entry, or a materially different path ──
++        if (!in.kick.dribble_path.empty() &&
++            (!have_path_ || in.kick.dribble_path_seq != path_seq_)) {
++            path_ = in.kick.dribble_path;
++            path_seq_ = in.kick.dribble_path_seq;
++            wp_idx_ = 0;
++            prev_point_ = ball_w;  // P of the first waypoint = ball when the path arrived
++            // A goal that moves with the ball changes the path every few ticks;
++            // log the start and at most once a second after that.
++            if (!have_path_ || step_count_ - last_path_log_step_ >= 50) {
++                RCLCPP_INFO(logger_,
++                    "[Dribble] %s path: %zu waypoints, goal (%.2f, %.2f), ball (%.2f, %.2f)",
++                    have_path_ ? "new" : "start", path_.size(),
++                    path_.back()[0], path_.back()[1], ball_w[0], ball_w[1]);
++                last_path_log_step_ = step_count_;
++            }
++            have_path_ = true;
++        }
++        if (!have_path_) {
++            return finish("no path received");
++        }
++
++        // ── Hand back to Walk (training terminations + deployment guards) ──
++        const bool tracked = ball.mask > 0.5f;
++        lost_ticks_ = tracked ? 0 : lost_ticks_ + 1;
++        if (lost_ticks_ * step_dt_ >= kick_th_.dribble_ball_lost_s) {
++            return finish("ball lost");
++        }
++        if (tracked && ball.dist() > db::BALL_TOO_FAR_M) {
++            return finish("ball too far");
++        }
++        const auto& goal = path_.back();
++        const double ball_goal = std::hypot(ball_w[0] - goal[0], ball_w[1] - goal[1]);
++        const double robot_goal = std::hypot(state.field_x - goal[0], state.field_y - goal[1]);
++        // 学習 (terminations.ball_reached_target) と同じく、最後のウェイポイントに進んでからだけ判定する。
++        // 終点が途中の点の近くを通る経路 (O 字・8 の字は終点 = 始点) で、走る前に終わらないように。
++        const bool at_final_waypoint = wp_idx_ + 1 >= path_.size();
++        if (tracked && at_final_waypoint &&
++            ball_goal < db::SUCCESS_RADIUS_M && robot_goal < db::SUCCESS_RADIUS_M) {
++            return finish("goal reached");
++        }
++        if (step_count_ * step_dt_ >= kick_th_.dribble_timeout_s) {
++            return finish("timeout");
++        }
++
++        // ── Waypoint pass rule (spec waypoints.pass_rule) ──
++        if (tracked && wp_idx_ + 1 < path_.size()) {
++            const auto& w = path_[wp_idx_];
++            const double dx = ball_w[0] - w[0], dy = ball_w[1] - w[1];
++            const double dist = std::hypot(dx, dy);
++            const double ux = w[0] - prev_point_[0], uy = w[1] - prev_point_[1];
++            const double seg = std::hypot(ux, uy);
++            const bool reached = dist < db::WAYPOINT_REACH_M;
++            const bool crossed = seg > 1e-6 && dist < db::PASS_LINE_MAX_M &&
++                                 (dx * ux + dy * uy) >= 0.0;
++            if (reached || crossed) {
++                prev_point_ = w;
++                ++wp_idx_;
++                RCLCPP_INFO(logger_, "[Dribble] waypoint %zu/%zu passed (%s, %.2f m)",
++                            wp_idx_, path_.size(), reached ? "reached" : "crossed", dist);
++            }
++        }
++
++        // ── Observation ──
++        std::array<float, db::OBS_DIM> frame{};
++        build_frame(state, ball, frame.data());
++        push_history(frame.data());
++
++        // ── Inference ──
++        static Ort::MemoryInfo mem =
++            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
++        std::array<float, db::CMD_DIM> command_in{};  // always 0 (Stage2)
++        const std::array<int64_t, 2> cmd_shape = {1, db::CMD_DIM};
++        const std::array<int64_t, 3> hist_shape = {1, io_.history_len, db::OBS_DIM};
++        std::array<Ort::Value, 2> inputs = {
++            Ort::Value::CreateTensor<float>(mem, command_in.data(), command_in.size(),
++                                            cmd_shape.data(), cmd_shape.size()),
++            Ort::Value::CreateTensor<float>(mem, history_.data(), history_.size(),
++                                            hist_shape.data(), hist_shape.size()),
++        };
++        const char* input_names[] = {"command", "obs_history"};
++        const char* output_names[] = {"actions"};
++        auto outputs = session_->Run(Ort::RunOptions{nullptr}, input_names, inputs.data(),
++                                     inputs.size(), output_names, 1);
++        const float* raw = outputs[0].GetTensorData<float>();
++
++        MotorCommand cmd;
++        cmd.q = default_angles_;
++        cmd.use_default_gains = true;
++        for (int i = 0; i < POLICY_NUM_DOF; ++i) {
++            const double a = std::clamp(static_cast<double>(raw[i]),
++                                        -db::ACTION_CLIP, db::ACTION_CLIP);
++            prev_actions_[i] = a;
++            cmd.q[LEG_INDEX_BEGIN + i] = default_angles_legs_[i] + db::ACTION_SCALE * a;
++        }
++
++        if (step_count_ % 25 == 1) {
++            RCLCPP_INFO(logger_,
++                "[Dribble step %d] wp %zu/%zu target_rel=(%.2f,%.2f) ball=(%.2f,%.2f)%s "
++                "ball_goal=%.2f robot_goal=%.2f robot field (%.2f,%.2f,%.1f°)",
++                step_count_, wp_idx_ + 1, path_.size(), frame[49], frame[50],
++                ball.x, ball.y, tracked ? "" : " (lost)", ball_goal, robot_goal,
++                state.field_x, state.field_y, state.field_yaw * 180.0 / M_PI);
++        }
++        return cmd;
++    }
++
++    bool is_finished() const override { return finished_; }
++    int step_count() const override { return step_count_; }
++    LegArray last_action_walk_units() const override { return prev_actions_; }
++
++private:
++    std::optional<MotorCommand> finish(const char* why) {
++        RCLCPP_INFO(logger_, "[Dribble] %s at step %d (waypoint %zu/%zu) — switching to WALK",
++                    why, step_count_, wp_idx_ + 1, path_.size());
++        finished_ = true;
++        return std::nullopt;
++    }
++
++    // Body-yaw-frame xy (vision) → field frame, with the latest /localization_result.
++    static std::array<double, 2> body_to_field(const RobotState& s, double x, double y) {
++        const double c = std::cos(s.field_yaw), sn = std::sin(s.field_yaw);
++        return {s.field_x + c * x - sn * y, s.field_y + sn * x + c * y};
++    }
++    // Field-frame point → body yaw frame, relative to the robot.
++    static std::array<double, 2> field_to_body(const RobotState& s, double wx, double wy) {
++        const double c = std::cos(s.field_yaw), sn = std::sin(s.field_yaw);
++        const double dx = wx - s.field_x, dy = wy - s.field_y;
++        return {c * dx + sn * dy, -sn * dx + c * dy};
++    }
++
++    // foot_link origin in the body yaw frame: leg FK gives it in the trunk
++    // frame, which still carries roll/pitch; rotate those out.
++    static std::array<double, 2> foot_xy_yaw_frame(const RobotState& s, bool left) {
++        double q6[6];
++        const int base = LEG_INDEX_BEGIN + (left ? 0 : POLICY_NUM_DOF / 2);
++        for (int i = 0; i < 6; ++i) q6[i] = s.joint_pos[base + i];
++        const auto p = leg_fk_foot_pos(q6, left);
++        const double rp0[3] = {s.imu_rpy[0], s.imu_rpy[1], 0.0};
++        double q[4];
++        rpy_to_quat(rp0, q);
++        // R(q) * v == rotate_inverse(conj(q), v)
++        const double q_conj[4] = {q[0], -q[1], -q[2], -q[3]};
++        double out[3];
++        quat_rotate_inverse(q_conj, p.data(), out);
++        return {out[0], out[1]};
++    }
++
++    void build_frame(const RobotState& state, const BallObs& ball, float* frame) {
++        double q[4];
++        rpy_to_quat(state.imu_rpy.data(), q);
++        const double g_world[3] = {0.0, 0.0, -1.0};
++        double pg[3];
++        quat_rotate_inverse(q, g_world, pg);
++
++        int idx = 0;
++        for (int i = 0; i < 3; ++i) frame[idx++] = static_cast<float>(state.imu_gyro[i]);
++        for (int i = 0; i < 3; ++i) frame[idx++] = static_cast<float>(pg[i]);
++        for (int i = 0; i < 3; ++i) frame[idx++] = 0.0f;  // velocity_commands
++        for (int i = 0; i < POLICY_NUM_DOF; ++i)
++            frame[idx++] = static_cast<float>(state.joint_pos[LEG_INDEX_BEGIN + i] - default_angles_legs_[i]);
++        for (int i = 0; i < POLICY_NUM_DOF; ++i)
++            frame[idx++] = static_cast<float>(state.joint_vel[LEG_INDEX_BEGIN + i]);
++        for (int i = 0; i < POLICY_NUM_DOF; ++i)
++            frame[idx++] = static_cast<float>(prev_actions_[i]);
++        // Gait phase: emit, then advance (same order as the walk).
++        frame[idx++] = static_cast<float>(std::sin(phase_rad_));
++        frame[idx++] = static_cast<float>(std::cos(phase_rad_));
++        frame[idx++] = static_cast<float>(std::sin(phase_rad_ + M_PI));
++        frame[idx++] = static_cast<float>(std::cos(phase_rad_ + M_PI));
++        phase_rad_ = std::fmod(phase_rad_ + 2.0 * M_PI * db::GAIT_FREQ_HZ * step_dt_, 2.0 * M_PI);
++
++        const auto& w = path_[wp_idx_];
++        const auto target = field_to_body(state, w[0], w[1]);
++        frame[idx++] = static_cast<float>(target[0]);
++        frame[idx++] = static_cast<float>(target[1]);
++        frame[idx++] = static_cast<float>(ball.x);
++        frame[idx++] = static_cast<float>(ball.y);
++        frame[idx++] = static_cast<float>(ball.vel_valid ? ball.vx : 0.0);
++        frame[idx++] = static_cast<float>(ball.vel_valid ? ball.vy : 0.0);
++        for (const bool left : {true, false}) {
++            const auto foot = foot_xy_yaw_frame(state, left);
++            frame[idx++] = static_cast<float>(ball.x - foot[0]);
++            frame[idx++] = static_cast<float>(ball.y - foot[1]);
++        }
++    }
++
++    void push_history(const float* frame) {
++        const int64_t H = io_.history_len;
++        if (!history_primed_) {
++            for (int64_t t = 0; t < H; ++t) {
++                std::copy(frame, frame + db::OBS_DIM, history_.data() + t * db::OBS_DIM);
++            }
++            history_primed_ = true;
++            return;
++        }
++        std::memmove(history_.data(), history_.data() + db::OBS_DIM,
++                     static_cast<size_t>((H - 1) * db::OBS_DIM) * sizeof(float));
++        std::copy(frame, frame + db::OBS_DIM, history_.data() + (H - 1) * db::OBS_DIM);
++    }
++
++    Ort::Session* session_;
++    DribblePolicyIO io_;
++    std::shared_ptr<WalkRLPolicyBehavior> walk_;
++    JointArray default_angles_;
++    LegArray   default_angles_legs_{};
++    double     step_dt_;
++    KickThresholds kick_th_;
++    JointArray relux_kp_;
++    JointArray relux_kd_;
++    rclcpp::Logger logger_;
++
++    std::vector<float> history_;   // H × 59, oldest first
++    bool history_primed_ = false;
++    LegArray prev_actions_{};
++    double phase_rad_ = 0.0;
++    std::vector<std::array<double, 2>> path_;  // field frame, last = goal
++    uint32_t path_seq_ = 0;
++    bool have_path_ = false;
++    size_t wp_idx_ = 0;
++    std::array<double, 2> prev_point_{};       // P of the pass rule (field frame)
++    int  last_path_log_step_ = 0;
++    bool ball_world_from_filter_ = true;
++    int  step_count_ = 0;
++    int  lost_ticks_ = 0;
++    bool finished_ = false;
++};
++
+ // ────────────────────────────────────────────────────────────────────────
+ // State machine: holds current behavior and routes step() / transitions.
+ // Auto transitions (e.g. get-ready -> walk) are decided by the Node, not the
+@@ -3039,6 +3445,18 @@ public:
+         //   "static"  (default) rebuild as a stand start (last_action = 0, gait stopped)
+         //   "inherit" copy the walk's history / last action / gait clock as-is
+         declare_parameter("amp_kick_entry_mode", std::string("static"));
++        // Dribble ONNX policy (IsaacLab dribble_target, k1_dribble_constants.hpp).
++        // Empty disables it. The strategy sends the path (nav_msgs/Path, field
++        // frame = /localization_result, last pose = goal, ball start not
++        // included) on dribble_cmd_topic; Walk→Dribble then fires once the ball
++        // is inside the training's start window (dribble_ball_* in
++        // k1_kick_params.yaml). /soccer_kick_cancel or an empty path stops it.
++        declare_parameter("dribble_model_path", std::string(""));
++        declare_parameter("dribble_cmd_topic", std::string("/soccer_dribble_cmd"));
++        // Ball position used for the dribble's waypoint / goal checks:
++        //   "filter"       (default) vision_filter's field-frame estimate
++        //   "localization" latest /localization_result + body-frame ball (old)
++        declare_parameter("dribble_ball_world_source", std::string("filter"));
+         // その場回転 ONNX ポリシー (観測は歩行と同一、コマンドが (0,0,残り角度))。
+         // 空なら無効。/pivot_turn_cmd (futbol_msgs/PivotTurn) で Walk→Pivot。
+         declare_parameter("pivot_model_path", std::string(""));
+@@ -3157,6 +3575,8 @@ public:
+             get_parameter("kick_model_path_pass").as_string();
+         const auto amp_kick_model_path = get_parameter("amp_kick_model_path").as_string();
+         const auto amp_kick_cmd_topic = get_parameter("amp_kick_cmd_topic").as_string();
++        const auto dribble_model_path = get_parameter("dribble_model_path").as_string();
++        const auto dribble_cmd_topic = get_parameter("dribble_cmd_topic").as_string();
+         const auto ufo_model_path = get_parameter("ufo_model_path").as_string();
+         const auto ufo_z_bank_path = get_parameter("ufo_z_bank_path").as_string();
+         odom_topic_ = get_parameter("odom_topic").as_string();
+@@ -3254,11 +3674,14 @@ public:
+         // (vision_filter_interface), which is only available in the futbol_main
+         // build, so it is gated on it.
+ #ifdef BUILD_FOR_FUTBOL_MAIN
+-        kick_feature_ = !kick_model_path.empty() || !amp_kick_model_path.empty();
++        kick_feature_ = !kick_model_path.empty() || !amp_kick_model_path.empty() ||
++                        !dribble_model_path.empty();
+         amp_kick_ = !amp_kick_model_path.empty();
++        dribble_ = !dribble_model_path.empty();
+ #else
+         kick_feature_ = false;
+-        if (!kick_model_path.empty() || !amp_kick_model_path.empty()) {
++        if (!kick_model_path.empty() || !amp_kick_model_path.empty() ||
++            !dribble_model_path.empty()) {
+             RCLCPP_WARN(get_logger(),
+                 "kick_model_path set but BUILD_FOR_FUTBOL_MAIN=OFF — kick disabled "
+                 "(ball state requires vision_filter_interface)");
+@@ -3276,6 +3699,17 @@ public:
+                 static_cast<long>(amp_kick_io_.history_len), qk::OBS_DIM,
+                 amp_kick_model_path.c_str(), amp_kick_cmd_topic.c_str());
+         }
++        if (dribble_) {
++            Ort::SessionOptions dribble_opts;
++            dribble_opts.SetIntraOpNumThreads(1);
++            dribble_session_ = std::make_unique<Ort::Session>(
++                *env_, dribble_model_path.c_str(), dribble_opts);
++            dribble_io_ = discover_dribble_io(*dribble_session_, dribble_model_path);
++            RCLCPP_INFO(get_logger(),
++                "Dribble model loaded (%ld frames x %d-dim frames): %s — path via %s",
++                static_cast<long>(dribble_io_.history_len), db::OBS_DIM,
++                dribble_model_path.c_str(), dribble_cmd_topic.c_str());
++        }
+         walk_kick_ = kick_feature_ && !kick_model_path.empty();
+         if (walk_kick_) {
+             // The kick policy is the IsaacLab walk_kick one (55-dim obs, 12 leg
+@@ -3444,6 +3878,9 @@ public:
+                         filtered.status != FilteredBallState::STATUS_LOST) {
+                         ball_x_ = filtered.local_position.x;
+                         ball_y_ = filtered.local_position.y;
++                        ball_gx_ = filtered.global_position.x;
++                        ball_gy_ = filtered.global_position.y;
++                        ball_global_valid_ = true;
+                         if (filtered.velocity_valid) {
+                             // 実速度をそのまま保持する。ポリシー観測には渡さず
+                             // (obs の ball_vel は 0 固定)、キック終了判定にのみ使う。
+@@ -3461,6 +3898,7 @@ public:
+                         // Fallback: raw projected detection, body frame already.
+                         ball_x_         = raw.local_position.x;
+                         ball_y_         = raw.local_position.y;
++                        ball_global_valid_ = false;
+                         ball_vx_        = 0.0;
+                         ball_vy_        = 0.0;
+                         ball_vel_valid_ = false;
+@@ -3504,7 +3942,8 @@ public:
+                     // while a kick runs is always dropped: the policy cannot be
+                     // swapped mid-kick.
+                     const auto* running = active_kick();
+-                    if (running && (kick_cmd_latch_.load() || amp != kick_.amp)) {
++                    if (running && (kick_cmd_latch_.load() || amp != kick_.amp ||
++                                    running == dribble_b_.get())) {
+                         RCLCPP_INFO(get_logger(),
+                             "[%s] ignored (kick in progress, step %d)",
+                             tag, running->step_count());
+@@ -3513,6 +3952,7 @@ public:
+                     std::lock_guard<std::mutex> lk(kick_mutex_);
+                     fill();
+                     kick_.amp     = amp;
++                    kick_.dribble = false;
+                     kick_.enabled = true;
+                     // While a kick runs with the latch off these arrive at ~10 Hz;
+                     // logging each one would flood the console.
+@@ -3561,6 +4001,14 @@ public:
+                         });
+                     });
+             }
++            if (dribble_) {
++                // nav_msgs/Path: field-frame waypoints (frame of /localization_result),
++                // last pose = goal, the ball's own position not included. See
++                // dribble_cmd_cb.
++                dribble_cmd_sub_ = sync_->subscribe<nav_msgs::msg::Path>(
++                    dribble_cmd_topic, 10,
++                    [this](const nav_msgs::msg::Path::SharedPtr msg) { dribble_cmd_cb(*msg); });
++            }
+ 
+             // Localization subscriber: robot field-frame heading. It is the
+             // zero-reference for the world-frame kick direction (matches the
+@@ -3807,6 +4255,20 @@ public:
+             amp_kick_b_->set_entry_mode(*mode);
+             RCLCPP_INFO(get_logger(), "amp_kick_entry_mode = %s", mode_str.c_str());
+         }
++        if (dribble_) {
++            dribble_b_ = std::make_shared<DribbleBehavior>(
++                dribble_session_.get(), dribble_io_, walk_,
++                default_angles_, step_dt_, kick_thresholds_,
++                relux_kp_, relux_kd_, logger);
++            const auto source = get_parameter("dribble_ball_world_source").as_string();
++            if (source != "filter" && source != "localization") {
++                throw std::runtime_error(
++                    "dribble_ball_world_source must be filter or localization (got '" +
++                    source + "')");
++            }
++            dribble_b_->set_ball_world_from_filter(source == "filter");
++            RCLCPP_INFO(get_logger(), "dribble_ball_world_source = %s", source.c_str());
++        }
+         if (walk_kick_) {
+             kick_b_ = std::make_shared<KickBehavior>(
+                 kick_session_.get(),
+@@ -4353,6 +4815,9 @@ private:
+         b.vx = ball_vx_;
+         b.vy = ball_vy_;
+         b.vel_valid = ball_vel_valid_;
++        b.gx = ball_gx_;
++        b.gy = ball_gy_;
++        b.global_valid = ball_global_valid_;
+         if (dt < sc::BALL_TIMEOUT_S) {
+             b.mask = 1.0f;
+             b.last_seen_dt_norm = 0.0;
+@@ -4816,7 +5281,7 @@ private:
+         // KickBehavior::step に渡すのと同一の in.kick をそのまま出すので値は一致する。
+         // target_angle はキック開始時にラッチした戦略指令。どちらも毎 tick 送るので、
+         // 単発指令でも可視化側は取りこぼさない。
+-        if (in_kick()) {
++        if (in_kick() && active_kick() != dribble_b_.get()) {
+             if (body_angle_pub_) {
+                 std_msgs::msg::Float64 ba_msg;
+                 ba_msg.data = in.kick.body_angle;
+@@ -4946,6 +5411,89 @@ private:
+         }
+     }
+ 
++    // dribble_cmd_topic handler. The strategy re-sends its path every cycle; only
++    // a material change (point count, or any point moved > db::PATH_CHANGE_TOL_M)
++    // replaces the stored one and bumps dribble_path_seq, which restarts the
++    // waypoint sequence in DribbleBehavior (P = ball at that moment). Re-anchoring
++    // on every identical republish would make the pass-line test unreachable.
++    // A path that already ran to the end (any Dribble→Walk) does not re-arm the
++    // trigger: the strategy has to send a different path, or an empty one first.
++    // An empty path cancels immediately.
++    void dribble_cmd_cb(const nav_msgs::msg::Path& msg) {
++        if (ufo_recovery_enabled_ && state_machine_ &&
++            state_machine_->current().get() == recovery_.get()) {
++            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
++                "[dribble_cmd] ignored while UFO recovery is active");
++            return;
++        }
++        const auto* running = active_kick();
++        if (running && running != dribble_b_.get()) {
++            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
++                "[dribble_cmd] ignored (kick in progress, step %d)", running->step_count());
++            return;
++        }
++        std::vector<std::array<double, 2>> path;
++        path.reserve(msg.poses.size());
++        for (const auto& ps : msg.poses) {
++            const double x = ps.pose.position.x, y = ps.pose.position.y;
++            if (!std::isfinite(x) || !std::isfinite(y)) {
++                RCLCPP_WARN(get_logger(), "[dribble_cmd] ignored: non-finite waypoint");
++                return;
++            }
++            path.push_back({x, y});
++        }
++        if (path.size() > static_cast<size_t>(db::MAX_WAYPOINTS)) {
++            // The training never saw more than MAX_WAYPOINTS; keep the first ones
++            // and the goal.
++            RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
++                "[dribble_cmd] %zu waypoints > %d — truncated", path.size(), db::MAX_WAYPOINTS);
++            const auto goal = path.back();
++            path.resize(db::MAX_WAYPOINTS - 1);
++            path.push_back(goal);
++        }
++
++        if (path.empty()) {
++            {
++                std::lock_guard<std::mutex> lk(kick_mutex_);
++                kick_.enabled = false;
++                kick_.dribble = false;
++                kick_.dribble_path.clear();
++                dribble_done_seq_.reset();
++            }
++            if (running) {
++                auto state = snapshot_state();
++                state_machine_->transition_to(walk_, state);
++                kick_to_walk_epilogue(state);
++                RCLCPP_INFO(get_logger(), "[dribble_cmd] empty path → WALK");
++            }
++            return;
++        }
++
++        std::lock_guard<std::mutex> lk(kick_mutex_);
++        bool same = kick_.dribble && kick_.dribble_path.size() == path.size();
++        for (size_t i = 0; same && i < path.size(); ++i) {
++            same = std::hypot(path[i][0] - kick_.dribble_path[i][0],
++                              path[i][1] - kick_.dribble_path[i][1]) <= db::PATH_CHANGE_TOL_M;
++        }
++        if (!same) {
++            kick_.dribble_path = std::move(path);
++            ++kick_.dribble_path_seq;
++            RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 1000,
++                        "[dribble_cmd] path #%u: %zu waypoints, goal (%.2f, %.2f)",
++                        kick_.dribble_path_seq, kick_.dribble_path.size(),
++                        kick_.dribble_path.back()[0], kick_.dribble_path.back()[1]);
++        }
++        if (dribble_done_seq_ && *dribble_done_seq_ == kick_.dribble_path_seq) {
++            return;  // this path already ran; wait for a different one
++        }
++        if (!(kick_.enabled && kick_.dribble)) {
++            RCLCPP_INFO(get_logger(), "[dribble_cmd] enabled=true policy=dribble");
++        }
++        kick_.amp     = false;
++        kick_.dribble = true;
++        kick_.enabled = true;
++    }
++
+     // Kick→Walk 遷移の後処理。transition_to(walk_, state) の直後に呼ぶ。
+     //   - 履歴バッファをキック終了姿勢の複製ではなく学習分布内の状態に作り直す
+     //     (kick_exit_history_mode; "tile" のときは何もしない)
+@@ -5000,15 +5548,19 @@ private:
+             // tick runs, so the whole kick aims at the direction commanded here.
+             latch_kick_reference(state);
+             bool amp = false;
++            bool dribble = false;
+             {
+                 std::lock_guard<std::mutex> lk(kick_mutex_);
+                 amp = kick_.amp;
++                dribble = kick_.dribble;
+             }
+             std::shared_ptr<KickBehaviorBase> next =
+-                amp ? std::shared_ptr<KickBehaviorBase>(amp_kick_b_)
+-                    : std::shared_ptr<KickBehaviorBase>(kick_b_);
++                dribble ? std::shared_ptr<KickBehaviorBase>(dribble_b_)
++                : amp   ? std::shared_ptr<KickBehaviorBase>(amp_kick_b_)
++                        : std::shared_ptr<KickBehaviorBase>(kick_b_);
+             last_kick_ = next.get();
+-            RCLCPP_INFO(get_logger(), "[Walk→Kick] policy=%s", amp ? "amp" : "walk_kick");
++            RCLCPP_INFO(get_logger(), "[Walk→Kick] policy=%s",
++                        dribble ? "dribble" : amp ? "amp" : "walk_kick");
+             if (amp && !state.field_yaw_valid) {
+                 RCLCPP_WARN(get_logger(),
+                     "[AMP kick] no /localization_result received — the world-frame target is "
+@@ -5019,6 +5571,9 @@ private:
+             {
+                 std::lock_guard<std::mutex> lk(kick_mutex_);
+                 kick_.enabled = false;
++                if (current.get() == dribble_b_.get()) {
++                    dribble_done_seq_ = kick_.dribble_path_seq;
++                }
+             }
+             RCLCPP_INFO(get_logger(), "[Kick→Walk] kick intent cleared");
+             state_machine_->transition_to(walk_, state);
+@@ -5107,6 +5662,13 @@ private:
+     bool amp_kick_ = false;    // AMP policy loaded (amp_kick_b_)
+     std::unique_ptr<Ort::Session> amp_kick_session_;
+     AmpKickPolicyIO amp_kick_io_;
++    // Dribble (dribble_model_path), alongside the kicks.
++    bool dribble_ = false;     // dribble policy loaded (dribble_b_)
++    std::unique_ptr<Ort::Session> dribble_session_;
++    DribblePolicyIO dribble_io_;
++    // dribble_path_seq of the last path that ran to the end; that path does not
++    // re-arm Walk→Dribble (see dribble_cmd_cb).
++    std::optional<uint32_t> dribble_done_seq_;
+     // The kick behavior that most recently ran (for the Kick→Walk epilogue).
+     KickBehaviorBase* last_kick_ = nullptr;
+ 
+@@ -5116,6 +5678,7 @@ private:
+         const Behavior* cur = state_machine_->current().get();
+         if (kick_b_ && cur == kick_b_.get()) return kick_b_.get();
+         if (amp_kick_b_ && cur == amp_kick_b_.get()) return amp_kick_b_.get();
++        if (dribble_b_ && cur == dribble_b_.get()) return dribble_b_.get();
+         return nullptr;
+     }
+     bool in_kick() const { return active_kick() != nullptr; }
+@@ -5165,6 +5728,7 @@ private:
+     std::shared_ptr<void> ball_sub_;
+     std::shared_ptr<void> kick_cmd_sub_;
+     std::shared_ptr<void> amp_kick_cmd_sub_;
++    std::shared_ptr<void> dribble_cmd_sub_;
+     std::shared_ptr<void> selfpos_sub_;
+     std::shared_ptr<void> odom_sub_;
+ #endif  // BUILD_FOR_FUTBOL_MAIN
+@@ -5293,6 +5857,9 @@ private:
+     double       ball_vx_        = 0.0;   // body yaw frame, world velocity
+     double       ball_vy_        = 0.0;
+     bool         ball_vel_valid_ = false;
++    double       ball_gx_        = 0.0;   // field frame (vision_filter global_position)
++    double       ball_gy_        = 0.0;
++    bool         ball_global_valid_ = false;
+     rclcpp::Time ball_last_seen_{};
+     bool         ball_ever_seen_ = false;
+     bool         ball_time_init_ = false;
+@@ -5337,6 +5904,7 @@ private:
+     std::shared_ptr<WalkRLPolicyBehavior> pivot_;  // null when pivot_model_path is empty
+     std::shared_ptr<KickBehavior> kick_b_;         // walk_kick; null unless kick_model_path is set
+     std::shared_ptr<AmpKickBehavior> amp_kick_b_;  // AMP quick kick; null unless amp_kick_model_path is set
++    std::shared_ptr<DribbleBehavior> dribble_b_;   // dribble; null unless dribble_model_path is set
+     std::shared_ptr<UfoRecoveryBehavior> recovery_;  // null when UFO paths are empty
+     std::unique_ptr<BehaviorStateMachine> state_machine_;
+ };
+-- 
+2.34.1
+
