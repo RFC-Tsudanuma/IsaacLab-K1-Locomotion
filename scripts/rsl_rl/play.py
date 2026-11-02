@@ -264,6 +264,50 @@ def setup_viser(env, urdf_path: str, port: int):
         print("[INFO] Viser: waypoint-task visualization enabled (path / waypoints / goal pose / trail)."
               " The velocity sliders are ignored: base_velocity is driven by the policy.")
 
+    # ------------------------------------------------------------------
+    # Block task (Isaac-Block-K1) specific GUI. Scene objects are (re)drawn
+    # every frame in _update_block_viser.
+    # ------------------------------------------------------------------
+    if _is_block_task(env):
+        with server.gui.add_folder("Block Task (goalkeeper)"):
+            gui_bl_new = server.gui.add_button("new ball", hint="Re-launch a ball now (goal line = current pose).")
+            gui_bl_last = server.gui.add_text("last outcome", initial_value="-", disabled=True)
+            gui_bl_cnt = server.gui.add_text("conceded / resolved / fell", initial_value="0 / 0 / 0", disabled=True)
+            gui_bl_speed = server.gui.add_number("launch speed [m/s]", initial_value=0.0, disabled=True)
+            gui_bl_lat = server.gui.add_number("target lateral [m]", initial_value=0.0, disabled=True)
+            gui_bl_bspeed = server.gui.add_number("ball speed [m/s]", initial_value=0.0, disabled=True)
+            gui_bl_bx = server.gui.add_number("ball x on line [m]", initial_value=0.0, disabled=True)
+            gui_bl_tta = server.gui.add_number("time to line [s]", initial_value=0.0, disabled=True)
+            gui_bl_ep = server.gui.add_number("episode time [s]", initial_value=0.0, disabled=True)
+            gui_bl_cmd = server.gui.add_text("command vx, vy, wz", initial_value="+0.00, +0.00, +0.00", disabled=True)
+            gui_bl_res = server.gui.add_number("|residual| max", initial_value=0.0, disabled=True)
+
+        pending_bl = {"relaunch": False}
+
+        @gui_bl_new.on_click
+        def _(_):
+            pending_bl["relaunch"] = True
+
+        gui.update({
+            "block": True,
+            "bl_pending": pending_bl,
+            "bl_last": gui_bl_last,
+            "bl_cnt": gui_bl_cnt,
+            "bl_counts": [0, 0, 0],
+            "bl_speed": gui_bl_speed,
+            "bl_lat": gui_bl_lat,
+            "bl_bspeed": gui_bl_bspeed,
+            "bl_bx": gui_bl_bx,
+            "bl_tta": gui_bl_tta,
+            "bl_ep": gui_bl_ep,
+            "bl_cmd": gui_bl_cmd,
+            "bl_res": gui_bl_res,
+            "bl_trail": [],  # robot xy trace of the current episode
+            "bl_ball_trail": [],  # true ball trace of the current episode
+        })
+        print("[INFO] Viser: block-task visualization enabled (ball true/observed, goal line, intercept, trails)."
+              " The velocity sliders are ignored: base_velocity is driven by the policy.")
+
     # NOTE: viser falls back to the next free port when the requested one is taken
     # (e.g. a previous play.py still holding it), so report the port the server
     # actually bound rather than the requested one.
@@ -446,6 +490,134 @@ def _update_waypoint_viser(env, server, gui, env_idx: int = 0):
     gui["wp_cmd"].value = f"{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}"
 
 
+def _is_block_task(env) -> bool:
+    """True when the env has a ``ball_launch`` command term (``BallLaunchCommand``)."""
+    try:
+        return hasattr(env.unwrapped.command_manager.get_term("ball_launch"), "line_pos_w")
+    except Exception:
+        return False
+
+
+def _update_block_viser(env, server, gui, env_idx: int = 0):
+    """Draw the block (goalkeeper) task state for one env.
+
+    Scene contents:
+      * white sphere + grey trace  = true ball and its trajectory this episode
+      * orange sphere + ray        = ball as the policy sees it (delayed / 30 fps / noisy) and its velocity
+      * red line                   = goal line (half width = goal_half_width); thin red line = conceded threshold
+      * yellow sphere              = predicted crossing point of the ball on the goal line (while approaching)
+      * blue trace                 = robot xy trajectory of the current episode
+    """
+    bl = env.unwrapped.command_manager.get_term("ball_launch")
+    robot = env.unwrapped.scene["robot"]
+    ball = env.unwrapped.scene["soccer_ball"]
+    cfg = bl.cfg
+    z = 0.02
+    ep_steps = int(env.unwrapped.episode_length_buf[env_idx])
+    base = robot.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    here = np.array([base[0], base[1], z], dtype=np.float32)
+
+    # -- outcome of the step that just finished (dones are computed before the reset)
+    tm = env.unwrapped.termination_manager
+    done_name = None
+    for name, label in (("ball_conceded", "conceded"), ("ball_resolved", "resolved"), ("base_contact", "fell"), ("base_height", "fell")):
+        try:
+            if bool(tm.get_term(name)[env_idx]):
+                done_name = label
+                break
+        except Exception:
+            pass
+    if done_name is not None:
+        idx = ("conceded", "resolved", "fell").index(done_name)
+        gui["bl_counts"][idx] += 1
+        detail = done_name
+        if done_name == "resolved":
+            parts = [k for k in ("out_wide", "away", "stopped") if bool(bl.metrics[k][env_idx])]
+            detail += " (" + ", ".join(parts) + ")" if parts else ""
+        gui["bl_last"].value = detail
+        gui["bl_cnt"].value = " / ".join(str(c) for c in gui["bl_counts"])
+        gui["bl_trail"].clear()
+        gui["bl_ball_trail"].clear()
+
+    # -- goal line (fixed at the episode start pose): x = line heading (forward), y = left
+    lp = bl.line_pos_w[env_idx].detach().cpu().numpy()
+    h = float(bl.line_heading[env_idx])
+    fwd = np.array([math.cos(h), math.sin(h), 0.0], dtype=np.float32)
+    left = np.array([-math.sin(h), math.cos(h), 0.0], dtype=np.float32)
+    origin = np.array([lp[0], lp[1], z], dtype=np.float32)
+    w = float(cfg.goal_half_width)
+    _add_polyline(server, "/block/goal_line", np.stack([origin - left * w, origin + left * w]), (230, 40, 40), 6.0)
+    behind = origin - fwd * float(cfg.behind_x)
+    _add_polyline(server, "/block/conceded_line", np.stack([behind - left * w, behind + left * w]), (230, 40, 40), 2.0)
+    _add_polyline(server, "/block/line_fwd", np.stack([origin, origin + fwd * 0.4]), (230, 40, 40), 3.0)
+
+    # -- true ball + trail
+    bp = ball.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    bv = ball.data.root_lin_vel_w[env_idx, :3].detach().cpu().numpy()
+    server.scene.add_icosphere("/block/ball", radius=float(cfg.ball_radius), color=(245, 245, 245), position=bp)
+    trail = gui["bl_ball_trail"]
+    if ep_steps <= 1:
+        trail.clear()
+    trail.append(np.array([bp[0], bp[1], z], dtype=np.float32))
+    if len(trail) > 1000:
+        del trail[0]
+    if len(trail) >= 2:
+        _add_polyline(server, "/block/ball_trail", np.stack(trail), (160, 160, 160), 2.0)
+
+    # -- observed (delayed / noisy) ball: relative pos + vel in the base yaw frame -> world
+    try:
+        obs_term = next(c.func for c in env.unwrapped.observation_manager._group_obs_class_term_cfgs["ball_noisy"] if c.func.__class__.__name__ == "DelayedBallObs")
+        rel = obs_term._out[env_idx].detach().cpu().numpy()
+        qw, qx, qy, qz = robot.data.root_quat_w[env_idx].detach().cpu().numpy().tolist()
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        c, s_ = math.cos(yaw), math.sin(yaw)
+        obs_p = np.array([base[0] + c * rel[0] - s_ * rel[1], base[1] + s_ * rel[0] + c * rel[1], float(cfg.ball_radius)], dtype=np.float32)
+        obs_v = np.array([c * rel[2] - s_ * rel[3], s_ * rel[2] + c * rel[3], 0.0], dtype=np.float32)
+        server.scene.add_icosphere("/block/ball_obs", radius=float(cfg.ball_radius) * 0.6, color=(255, 160, 0), position=obs_p)
+        _add_polyline(server, "/block/ball_obs_vel", np.stack([obs_p, obs_p + obs_v * 0.3]), (255, 160, 0), 3.0)
+    except Exception:
+        pass
+    _add_polyline(server, "/block/ball_vel", np.stack([bp, bp + bv.astype(np.float32) * 0.3]), (245, 245, 245), 3.0)
+
+    # -- predicted crossing point on the goal line (same formula as foot_on_intercept)
+    x, y, vx, vy = (float(t[env_idx]) for t in bl.ball_line_state())
+    approaching = vx < -0.1 and x > 0.0
+    if approaching:
+        y_int = y + vy * (x / max(-vx, 0.1))
+        p_int = origin + left * float(np.clip(y_int, -w, w))
+        server.scene.add_icosphere("/block/intercept", radius=0.06, color=(255, 230, 0), position=p_int)
+    else:
+        server.scene.add_icosphere("/block/intercept", radius=0.001, color=(255, 230, 0), position=origin)
+
+    # -- robot trail
+    rtrail = gui["bl_trail"]
+    if ep_steps <= 1:
+        rtrail.clear()
+    rtrail.append(here)
+    if len(rtrail) > 1000:
+        del rtrail[0]
+    if len(rtrail) >= 2:
+        _add_polyline(server, "/block/trail", np.stack(rtrail), (60, 130, 255), 3.0)
+
+    # -- readouts
+    speed = float(np.linalg.norm(bv[:2]))
+    server.scene.add_label(
+        "/block/label",
+        f"ball {speed:.1f} m/s, x {x:+.2f} m | last: {gui['bl_last'].value}",
+        position=np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32),
+    )
+    gui["bl_speed"].value = round(float(bl.metrics["launch_speed"][env_idx]), 2)
+    gui["bl_lat"].value = round(float(bl.launch_lateral[env_idx]), 2)
+    gui["bl_bspeed"].value = round(speed, 2)
+    gui["bl_bx"].value = round(x, 2)
+    gui["bl_tta"].value = round(x / -vx, 2) if approaching else 0.0
+    gui["bl_ep"].value = round(ep_steps * env.unwrapped.step_dt, 2)
+    cmd = env.unwrapped.command_manager.get_command("base_velocity")[env_idx].tolist()
+    gui["bl_cmd"].value = f"{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}"
+    res = env.unwrapped.action_manager.get_term("joint_residual").raw_actions[env_idx]
+    gui["bl_res"].value = round(float(res.abs().max()), 3)
+
+
 def override_command_from_viser(env, gui):
     """Overwrite the ``base_velocity`` command tensor with viser GUI values.
 
@@ -466,6 +638,17 @@ def override_command_from_viser(env, gui):
         if mode != "random":
             # pinned every step: _resample_command re-randomizes pass_radius at reset
             wp.pass_radius[:] = wp.cfg.loose_radius if mode == "fast" else wp.cfg.strict_radius
+        return
+
+    # BallLaunchCommand (Isaac-Block-K1): base_velocity is the policy output, so the sliders
+    # must not touch it. "new ball" re-launches from the current pose (goal line moves with it).
+    if gui.get("block"):
+        if gui["bl_pending"]["relaunch"]:
+            gui["bl_pending"]["relaunch"] = False
+            bl = env.unwrapped.command_manager.get_term("ball_launch")
+            bl._resample_command(torch.tensor([gui.get("bl_env_idx", 0)], device=env.unwrapped.device))
+            gui["bl_trail"].clear()
+            gui["bl_ball_trail"].clear()
         return
 
     # TargetHeadingCommand (Isaac-Velocity-Flat-Turn): the command is the remaining
@@ -539,6 +722,9 @@ def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0, s
         _update_turn_viser(env, server, gui, env_idx=env_idx)
     if server is not None and gui is not None and gui.get("waypoint"):
         _update_waypoint_viser(env, server, gui, env_idx=env_idx)
+    if server is not None and gui is not None and gui.get("block"):
+        gui["bl_env_idx"] = env_idx
+        _update_block_viser(env, server, gui, env_idx=env_idx)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)

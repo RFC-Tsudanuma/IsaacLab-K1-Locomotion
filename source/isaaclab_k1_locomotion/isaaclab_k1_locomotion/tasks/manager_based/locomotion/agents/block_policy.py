@@ -34,47 +34,11 @@ from tensordict import TensorDict
 
 from isaaclab.utils import configclass
 from isaaclab_rl.rsl_rl import RslRlPpoAlgorithmCfg
-from rsl_rl.networks import MLP
 from rsl_rl.storage import RolloutStorage
 
 from ..mdp.block import BALL_DIM, BALL_HISTORY, JOINT_DIM
+from .block_nets import BlockHead, CausalTransformerEncoder
 from .waypoint_policy import RslRlWaypointActorCriticCfg, WaypointActorCritic, WaypointPPO
-
-
-class CausalTransformerEncoder(nn.Module):
-    """(B, T, in_dim) → (B, T, latent_dim)。時刻 t の出力は t 以前のフレームだけを見る。"""
-
-    def __init__(self, in_dim: int, seq_len: int, d_model: int, nhead: int, num_layers: int, latent_dim: int):
-        super().__init__()
-        self.in_proj = nn.Linear(in_dim, d_model)
-        self.pos = nn.Parameter(torch.randn(seq_len, d_model) * 0.02)
-        layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward=2 * d_model, dropout=0.0, batch_first=True, norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers, enable_nested_tensor=False)
-        self.out = nn.Linear(d_model, latent_dim)
-        self.register_buffer("mask", nn.Transformer.generate_square_subsequent_mask(seq_len), persistent=False)
-
-    def forward(self, frames: torch.Tensor) -> torch.Tensor:
-        h = self.in_proj(frames) + self.pos
-        return self.out(self.encoder(h, mask=self.mask, is_causal=True))
-
-
-class BlockHead(nn.Module):
-    """正規化済み ``[内界 (direct_dim), ボール履歴 (T × 4)]`` → encoder → ``[内界, latent_T]`` → MLP。"""
-
-    def __init__(self, direct_dim: int, seq_len: int, encoder: CausalTransformerEncoder, output_dim: int, hidden_dims, activation):
-        super().__init__()
-        self.direct_dim = direct_dim
-        self.seq_len = seq_len
-        self.encoder = encoder
-        self.mlp = MLP(direct_dim + encoder.out.out_features, output_dim, hidden_dims, activation)
-
-    def latents(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x[..., self.direct_dim :].reshape(-1, self.seq_len, BALL_DIM))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.mlp(torch.cat([x[..., : self.direct_dim], self.latents(x)[:, -1]], dim=-1))
 
 
 class BlockActorCritic(WaypointActorCritic):
