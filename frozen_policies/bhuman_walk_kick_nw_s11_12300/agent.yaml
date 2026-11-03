@@ -1,0 +1,75 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 48
+max_iterations: 600
+empirical_normalization: null
+obs_groups:
+  policy:
+  - command
+  - policy
+  critic:
+  - command
+  - critic
+clip_actions: null
+save_interval: 100
+experiment_name: k1_bhuman_walk_kick
+run_name: nw_s11_overspeed
+logger: tensorboard
+neptune_project: isaaclab
+wandb_project: isaaclab
+resume: true
+load_run: 2026-11-03_07-46-48_nw_s10_fasthandoff
+load_checkpoint: model_11999.pt
+class_name: OnPolicyRunner
+policy:
+  class_name: HistoryActorCritic
+  init_noise_std: 0.7207805082202461
+  noise_std_type: scalar
+  state_dependent_std: false
+  actor_obs_normalization: true
+  critic_obs_normalization: true
+  actor_hidden_dims:
+  - 512
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 512
+  - 256
+  - 128
+  activation: elu
+  history_length: 100
+  mlp_history_steps: 4
+  cnn_kernel_sizes: !!python/tuple
+  - 8
+  - 4
+  cnn_filter_sizes: !!python/tuple
+  - 32
+  - 16
+  cnn_stride_sizes: !!python/tuple
+  - 4
+  - 2
+algorithm:
+  class_name: PPOActorFreeze
+  num_learning_epochs: 5
+  num_mini_batches: 8
+  learning_rate: 0.00012551115172973836
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  entropy_coef: 0.005399484409787433
+  desired_kl: 0.003
+  max_grad_norm: 1.0
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  normalize_advantage_per_mini_batch: false
+  rnd_cfg: null
+  symmetry_cfg:
+    use_data_augmentation: false
+    use_mirror_loss: true
+    data_augmentation_func: isaaclab_k1_locomotion.tasks.manager_based.locomotion.mdp.symmetry:compute_symmetric_states_full_history
+    mirror_loss_coeff: 0.5
+  actor_freeze_iterations: 10
+  std_range:
+  - 0.12
+  - 0.13
