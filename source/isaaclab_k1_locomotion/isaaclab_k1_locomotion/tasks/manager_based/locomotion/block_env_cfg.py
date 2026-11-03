@@ -54,6 +54,8 @@ from .mdp.block import (
     ball_conceded,
     ball_resolved,
     ball_state_rel,
+    body_forward_l2,
+    body_on_intercept,
     foot_on_intercept,
     joint_residual_l2,
 )
@@ -170,8 +172,11 @@ class K1BlockRewardsCfg:
     blocked = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     conceded = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": "ball_conceded"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
-    # shaping: ボール接近中、予測到達点 (ライン上の y) に足を置く
+    # shaping: ボール接近中、予測到達点 (ライン上の y) に足を置く / 胴体を横に合わせる
     foot_on_intercept = RewTerm(func=foot_on_intercept, weight=0.5, params={"std": 0.15})
+    body_on_intercept = RewTerm(func=body_on_intercept, weight=0.5, params={"std": 0.3})
+    # ラインより前へ出る (ボールへ突っ込む) 動きは減点: ライン上で横に動いて止める方針 (2026-11-02 ユーザー指示)
+    body_forward_l2 = RewTerm(func=body_forward_l2, weight=-2.0, params={"margin": 0.2})
     # 事前分布 (歩行 expert) からのずれと、その変化率・コマンド変化率は軽く抑える
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
     joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})

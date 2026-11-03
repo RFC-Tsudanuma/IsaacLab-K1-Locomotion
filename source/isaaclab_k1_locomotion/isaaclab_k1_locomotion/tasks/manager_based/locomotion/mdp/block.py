@@ -12,9 +12,11 @@
 
 * **conceded** (失点): ボールがラインの後ろ (``behind_x``) かつゴール幅 (``goal_half_width``) 内に入った
 * **resolved** (阻止): 失点せずに、ボールが (a) ゴール幅の外に逸れた、(b) 前方へ弾き返された、
-  (c) 止まった、のいずれか
+  (c) 止まった、のいずれかになった後 ``resolve_hold_s`` 秒 (既定 2.5 s) 転倒も失点もせずに立ち続けた
 
 を判定する。両方とも終了条件 (time_out=False) で、報酬は ``is_terminated_term`` で与える。
+阻止の瞬間に終わらせないのは、体勢を崩しながら触ればよい方策にしないため (2026-11-02 ユーザー指示):
+触った後に転べば転倒の −200 だけで阻止の +100 は貰えない。
 
 ボール観測は 2 系統:
 
@@ -152,7 +154,10 @@ class BallLaunchCommand(CommandTerm):
         self.line_heading = torch.zeros(n, device=self.device)
         self.cmd_buf = torch.zeros(n, 4, device=self.device)
         self.launch_lateral = torch.zeros(n, device=self.device)  # 狙った左右位置 (評価用)
-        for name in ("conceded", "resolved", "out_wide", "away", "stopped", "launch_speed"):
+        # 最初に阻止条件を満たした時刻 [s] (未達なら −1) と、その時の内訳 (0 なし / 1 幅外 / 2 前へ弾く / 3 止めた)
+        self.resolved_at = torch.full((n,), -1.0, device=self.device)
+        self.resolve_kind = torch.zeros(n, dtype=torch.long, device=self.device)
+        for name in ("conceded", "resolved", "out_wide", "away", "stopped", "lost_after_touch", "launch_speed"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
     @property
@@ -169,6 +174,10 @@ class BallLaunchCommand(CommandTerm):
         x, y = self._to_line(self.ball.data.root_pos_w[:, :2] - self.line_pos_w)
         vx, vy = self._to_line(self.ball.data.root_lin_vel_w[:, :2])
         return x, y, vx, vy
+
+    def body_line_xy(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """胴体のライン座標系での (x, y)。x > 0 はラインより前に出ている。"""
+        return self._to_line(self.robot.data.root_pos_w[:, :2] - self.line_pos_w)
 
     def feet_line_y(self) -> torch.Tensor:
         """両足のライン座標系 y (N, 2)。"""
@@ -190,9 +199,18 @@ class BallLaunchCommand(CommandTerm):
         stopped = (speed < self.cfg.stop_speed) & (x > -self.cfg.behind_x) & (elapsed > 0.5)
         return out_wide, away, stopped
 
-    def resolved(self) -> torch.Tensor:
+    def resolved_instant(self) -> torch.Tensor:
+        """いま阻止条件を満たしているか (瞬間値)。"""
         out_wide, away, stopped = self.resolve_parts()
         return ~self.conceded() & (out_wide | away | stopped)
+
+    def elapsed(self) -> torch.Tensor:
+        return self._env.episode_length_buf.float() * self._env.step_dt
+
+    def resolved(self) -> torch.Tensor:
+        """阻止 (終了条件): 最初の阻止から resolve_hold_s 秒、失点せずに経過した。"""
+        held = (self.resolved_at >= 0.0) & (self.elapsed() - self.resolved_at >= self.cfg.resolve_hold_s)
+        return held & ~self.conceded()
 
     # -- CommandTerm hooks ----------------------------------------------------------
     def reset(self, env_ids: Sequence[int] | None = None) -> dict[str, float]:
@@ -202,10 +220,14 @@ class BallLaunchCommand(CommandTerm):
         return super().reset(env_ids)
 
     def _update_metrics(self):
-        self.metrics["conceded"] = self.conceded().float()
-        self.metrics["resolved"] = self.resolved().float()
-        for name, part in zip(("out_wide", "away", "stopped"), self.resolve_parts()):
-            self.metrics[name] = (part & ~self.conceded()).float()
+        conceded = self.conceded()
+        resolved = self.resolved()
+        self.metrics["conceded"] = conceded.float()
+        self.metrics["resolved"] = resolved.float()
+        for kind, name in enumerate(("out_wide", "away", "stopped"), start=1):
+            self.metrics[name] = (resolved & (self.resolve_kind == kind)).float()
+        # 一度は阻止したが、保持時間を待たずに終わった (転倒 / 時間切れ)
+        self.metrics["lost_after_touch"] = ((self.resolved_at >= 0.0) & ~resolved & ~conceded).float()
 
     def _resample_command(self, env_ids: Sequence[int]):
         n = len(env_ids)
@@ -247,8 +269,17 @@ class BallLaunchCommand(CommandTerm):
         self.ball.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
         self.metrics["launch_speed"][env_ids] = speed
         self.launch_lateral[env_ids] = lateral
+        self.resolved_at[env_ids] = -1.0
+        self.resolve_kind[env_ids] = 0
 
     def _update_command(self):
+        # 阻止のラッチ (毎 step、終了判定の後に呼ばれる → 次 step の終了判定が見る)
+        out_wide, away, stopped = self.resolve_parts()
+        first = (self.resolved_at < 0.0) & ~self.conceded() & (out_wide | away | stopped)
+        self.resolved_at[first] = self.elapsed()[first]
+        kind = torch.where(out_wide, 1, torch.where(away, 2, 3))
+        self.resolve_kind[first] = kind[first]
+
         rel = self.line_pos_w - self.robot.data.root_pos_w[:, :2]
         h = self.robot.data.heading_w
         c, s = torch.cos(h), torch.sin(h)
@@ -293,6 +324,8 @@ class BallLaunchCommandCfg(CommandTermCfg):
     """ライン前方でこの前向き速度以上なら「前に弾いた」= 阻止。"""
     stop_speed: float = 0.1
     """この速度未満 (かつ失点していない) なら「止めた」= 阻止。"""
+    resolve_hold_s: float = 2.5
+    """最初に阻止条件を満たしてから、転倒・失点せずにこの秒数立ち続けたら阻止 (終了)。"""
 
 
 # ---------------------------------------------------------------------------
@@ -309,14 +342,33 @@ def ball_resolved(env: "ManagerBasedRLEnv", command_name: str = "ball_launch") -
 # ---------------------------------------------------------------------------
 # 報酬
 # ---------------------------------------------------------------------------
+def _intercept(term: BallLaunchCommand) -> tuple[torch.Tensor, torch.Tensor]:
+    """(接近中か, ボールの予測ライン到達点 y)。"""
+    x, y, vx, vy = term.ball_line_state()
+    approaching = (vx < -0.1) & (x > 0.0)
+    return approaching, y + vy * (x / (-vx).clamp(min=0.1))
+
+
 def foot_on_intercept(env: "ManagerBasedRLEnv", std: float = 0.15, command_name: str = "ball_launch") -> torch.Tensor:
     """ボールの予測ライン到達点 (y) に近い足があるほど高い [0, 1] (ボール接近中のみ)。"""
     term: BallLaunchCommand = env.command_manager.get_term(command_name)
-    x, y, vx, vy = term.ball_line_state()
-    approaching = (vx < -0.1) & (x > 0.0)
-    y_int = y + vy * (x / (-vx).clamp(min=0.1))
+    approaching, y_int = _intercept(term)
     d = (term.feet_line_y() - y_int.unsqueeze(1)).abs().min(dim=1).values
     return approaching.float() * torch.exp(-torch.square(d / std))
+
+
+def body_on_intercept(env: "ManagerBasedRLEnv", std: float = 0.3, command_name: str = "ball_launch") -> torch.Tensor:
+    """胴体の横位置 (ライン系 y) がボールの予測到達点に近いほど高い [0, 1] (接近中のみ)。横へ動く動機。"""
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    approaching, y_int = _intercept(term)
+    _, body_y = term.body_line_xy()
+    return approaching.float() * torch.exp(-torch.square((body_y - y_int) / std))
+
+
+def body_forward_l2(env: "ManagerBasedRLEnv", margin: float = 0.2, command_name: str = "ball_launch") -> torch.Tensor:
+    """胴体がゴールラインより margin [m] 以上前に出た分の二乗 (ボールへ突っ込む動きを抑える)。"""
+    body_x, _ = env.command_manager.get_term(command_name).body_line_xy()
+    return torch.square((body_x - margin).clamp(min=0.0))
 
 
 def joint_residual_l2(env: "ManagerBasedRLEnv", action_name: str = "joint_residual") -> torch.Tensor:

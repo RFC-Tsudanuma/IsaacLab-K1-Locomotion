@@ -44,7 +44,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 import isaaclab_k1_locomotion.tasks  # noqa: F401, E402
 
 OUTCOMES = ("conceded", "resolved", "fell", "timeout")
-REASONS = ("out_wide", "away", "stopped")  # resolved の内訳 (コマンド項の Metrics から)
+REASONS = ("out_wide", "away", "stopped", "lost_after_touch")  # resolved の内訳 + 触った後に転倒/時間切れ (コマンド項の Metrics から)
 
 
 def table(title, key, edges, rows):
@@ -91,7 +91,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             speed = term.metrics["launch_speed"].clone()
             lateral = term.launch_lateral.abs().clone()
             t_ep = (raw_env.episode_length_buf + 1).float() * dt
-            base_y = term._to_line(robot.data.root_pos_w[:, :2] - term.line_pos_w)[1].abs()
+            base_x, base_y = term.body_line_xy()
+            base_y = base_y.abs()
             touched = torch.norm(robot.data.root_pos_w[:, :2] - raw_env.scene["soccer_ball"].data.root_pos_w[:, :2], dim=1) < 0.45
             ball_w = raw_env.scene["soccer_ball"].data.root_pos_w
             ball_z = ball_w[:, 2] - raw_env.scene.env_origins[:, 2]
@@ -110,7 +111,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             outcome[fell] = 2  # 転倒は同時に失点していても転倒扱い
             for i in d.nonzero().flatten().tolist():
                 rows.append({"speed": speed[i].item(), "lateral": lateral[i].item(), "t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]],
-                             "base_y": base_y[i].item(), "near": touched[i].item(),
+                             "base_x": base_x[i].item(), "base_y": base_y[i].item(), "near": touched[i].item(),
                              "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item()})
             if step % 500 == 0:
                 print(f"[step {step}] episodes={len(rows)}")
@@ -122,6 +123,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     res = [r for r in rows if r["outcome"] == "resolved"]
     print(f"  終了直前に胴体がボール 0.45 m 以内 (阻止のみ): {100.0 * sum(r['near'] for r in res) / max(len(res), 1):5.1f}%")
     print(f"  終了時の胴体の横ずれ |y| 平均: 全体 {sum(r['base_y'] for r in rows) / n:.3f} m, 阻止 {sum(r['base_y'] for r in res) / max(len(res), 1):.3f} m")
+    print(f"  終了時の胴体のライン前方 x 平均: 全体 {sum(r['base_x'] for r in rows) / n:+.3f} m, 阻止 {sum(r['base_x'] for r in res) / max(len(res), 1):+.3f} m,"
+          f" 0.5 m 以上前に出た割合 {100.0 * sum(r['base_x'] > 0.5 for r in rows) / n:5.1f}%")
     print(f"  阻止時 (終了 1 step 前): ボール高さ z 平均 {sum(r['ball_z'] for r in res) / max(len(res), 1):.3f} m, 最寄り足との距離 平均 {sum(r['feet_d'] for r in res) / max(len(res), 1):.3f} m")
     table("launch speed [m/s]", "speed", [1.0, 2.0, 3.0, 4.5], rows)
     table("|target lateral| [m]", "lateral", [0.25, 0.5, 0.75], rows)
