@@ -362,3 +362,10 @@ class K1StealPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class K1StealDirPPORunnerCfg(K1StealPPORunnerCfg):
+    """方向指定版 (Isaac-StealDir-K1-v0)。観測が target_dir (2) 分増える以外は K1StealPPORunnerCfg と同じ。"""
+
+    experiment_name = "k1_steal_dir"

@@ -319,6 +319,7 @@ def setup_viser(env, urdf_path: str, port: int):
             gui_st_last = server.gui.add_text("last outcome", initial_value="-", disabled=True)
             gui_st_cnt = server.gui.add_text("stolen / lost / no_foot / fell", initial_value="0 / 0 / 0 / 0", disabled=True)
             gui_st_state = server.gui.add_text("state", initial_value="approach", disabled=True)
+            gui_st_dir = server.gui.add_dropdown("target dir (next placement)", options=("random", "front", "left", "back", "right"), initial_value="random")
             gui_st_body = server.gui.add_number("body-ball [m]", initial_value=0.0, disabled=True)
             gui_st_foot = server.gui.add_number("foot-ball [m]", initial_value=0.0, disabled=True)
             gui_st_br = server.gui.add_number("ball-obstacle [m]", initial_value=0.0, disabled=True)
@@ -340,6 +341,7 @@ def setup_viser(env, urdf_path: str, port: int):
             "st_cnt": gui_st_cnt,
             "st_counts": [0, 0, 0, 0],
             "st_state": gui_st_state,
+            "st_dir": gui_st_dir,
             "st_body": gui_st_body,
             "st_foot": gui_st_foot,
             "st_br": gui_st_br,
@@ -679,6 +681,7 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
       * orange / green circle      = steal radius around the obstacle (green once the ball is outside = stolen latch)
       * white sphere + grey trace  = ball and its trajectory this episode; white ray = ball velocity
       * yellow sphere              = ball turns yellow while a foot touches it (contact sensor)
+      * green arrow from the ball  = target direction (directed task only); label shows front/left/back/right
       * blue trace                 = robot xy trajectory of the current episode
     """
     st = env.unwrapped.command_manager.get_term("steal")
@@ -725,6 +728,14 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
     touching = bool(st.foot_contact_now()[env_idx])
     server.scene.add_icosphere("/steal/ball", radius=float(cfg.ball_radius), color=(255, 230, 0) if touching else (245, 245, 245), position=bp)
     _add_polyline(server, "/steal/ball_vel", np.stack([bp, bp + bv * 0.3]), (245, 245, 245), 3.0)
+    dir_name = ""
+    if cfg.directed:
+        d = st.target_dir_w[env_idx].detach().cpu().numpy().astype(np.float32)
+        d3 = np.array([d[0], d[1], 0.0], dtype=np.float32)
+        tip = bp + d3 * 0.5
+        side = np.array([-d[1], d[0], 0.0], dtype=np.float32) * 0.08
+        _add_polyline(server, "/steal/target_dir", np.stack([bp, tip, tip - d3 * 0.12 + side, tip, tip - d3 * 0.12 - side]), (0, 220, 60), 4.0)
+        dir_name = ("front", "left", "back", "right")[int(st.target_idx[env_idx])] + " | "
     trail = gui["st_ball_trail"]
     if ep_steps <= 1:
         trail.clear()
@@ -753,7 +764,7 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
         state = "approach"
     server.scene.add_label(
         "/steal/label",
-        f"{state} | ball-obstacle {float(st.ball_obstacle_dist()[env_idx]):.2f} m | last: {gui['st_last'].value}",
+        f"{dir_name}{state} | ball-obstacle {float(st.ball_obstacle_dist()[env_idx]):.2f} m | last: {gui['st_last'].value}",
         position=np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32),
     )
     gui["st_state"].value = state
@@ -807,7 +818,13 @@ def override_command_from_viser(env, gui):
         if gui["st_pending"]["replace"]:
             gui["st_pending"]["replace"] = False
             st = env.unwrapped.command_manager.get_term("steal")
-            st._resample_command(torch.tensor([gui.get("st_env_idx", 0)], device=env.unwrapped.device))
+            i = gui.get("st_env_idx", 0)
+            st._resample_command(torch.tensor([i], device=env.unwrapped.device))
+            if gui["st_dir"].value != "random":
+                k = ("front", "left", "back", "right").index(gui["st_dir"].value)
+                h = float(env.unwrapped.scene["robot"].data.heading_w[i]) + k * math.pi / 2
+                st.target_idx[i] = k
+                st.target_dir_w[i] = torch.tensor([math.cos(h), math.sin(h)], device=env.unwrapped.device)
             gui["st_trail"].clear()
             gui["st_ball_trail"].clear()
         return

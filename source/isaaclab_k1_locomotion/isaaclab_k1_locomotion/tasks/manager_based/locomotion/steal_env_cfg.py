@@ -18,6 +18,10 @@
 * reward: 奪取 (+) / 失敗 (−) / 転倒 (−) / 胴体→ボール接近 / ボールが障害物から離れる速度 / 時間罰則 /
   残差・コマンドの大きさと変化率 (−)
 * termination: 奪取 (hold 後)・失敗で終了 (time_out=False)。
+
+方向指定版 (Isaac-StealDir-K1, `K1StealDirEnvCfg`): 上記に目標方向 (前/左/後/右) の観測 ``target_dir`` (2) を
+末尾に足し、報酬の「障害物から離れる速度」を「目標方向の速度」に置き換え、方向違いで圏外へ出たら
+``ball_wrong_dir`` (−20) で終了する。配置・判定の詳細は mdp/steal.py。
 """
 
 import math
@@ -36,7 +40,18 @@ from .block_env_cfg import K1BlockActionsCfg, K1BlockSceneCfg
 from .flat_env_cfg import K1FlatObservationsCfg, K1FlatStancePlanePolishCfg
 from .mdp.block import joint_residual_l2
 from .mdp.observations import ball_pos_rel, ball_vel
-from .mdp.steal import StealCommandCfg, ball_away_speed, ball_lost, ball_no_foot, ball_stolen, body_ball_progress, foot_near_ball
+from .mdp.steal import (
+    StealCommandCfg,
+    ball_away_speed,
+    ball_lost,
+    ball_no_foot,
+    ball_stolen,
+    ball_target_speed,
+    ball_wrong_dir,
+    body_ball_progress,
+    foot_near_ball,
+    steal_target_dir,
+)
 from .mdp.waypoint import ExternalVelocityCommandCfg, walk_command_rate_l2
 from .rough_env_cfg import K1CriticCfg, K1PolicyCfg
 
@@ -168,6 +183,56 @@ class K1StealEnvCfg(K1FlatStancePlanePolishCfg):
 
 @configclass
 class K1StealEnvCfg_PLAY(K1StealEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        self.scene.num_envs = 32
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.observations.steal_policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+# ---------------------------------------------------------------------------
+# 方向指定版 (Isaac-StealDir-K1)
+# ---------------------------------------------------------------------------
+@configclass
+class K1StealDirPolicyCfg(K1StealPolicyCfg):
+    target_dir = ObsTerm(func=steal_target_dir)
+
+
+@configclass
+class K1StealDirCriticCfg(K1StealCriticCfg):
+    target_dir = ObsTerm(func=steal_target_dir)
+
+
+@configclass
+class K1StealDirObservationsCfg(K1FlatObservationsCfg):
+    steal_policy: K1StealDirPolicyCfg = K1StealDirPolicyCfg()
+    steal_critic: K1StealDirCriticCfg = K1StealDirCriticCfg()
+
+
+@configclass
+class K1StealDirRewardsCfg(K1StealRewardsCfg):
+    ball_away_speed = None
+    ball_target_speed = RewTerm(func=ball_target_speed, weight=2.0, params={"max_speed": 3.0})
+    wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-20.0, params={"term_keys": "ball_wrong_dir"})
+
+
+@configclass
+class K1StealDirEnvCfg(K1StealEnvCfg):
+    observations: K1StealDirObservationsCfg = K1StealDirObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.steal.directed = True
+        self.rewards = K1StealDirRewardsCfg()
+        self.terminations.ball_wrong_dir = DoneTerm(func=ball_wrong_dir)
+
+
+@configclass
+class K1StealDirEnvCfg_PLAY(K1StealDirEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 

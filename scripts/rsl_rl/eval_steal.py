@@ -44,7 +44,8 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401, E402
 
-OUTCOMES = ("stolen", "lost", "fell", "timeout", "no_foot")
+OUTCOMES = ("stolen", "lost", "fell", "timeout", "no_foot", "wrong_dir")
+DIRS = ("front", "left", "back", "right")
 
 
 def table(title, key, edges, rows):
@@ -107,11 +108,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             outcome[tm.get_term("ball_stolen")] = 0
             outcome[tm.get_term("ball_lost")] = 1
             outcome[tm.get_term("ball_no_foot")] = 4
+            if "ball_wrong_dir" in tm.active_terms:
+                outcome[tm.get_term("ball_wrong_dir")] = 5
             outcome[fell] = 2  # 転倒は同時に失敗していても転倒扱い
             for i in d.nonzero().flatten().tolist():
                 rows.append({"t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]], "t_steal": t_steal[i].item(),
                              "dist0": dist0[i].item(), "ball_r": ball_r[i].item(), "touched": t_steal[i].item() >= 0.0,
-                             "foot": foot_touch[i].item(), "bumped": bumped[i].item()})
+                             "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(term.target_idx[i])})
             foot_touch[d] = False
             bumped[d] = False
             if step % 500 == 0:
@@ -128,6 +131,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  胴体が障害物に 0.25 m 以内まで接近: 全体 {100.0 * sum(r['bumped'] for r in rows) / n:5.1f}%")
     table("終了時の robot-obstacle 距離 [m] (≈ 初期距離の目安)", "dist0", [1.0, 1.5, 2.0, 2.5], rows)
     table("episode time at end [s]", "t", [1.0, 2.0, 3.0, 5.0], rows)
+    if term.cfg.directed:
+        table(f"target direction (bins = {', '.join(DIRS)})", "dir", [0.5, 1.5, 2.5], rows)
     env.close()
 
 

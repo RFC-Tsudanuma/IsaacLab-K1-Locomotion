@@ -19,6 +19,12 @@
 
 を判定する。報酬は終端 (is_terminated_term) が主で、shaping は胴体→ボールの接近ポテンシャルと
 ボールが障害物から離れる速度、時間罰則のみ。
+
+方向指定 (``directed=True``, Isaac-StealDir-K1, 2026-11-05): エピソード開始時にボールを出す目標方向を
+ロボット初期進行方向基準の 前 / 左 / 後 / 右 から 1 つ抽選し (ボール→障害物方向から ``target_min_angle``
+未満の候補は除外 = 敵のいる側へは出さない)、ボールが ``steal_radius`` を出た時点の変位が目標方向から
+``target_tolerance`` 以内なら奪取、外れていれば **wrong_dir** (不成立) で終了する。方策は目標方向を
+base yaw 座標系の単位ベクトルとして観測する (:func:`steal_target_dir`)。
 """
 
 from __future__ import annotations
@@ -58,7 +64,10 @@ class StealCommand(CommandTerm):
         self.cmd_buf = torch.zeros(n, 2, device=self.device)
         self.stolen_at = torch.full((n,), -1.0, device=self.device)  # 最初に圏外へ出た時刻 [s] (未達 −1)
         self.prev_body_dist = torch.zeros(n, device=self.device)  # 胴体→ボール距離 (接近ポテンシャル用)
-        for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal"):
+        self.target_dir_w = torch.zeros(n, 2, device=self.device)  # 目標方向 (world 単位ベクトル)
+        self.target_idx = torch.zeros(n, dtype=torch.long, device=self.device)  # 0 前 / 1 左 / 2 後 / 3 右 (初期進行方向基準)
+        self.ball_start_xy = torch.zeros(n, 2, device=self.device)
+        for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal", "wrong_dir"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
     @property
@@ -92,6 +101,18 @@ class StealCommand(CommandTerm):
     def elapsed(self) -> torch.Tensor:
         return self._env.episode_length_buf.float() * self._env.step_dt
 
+    def target_dir_b(self) -> torch.Tensor:
+        """目標方向を base yaw 座標系で (N, 2)。"""
+        h = self.robot.data.heading_w
+        c, s = torch.cos(h), torch.sin(h)
+        d = self.target_dir_w
+        return torch.stack([c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]], dim=1)
+
+    def dir_ok(self) -> torch.Tensor:
+        """ボールの初期位置からの変位が目標方向から target_tolerance 以内 (変位ゼロは False)。"""
+        disp = self.ball_xy() - self.ball_start_xy
+        return torch.sum(disp * self.target_dir_w, dim=1) >= torch.norm(disp, dim=1) * math.cos(self.cfg.target_tolerance)
+
     def foot_contact_now(self) -> torch.Tensor:
         """いずれかの足がボールに触れている (接触センサのフィルタ済み力 > 閾値)。"""
         hit = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
@@ -111,6 +132,10 @@ class StealCommand(CommandTerm):
     def lost(self) -> torch.Tensor:
         return self.lost_obstacle()
 
+    def wrong_dir(self) -> torch.Tensor:
+        """足で触れた後、目標方向から外れて圏外へ出た (directed のときだけ終了条件に使う)。"""
+        return self.foot_touched & (self.ball_obstacle_dist() > self.cfg.steal_radius) & (self.stolen_at < 0.0) & ~self.dir_ok()
+
     def stolen(self) -> torch.Tensor:
         """成功 (終了条件): 最初に圏外へ出てから hold_s 秒、失敗せずに経過した。"""
         held = (self.stolen_at >= 0.0) & (self.elapsed() - self.stolen_at >= self.cfg.hold_s)
@@ -129,6 +154,7 @@ class StealCommand(CommandTerm):
         self.metrics["lost_no_foot"] = self.lost_no_foot().float()
         self.metrics["lost_after_touch"] = ((self.stolen_at >= 0.0) & ~stolen & ~lost).float()
         self.metrics["time_to_steal"] = torch.where(stolen, self.stolen_at, torch.zeros_like(self.stolen_at))
+        self.metrics["wrong_dir"] = self.wrong_dir().float()
 
     def _resample_command(self, env_ids: Sequence[int]):
         n = len(env_ids)
@@ -160,6 +186,18 @@ class StealCommand(CommandTerm):
         pose[:, 3] = 1.0
         self.ball.write_root_pose_to_sim(pose, env_ids=env_ids)
         self.ball.write_root_velocity_to_sim(torch.zeros(n, 6, device=dev), env_ids=env_ids)
+        ball_xy = pose[:, :2]
+
+        # 目標方向: 初期進行方向基準の 前 / 左 / 後 / 右 から、ボール→障害物方向に近い候補を除いて抽選
+        cand_ang = heading.unsqueeze(1) + torch.arange(4, device=dev) * (math.pi / 2)  # (n, 4)
+        cand = torch.stack([torch.cos(cand_ang), torch.sin(cand_ang)], dim=2)  # (n, 4, 2)
+        to_obs = obs_xy - ball_xy
+        to_obs = to_obs / torch.norm(to_obs, dim=1, keepdim=True).clamp(min=1e-6)
+        allowed = torch.sum(cand * to_obs.unsqueeze(1), dim=2) < math.cos(cfg.target_min_angle)  # (n, 4)
+        idx = torch.multinomial(allowed.float(), 1).squeeze(1)
+        self.target_idx[env_ids] = idx
+        self.target_dir_w[env_ids] = cand[torch.arange(n, device=dev), idx]
+        self.ball_start_xy[env_ids] = ball_xy
 
         self.stolen_at[env_ids] = -1.0
         self.foot_touched[env_ids] = False
@@ -169,6 +207,8 @@ class StealCommand(CommandTerm):
         # 足接触の記録と成功のラッチ (毎 step、終了判定の後に呼ばれる → 次 step の終了判定が見る)
         self.foot_touched |= self.foot_contact_now()
         first = (self.stolen_at < 0.0) & ~self.lost_obstacle() & self.foot_touched & (self.ball_obstacle_dist() > self.cfg.steal_radius)
+        if self.cfg.directed:
+            first &= self.dir_ok()
         self.stolen_at[first] = self.elapsed()[first]
 
         rel = self.obstacle_xy() - self.robot.data.root_pos_w[:, :2]
@@ -213,6 +253,14 @@ class StealCommandCfg(CommandTermCfg):
     hold_s: float = 1.5
     """ラッチしてから転倒・失敗せずにこの秒数立ち続けたら成功 (終了)。"""
 
+    directed: bool = False
+    """True: 目標方向 (前/左/後/右) を抽選し、方向が合ったときだけ奪取とみなす (Isaac-StealDir-K1)。"""
+    target_min_angle: float = math.radians(60.0)
+    """ボール→障害物方向からこの角度未満の候補は抽選しない (ボール半径 0.31 m・敵+ボール半径 0.26 m で
+    直進しても当たらない下限 ≈ 57°)。90° 間隔の 4 候補なので少なくとも 2 候補は残る。"""
+    target_tolerance: float = math.radians(45.0)
+    """圏外に出た時点の変位と目標方向の角度差がこれ以内なら方向成立。"""
+
 
 # ---------------------------------------------------------------------------
 # 終了条件
@@ -227,6 +275,18 @@ def ball_lost(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Te
 
 def ball_no_foot(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
     return env.command_manager.get_term(command_name).lost_no_foot()
+
+
+def ball_wrong_dir(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
+    return env.command_manager.get_term(command_name).wrong_dir()
+
+
+# ---------------------------------------------------------------------------
+# 観測
+# ---------------------------------------------------------------------------
+def steal_target_dir(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
+    """目標方向の単位ベクトル (base yaw 座標系, 2)。"""
+    return env.command_manager.get_term(command_name).target_dir_b()
 
 
 # ---------------------------------------------------------------------------
@@ -251,3 +311,10 @@ def ball_away_speed(env: "ManagerBasedRLEnv", max_speed: float = 3.0, command_na
     """ボールが障害物から遠ざかる速度 [m/s] (上限 max_speed)。足で触れた後だけ有効 (足以外で押すのは報酬なし)。"""
     term: StealCommand = env.command_manager.get_term(command_name)
     return term.ball_away_speed().clamp(max=max_speed) * term.foot_touched.float()
+
+
+def ball_target_speed(env: "ManagerBasedRLEnv", max_speed: float = 3.0, command_name: str = "steal") -> torch.Tensor:
+    """ボール速度の目標方向成分 [m/s] (負は 0、上限 max_speed)。足で触れた後だけ有効。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    v = torch.sum(term.ball.data.root_lin_vel_w[:, :2] * term.target_dir_w, dim=1)
+    return v.clamp(min=0.0, max=max_speed) * term.foot_touched.float()
