@@ -22,6 +22,7 @@ from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
 from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
 from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgorithmCfg
 from .block_policy import RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
+from .steal_policy import RslRlStealActorCriticCfg, RslRlStealPpoAlgorithmCfg
 
 
 @configclass
@@ -317,6 +318,37 @@ class K1BlockPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {"policy": ["block_policy", "ball_noisy"], "critic": ["block_critic", "ball_true"]}
     policy = RslRlBlockActorCriticCfg()
     algorithm = RslRlBlockPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.0,
+        num_learning_epochs=5,
+        num_mini_batches=4,
+        learning_rate=5.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+    )
+
+
+@configclass
+class K1StealPPORunnerCfg(RslRlOnPolicyRunnerCfg):
+    """凍結歩行 expert を事前分布にしたボール奪取方策の学習 (Isaac-Steal-K1-v0)。
+
+    環境は `K1StealEnvCfg`。方策は StealActorCritic (歩行コマンド 3 + 関節残差 12、MLP、凍結 expert を内包)、
+    アルゴリズムは StealPPO (storage には steal_* グループのみ保存)。
+    コマンドはクランプされるので entropy_coef は 0 (waypoint v1 の教訓)。mirror loss なし。スクラッチ学習。
+    """
+
+    num_steps_per_env = 48
+    max_iterations = 3000
+    save_interval = 100
+    experiment_name = "k1_steal"
+    obs_groups = {"policy": ["steal_policy"], "critic": ["steal_critic"]}
+    policy = RslRlStealActorCriticCfg()
+    algorithm = RslRlStealPpoAlgorithmCfg(
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,

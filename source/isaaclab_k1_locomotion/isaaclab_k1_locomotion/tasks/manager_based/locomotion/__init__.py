@@ -330,3 +330,23 @@ gym.register(
         "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockPPORunnerCfg",
     },
 )
+
+gym.register(
+    id="Isaac-Steal-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.steal_env_cfg:K1StealEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StealPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Steal-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.steal_env_cfg:K1StealEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StealPPORunnerCfg",
+    },
+)

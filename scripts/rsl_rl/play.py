@@ -75,6 +75,7 @@ from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
+import trimesh
 import torch
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -306,6 +307,50 @@ def setup_viser(env, urdf_path: str, port: int):
             "bl_ball_trail": [],  # true ball trace of the current episode
         })
         print("[INFO] Viser: block-task visualization enabled (ball true/observed, goal line, intercept, trails)."
+              " The velocity sliders are ignored: base_velocity is driven by the policy.")
+
+    # ------------------------------------------------------------------
+    # Steal task (Isaac-Steal-K1) specific GUI. Scene objects are (re)drawn
+    # every frame in _update_steal_viser.
+    # ------------------------------------------------------------------
+    if _is_steal_task(env):
+        with server.gui.add_folder("Steal Task"):
+            gui_st_new = server.gui.add_button("new placement", hint="Re-place the obstacle and the ball now.")
+            gui_st_last = server.gui.add_text("last outcome", initial_value="-", disabled=True)
+            gui_st_cnt = server.gui.add_text("stolen / lost / no_foot / fell", initial_value="0 / 0 / 0 / 0", disabled=True)
+            gui_st_state = server.gui.add_text("state", initial_value="approach", disabled=True)
+            gui_st_body = server.gui.add_number("body-ball [m]", initial_value=0.0, disabled=True)
+            gui_st_foot = server.gui.add_number("foot-ball [m]", initial_value=0.0, disabled=True)
+            gui_st_br = server.gui.add_number("ball-obstacle [m]", initial_value=0.0, disabled=True)
+            gui_st_away = server.gui.add_number("ball away speed [m/s]", initial_value=0.0, disabled=True)
+            gui_st_ep = server.gui.add_number("episode time [s]", initial_value=0.0, disabled=True)
+            gui_st_cmd = server.gui.add_text("command vx, vy, wz", initial_value="+0.00, +0.00, +0.00", disabled=True)
+            gui_st_res = server.gui.add_number("|residual| max", initial_value=0.0, disabled=True)
+
+        pending_st = {"replace": False}
+
+        @gui_st_new.on_click
+        def _(_):
+            pending_st["replace"] = True
+
+        gui.update({
+            "steal": True,
+            "st_pending": pending_st,
+            "st_last": gui_st_last,
+            "st_cnt": gui_st_cnt,
+            "st_counts": [0, 0, 0, 0],
+            "st_state": gui_st_state,
+            "st_body": gui_st_body,
+            "st_foot": gui_st_foot,
+            "st_br": gui_st_br,
+            "st_away": gui_st_away,
+            "st_ep": gui_st_ep,
+            "st_cmd": gui_st_cmd,
+            "st_res": gui_st_res,
+            "st_trail": [],  # robot xy trace of the current episode
+            "st_ball_trail": [],  # ball trace of the current episode
+        })
+        print("[INFO] Viser: steal-task visualization enabled (obstacle, steal radius, ball, foot contact, trails)."
               " The velocity sliders are ignored: base_velocity is driven by the policy.")
 
     # NOTE: viser falls back to the next free port when the requested one is taken
@@ -618,6 +663,111 @@ def _update_block_viser(env, server, gui, env_idx: int = 0):
     gui["bl_res"].value = round(float(res.abs().max()), 3)
 
 
+def _is_steal_task(env) -> bool:
+    """True when the env has a ``steal`` command term (``StealCommand``)."""
+    try:
+        return hasattr(env.unwrapped.command_manager.get_term("steal"), "stolen_at")
+    except Exception:
+        return False
+
+
+def _update_steal_viser(env, server, gui, env_idx: int = 0):
+    """Draw the steal task state for one env.
+
+    Scene contents:
+      * red cylinder               = obstacle (enemy); thin red circle = contact threshold (lost when the ball enters)
+      * orange / green circle      = steal radius around the obstacle (green once the ball is outside = stolen latch)
+      * white sphere + grey trace  = ball and its trajectory this episode; white ray = ball velocity
+      * yellow sphere              = ball turns yellow while a foot touches it (contact sensor)
+      * blue trace                 = robot xy trajectory of the current episode
+    """
+    st = env.unwrapped.command_manager.get_term("steal")
+    robot = env.unwrapped.scene["robot"]
+    ball = env.unwrapped.scene["soccer_ball"]
+    cfg = st.cfg
+    z = 0.02
+    ep_steps = int(env.unwrapped.episode_length_buf[env_idx])
+    base = robot.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    here = np.array([base[0], base[1], z], dtype=np.float32)
+
+    # -- outcome of the step that just finished (dones are computed before the reset)
+    tm = env.unwrapped.termination_manager
+    done_name = None
+    for name, label in (("ball_stolen", "stolen"), ("ball_lost", "lost"), ("ball_no_foot", "no_foot"), ("base_contact", "fell"), ("base_height", "fell")):
+        try:
+            if bool(tm.get_term(name)[env_idx]):
+                done_name = label
+                break
+        except Exception:
+            pass
+    if done_name is not None:
+        gui["st_counts"][("stolen", "lost", "no_foot", "fell").index(done_name)] += 1
+        gui["st_last"].value = done_name
+        gui["st_cnt"].value = " / ".join(str(c) for c in gui["st_counts"])
+        gui["st_trail"].clear()
+        gui["st_ball_trail"].clear()
+
+    # -- obstacle cylinder + contact threshold + steal radius
+    op = st.obstacle.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    r_obs = float(cfg.obstacle_radius)
+    cyl = trimesh.creation.cylinder(radius=r_obs, height=float(cfg.obstacle_height), sections=24)
+    cyl.visual.face_colors = (200, 50, 50, 255)
+    server.scene.add_mesh_trimesh("/steal/obstacle", cyl, position=op)
+    th = np.linspace(0.0, 2.0 * math.pi, 49)
+    ring = lambda r: np.stack([op[0] + r * np.cos(th), op[1] + r * np.sin(th), np.full_like(th, z)], axis=1).astype(np.float32)
+    _add_polyline(server, "/steal/lost_ring", ring(r_obs + float(cfg.ball_radius) + float(cfg.touch_margin)), (230, 40, 40), 2.0)
+    latched = float(st.stolen_at[env_idx]) >= 0.0
+    _add_polyline(server, "/steal/steal_ring", ring(float(cfg.steal_radius)), (0, 220, 60) if latched else (255, 160, 0), 3.0)
+
+    # -- ball (yellow while a foot touches it) + velocity ray + trail
+    bp = ball.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    bv = ball.data.root_lin_vel_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
+    touching = bool(st.foot_contact_now()[env_idx])
+    server.scene.add_icosphere("/steal/ball", radius=float(cfg.ball_radius), color=(255, 230, 0) if touching else (245, 245, 245), position=bp)
+    _add_polyline(server, "/steal/ball_vel", np.stack([bp, bp + bv * 0.3]), (245, 245, 245), 3.0)
+    trail = gui["st_ball_trail"]
+    if ep_steps <= 1:
+        trail.clear()
+    trail.append(np.array([bp[0], bp[1], z], dtype=np.float32))
+    if len(trail) > 1000:
+        del trail[0]
+    if len(trail) >= 2:
+        _add_polyline(server, "/steal/ball_trail", np.stack(trail), (160, 160, 160), 2.0)
+
+    # -- robot trail
+    rtrail = gui["st_trail"]
+    if ep_steps <= 1:
+        rtrail.clear()
+    rtrail.append(here)
+    if len(rtrail) > 1000:
+        del rtrail[0]
+    if len(rtrail) >= 2:
+        _add_polyline(server, "/steal/trail", np.stack(rtrail), (60, 130, 255), 3.0)
+
+    # -- readouts
+    if latched:
+        state = f"hold {float(st.elapsed()[env_idx]) - float(st.stolen_at[env_idx]):.1f}/{float(cfg.hold_s):.1f} s"
+    elif bool(st.foot_touched[env_idx]):
+        state = "touched"
+    else:
+        state = "approach"
+    server.scene.add_label(
+        "/steal/label",
+        f"{state} | ball-obstacle {float(st.ball_obstacle_dist()[env_idx]):.2f} m | last: {gui['st_last'].value}",
+        position=np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32),
+    )
+    gui["st_state"].value = state
+    gui["st_body"].value = round(float(st.body_ball_dist()[env_idx]), 2)
+    gui["st_foot"].value = round(float(st.foot_ball_dist()[env_idx]), 2)
+    gui["st_br"].value = round(float(st.ball_obstacle_dist()[env_idx]), 2)
+    gui["st_away"].value = round(float(st.ball_away_speed()[env_idx]), 2)
+    gui["st_ep"].value = round(ep_steps * env.unwrapped.step_dt, 2)
+    cmd = env.unwrapped.command_manager.get_command("base_velocity")[env_idx].tolist()
+    gui["st_cmd"].value = f"{cmd[0]:+.2f}, {cmd[1]:+.2f}, {cmd[2]:+.2f}"
+    res = env.unwrapped.action_manager.get_term("joint_residual").raw_actions[env_idx]
+    gui["st_res"].value = round(float(res.abs().max()), 3)
+
+
 def override_command_from_viser(env, gui):
     """Overwrite the ``base_velocity`` command tensor with viser GUI values.
 
@@ -649,6 +799,17 @@ def override_command_from_viser(env, gui):
             bl._resample_command(torch.tensor([gui.get("bl_env_idx", 0)], device=env.unwrapped.device))
             gui["bl_trail"].clear()
             gui["bl_ball_trail"].clear()
+        return
+
+    # StealCommand (Isaac-Steal-K1): base_velocity is the policy output, so the sliders
+    # must not touch it. "new placement" re-places the obstacle and the ball around the current pose.
+    if gui.get("steal"):
+        if gui["st_pending"]["replace"]:
+            gui["st_pending"]["replace"] = False
+            st = env.unwrapped.command_manager.get_term("steal")
+            st._resample_command(torch.tensor([gui.get("st_env_idx", 0)], device=env.unwrapped.device))
+            gui["st_trail"].clear()
+            gui["st_ball_trail"].clear()
         return
 
     # TargetHeadingCommand (Isaac-Velocity-Flat-Turn): the command is the remaining
@@ -725,6 +886,9 @@ def update_viser(env, base_frame, viser_urdf, joint_indices, env_idx: int = 0, s
     if server is not None and gui is not None and gui.get("block"):
         gui["bl_env_idx"] = env_idx
         _update_block_viser(env, server, gui, env_idx=env_idx)
+    if server is not None and gui is not None and gui.get("steal"):
+        gui["st_env_idx"] = env_idx
+        _update_steal_viser(env, server, gui, env_idx=env_idx)
 
 
 @hydra_task_config(args_cli.task, args_cli.agent)
