@@ -21,6 +21,7 @@ from .history_actor_critic import RslRlHistoryActorCriticCfg
 from .multi_expert_ppo import RslRlMultiExpertPpoAlgorithmCfg
 from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
 from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgorithmCfg
+from .tracking_policy import RslRlTrackingActorCriticCfg
 from .block_policy import RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
 from .steal_policy import RslRlStealActorCriticCfg, RslRlStealPpoAlgorithmCfg
 
@@ -298,6 +299,16 @@ class K1WaypointPPORunnerCfg(RslRlOnPolicyRunnerCfg):
         desired_kl=0.01,
         max_grad_norm=1.0,
     )
+
+
+@configclass
+class K1TrackingPPORunnerCfg(K1WaypointPPORunnerCfg):
+    """凍結ゲート (歩行 + 回転 expert) に 5 次元コマンドを出す経路追従 + 姿勢到達 / 見ながら到達方策の
+    学習 (Isaac-Tracking-K1-v0)。環境は `K1TrackingEnvCfg`、方策は TrackingActorCritic、PPO は WaypointPPO を流用。
+    設計は rl_traking.md。"""
+
+    experiment_name = "k1_tracking"
+    policy = RslRlTrackingActorCriticCfg()
 
 
 @configclass
