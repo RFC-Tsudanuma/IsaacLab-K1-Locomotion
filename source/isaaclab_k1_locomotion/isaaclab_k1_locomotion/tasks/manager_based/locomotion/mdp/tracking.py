@@ -155,6 +155,10 @@ class TrackingGoalCommand(WaypointCommand):
     通過半径は 1 値 (fast / strict は廃止)。観測 (base yaw 系, 2K+10 次元):
     ``[次の K 点 xy (2K), ゴール xy (2), ゴール yaw 誤差 cos/sin (2, look では 0),
     見つめる対象 xy (2, pose では 0), task_mode one-hot (2), pivot 既定目標 cos/sin (2)]``。
+
+    観測・経由点の通過判定・pivot 既定目標は **遅延した自己位置推定** (x, y, yaw を ``obs_delay_s`` 秒前の
+    値にしたもの、遅延はエピソードごとに一様乱数) で計算する。実機では相対位置が自己位置推定経由で
+    100〜300 ms 遅れるため (2026-11-06 ユーザー報告)。報酬・到達判定・metrics は真の姿勢。
     """
 
     cfg: "TrackingGoalCommandCfg"
@@ -170,22 +174,38 @@ class TrackingGoalCommand(WaypointCommand):
         self.prev_heading_err = torch.zeros(n, device=self.device)  # heading_progress 報酬のポテンシャル
         for name in ("look_at_err", "look_at_violation_frac"):
             self.metrics[name] = torch.zeros(n, device=self.device)
+        # 自己位置推定の遅延: 真の (x, y, yaw) をリングバッファに積み、delay_steps 前の値を推定姿勢として使う
+        self._pose_hist_len = int(round(cfg.obs_delay_s[1] / env.step_dt)) + 1
+        self._pose_hist = torch.zeros(n, self._pose_hist_len, 3, device=self.device)
+        self._hist_idx = 0
+        self._delay_steps = torch.zeros(n, dtype=torch.long, device=self.device)
+
+    def _pose(self, est: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        """(xy, yaw)。est=True なら遅延した自己位置推定、False なら真値。"""
+        if not est:
+            return self._pos(), self.robot.data.heading_w
+        idx = (self._hist_idx - self._delay_steps) % self._pose_hist_len
+        hist = self._pose_hist[self._env_idx, idx]
+        return hist[:, :2], hist[:, 2]
 
     def is_look(self) -> torch.Tensor:
         return self.task_mode == TASK_LOOK
 
-    def look_at_err(self) -> torch.Tensor:
-        """機体 yaw から見つめる対象への方位角誤差 [rad] (±π)。"""
-        d = self.look_at_w - self._pos()
-        return math_utils.wrap_to_pi(torch.atan2(d[:, 1], d[:, 0]) - self.robot.data.heading_w)
+    def look_at_err(self, est: bool = False) -> torch.Tensor:
+        """機体 yaw から見つめる対象への方位角誤差 [rad] (±π)。est=True は遅延した推定姿勢で計算。"""
+        pos, heading = self._pose(est)
+        d = self.look_at_w - pos
+        return math_utils.wrap_to_pi(torch.atan2(d[:, 1], d[:, 0]) - heading)
 
     def pivot_default(self) -> torch.Tensor:
-        """pivot の既定目標 (現在 yaw からの相対角 [rad]): look = 見つめる対象の方位、
+        """pivot の既定目標 (現在 yaw からの相対角 [rad]、推定姿勢基準): look = 見つめる対象の方位、
         pose = 全経由点通過後はゴール yaw 誤差、それ以前は次の目標点の方位。"""
-        target = self.points_w[self._env_idx, self.target_idx] - self._pos()
-        to_target = math_utils.wrap_to_pi(torch.atan2(target[:, 1], target[:, 0]) - self.robot.data.heading_w)
-        pose_default = torch.where(self.all_passed(), self.goal_yaw_err(), to_target)
-        return torch.where(self.is_look(), self.look_at_err(), pose_default)
+        pos, heading = self._pose(est=True)
+        target = self.points_w[self._env_idx, self.target_idx] - pos
+        to_target = math_utils.wrap_to_pi(torch.atan2(target[:, 1], target[:, 0]) - heading)
+        yaw_err = math_utils.wrap_to_pi(self.goal_yaw_w - heading)
+        pose_default = torch.where(self.all_passed(), yaw_err, to_target)
+        return torch.where(self.is_look(), self.look_at_err(est=True), pose_default)
 
     def heading_err(self) -> torch.Tensor:
         """向きの誤差 [rad] (heading_progress 報酬用): look = 見つめる対象への方位誤差、
@@ -228,12 +248,20 @@ class TrackingGoalCommand(WaypointCommand):
             clear = torch.norm(pts - look.unsqueeze(1), dim=-1).min(dim=1).values >= self.cfg.look_at_clearance
             todo &= ~clear
         self.look_at_w[env_ids] = look
+        delay = torch.empty(n, device=self.device).uniform_(*self.cfg.obs_delay_s) / self._env.step_dt
+        self._delay_steps[env_ids] = torch.round(delay).long().clamp(0, self._pose_hist_len - 1)
+        self._pose_hist[env_ids, :, :2] = self._pos()[env_ids].unsqueeze(1)
+        self._pose_hist[env_ids, :, 2] = self.robot.data.heading_w[env_ids].unsqueeze(1)
         self._look_steps[env_ids] = 0.0
         self._look_violations[env_ids] = 0.0
         self.prev_heading_err[env_ids] = self.heading_err()[env_ids]
 
     def _update_command(self):
-        pos = self._pos()
+        # 真の姿勢を履歴に積み、以降の観測・通過判定は遅延した推定姿勢 (pos, heading) で計算する
+        self._hist_idx = (self._hist_idx + 1) % self._pose_hist_len
+        self._pose_hist[:, self._hist_idx, :2] = self._pos()
+        self._pose_hist[:, self._hist_idx, 2] = self.robot.data.heading_w
+        pos, heading = self._pose(est=True)
         target = self.points_w[self._env_idx, self.target_idx]
         near = torch.norm(pos - target, dim=1) < self.pass_radius
         self.target_idx += (near & (self.target_idx < self.num_waypoints)).long()
@@ -249,10 +277,9 @@ class TrackingGoalCommand(WaypointCommand):
         idx = (self.target_idx.unsqueeze(1) + self._window.unsqueeze(0)).clamp(max=k)
         sel = torch.gather(self.points_w, 1, idx.unsqueeze(-1).expand(-1, -1, 2))
         rel = torch.cat([sel, self.goal_w().unsqueeze(1), self.look_at_w.unsqueeze(1)], dim=1) - pos.unsqueeze(1)
-        heading = self.robot.data.heading_w
         c, s = torch.cos(heading).unsqueeze(1), torch.sin(heading).unsqueeze(1)
         rel_b = torch.stack([c * rel[..., 0] + s * rel[..., 1], -s * rel[..., 0] + c * rel[..., 1]], dim=-1)
-        yaw_err = self.goal_yaw_err()
+        yaw_err = math_utils.wrap_to_pi(self.goal_yaw_w - heading)
         look_f = look.float().unsqueeze(1)
         pose_f = 1.0 - look_f
         pivot = self.pivot_default()
@@ -288,6 +315,9 @@ class TrackingGoalCommandCfg(WaypointCommandCfg):
 
     goal_pos_tolerance: float = 0.1
     goal_yaw_tolerance: float = 0.1
+
+    obs_delay_s: tuple[float, float] = (0.1, 0.3)
+    """自己位置推定の遅延 [s] (エピソードごとに一様乱数)。観測・通過判定・pivot 既定目標に掛かる。(0, 0) で無効。"""
 
 
 # ---------------------------------------------------------------------------
