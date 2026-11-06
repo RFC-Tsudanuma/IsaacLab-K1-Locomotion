@@ -250,3 +250,5 @@ critic は同じ項をノイズ無しで。停滞したときだけ関節位置�
   **採用: v7b model_1200** (`logs/rsl_rl/k1_tracking/2026-11-06_15-03-36_tracking_v7b_turn9000_modestd`、新 pivot expert model_9000 + mode std 下限 0.3)。
   v5a model_1200 (5.02 / 5.14) から pose −0.18 s、look −0.23 s。pivot 使用は 1 % 未満で、改善は新 expert のもとで探索の失敗コストが消えたことによる。
   `frozen_policies/best_tracking/{model_v7b_1200.pt,tracking_v7b_1200.onnx}`、実機 `assets/k1_tracking_2026-11-06_v7b_1200.onnx`。
+- v7b model_1200 の学習時リセット (関節 ±30°, 初速 ±0.5) 評価は下記 (v5a model_1200 は到達 95.8 % / 転倒 4.2 %)。
+    episodes 2053: reached 96.35%  falls 3.56%
