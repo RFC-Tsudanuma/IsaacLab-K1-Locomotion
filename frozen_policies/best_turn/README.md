@@ -6,10 +6,33 @@
 
 | | |
 |---|---|
-| 学習 run | `scripts/rsl_rl/logs/rsl_rl/k1_turn/2026-09-16_03-56-13` |
-| checkpoint | `model_7999.pt` (8000 iter 完走、スクラッチ学習) |
-| 学習ログ | `scripts/rsl_rl/turn_v11_nohup.log` |
-| エクスポート日 | 2026-09-18 |
+| **現行 checkpoint** | **`model_9000.pt`** (`policy.onnx` / `policy.pt` はこれの書き出し) |
+| 現行の学習 run | `scripts/rsl_rl/logs/rsl_rl/k1_transition/2026-11-05_19-39-03_turnfast_v1` |
+| 現行の学習ログ | `scripts/rsl_rl/turnfast_v1_nohup.log` |
+| 旧 checkpoint | `model_7999.pt` (2026-09-18 まではこちらが現行) |
+| 旧 run | `scripts/rsl_rl/logs/rsl_rl/k1_turn/2026-09-16_03-56-13` (`turn_v11_nohup.log`) |
+| エクスポート日 | 2026-11-05 (model_9000) / 2026-09-18 (model_7999) |
+
+### model_9000 (2026-11-05): 歩行中からの進入の追加学習
+
+`model_7999` は**その場 (立位) から回り始める**分布しか持っておらず、歩行中に pivot へ
+切り替えると落ちた (`scripts/rsl_rl/eval_pivot_overhead.py`、1.0 m/s 進入・ゲートを外した
+expert 単体駆動で **転倒 29.7 %**)。`K1FlatTurnFinetuneCfg` の `reset_base` 速度
+ランダム化 (±1.4 m/s) は「立位姿勢のまま滑っている」初期状態でしかなく、実際の進入
+(遊脚・歩行中の関節速度・2 秒ぶんの歩行観測履歴) が分布に入っていなかったため。
+
+`Isaac-Velocity-Flat-Transition-TurnFast` (`K1FlatTransitionTurnFastCfg`) で
+`MultiExpertPPO` (learner=turn、歩行 expert = `best_walk/model_52700` を凍結) により
+1000 iteration 追加学習した。歩行 expert が実際に歩いた状態から制御が渡るので、
+状態注入 (gait-state bank) は不要。
+
+| 1.0 m/s 進入・expert 単体 (256 env) | 転倒 | 回転時間 |
+|---|---|---|
+| model_7999 | 29.7 % | 0.74 s |
+| model_9000 | **0.0 %** | 0.68 s |
+
+立位スタートの性能は落ちていない (回転 0.80 → 0.72 s、停止→180°→歩行再開の合計
+1.20 → 1.12 s、転倒 1.2 % → 0.0 %)。整定時間は 0.47 → 0.42 s。
 
 ## インタフェース
 

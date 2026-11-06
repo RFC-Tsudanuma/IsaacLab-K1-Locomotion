@@ -4,6 +4,21 @@
 凍結 expert 2 本 (`best_walk/model_52500.pt`, `best_turn/model_7999.pt`) とゲート MLP を
 1 つの ONNX に融合してある (`scripts/rsl_rl/export_gating_policy.py`)。
 
+## 現行 (2026-11-06 採用)
+
+| | |
+|---|---|
+| 融合 ONNX | `gating_5897_turn9000.onnx` |
+| ゲート重み | `model_5897.pt` (`2026-10-31_..._gate_v4` 由来。2026-11-05/06 の追加学習 v5/v6 は高速進入で退行したため**不採用**) |
+| 凍結 expert | `best_walk/model_52700.pt` + `best_turn/model_9000.pt` (**回転 expert を歩行中進入向けに再学習**) |
+| 検証 | torch 等価性 `max|Δaction| < 1e-4` / mode=0 vs `best_walk/policy.onnx` `≤ 2.2e-3` / mode=1 vs `best_turn/policy.onnx` `≤ 3.8e-4` |
+| 計測・判断の詳細 | [`PIVOT_FIXED_COST_MEMO.md`](PIVOT_FIXED_COST_MEMO.md) |
+
+1.0 m/s で歩きながら pivot に入って転倒 0.20 % (1024 env)。旧 expert は 12.9 % (ゲート経由) /
+29.7 % (expert 単体) で落ちていた。停止 → 180° pivot → 1.0 m/s 復帰は合計 1.12 s・転倒 0 %。
+
+以下の「来歴」以降は gate_v1 (model_2500) 当時の記述。インタフェース・学習時の要点は現行でも有効。
+
 ## 来歴
 
 | | |

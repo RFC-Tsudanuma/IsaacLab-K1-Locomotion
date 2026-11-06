@@ -2125,3 +2125,36 @@ class K1FlatTransitionCfg_PLAY(K1FlatTransitionCfg):
         self.events.base_external_force_torque = None
         self.events.push_robot = None
         self.commands.base_velocity.debug_vis = True
+
+
+@configclass
+class K1FlatTransitionTurnFastCfg(K1FlatGatingCfg):
+    """回転 expert の「歩行中からの進入」追加学習用 (2026-11-05)。
+
+    経路追従セッションの依頼 (pivot の固定コスト削減) の実測で、1.0 m/s で歩行中に
+    pivot へ切り替えると **転倒 31.6 %**、ゲートを外して回転 expert 単体で駆動しても
+    **25.8 %** 落ちることが分かった (`scripts/rsl_rl/eval_pivot_overhead.py`)。
+    つまりゲートの混合ではなく**回転 expert が「歩容の途中・移動中から回り始める」状態を
+    知らない**ことが原因。`K1FlatTurnFinetuneCfg` の ``reset_base`` 速度ランダム化
+    (±1.4 m/s) は「立位姿勢のまま滑っている」初期状態でしかなく、実際の進入
+    (遊脚・歩行中の関節速度・2 秒ぶんの歩行観測履歴) は分布に入っていない。
+
+    そこでゲート学習環境 (`K1FlatGatingCfg`: 実機指令域 x±2.0 / y±1.2、
+    extreme 0.6、切替頻度↑、転倒罰 -400) をそのまま使い、``MultiExpertPPO``
+    (learner=turn) で**回転 expert だけを追加学習**する。歩行 expert が実際に歩いた
+    状態から制御が渡るので、状態注入 (gait-state bank) は不要。
+
+    ゲート環境との唯一の差分は早期打ち切りを切ること。デプロイは残り 15° で walk に
+    倒すが、経路追従側 (`ExternalTransitionCommand`) は早期打ち切りを使わず最後まで
+    回しきるので、最後の 15° と整定の練習を落とさない。
+
+    使い方::
+
+        ./train_transition_turnfast.sh \\
+            --checkpoint /abs/path/frozen_policies/best_turn/model_7999.pt \\
+            --frozen_ckpt walk=/abs/path/frozen_policies/best_walk/model_52700.pt
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.base_velocity.turn_early_exit_rad = 0.0
