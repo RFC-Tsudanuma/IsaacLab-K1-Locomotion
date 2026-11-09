@@ -67,6 +67,7 @@ class StealCommand(CommandTerm):
         self.target_dir_w = torch.zeros(n, 2, device=self.device)  # 目標方向 (world 単位ベクトル)
         self.target_idx = torch.zeros(n, dtype=torch.long, device=self.device)  # 0 前 / 1 左 / 2 後 / 3 右 (初期進行方向基準)
         self.ball_start_xy = torch.zeros(n, 2, device=self.device)
+        self.ball_side0 = torch.zeros(n, device=self.device)  # 配置時のボール方位 (障害物→ロボット方向からの角度) [rad] 評価用
         for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal", "wrong_dir"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
@@ -177,7 +178,9 @@ class StealCommand(CommandTerm):
 
         # ボール: 障害物中心からロボット側 (障害物→ロボット方向 ±ball_side_angle) に半径 ball_radius_range
         to_robot = torch.atan2(pos[:, 1] - obs_xy[:, 1], pos[:, 0] - obs_xy[:, 0])
-        ang = to_robot + torch.empty(n, device=dev).uniform_(-cfg.ball_side_angle, cfg.ball_side_angle)
+        side = torch.empty(n, device=dev).uniform_(-cfg.ball_side_angle, cfg.ball_side_angle)
+        ang = to_robot + side
+        self.ball_side0[env_ids] = side
         r_min = max(cfg.ball_radius_range[0], cfg.obstacle_radius + cfg.ball_radius + cfg.touch_margin + 0.03)
         r = torch.empty(n, device=dev).uniform_(r_min, cfg.ball_radius_range[1])
         pose = torch.zeros(n, 7, device=dev)
@@ -318,3 +321,9 @@ def ball_target_speed(env: "ManagerBasedRLEnv", max_speed: float = 3.0, command_
     term: StealCommand = env.command_manager.get_term(command_name)
     v = torch.sum(term.ball.data.root_lin_vel_w[:, :2] * term.target_dir_w, dim=1)
     return v.clamp(min=0.0, max=max_speed) * term.foot_touched.float()
+
+
+def trunk_obstacle_contact(env: "ManagerBasedRLEnv", threshold: float = 1.0, sensor_name: str = "contact_trunk_obstacle") -> torch.Tensor:
+    """胴体が障害物 (敵) に触れている (フィルタ済み接触力 > threshold) 間 1。"""
+    f = env.scene[sensor_name].data.force_matrix_w
+    return (torch.norm(f, dim=-1).amax(dim=(1, 2)) > threshold).float()

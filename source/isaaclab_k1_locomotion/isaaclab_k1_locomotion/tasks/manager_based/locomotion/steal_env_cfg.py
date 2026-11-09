@@ -17,7 +17,7 @@
     - ``steal_critic``: 歩行 K1CriticCfg (線速度・ZMP 込み・ノイズなし) + 同上
 * reward: 奪取 (+) / 失敗 (−) / 転倒 (−) / 胴体→ボール接近 / ボールが障害物から離れる速度 / 時間罰則 /
   残差・コマンドの大きさと変化率 (−)
-* termination: 奪取 (hold 後)・失敗で終了 (time_out=False)。
+* termination: 奪取 (hold 後)・失敗で終了 (time_out=False)。胴体接触 (base_contact) では終了しない。
 
 方向指定版 (Isaac-StealDir-K1, `K1StealDirEnvCfg`): 上記に目標方向 (前/左/後/右) の観測 ``target_dir`` (2) を
 末尾に足し、報酬の「障害物から離れる速度」を「目標方向の速度」に置き換え、方向違いで圏外へ出たら
@@ -31,6 +31,7 @@ from isaaclab.assets import RigidObjectCfg
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
+from isaaclab.sensors import ContactSensorCfg
 from isaaclab.sim.schemas import CollisionPropertiesCfg, MassPropertiesCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
@@ -51,6 +52,7 @@ from .mdp.steal import (
     body_ball_progress,
     foot_near_ball,
     steal_target_dir,
+    trunk_obstacle_contact,
 )
 from .mdp.waypoint import ExternalVelocityCommandCfg, walk_command_rate_l2
 from .rough_env_cfg import K1CriticCfg, K1PolicyCfg
@@ -75,6 +77,15 @@ class K1StealSceneCfg(K1BlockSceneCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=0.8, restitution=0.3),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(pos=(2.0, 0.0, OBSTACLE_HEIGHT / 2)),
+    )
+    # 胴体と障害物 (敵) の接触だけを拾うセンサ。歩行の base_contact 終了判定は敵との体当たりでも
+    # 発火するので steal では外し、こちらで軽い罰則にする (2026-11-09: 敵の裏側のボールを取りに行く
+    # 以上ある程度の体当たりは許容する、というユーザー方針)
+    contact_trunk_obstacle: ContactSensorCfg = ContactSensorCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/Trunk",
+        update_period=0.0,
+        history_length=1,
+        filter_prim_paths_expr=["{ENV_REGEX_NS}/Obstacle"],
     )
 
 
@@ -120,7 +131,9 @@ class K1StealRewardsCfg:
     # 主目的: 奪取 (+2 実効) / 敵に当てた (−4 実効) / 転倒 (−4 実効)
     stolen = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_stolen"})
     lost = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": "ball_lost"})
-    fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
+    fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": "base_height"})
+    # 胴体が敵に触れている間の軽い罰則 (−0.01/step)。体当たり自体は許容する
+    trunk_obstacle_contact = RewTerm(func=trunk_obstacle_contact, weight=-0.5)
     # 足以外で圏外へ出した (不成立): 弱い罰則で終了。−200 だと「触らない」方策に落ちる (v4)
     no_foot = RewTerm(func=mdp.is_terminated_term, weight=-20.0, params={"term_keys": "ball_no_foot"})
     # shaping: ボールへ近づく (ポテンシャル, 1 m 接近 = +1) / ボールを障害物から離す速度 / 速く終えるほど得
@@ -152,6 +165,8 @@ class K1StealEnvCfg(K1FlatStancePlanePolishCfg):
 
         self.rewards = K1StealRewardsCfg()
 
+        # 胴体接触では終了しない (敵との体当たりを許容)。転倒は base_height (0.35 m) で検出する
+        self.terminations.base_contact = None
         self.terminations.ball_stolen = DoneTerm(func=ball_stolen)
         self.terminations.ball_lost = DoneTerm(func=ball_lost)
         self.terminations.ball_no_foot = DoneTerm(func=ball_no_foot)

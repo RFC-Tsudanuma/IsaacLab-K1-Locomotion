@@ -88,22 +88,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     sensors = [raw_env.scene[n] for n in ("contact_balls_right", "contact_balls_left")]
     foot_touch = torch.zeros(env.num_envs, dtype=torch.bool, device=agent_cfg.device)  # 足がボールに触れた (接触センサ)
     bumped = torch.zeros_like(foot_touch)  # 胴体が障害物に接近しすぎた (敵にぶつかった目安)
+    trunk_hit = torch.zeros_like(foot_touch)  # 胴体と障害物の接触センサが反応した
+    trunk_sensor = raw_env.scene["contact_trunk_obstacle"] if "contact_trunk_obstacle" in raw_env.scene.sensors else None
     obs = env.get_observations()
     with torch.inference_mode():
         for step in range(args_cli.steps):
             # 終了 step の値 (reset で消える前に控える)
             dist0 = torch.norm(term.obstacle_xy() - raw_env.scene["robot"].data.root_pos_w[:, :2], dim=1)
             ball_r = term.ball_obstacle_dist().clone()
+            side0 = term.ball_side0.abs().rad2deg()
             t_ep = (raw_env.episode_length_buf + 1).float() * dt
             t_steal = term.stolen_at.clone()
             obs, _, dones, _ = env.step(policy(obs))
             for sen in sensors:
                 foot_touch |= torch.norm(sen.data.force_matrix_w, dim=-1).amax(dim=(1, 2)) > 1.0
             bumped |= torch.norm(term.obstacle_xy() - raw_env.scene["robot"].data.root_pos_w[:, :2], dim=1) < term.cfg.obstacle_radius + 0.25
+            if trunk_sensor is not None:
+                trunk_hit |= torch.norm(trunk_sensor.data.force_matrix_w, dim=-1).amax(dim=(1, 2)) > 1.0
             d = dones.bool()
             if not d.any():
                 continue
-            fell = tm.get_term("base_contact") | tm.get_term("base_height")
+            fell = tm.get_term("base_height")
+            if "base_contact" in tm.active_terms:
+                fell = fell | tm.get_term("base_contact")
             outcome = torch.full_like(d, 3, dtype=torch.long)  # timeout
             outcome[tm.get_term("ball_stolen")] = 0
             outcome[tm.get_term("ball_lost")] = 1
@@ -114,9 +121,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             for i in d.nonzero().flatten().tolist():
                 rows.append({"t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]], "t_steal": t_steal[i].item(),
                              "dist0": dist0[i].item(), "ball_r": ball_r[i].item(), "touched": t_steal[i].item() >= 0.0,
-                             "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(term.target_idx[i])})
+                             "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(term.target_idx[i]),
+                             "side0": side0[i].item(), "trunk": trunk_hit[i].item()})
             foot_touch[d] = False
             bumped[d] = False
+            trunk_hit[d] = False
             if step % 500 == 0:
                 print(f"[step {step}] episodes={len(rows)}")
 
@@ -129,8 +138,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  終了時の ball-obstacle 距離 平均: 全体 {sum(r['ball_r'] for r in rows) / n:.2f} m")
     print(f"  足がボールに触れた (接触センサ): 全体 {100.0 * sum(r['foot'] for r in rows) / n:5.1f}%, 奪取のみ {100.0 * sum(r['foot'] for r in stolen) / max(len(stolen), 1):5.1f}%")
     print(f"  胴体が障害物に 0.25 m 以内まで接近: 全体 {100.0 * sum(r['bumped'] for r in rows) / n:5.1f}%")
+    print(f"  胴体が障害物に接触 (センサ): 全体 {100.0 * sum(r['trunk'] for r in rows) / n:5.1f}%, 奪取のみ {100.0 * sum(r['trunk'] for r in stolen) / max(len(stolen), 1):5.1f}%")
     table("終了時の robot-obstacle 距離 [m] (≈ 初期距離の目安)", "dist0", [1.0, 1.5, 2.0, 2.5], rows)
     table("episode time at end [s]", "t", [1.0, 2.0, 3.0, 5.0], rows)
+    table("|ball side angle| at start [deg] (0 = robot side, 180 = behind the obstacle)", "side0", [45.0, 90.0, 135.0], rows)
     if term.cfg.directed:
         table(f"target direction (bins = {', '.join(DIRS)})", "dir", [0.5, 1.5, 2.5], rows)
     env.close()

@@ -714,7 +714,11 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
     op = st.obstacle.data.root_pos_w[env_idx, :3].detach().cpu().numpy().astype(np.float32)
     r_obs = float(cfg.obstacle_radius)
     cyl = trimesh.creation.cylinder(radius=r_obs, height=float(cfg.obstacle_height), sections=24)
-    cyl.visual.face_colors = (200, 50, 50, 255)
+    trunk_hit = False
+    if "contact_trunk_obstacle" in env.unwrapped.scene.sensors:
+        f = env.unwrapped.scene["contact_trunk_obstacle"].data.force_matrix_w[env_idx]
+        trunk_hit = bool(torch.norm(f, dim=-1).max() > 1.0)
+    cyl.visual.face_colors = (255, 140, 0, 255) if trunk_hit else (200, 50, 50, 255)
     server.scene.add_mesh_trimesh("/steal/obstacle", cyl, position=op)
     th = np.linspace(0.0, 2.0 * math.pi, 49)
     ring = lambda r: np.stack([op[0] + r * np.cos(th), op[1] + r * np.sin(th), np.full_like(th, z)], axis=1).astype(np.float32)
