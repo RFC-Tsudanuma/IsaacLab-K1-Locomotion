@@ -320,6 +320,7 @@ def setup_viser(env, urdf_path: str, port: int):
             gui_st_cnt = server.gui.add_text("stolen / lost / no_foot / fell", initial_value="0 / 0 / 0 / 0", disabled=True)
             gui_st_state = server.gui.add_text("state", initial_value="approach", disabled=True)
             gui_st_dir = server.gui.add_dropdown("target dir (next placement)", options=("random", "front", "left", "back", "right"), initial_value="random")
+            gui_st_side = server.gui.add_number("ball side at start [deg] (180 = behind)", initial_value=0.0, disabled=True)
             gui_st_body = server.gui.add_number("body-ball [m]", initial_value=0.0, disabled=True)
             gui_st_foot = server.gui.add_number("foot-ball [m]", initial_value=0.0, disabled=True)
             gui_st_br = server.gui.add_number("ball-obstacle [m]", initial_value=0.0, disabled=True)
@@ -342,6 +343,7 @@ def setup_viser(env, urdf_path: str, port: int):
             "st_counts": [0, 0, 0, 0],
             "st_state": gui_st_state,
             "st_dir": gui_st_dir,
+            "st_side": gui_st_side,
             "st_body": gui_st_body,
             "st_foot": gui_st_foot,
             "st_br": gui_st_br,
@@ -677,7 +679,8 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
     """Draw the steal task state for one env.
 
     Scene contents:
-      * red cylinder               = obstacle (enemy); thin red circle = contact threshold (lost when the ball enters)
+      * red cylinder               = obstacle (enemy), orange while the trunk touches it; thin red circle = contact
+                                     threshold (lost when the ball enters)
       * orange / green circle      = steal radius around the obstacle (green once the ball is outside = stolen latch)
       * white sphere + grey trace  = ball and its trajectory this episode; white ray = ball velocity
       * yellow sphere              = ball turns yellow while a foot touches it (contact sensor)
@@ -772,6 +775,7 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
         position=np.array([base[0], base[1], base[2] + 0.6], dtype=np.float32),
     )
     gui["st_state"].value = state
+    gui["st_side"].value = round(math.degrees(abs(float(st.ball_side0[env_idx]))), 0)
     gui["st_body"].value = round(float(st.body_ball_dist()[env_idx]), 2)
     gui["st_foot"].value = round(float(st.foot_ball_dist()[env_idx]), 2)
     gui["st_br"].value = round(float(st.ball_obstacle_dist()[env_idx]), 2)
