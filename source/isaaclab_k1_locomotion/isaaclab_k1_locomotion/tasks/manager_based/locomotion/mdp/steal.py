@@ -5,7 +5,7 @@
 
 """ボール奪取タスク (Isaac-Steal-K1) の MDP 部品 (2026-11-03)。
 
-円柱障害物 (敵ロボット想定) の手前 ``ball_radius_range`` 以内に静止ボールを置き、凍結歩行 expert +
+円柱障害物 (敵ロボット想定) の周囲 ``ball_radius_range`` 以内 (``ball_side_angle`` の弧) に静止ボールを置き、凍結歩行 expert +
 関節残差の方策 (agents/steal_policy.py) でボールへ近づき、足で触れて敵から離す。
 :class:`StealCommand` が各エピソード開始時に障害物とボールを配置し、
 
@@ -239,7 +239,7 @@ class StealCommandCfg(CommandTermCfg):
     ball_radius_range: tuple[float, float] = (0.0, 0.5)
     """障害物中心からボールまでの距離 [m]。下限は障害物 + ボール半径 + margin に切り上げる。"""
     ball_side_angle: float = math.radians(75.0)
-    """ボールの方位 (障害物→ロボット方向からの角度) の範囲 ±[rad]。手前側だけに置く。"""
+    """ボールの方位 (障害物→ロボット方向からの角度) の範囲 ±[rad]。π で全周 (裏側も含む)。"""
 
     touch_margin: float = 0.02
     """ボール中心と障害物中心の距離がこの余裕以内なら「敵に触れた」= 失敗。"""

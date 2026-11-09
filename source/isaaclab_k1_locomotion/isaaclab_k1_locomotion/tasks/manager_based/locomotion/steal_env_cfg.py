@@ -5,7 +5,7 @@
 
 """ボール奪取環境 (Isaac-Steal-K1-v0, 2026-11-03)。
 
-円柱障害物 (敵ロボット想定) の手前 50 cm 以内に置かれた静止ボールへ近づき、足で触れて
+円柱障害物 (敵ロボット想定) の周囲 50 cm 以内 (全周、裏側も含む) に置かれた静止ボールへ近づき、足で触れて
 障害物に当てない方向へ動かす (敵の圏外 = 中心から 0.8 m へ出す) 方策を、凍結歩行 expert
 (frozen_policies/best_walk) + 関節残差で学習する。構成は Block (block_env_cfg.py) に準じる:
 
@@ -109,7 +109,8 @@ class K1StealObservationsCfg(K1FlatObservationsCfg):
 @configclass
 class K1StealCommandsCfg:
     base_velocity = ExternalVelocityCommandCfg(asset_name="robot", action_name="walk_command")
-    steal = StealCommandCfg(asset_name="robot", obstacle_radius=OBSTACLE_RADIUS, obstacle_height=OBSTACLE_HEIGHT)
+    # ボールは障害物の全周 (±180°) に置く。v5 系 (best_steal model_11000) はロボット側 ±75° で学習した (2026-11-09 変更)
+    steal = StealCommandCfg(asset_name="robot", obstacle_radius=OBSTACLE_RADIUS, obstacle_height=OBSTACLE_HEIGHT, ball_side_angle=math.pi)
 
 
 @configclass
