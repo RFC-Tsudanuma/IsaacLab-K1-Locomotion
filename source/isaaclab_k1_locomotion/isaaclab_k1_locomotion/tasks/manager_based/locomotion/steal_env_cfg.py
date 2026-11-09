@@ -232,6 +232,8 @@ class K1StealDirObservationsCfg(K1FlatObservationsCfg):
 @configclass
 class K1StealDirRewardsCfg(K1StealRewardsCfg):
     ball_away_speed = None
+    # 360° 学習の v3 (2026-11-09) と同じ: 足をボールへ寄せる shaping を 3 倍 (裏側での転倒が減った)
+    foot_near_ball = RewTerm(func=foot_near_ball, weight=3.0, params={"std": 0.2})
     ball_target_speed = RewTerm(func=ball_target_speed, weight=2.0, params={"max_speed": 3.0})
     wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-20.0, params={"term_keys": "ball_wrong_dir"})
 
