@@ -68,6 +68,7 @@ class StealCommand(CommandTerm):
         self.target_idx = torch.zeros(n, dtype=torch.long, device=self.device)  # 0 前 / 1 左 / 2 後 / 3 右 (初期進行方向基準)
         self.ball_start_xy = torch.zeros(n, 2, device=self.device)
         self.ball_side0 = torch.zeros(n, device=self.device)  # 配置時のボール方位 (障害物→ロボット方向からの角度) [rad] 評価用
+        self.bearing0 = torch.zeros(n, device=self.device)  # 配置時の敵の方位 (ロボット初期向きからの角度) [rad] 評価用
         for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal", "wrong_dir"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
@@ -168,7 +169,9 @@ class StealCommand(CommandTerm):
 
         # 障害物: ロボット前方 ±bearing、距離 distance_range
         dist = torch.empty(n, device=dev).uniform_(*cfg.distance_range)
-        bearing = heading + torch.empty(n, device=dev).uniform_(-cfg.bearing, cfg.bearing)
+        rel_bearing = torch.empty(n, device=dev).uniform_(-cfg.bearing, cfg.bearing)
+        self.bearing0[env_ids] = rel_bearing
+        bearing = heading + rel_bearing
         obs_xy = pos + dist.unsqueeze(1) * torch.stack([torch.cos(bearing), torch.sin(bearing)], dim=1)
         pose = torch.zeros(n, 7, device=dev)
         pose[:, :2] = obs_xy

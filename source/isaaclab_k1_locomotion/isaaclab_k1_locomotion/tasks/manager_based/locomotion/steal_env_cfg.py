@@ -121,7 +121,14 @@ class K1StealObservationsCfg(K1FlatObservationsCfg):
 class K1StealCommandsCfg:
     base_velocity = ExternalVelocityCommandCfg(asset_name="robot", action_name="walk_command")
     # ボールは障害物の全周 (±180°) に置く。v5 系 (best_steal model_11000) はロボット側 ±75° で学習した (2026-11-09 変更)
-    steal = StealCommandCfg(asset_name="robot", obstacle_radius=OBSTACLE_RADIUS, obstacle_height=OBSTACLE_HEIGHT, ball_side_angle=math.pi)
+    # 敵の方位もロボットの初期向きから全周 (±180°、背を向けた状態を含む)。best_steal_dir model_21997 までは ±45° (2026-11-10 変更)
+    steal = StealCommandCfg(
+        asset_name="robot",
+        obstacle_radius=OBSTACLE_RADIUS,
+        obstacle_height=OBSTACLE_HEIGHT,
+        ball_side_angle=math.pi,
+        bearing=math.pi,
+    )
 
 
 @configclass
@@ -234,7 +241,8 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     ball_away_speed = None
     # 360° 学習の v3 (2026-11-09) と同じ: 足をボールへ寄せる shaping を 3 倍 (裏側での転倒が減った)
     foot_near_ball = RewTerm(func=foot_near_ball, weight=3.0, params={"std": 0.2})
-    ball_target_speed = RewTerm(func=ball_target_speed, weight=2.0, params={"max_speed": 3.0})
+    # 2.0 より 5.0 の方が良かった (2026-11-10: 85.6% vs 82.4%、best_steal_dir は 5.0 で学習)
+    ball_target_speed = RewTerm(func=ball_target_speed, weight=5.0, params={"max_speed": 3.0})
     wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-20.0, params={"term_keys": "ball_wrong_dir"})
 
 

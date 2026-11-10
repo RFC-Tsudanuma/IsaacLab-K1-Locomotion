@@ -26,6 +26,7 @@ parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--steps", type=int, default=1500, help="評価 step 数 (50 Hz)")
 parser.add_argument("--zero_policy", action="store_true", help="診断用: 残差 0・コマンド 0 (歩行 expert の立位) で評価")
 parser.add_argument("--stochastic", action="store_true", help="平均ではなくサンプルした行動で評価 (学習時と同条件)")
+parser.add_argument("--diag_back", action="store_true", help="診断: 敵が背後 (|方位|>135°) の開始 1 s の方策出力 (コマンド・残差) を集計")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -85,6 +86,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     dt = raw_env.step_dt
 
     rows = []
+    diag = []
     sensors = [raw_env.scene[n] for n in ("contact_balls_right", "contact_balls_left")]
     foot_touch = torch.zeros(env.num_envs, dtype=torch.bool, device=agent_cfg.device)  # 足がボールに触れた (接触センサ)
     bumped = torch.zeros_like(foot_touch)  # 胴体が障害物に接近しすぎた (敵にぶつかった目安)
@@ -97,9 +99,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             dist0 = torch.norm(term.obstacle_xy() - raw_env.scene["robot"].data.root_pos_w[:, :2], dim=1)
             ball_r = term.ball_obstacle_dist().clone()
             side0 = term.ball_side0.abs().rad2deg()
+            bear0 = term.bearing0.abs().rad2deg()
             t_ep = (raw_env.episode_length_buf + 1).float() * dt
             t_steal = term.stolen_at.clone()
-            obs, _, dones, _ = env.step(policy(obs))
+            act = policy(obs)
+            if args_cli.diag_back:
+                early = (raw_env.episode_length_buf < 50) & (term.bearing0.abs() > 2.356)
+                if early.any():
+                    cmd = act[early, 12:15]
+                    res = act[early, 15:27]
+                    diag.append(torch.cat([cmd.abs().mean(0), cmd.mean(0), res.abs().amax(1).mean().view(1)]).cpu())
+            obs, _, dones, _ = env.step(act)
             for sen in sensors:
                 foot_touch |= torch.norm(sen.data.force_matrix_w, dim=-1).amax(dim=(1, 2)) > 1.0
             bumped |= torch.norm(term.obstacle_xy() - raw_env.scene["robot"].data.root_pos_w[:, :2], dim=1) < term.cfg.obstacle_radius + 0.25
@@ -122,7 +132,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 rows.append({"t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]], "t_steal": t_steal[i].item(),
                              "dist0": dist0[i].item(), "ball_r": ball_r[i].item(), "touched": t_steal[i].item() >= 0.0,
                              "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(term.target_idx[i]),
-                             "side0": side0[i].item(), "trunk": trunk_hit[i].item()})
+                             "side0": side0[i].item(), "trunk": trunk_hit[i].item(), "bear0": bear0[i].item()})
             foot_touch[d] = False
             bumped[d] = False
             trunk_hit[d] = False
@@ -142,8 +152,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     table("終了時の robot-obstacle 距離 [m] (≈ 初期距離の目安)", "dist0", [1.0, 1.5, 2.0, 2.5], rows)
     table("episode time at end [s]", "t", [1.0, 2.0, 3.0, 5.0], rows)
     table("|ball side angle| at start [deg] (0 = robot side, 180 = behind the obstacle)", "side0", [45.0, 90.0, 135.0], rows)
+    table("|opponent bearing| at start [deg] (0 = in front of the robot, 180 = behind it)", "bear0", [45.0, 90.0, 135.0], rows)
     if term.cfg.directed:
         table(f"target direction (bins = {', '.join(DIRS)})", "dir", [0.5, 1.5, 2.5], rows)
+    if diag:
+        d = torch.stack(diag).mean(0).tolist()
+        print(f"\n  [diag_back] 背後スタートの開始 1 s: |cmd| mean vx {d[0]:.2f} vy {d[1]:.2f} wz {d[2]:.2f} / "
+              f"cmd mean vx {d[3]:+.2f} vy {d[4]:+.2f} wz {d[5]:+.2f} / |residual| max mean {d[6]:.2f}")
     env.close()
 
 
