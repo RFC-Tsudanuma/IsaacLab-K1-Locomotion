@@ -80,22 +80,26 @@ class BlockActorCritic(WaypointActorCritic):
         self.num_env_actions = int(num_actions)
         self.residual_scale = float(residual_scale)
 
-        heads = {}
+        heads, frame_dims = {}, {}
         for set_name in ("policy", "critic"):
             groups = obs_groups[set_name]
             ball_dim = obs[groups[-1]].shape[-1]
-            if ball_dim != ball_history * BALL_DIM:
+            # 1 フレームの次元は観測から決める: 真値は BALL_DIM (位置 + 速度)、ノイズ側は pos_only なら 2
+            if ball_dim % ball_history != 0 or ball_dim // ball_history not in (2, BALL_DIM):
                 raise ValueError(
-                    f"obs_groups['{set_name}'] の末尾グループ '{groups[-1]}' はボール履歴 ({ball_history} × {BALL_DIM}"
-                    f" = {ball_history * BALL_DIM}) のはずですが {ball_dim} 次元です。"
+                    f"obs_groups['{set_name}'] の末尾グループ '{groups[-1]}' はボール履歴 ({ball_history} × 2 or {BALL_DIM})"
+                    f" のはずですが {ball_dim} 次元です。"
                 )
+            frame_dims[set_name] = ball_dim // ball_history
             heads[set_name] = sum(obs[g].shape[-1] for g in groups[:-1])
 
-        def encoder():
-            return CausalTransformerEncoder(BALL_DIM, ball_history, d_model, nhead, num_layers, latent_dim)
+        def encoder(in_dim):
+            return CausalTransformerEncoder(in_dim, ball_history, d_model, nhead, num_layers, latent_dim)
 
-        self.actor = BlockHead(heads["policy"], ball_history, encoder(), self.num_policy_actions, list(actor_hidden_dims), activation)
-        self.critic = BlockHead(heads["critic"], ball_history, encoder(), 1, list(critic_hidden_dims), activation)
+        self.actor = BlockHead(
+            heads["policy"], ball_history, encoder(frame_dims["policy"]), self.num_policy_actions, list(actor_hidden_dims), activation
+        )
+        self.critic = BlockHead(heads["critic"], ball_history, encoder(frame_dims["critic"]), 1, list(critic_hidden_dims), activation)
         if noise_std_type == "scalar":
             self.std = nn.Parameter(init_noise_std * torch.ones(self.num_policy_actions))
         else:

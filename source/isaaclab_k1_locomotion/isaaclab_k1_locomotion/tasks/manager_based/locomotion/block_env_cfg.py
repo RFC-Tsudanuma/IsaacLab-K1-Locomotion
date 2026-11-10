@@ -34,6 +34,7 @@ import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
@@ -50,13 +51,19 @@ from .mdp.block import (
     BALL_HISTORY,
     JOINT_DIM,
     BallLaunchCommandCfg,
+    BallSpeedCurriculum,
     DelayedBallObs,
+    TouchVelocityKill,
     ball_conceded,
+    ball_held_at_feet,
+    ball_speed_after_touch,
     ball_resolved,
     ball_state_rel,
+    ball_stopped,
     body_forward_l2,
     body_on_intercept,
     foot_on_intercept,
+    foot_yield_on_contact,
     joint_residual_l2,
 )
 from .mdp.waypoint import ExternalVelocityCommandCfg, WalkCommandActionCfg, walk_command_rate_l2
@@ -172,11 +179,21 @@ class K1BlockRewardsCfg:
     blocked = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     conceded = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": "ball_conceded"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
+    # 阻止終了時にボールが足元にあるほど blocked に上乗せ (v19d/e で 100〜200: 足元保持 +1pt、失点 +2〜3pt で不採用 → 0)
+    stopped_bonus = RewTerm(func=ball_stopped, weight=0.0, params={"std": 0.5})
     # shaping: ボール接近中、予測到達点 (ライン上の y) に足を置く / 胴体を横に合わせる
     foot_on_intercept = RewTerm(func=foot_on_intercept, weight=0.5, params={"std": 0.15})
     body_on_intercept = RewTerm(func=body_on_intercept, weight=0.5, params={"std": 0.3})
     # ラインより前へ出る (ボールへ突っ込む) 動きは減点: ライン上で横に動いて止める方針 (2026-11-02 ユーザー指示)
     body_forward_l2 = RewTerm(func=body_forward_l2, weight=-2.0, params={"margin": 0.2})
+    # 阻止後はボールを足元に遅く留めるほど加点 (保持 2.5 s で最大 +1 実効 = blocked の半分)
+    ball_held_at_feet = RewTerm(func=ball_held_at_feet, weight=0.4, params={"pos_std": 0.3, "vel_std": 0.5})
+    # 弾いた後のボール速度は密に罰する (1.5 m/s で弾いて保持 2.5 s → −0.75 実効、上限 −1。−0.4 は失点率が戻らず −0.2 を採用、v17f)
+    ball_speed_after_touch = RewTerm(func=ball_speed_after_touch, weight=-0.2, params={"max_speed": 2.0})
+    # 接触フレームでボールの速さを落とした分を加点 (JOGA の touch velocity kill)。v20 (10) / v20b (40) とも弾き出し速度は変わらず → 0 (2026-11-10)
+    touch_velocity_kill = RewTerm(func=TouchVelocityKill, weight=0.0, params={"dist": 0.35})
+    # 接触時に足をボールの進行方向へ引くと加点 (v18b/d, v19b: 2.0 は無効、5〜10 は「よける」になり失点 30〜60% → 0)
+    foot_yield_on_contact = RewTerm(func=foot_yield_on_contact, weight=0.0, params={"dist": 0.3, "min_speed": 0.3})
     # 事前分布 (歩行 expert) からのずれと、その変化率・コマンド変化率は軽く抑える
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
     joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})
@@ -239,3 +256,78 @@ class K1BlockEnvCfg_PLAY(K1BlockEnvCfg):
         self.observations.block_policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+# ---------------------------------------------------------------------------
+# 横移動を速くした変種 (2026-11-04 ユーザー提案): 歩行 expert の学習範囲 (vy ±0.9, 1.8→2.0 Hz) の外だが、
+# expert に vy 1.5 m/s + 2.3 Hz を与えても転倒せず横速度が 0.70 → 0.92 m/s に伸びた (scratchpad の固定コマンド試験)。
+# 位相周波数は ||cmd_xy|| に対する線形で 1.0 m/s 以下 1.8 Hz、1.5 m/s で 2.3 Hz。コマンド上限は
+# K1BlockFastLateralPPORunnerCfg 側で (1.5, 1.5, 2.0) (vx も 1.5 に下げ、軸方向の飽和で 2.3 Hz 止まりにする)。
+# ---------------------------------------------------------------------------
+@configclass
+class K1BlockFastLateralEnvCfg(K1BlockEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        fast = {"low_speed": 1.0, "high_speed": 1.5, "low_freq": 1.8, "high_freq": 2.3}
+        # 位相の積分は 1 step 内で最初に gait_phase を評価したグループの params で進む (policy が先頭) が、
+        # 4 グループとも同じ値にして齟齬を無くす
+        for group in (self.observations.policy, self.observations.critic, self.observations.block_policy, self.observations.block_critic):
+            group.gait_phase.params.update(fast)
+
+
+@configclass
+class K1BlockFastLateralEnvCfg_PLAY(K1BlockFastLateralEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.scene.num_envs = 32
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.observations.block_policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1BlockFastRawPosEnvCfg(K1BlockFastLateralEnvCfg):
+    """実機の入力に合わせ、actor のボール位置は生の検出 (遅延 0.03〜0.08 s)、速度はフィルタ越し (0.16〜0.24 s) にする (2026-11-10)。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.08)
+
+
+@configclass
+class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.08)
+
+
+@configclass
+class K1BlockCurriculumEnvCfg(K1BlockFastLateralEnvCfg):
+    """球速カリキュラム: 上限 2 m/s から始め、「阻止して足元に保持」の割合が 25% を超えるたびに 0.5 m/s ずつ 8 m/s まで上げる。"""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.curriculum.ball_speed = CurrTerm(
+            func=BallSpeedCurriculum, params={"start_speed": 2.0, "final_speed": 8.0, "step": 0.5, "threshold": 0.25}
+        )
+
+
+# ---------------------------------------------------------------------------
+# 観測アブレーション (2026-11-04 ユーザー提案): actor のボール観測を遅延 + ノイズ付きの **位置 xy のみ** にする。
+# 実機の速度推定は遅延 ≈ 0.6 s あり、速度を観測に入れても sim2real しないため。critic は真値 (位置 + 速度) のまま、
+# ノイズ側 encoder には履歴から速度相当を latent に落とすことを期待する (latent 蒸留で真値 latent に寄せる)。
+# ---------------------------------------------------------------------------
+@configclass
+class K1BlockPosOnlyEnvCfg(K1BlockEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.observations.ball_noisy.ball.params["pos_only"] = True
+
+
+@configclass
+class K1BlockPosOnlyEnvCfg_PLAY(K1BlockEnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.observations.ball_noisy.ball.params["pos_only"] = True

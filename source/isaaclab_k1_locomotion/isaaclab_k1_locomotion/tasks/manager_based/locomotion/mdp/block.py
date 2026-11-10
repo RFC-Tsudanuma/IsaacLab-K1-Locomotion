@@ -81,6 +81,7 @@ class DelayedBallObs(ManagerTermBase):
         self._buf = torch.zeros(n, self._len, BALL_DIM, device=dev)
         self._ptr = 0
         self._delay = torch.zeros(n, dtype=torch.long, device=dev)
+        self._pos_delay = torch.zeros(n, dtype=torch.long, device=dev)
         self._acc = torch.zeros(n, device=dev)
         self._out = torch.zeros(n, BALL_DIM, device=dev)
         self._fresh = torch.ones(n, dtype=torch.bool, device=dev)
@@ -90,9 +91,10 @@ class DelayedBallObs(ManagerTermBase):
     def reset(self, env_ids: Sequence[int] | None = None):
         if env_ids is None:
             env_ids = slice(None)
-        lo, hi = self.cfg.params["delay_range"]
-        delay = torch.empty_like(self._acc[env_ids]).uniform_(lo, hi) / self._env.step_dt
-        self._delay[env_ids] = delay.round().long().clamp(0, self._len - 1)
+        p = self.cfg.params
+        for buf, rng in ((self._delay, p["delay_range"]), (self._pos_delay, p.get("pos_delay_range") or p["delay_range"])):
+            delay = torch.empty_like(self._acc[env_ids]).uniform_(*rng) / self._env.step_dt
+            buf[env_ids] = delay.round().long().clamp(0, self._len - 1)
         self._acc[env_ids] = 0.0
         self._fresh[env_ids] = True
 
@@ -111,7 +113,13 @@ class DelayedBallObs(ManagerTermBase):
         vel_noise: float = 1.0,
         vel_noise_rel: float = 0.3,
         drop_prob: float = 0.1,
+        pos_only: bool = False,
+        pos_delay_range: tuple[float, float] | None = None,
     ) -> torch.Tensor:
+        """``pos_only`` で位置 xy だけを返す (実機の速度推定は遅延 ≈ 0.6 s で使えないため、速度は encoder に履歴から推定させる)。
+
+        ``pos_delay_range`` を与えると位置だけ別の遅延にする (実機: 位置は生の検出 0.03〜0.08 s、速度はフィルタ越し 0.16〜0.24 s)。
+        None なら位置も ``delay_range``。"""
         true = ball_state_rel(env)
         fresh = self._fresh
         if fresh.any():
@@ -121,6 +129,9 @@ class DelayedBallObs(ManagerTermBase):
             self._fresh[:] = False
         self._buf[:, self._ptr] = true
         delayed = self._buf[self._env_idx, (self._ptr - self._delay) % self._len]
+        if pos_delay_range is not None:
+            delayed = delayed.clone()
+            delayed[:, :2] = self._buf[self._env_idx, (self._ptr - self._pos_delay) % self._len, :2]
         self._ptr = (self._ptr + 1) % self._len
 
         # カメラ周期で新フレーム到着 (検出欠けは到着扱いにしない → 前回値を保持)
@@ -129,7 +140,7 @@ class DelayedBallObs(ManagerTermBase):
         self._acc -= new_frame.float()
         new_frame &= torch.rand_like(self._acc) >= drop_prob
         self._out = torch.where(new_frame.unsqueeze(1), self._noise(delayed, pos_noise, vel_noise, vel_noise_rel), self._out)
-        return self._out.clone()
+        return self._out[:, :2].clone() if pos_only else self._out.clone()
 
 
 # ---------------------------------------------------------------------------
@@ -369,6 +380,128 @@ def body_forward_l2(env: "ManagerBasedRLEnv", margin: float = 0.2, command_name:
     """胴体がゴールラインより margin [m] 以上前に出た分の二乗 (ボールへ突っ込む動きを抑える)。"""
     body_x, _ = env.command_manager.get_term(command_name).body_line_xy()
     return torch.square((body_x - margin).clamp(min=0.0))
+
+
+def ball_held_at_feet(
+    env: "ManagerBasedRLEnv", pos_std: float = 0.3, vel_std: float = 0.5, command_name: str = "ball_launch"
+) -> torch.Tensor:
+    """阻止後 (最初の阻止条件を満たしてから終了まで)、ボールが最寄り足の近くで遅いほど高い [0, 1]。
+
+    阻止の 3 種 (幅外 / 前へ弾く / 止めた) はどれも同じ ``blocked`` 報酬なので、これで「弾き飛ばすより
+    足元に止める」方向へ寄せる (2026-11-07 ユーザー指示)。阻止ラッチ後に限るのは、ラッチ前に遅い
+    ボールを足元で転がし続けて稼ぐ抜け道を塞ぐため (ラッチ後は resolve_hold_s で必ず終了する)。
+    """
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    speed = torch.norm(term.ball.data.root_lin_vel_w[:, :2], dim=1)
+    return (term.resolved_at >= 0.0).float() * torch.exp(-torch.square(_ball_feet_dist(term) / pos_std) - torch.square(speed / vel_std))
+
+
+def ball_speed_after_touch(env: "ManagerBasedRLEnv", max_speed: float = 2.0, command_name: str = "ball_launch") -> torch.Tensor:
+    """触った後 (ラインへ向かう速度が消えた後) のボール速度 [m/s] (max_speed でクリップ)。負の重みで「弾き飛ばすほど損」。
+
+    `ball_held_at_feet` だけだと止めた事例が稀で勾配がほぼ出なかった (v17a/b: Episode_Reward ≈ 0.001) ので、
+    弾き返す速度に比例する密な罰を足す。接近中 (vx < −0.1) は制御できないので除外。ライン後方でも vx < −0.1 なら
+    除外する (v17c/d で「x ≤ 0 も罰」としたら幅外に抜けた未接触の球まで罰され、失点率が 13 → 22% に悪化した)。
+    クリップは、速い球を強く弾いた阻止が失点 (−4) より損にならないための上限 (2 m/s × 2.5 s × 0.4 = −2)。
+    """
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    _, _, vx, _ = term.ball_line_state()
+    speed = torch.norm(term.ball.data.root_lin_vel_w[:, :2], dim=1).clamp(max=max_speed)
+    return (vx >= -0.1).float() * speed
+
+
+def _ball_feet_dist(term: BallLaunchCommand) -> torch.Tensor:
+    """ボールと最寄り足の xy 距離 (N,)。"""
+    feet = term.robot.data.body_link_pos_w[:, term._feet_idx, :2]
+    return torch.norm(feet - term.ball.data.root_pos_w[:, :2].unsqueeze(1), dim=-1).min(dim=1).values
+
+
+def ball_stopped(env: "ManagerBasedRLEnv", std: float = 0.5, command_name: str = "ball_launch") -> torch.Tensor:
+    """阻止 (終了) の瞬間に、ボールが最寄り足に近いほど高い終端ボーナス [0, 1] (遠くへ弾いた阻止は 0)。
+
+    内訳 kind==3「止めた」を使わないのは、弾いた直後 vx > 0.3 で「前へ弾いた」が先にラッチされ、その後足元で
+    止まっても kind が変わらないため (v18a/c で止めた割合が 15% で頭打ちになった原因)。"""
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    return term.resolved().float() * torch.exp(-torch.square(_ball_feet_dist(term) / std))
+
+
+class TouchVelocityKill(ManagerTermBase):
+    """接触フレームでボールの xy 速さが落ちた分 [m/s] を加点 (JOGA の touch velocity kill)。
+
+    接触は「最寄り足から dist 以内」で判定する (1 step での速さの減少は接触以外では起きない: 減衰は 0.2%/step)。
+    蹴り返すほど減少量は小さく、殺すほど大きい。足元で止まる結果を要求しないので失点回避と競合しにくい。
+    """
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.term: BallLaunchCommand = env.command_manager.get_term(cfg.params.get("command_name", "ball_launch"))
+        self.prev_speed = torch.zeros(env.num_envs, device=env.device)
+
+    def reset(self, env_ids: Sequence[int] | None = None):
+        if env_ids is None:
+            env_ids = slice(None)
+        # 射出直後の速さを入れておく (reset 直後の 1 step で射出速度ぶんの減少が立たないように)
+        self.prev_speed[env_ids] = torch.norm(self.term.ball.data.root_lin_vel_w[env_ids, :2], dim=1)
+
+    def __call__(self, env: "ManagerBasedRLEnv", dist: float = 0.35, command_name: str = "ball_launch") -> torch.Tensor:
+        speed = torch.norm(self.term.ball.data.root_lin_vel_w[:, :2], dim=1)
+        drop = (self.prev_speed - speed).clamp(min=0.0)
+        self.prev_speed = speed
+        return (_ball_feet_dist(self.term) < dist).float() * drop
+
+
+def foot_yield_on_contact(
+    env: "ManagerBasedRLEnv", dist: float = 0.3, min_speed: float = 0.3, command_name: str = "ball_launch"
+) -> torch.Tensor:
+    """接触直前〜接触中 (最寄り足とボールが dist 以内)、足がボールの進行方向へ動く (引いて勢いを殺す) と正、
+    向かって蹴ると負 [−1, 1]。弾き飛ばしを減らして足元に止めるための shaping (2026-11-08 ユーザー提案)。"""
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    ball_p = term.ball.data.root_pos_w[:, :2]
+    ball_v = term.ball.data.root_lin_vel_w[:, :2]
+    feet_p = term.robot.data.body_link_pos_w[:, term._feet_idx, :2]
+    feet_v = term.robot.data.body_link_lin_vel_w[:, term._feet_idx, :2]
+    d, nearest = torch.norm(feet_p - ball_p.unsqueeze(1), dim=-1).min(dim=1)
+    foot_v = feet_v[torch.arange(feet_v.shape[0], device=feet_v.device), nearest]
+    speed = torch.norm(ball_v, dim=1)
+    along = torch.sum(foot_v * ball_v, dim=1) / speed.clamp(min=1e-6)
+    return ((d < dist) & (speed > min_speed)).float() * along.clamp(-1.0, 1.0)
+
+
+class BallSpeedCurriculum(ManagerTermBase):
+    """球速カリキュラム: 遅い球 (上限 start_speed) から始め、終了エピソードのうち「阻止して終了時にボールが足元
+    (held_dist 以内、held_speed 未満)」の割合の EMA が threshold を超えるたびに上限を step 上げる (final_speed まで)。
+    curriculum_manager.compute は command_manager.reset より前に呼ばれるので、終了 step の状態がそのまま読める。"""
+
+    def __init__(self, cfg, env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        p = cfg.params
+        self.term: BallLaunchCommand = env.command_manager.get_term(p.get("command_name", "ball_launch"))
+        self.max_speed = float(p.get("start_speed", 2.0))
+        self.term.cfg.speed_range = (self.term.cfg.speed_range[0], self.max_speed)
+        self.ema = 0.0
+
+    def __call__(
+        self,
+        env: "ManagerBasedRLEnv",
+        env_ids: Sequence[int],
+        start_speed: float = 2.0,
+        final_speed: float = 8.0,
+        step: float = 0.5,
+        threshold: float = 0.25,
+        ema: float = 0.995,
+        held_dist: float = 1.0,
+        held_speed: float = 0.3,
+        command_name: str = "ball_launch",
+    ) -> torch.Tensor:
+        if len(env_ids) > 0:
+            speed = torch.norm(self.term.ball.data.root_lin_vel_w[:, :2], dim=1)
+            held = self.term.resolved() & (_ball_feet_dist(self.term) < held_dist) & (speed < held_speed)
+            self.ema = ema * self.ema + (1.0 - ema) * held[env_ids].float().mean().item()
+            if self.ema > threshold and self.max_speed < final_speed:
+                self.max_speed = min(self.max_speed + step, final_speed)
+                self.term.cfg.speed_range = (self.term.cfg.speed_range[0], self.max_speed)
+                self.ema = 0.0
+        return torch.tensor(self.max_speed, device=self.device)
 
 
 def joint_residual_l2(env: "ManagerBasedRLEnv", action_name: str = "joint_residual") -> torch.Tensor:

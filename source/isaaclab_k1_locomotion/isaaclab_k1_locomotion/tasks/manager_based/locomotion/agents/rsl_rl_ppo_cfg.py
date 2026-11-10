@@ -345,6 +345,14 @@ class K1BlockPPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
 
 @configclass
+class K1BlockFastLateralPPORunnerCfg(K1BlockPPORunnerCfg):
+    """横移動を速くした阻止方策 (Isaac-Block-K1-Fast-v0): コマンド上限 (1.5, 1.5, 2.0)。環境側は
+    K1BlockFastLateralEnvCfg (1.5 m/s で 2.3 Hz)。v10 の checkpoint から resume して使う。"""
+
+    policy = RslRlBlockActorCriticCfg(command_limits=(1.5, 1.5, 2.0))
+
+
+@configclass
 class K1StealPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """凍結歩行 expert を事前分布にしたボール奪取方策の学習 (Isaac-Steal-K1-v0)。
 

@@ -342,6 +342,67 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Block-K1-PosOnly-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.block_env_cfg:K1BlockPosOnlyEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Block-K1-PosOnly-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.block_env_cfg:K1BlockPosOnlyEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Block-K1-Fast-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.block_env_cfg:K1BlockFastLateralEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockFastLateralPPORunnerCfg",
+    },
+)
+
+for _suffix, _cfg in (("", "K1BlockFastRawPosEnvCfg"), ("-Play", "K1BlockFastRawPosEnvCfg_PLAY")):
+    gym.register(
+        id=f"Isaac-Block-K1-FastRawPos{_suffix}-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.block_env_cfg:{_cfg}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockFastLateralPPORunnerCfg",
+        },
+    )
+
+gym.register(
+    id="Isaac-Block-K1-Curr-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.block_env_cfg:K1BlockCurriculumEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockFastLateralPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-Block-K1-Fast-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.block_env_cfg:K1BlockFastLateralEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1BlockFastLateralPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Steal-K1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

@@ -86,6 +86,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     rows = []
     logged = {k: [] for k in ("conceded", "resolved") + REASONS}  # 学習ログと同じ Metrics/ の値 (reset 呼び出しごとの平均)
     obs = env.get_observations()
+    # 弾き出し速度: 最初に足 (xy 0.35 m 以内) に触れた後のボール速さの最大値 (接触の次 step から)
+    touched_foot = torch.zeros(env.num_envs, dtype=torch.bool, device=raw_env.device)
+    peak_after = torch.zeros(env.num_envs, device=raw_env.device)
     with torch.inference_mode():
         for step in range(args_cli.steps):
             speed = term.metrics["launch_speed"].clone()
@@ -97,6 +100,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             ball_w = raw_env.scene["soccer_ball"].data.root_pos_w
             ball_z = ball_w[:, 2] - raw_env.scene.env_origins[:, 2]
             feet_d = torch.norm(robot.data.body_link_pos_w[:, term._feet_idx, :] - ball_w.unsqueeze(1), dim=-1).min(dim=1).values
+            ball_v = torch.norm(raw_env.scene["soccer_ball"].data.root_lin_vel_w[:, :2], dim=1)
+            peak_after = torch.where(touched_foot, torch.maximum(peak_after, ball_v), peak_after)
+            feet_d_xy = torch.norm(robot.data.body_link_pos_w[:, term._feet_idx, :2] - ball_w[:, :2].unsqueeze(1), dim=-1).min(dim=1).values
+            touched_foot |= feet_d_xy < 0.35
+            rebound = torch.where(touched_foot, peak_after, torch.full_like(peak_after, float("nan")))
             obs, _, dones, extras = env.step(policy(obs))
             for k in logged:
                 if f"Metrics/ball_launch/{k}" in extras.get("log", {}):
@@ -112,7 +120,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             for i in d.nonzero().flatten().tolist():
                 rows.append({"speed": speed[i].item(), "lateral": lateral[i].item(), "t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]],
                              "base_x": base_x[i].item(), "base_y": base_y[i].item(), "near": touched[i].item(),
-                             "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item()})
+                             "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item(), "ball_v": ball_v[i].item(), "rebound": rebound[i].item()})
+            touched_foot[d] = False
+            peak_after[d] = 0.0
             if step % 500 == 0:
                 print(f"[step {step}] episodes={len(rows)}")
 
@@ -125,7 +135,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  終了時の胴体の横ずれ |y| 平均: 全体 {sum(r['base_y'] for r in rows) / n:.3f} m, 阻止 {sum(r['base_y'] for r in res) / max(len(res), 1):.3f} m")
     print(f"  終了時の胴体のライン前方 x 平均: 全体 {sum(r['base_x'] for r in rows) / n:+.3f} m, 阻止 {sum(r['base_x'] for r in res) / max(len(res), 1):+.3f} m,"
           f" 0.5 m 以上前に出た割合 {100.0 * sum(r['base_x'] > 0.5 for r in rows) / n:5.1f}%")
-    print(f"  阻止時 (終了 1 step 前): ボール高さ z 平均 {sum(r['ball_z'] for r in res) / max(len(res), 1):.3f} m, 最寄り足との距離 平均 {sum(r['feet_d'] for r in res) / max(len(res), 1):.3f} m")
+    print(f"  阻止時 (終了 1 step 前): ボール高さ z 平均 {sum(r['ball_z'] for r in res) / max(len(res), 1):.3f} m, 最寄り足との距離 平均 {sum(r['feet_d'] for r in res) / max(len(res), 1):.3f} m, ボール速度 平均 {sum(r['ball_v'] for r in res) / max(len(res), 1):.3f} m/s, 1 m 以内で 0.3 m/s 未満 {100.0 * sum(r['feet_d'] < 1.0 and r['ball_v'] < 0.3 for r in res) / max(len(res), 1):5.1f}%")
+    reb = [r["rebound"] for r in res if r["rebound"] == r["rebound"]]
+    print(f"  阻止のうち足に触れた割合 {100.0 * len(reb) / max(len(res), 1):5.1f}%, 接触後のボール最大速度 (弾き出し) 平均 {sum(reb) / max(len(reb), 1):.3f} m/s,"
+          f" 1 m/s 未満 {100.0 * sum(v < 1.0 for v in reb) / max(len(reb), 1):5.1f}%")
     table("launch speed [m/s]", "speed", [1.0, 2.0, 3.0, 4.5], rows)
     table("|target lateral| [m]", "lateral", [0.25, 0.5, 0.75], rows)
     print("\n  失点率 [%] 速度帯 (行) × |狙い横| (列):")
