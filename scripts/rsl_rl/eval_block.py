@@ -92,6 +92,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     with torch.inference_mode():
         for step in range(args_cli.steps):
             speed = term.metrics["launch_speed"].clone()
+            dist = term.metrics["launch_dist"].clone()
             lateral = term.launch_lateral.abs().clone()
             t_ep = (raw_env.episode_length_buf + 1).float() * dt
             base_x, base_y = term.body_line_xy()
@@ -118,7 +119,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             outcome[tm.get_term("ball_conceded")] = 0
             outcome[fell] = 2  # 転倒は同時に失点していても転倒扱い
             for i in d.nonzero().flatten().tolist():
-                rows.append({"speed": speed[i].item(), "lateral": lateral[i].item(), "t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]],
+                rows.append({"speed": speed[i].item(), "dist": dist[i].item(), "lateral": lateral[i].item(), "t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]],
                              "base_x": base_x[i].item(), "base_y": base_y[i].item(), "near": touched[i].item(),
                              "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item(), "ball_v": ball_v[i].item(), "rebound": rebound[i].item()})
             touched_foot[d] = False
@@ -139,10 +140,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     reb = [r["rebound"] for r in res if r["rebound"] == r["rebound"]]
     print(f"  阻止のうち足に触れた割合 {100.0 * len(reb) / max(len(res), 1):5.1f}%, 接触後のボール最大速度 (弾き出し) 平均 {sum(reb) / max(len(reb), 1):.3f} m/s,"
           f" 1 m/s 未満 {100.0 * sum(v < 1.0 for v in reb) / max(len(reb), 1):5.1f}%")
-    table("launch speed [m/s]", "speed", [1.0, 2.0, 3.0, 4.5], rows)
-    table("|target lateral| [m]", "lateral", [0.25, 0.5, 0.75], rows)
+    table("launch speed [m/s]", "speed", [1.0, 2.0, 3.0, 4.5, 6.0], rows)
+    table("launch distance [m]", "dist", [3.0, 6.0, 9.0, 11.9], rows)
+    table("|target lateral| [m]", "lateral", [0.5, 1.0, 1.5], rows)
     print("\n  失点率 [%] 速度帯 (行) × |狙い横| (列):")
-    lat_edges, spd_edges = [0.25, 0.5, 0.75, float("inf")], [1.0, 2.0, 3.0, 4.5, float("inf")]
+    lat_edges, spd_edges = [0.5, 1.0, 1.5, float("inf")], [1.0, 2.0, 3.0, 4.5, 6.0, float("inf")]
     print("    " + " ".join(f"{'<' + str(e):>7s}" for e in lat_edges))
     lo_s = -float("inf")
     for hi_s in spd_edges:

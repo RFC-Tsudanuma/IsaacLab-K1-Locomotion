@@ -168,7 +168,7 @@ class BallLaunchCommand(CommandTerm):
         # 最初に阻止条件を満たした時刻 [s] (未達なら −1) と、その時の内訳 (0 なし / 1 幅外 / 2 前へ弾く / 3 止めた)
         self.resolved_at = torch.full((n,), -1.0, device=self.device)
         self.resolve_kind = torch.zeros(n, dtype=torch.long, device=self.device)
-        for name in ("conceded", "resolved", "out_wide", "away", "stopped", "lost_after_touch", "launch_speed"):
+        for name in ("conceded", "resolved", "out_wide", "away", "stopped", "lost_after_touch", "launch_speed", "launch_dist"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
     @property
@@ -279,6 +279,7 @@ class BallLaunchCommand(CommandTerm):
         self.ball.write_root_pose_to_sim(root_pose, env_ids=env_ids)
         self.ball.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
         self.metrics["launch_speed"][env_ids] = speed
+        self.metrics["launch_dist"][env_ids] = dist
         self.launch_lateral[env_ids] = lateral
         self.resolved_at[env_ids] = -1.0
         self.resolve_kind[env_ids] = 0
@@ -311,16 +312,16 @@ class BallLaunchCommandCfg(CommandTermCfg):
     resampling_time_range: tuple[float, float] = (1.0e6, 1.0e6)
     """エピソード中は再射出しない (reset 時のみ)。"""
 
-    speed_range: tuple[float, float] = (0.4, 6.0)
-    """射出速度 [m/s]。"""
+    speed_range: tuple[float, float] = (0.4, 8.0)
+    """射出速度 [m/s]。実機の蹴りが 6 m/s を超えるので 8 まで (v16 以降は hydra 上書きで、2026-11-11 から既定)。"""
     time_to_arrival_range: tuple[float, float] = (0.8, 3.0)
     """到達までの時間 [s]。射出距離 = 速度 × これ (distance_range にクランプ)。"""
-    distance_range: tuple[float, float] = (1.0, 5.0)
-    """射出距離 [m] のクランプ。"""
+    distance_range: tuple[float, float] = (1.0, 12.0)
+    """射出距離 [m] のクランプ。試合で遠くからの蹴りを止められなかったため 7 → 12 m (2026-11-11 ユーザー指示)。約 2 割が 12 m に張り付く。"""
     approach_angle: float = math.pi / 3
     """射出位置の方位 (ロボット初期進行方向からの角度) の範囲 ±[rad]。"""
-    target_lateral: float = 1.0
-    """狙い点のロボット初期位置からの左右オフセット ±[m]。"""
+    target_lateral: float = 2.0
+    """狙い点のロボット初期位置からの左右オフセット ±[m]。1.0 → 2.0 (2026-11-11 ユーザー指示: 周囲 2 m を守る)。"""
     bounce_prob: float = 0.3
     """上向き初速を与える (バウンドする) 確率。"""
     bounce_vz: float = 2.0
@@ -329,8 +330,8 @@ class BallLaunchCommandCfg(CommandTermCfg):
 
     behind_x: float = 0.3
     """ライン後方 [m]: これより後ろに入ったら失点判定。"""
-    goal_half_width: float = 1.6
-    """ゴール半幅 [m]: ライン後方でもこの外は失点にしない (横に逸れた = 阻止)。"""
+    goal_half_width: float = 2.6
+    """ゴール半幅 [m]: ライン後方でもこの外は失点にしない (横に逸れた = 阻止)。target_lateral + 0.6 (1.6 → 2.6)。"""
     away_speed: float = 0.3
     """ライン前方でこの前向き速度以上なら「前に弾いた」= 阻止。"""
     stop_speed: float = 0.1

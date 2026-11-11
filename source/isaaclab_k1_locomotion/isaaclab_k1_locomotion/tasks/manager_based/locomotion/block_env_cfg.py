@@ -183,9 +183,9 @@ class K1BlockRewardsCfg:
     stopped_bonus = RewTerm(func=ball_stopped, weight=0.0, params={"std": 0.5})
     # shaping: ボール接近中、予測到達点 (ライン上の y) に足を置く / 胴体を横に合わせる
     foot_on_intercept = RewTerm(func=foot_on_intercept, weight=0.5, params={"std": 0.15})
-    body_on_intercept = RewTerm(func=body_on_intercept, weight=0.5, params={"std": 0.3})
-    # ラインより前へ出る (ボールへ突っ込む) 動きは減点: ライン上で横に動いて止める方針 (2026-11-02 ユーザー指示)
-    body_forward_l2 = RewTerm(func=body_forward_l2, weight=-2.0, params={"margin": 0.2})
+    body_on_intercept = RewTerm(func=body_on_intercept, weight=0.5, params={"std": 0.6})  # std 0.3 → 0.6: 遠い横球でも早くから胴体を寄せる勾配 (v22d, 2026-11-11)
+    # ラインより前へ出る (ボールへ突っ込む) 動きは減点: ライン上で横に動いて止める方針 (2026-11-02 ユーザー指示) margin 0.2 → 1.0 (v22c, 2026-11-11): 射出 12 m・狙い ±2 m では斜め前方の迎撃を許す方が失点が減る (実際の胴体位置はライン後方に留まる)
+    body_forward_l2 = RewTerm(func=body_forward_l2, weight=-2.0, params={"margin": 1.0})
     # 阻止後はボールを足元に遅く留めるほど加点 (保持 2.5 s で最大 +1 実効 = blocked の半分)
     ball_held_at_feet = RewTerm(func=ball_held_at_feet, weight=0.4, params={"pos_std": 0.3, "vel_std": 0.5})
     # 弾いた後のボール速度は密に罰する (1.5 m/s で弾いて保持 2.5 s → −0.75 実効、上限 −1。−0.4 は失点率が戻らず −0.2 を採用、v17f)
@@ -238,11 +238,11 @@ class K1BlockEnvCfg(K1FlatStancePlanePolishCfg):
             "pitch": (-0.02, 0.02),
         }
 
-        # ボールは最長 5 m 先から来て弾かれて飛ぶので平面の縁を広げる
+        # ボールは最長 12 m 先から来て弾かれて飛ぶので平面の縁を広げる (env 間の衝突は filter_collisions で切れている)
         self.scene.terrain.terrain_generator = PLANE_HEAVY_TERRAIN_CFG.replace(border_width=15.0)
 
-        # 到達 ≤ 3 s + 止まる/弾く時間。阻止・失点で早期終了するので大半はこれより短い。
-        self.episode_length_s = 8.0
+        # 到達 (12 m を 4 m/s、減衰 0.1 で ≈ 3.6 s) + 阻止保持 2.5 s + 余裕。阻止・失点で早期終了するので大半はこれより短い。
+        self.episode_length_s = 10.0
 
 
 @configclass
