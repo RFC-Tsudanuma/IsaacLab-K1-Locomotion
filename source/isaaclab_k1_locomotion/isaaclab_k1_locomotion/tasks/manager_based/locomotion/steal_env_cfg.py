@@ -243,7 +243,15 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     foot_near_ball = RewTerm(func=foot_near_ball, weight=3.0, params={"std": 0.2})
     # 2.0 より 5.0 の方が良かった (2026-11-10: 85.6% vs 82.4%、best_steal_dir は 5.0 で学習)
     ball_target_speed = RewTerm(func=ball_target_speed, weight=5.0, params={"max_speed": 3.0})
-    wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-20.0, params={"term_keys": "ball_wrong_dir"})
+    # 以下は敵の方位 ±180° (背を向けた開始を含む) の学習で決めた値 (2026-11-11、best_steal_dir model_30700)。
+    # 背後スタートで立位から後退・横・旋回と大きな残差を同時に出して転倒していたので、残差とコマンド変化率の
+    # 罰則を 4 倍にし、転倒罰則を −200 → −400 → −800 → −1600 と強めるたびに奪取率も転倒も改善した
+    # (24600: 奪取 85.2% / 転倒 7.1% → 30700: 94.0% / 1.0%)。最後に足以外・違う方向を −60 にして上積み。
+    fell = RewTerm(func=mdp.is_terminated_term, weight=-1600.0, params={"term_keys": "base_height"})
+    no_foot = RewTerm(func=mdp.is_terminated_term, weight=-60.0, params={"term_keys": "ball_no_foot"})
+    wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-60.0, params={"term_keys": "ball_wrong_dir"})
+    joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.2)
+    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.2, params={"action_name": "walk_command"})
 
 
 @configclass
