@@ -28,6 +28,13 @@ parser.add_argument(
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
 parser.add_argument(
+    "--curriculum_stage",
+    type=int,
+    choices=(0, 1, 2),
+    default=None,
+    help="Initial direction curriculum stage for tasks that support staged direction expansion.",
+)
+parser.add_argument(
     "--load_pretrained", type=str, default=None,
     help="Path to a pretrained checkpoint (.pt) to initialize weights (strict=False, for transfer learning)."
 )
@@ -161,6 +168,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         from config_overrides import apply_overrides_from_file
 
         apply_overrides_from_file(args_cli.override_json, env_cfg=env_cfg, agent_cfg=agent_cfg)
+
+    if args_cli.curriculum_stage is not None:
+        direction_expansion = getattr(getattr(env_cfg, "curriculum", None), "direction_expansion", None)
+        if direction_expansion is None or "initial_stage" not in direction_expansion.params:
+            raise ValueError(
+                f"Task '{args_cli.task}' does not support --curriculum_stage."
+            )
+        direction_expansion.params["initial_stage"] = args_cli.curriculum_stage
+        print(f"[INFO]: Initial direction curriculum stage: {args_cli.curriculum_stage}")
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here

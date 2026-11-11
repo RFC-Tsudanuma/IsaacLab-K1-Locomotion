@@ -14,7 +14,7 @@ from isaaclab.envs.mdp import UniformVelocityCommand
 from isaaclab.envs.mdp.commands.commands_cfg import UniformVelocityCommandCfg
 from isaaclab.markers import VisualizationMarkers
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ...locomotion.mdp.commands import DiscreteVelocityCommand, DiscreteVelocityCommandCfg
 from .kick_state import kick_state
@@ -342,7 +342,7 @@ class BallFollowVelocityCommand(DiscreteVelocityCommand):
         # G - ロボット のワールドフレームベクトルをロボットフレームに変換
         to_G_w = torch.zeros(self.num_envs, 3, device=self.device)
         to_G_w[:, :2] = state["G"] - robot_pos_w
-        to_G_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), to_G_w)
+        to_G_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), to_G_w)
 
         max_vel = self.cfg.max_vel
         self.vel_command_b[:, 0] = torch.clamp(to_G_b[:, 0], -max_vel, max_vel)

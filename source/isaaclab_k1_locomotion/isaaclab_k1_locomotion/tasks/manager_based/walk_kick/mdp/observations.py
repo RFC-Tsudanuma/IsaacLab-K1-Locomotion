@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 import isaaclab.envs.mdp as base_mdp
 from isaaclab.managers import SceneEntityCfg
-from isaaclab.utils.math import quat_rotate_inverse, yaw_quat
+from isaaclab.utils.math import quat_apply_inverse, yaw_quat
 
 from ...locomotion.mdp.events import get_phase_freq, get_phase_offset
 
@@ -39,7 +39,7 @@ def ball_pos_rel(
     robot = env.scene["robot"]
 
     rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-    rel_pos_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
+    rel_pos_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)
     return rel_pos_b
 
 
@@ -51,7 +51,7 @@ def ball_vel_b(
     ball = env.scene[ball_cfg.name]
     robot = env.scene["robot"]
 
-    vel_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), ball.data.root_lin_vel_w[:, :3])
+    vel_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), ball.data.root_lin_vel_w[:, :3])
     return vel_b[:, :2]
 
 
@@ -68,7 +68,7 @@ def sole_pos_b(
     body_idx = asset_cfg.body_ids[0]
 
     offset_w = robot.data.body_pos_w[:, body_idx, :] - robot.data.root_pos_w[:, :3]
-    return quat_rotate_inverse(robot.data.root_quat_w, offset_w)
+    return quat_apply_inverse(robot.data.root_quat_w, offset_w)
 
 
 def gait_phase_sincos(
@@ -132,7 +132,7 @@ def kick_dir_b(
     dir_w[:, 0] = command[:, 1]  # cos θ
     dir_w[:, 1] = command[:, 0]  # sin θ
 
-    dir_b = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), dir_w)
+    dir_b = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), dir_w)
     return dir_b[:, :2]
 
 
@@ -297,7 +297,7 @@ def noisy_ball_pos_b(
     robot = env.scene["robot"]
 
     rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-    cur = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)  # (N, 3)
+    cur = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)  # (N, 3)
 
     buf_len = int(delay_step_range[1]) + 1
     frame_dt = 1.0 / camera_hz
@@ -384,7 +384,7 @@ def prev_ball_pos_b(
     robot = env.scene["robot"]
 
     rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-    cur = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)[:, :2]
+    cur = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)[:, :2]
 
     step = int(env.common_step_counter)
     state = getattr(env, "_prev_ball_pos_state", None)
@@ -453,7 +453,7 @@ def delayed_ball_pos_b(
     robot = env.scene["robot"]
 
     rel_pos_w = ball.data.root_pos_w[:, :3] - robot.data.root_pos_w[:, :3]
-    cur = quat_rotate_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)  # (N, 3)
+    cur = quat_apply_inverse(yaw_quat(robot.data.root_quat_w), rel_pos_w)  # (N, 3)
 
     step = int(env.common_step_counter)
     state = getattr(env, _BALL_HIST_ATTR, None)
