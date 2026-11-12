@@ -69,6 +69,14 @@ class StealCommand(CommandTerm):
         self.ball_start_xy = torch.zeros(n, 2, device=self.device)
         self.ball_side0 = torch.zeros(n, device=self.device)  # 配置時のボール方位 (障害物→ロボット方向からの角度) [rad] 評価用
         self.bearing0 = torch.zeros(n, device=self.device)  # 配置時の敵の方位 (ロボット初期向きからの角度) [rad] 評価用
+        # 動く敵とボール (ドリブル想定, 2026-11-11)。速度は配置時に抽選して world 系で一定 (直進)
+        self.move_speed_max = float(cfg.move_speed_max)  # カリキュラムで更新 (steal_move_speed_curriculum)
+        self.obstacle_vel = torch.zeros(n, 2, device=self.device)
+        self.ball_drive_vel = torch.zeros(n, 2, device=self.device)
+        self.ball_driven = torch.zeros(n, dtype=torch.bool, device=self.device)  # ロボットが近づく / 触れるまで駆動
+        self.moving_ep = torch.zeros(n, dtype=torch.bool, device=self.device)
+        self.follow_offset = torch.zeros(n, 2, device=self.device)  # 解放後〜足で触れるまで: 敵 = ボール + offset
+        self.ball_touch_xy = torch.zeros(n, 2, device=self.device)  # 最初に足で触れた時のボール位置 (方向判定の基準)
         for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal", "wrong_dir"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
@@ -111,8 +119,9 @@ class StealCommand(CommandTerm):
         return torch.stack([c * d[:, 0] + s * d[:, 1], -s * d[:, 0] + c * d[:, 1]], dim=1)
 
     def dir_ok(self) -> torch.Tensor:
-        """ボールの初期位置からの変位が目標方向から target_tolerance 以内 (変位ゼロは False)。"""
-        disp = self.ball_xy() - self.ball_start_xy
+        """最初に足で触れた時のボール位置からの変位が目標方向から target_tolerance 以内 (変位ゼロは False)。
+        静止ボールでは初期位置と同じ。動くボールではドリブルでの移動分を含めないため触れた位置を基準にする。"""
+        disp = self.ball_xy() - self.ball_touch_xy
         return torch.sum(disp * self.target_dir_w, dim=1) >= torch.norm(disp, dim=1) * math.cos(self.cfg.target_tolerance)
 
     def foot_contact_now(self) -> torch.Tensor:
@@ -205,13 +214,72 @@ class StealCommand(CommandTerm):
         self.target_dir_w[env_ids] = cand[torch.arange(n, device=dev), idx]
         self.ball_start_xy[env_ids] = ball_xy
 
+        # 動き: 敵は速さ U(0, move_speed_max)・向き一様で直進。ボールは敵の速度 + 最大 ball_rel_speed_max の差
+        ids = torch.as_tensor(env_ids, device=dev)
+        speed = torch.rand(n, device=dev) * self.move_speed_max
+        speed[torch.rand(n, device=dev) < cfg.static_prob] = 0.0  # 静止の敵も一定割合で残す (静止での奪取率の維持)
+        ang_v = torch.rand(n, device=dev) * 2 * math.pi
+        self.obstacle_vel[ids] = speed.unsqueeze(1) * torch.stack([torch.cos(ang_v), torch.sin(ang_v)], dim=1)
+        rel = torch.sqrt(torch.rand(n, device=dev)) * torch.minimum(speed, torch.full_like(speed, cfg.ball_rel_speed_max))
+        ang_r = torch.rand(n, device=dev) * 2 * math.pi
+        self.ball_drive_vel[ids] = self.obstacle_vel[ids] + rel.unsqueeze(1) * torch.stack([torch.cos(ang_r), torch.sin(ang_r)], dim=1)
+        self.ball_driven[ids] = speed > 1e-3
+        self.moving_ep[ids] = speed > 1e-3
+        self.ball_touch_xy[ids] = ball_xy
+        if self.ball_driven[ids].any():
+            self._write_ball_vel(ids, self.ball_drive_vel[ids])
+
         self.stolen_at[env_ids] = -1.0
         self.foot_touched[env_ids] = False
         self.prev_body_dist[env_ids] = torch.norm(pose[:, :2] - pos, dim=1)
 
+    def _write_ball_vel(self, ids: torch.Tensor, vel_xy: torch.Tensor):
+        """ボールに水平速度を与える (z 速度は保持、角速度は転がり条件 ω = z × v / r)。"""
+        v = self.ball.data.root_lin_vel_w[ids].clone()
+        v[:, :2] = vel_xy
+        w = torch.zeros_like(v)
+        w[:, 0] = -vel_xy[:, 1] / self.cfg.ball_radius
+        w[:, 1] = vel_xy[:, 0] / self.cfg.ball_radius
+        self.ball.write_root_velocity_to_sim(torch.cat([v, w], dim=1), env_ids=ids)
+
+    def _move_opponent_and_ball(self):
+        """動くエピソード: (1) ロボットが近づくまで敵は直進・ボールは駆動、(2) 解放後〜足で触れるまで敵はボールに
+        一定の offset で付いていく (ボールを保持し続けるドリブラー。自然に離れて no_foot / lost になるのを防ぐ)、
+        (3) 足で触れた後は敵はそのまま直進し、ボールは物理のまま。"""
+        cfg = self.cfg
+        near = (torch.norm(self.ball_xy() - self.robot.data.root_pos_w[:, :2], dim=1) < cfg.ball_release_body_dist) | (
+            self.foot_ball_dist() < cfg.ball_release_foot_dist
+        )
+        released = self.ball_driven & (near | self.foot_touched)
+        self.follow_offset[released] = self.obstacle_xy()[released] - self.ball_xy()[released]
+        self.ball_driven &= ~released
+        follow = self.moving_ep & ~self.ball_driven & ~self.foot_touched
+
+        if self.moving_ep.any():
+            ids = self.moving_ep.nonzero().flatten()
+            pose = self.obstacle.data.root_pose_w[ids].clone()
+            xy = pose[:, :2] + self.obstacle_vel[ids] * self._env.step_dt
+            f = follow[ids]
+            xy[f] = self.ball_xy()[ids][f] + self.follow_offset[ids][f]
+            pose[:, :2] = xy
+            pose[:, 3:] = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+            self.obstacle.write_root_pose_to_sim(pose, env_ids=ids)
+        if self.ball_driven.any():
+            ids = self.ball_driven.nonzero().flatten()
+            vel = self.ball_drive_vel[ids].clone()
+            # 駆動中に敵へ当たる / 圏外へ流れる (ロボットのせいでない終了) を防ぐ: 帯の外では敵と同じ速度に戻す
+            d = self.ball_obstacle_dist()[ids]
+            r_min = cfg.obstacle_radius + cfg.ball_radius + cfg.touch_margin + 0.03
+            off_band = (d < r_min) | (d > cfg.steal_radius - 0.15)
+            vel[off_band] = self.obstacle_vel[ids][off_band]
+            self._write_ball_vel(ids, vel)
+
     def _update_command(self):
+        self._move_opponent_and_ball()
         # 足接触の記録と成功のラッチ (毎 step、終了判定の後に呼ばれる → 次 step の終了判定が見る)
-        self.foot_touched |= self.foot_contact_now()
+        new_touch = self.foot_contact_now() & ~self.foot_touched
+        self.ball_touch_xy[new_touch] = self.ball_xy()[new_touch]
+        self.foot_touched |= new_touch
         first = (self.stolen_at < 0.0) & ~self.lost_obstacle() & self.foot_touched & (self.ball_obstacle_dist() > self.cfg.steal_radius)
         if self.cfg.directed:
             first &= self.dir_ok()
@@ -258,6 +326,18 @@ class StealCommandCfg(CommandTermCfg):
     """ボールが障害物中心からこの距離の外に出たら奪取 (ラッチ)。"""
     hold_s: float = 1.5
     """ラッチしてから転倒・失敗せずにこの秒数立ち続けたら成功 (終了)。"""
+
+    move_speed_max: float = 0.0
+    """敵の直進速度の上限の初期値 [m/s] (0 で静止)。steal_move_speed_curriculum が move_speed_limit まで上げる。"""
+    move_speed_limit: float = 1.0
+    static_prob: float = 0.3
+    """動く敵のカリキュラム中も、この割合のエピソードは敵・ボールを静止させる (速さ一様だと静止がほぼ無く、
+    静止での奪取率が 94 → 90.6% に落ちた)。"""
+    ball_rel_speed_max: float = 0.2
+    """ボールの速度 = 敵の速度 + この大きさ以内の差 [m/s] (ボールと敵は別々の速度で動く)。"""
+    ball_release_body_dist: float = 0.45
+    ball_release_foot_dist: float = 0.3
+    """ロボットの胴体 / 足がボールにこの距離まで近づいたらボールの駆動をやめて物理に任せる [m]。"""
 
     directed: bool = False
     """True: 目標方向 (前/左/後/右) を抽選し、方向が合ったときだけ奪取とみなす (Isaac-StealDir-K1)。"""
@@ -330,3 +410,42 @@ def trunk_obstacle_contact(env: "ManagerBasedRLEnv", threshold: float = 1.0, sen
     """胴体が障害物 (敵) に触れている (フィルタ済み接触力 > threshold) 間 1。"""
     f = env.scene[sensor_name].data.force_matrix_w
     return (torch.norm(f, dim=-1).amax(dim=(1, 2)) > threshold).float()
+
+
+# ---------------------------------------------------------------------------
+# 観測 (critic のみ) とカリキュラム
+# ---------------------------------------------------------------------------
+def steal_obstacle_vel(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
+    """敵の速度 (base yaw 系, 2)。方策には入れず critic だけが見る (実機ノードの入力契約を変えないため)。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    h = term.robot.data.heading_w
+    c, s = torch.cos(h), torch.sin(h)
+    v = term.obstacle_vel
+    return torch.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1]], dim=1)
+
+
+def steal_move_speed_curriculum(
+    env: "ManagerBasedRLEnv",
+    env_ids: Sequence[int],
+    command_name: str = "steal",
+    step: float = 0.1,
+    up_threshold: float = 0.75,
+    min_episodes: int = 20000,
+) -> float:
+    """敵・ボールの速度上限を、終了したエピソードの奪取率が up_threshold 以上なら step ずつ上げる。
+    学習中の奪取率は探索ノイズ込みで決定的評価より約 10 pt 低い (評価 95% で学習中 83%) ので 0.75 (0.85 では 0.2〜0.3 で停滞)。
+
+    min_episodes 本ごとに判定 (下げない)。戻り値 (現在の上限) は Curriculum/ に記録される。
+    """
+    term: StealCommand = env.command_manager.get_term(command_name)
+    if not hasattr(term, "_cur_n"):
+        term._cur_n, term._cur_ok = 0, 0
+    if len(env_ids) > 0:
+        ok = env.termination_manager.get_term("ball_stolen")[env_ids]
+        term._cur_n += len(env_ids)
+        term._cur_ok += int(ok.sum())
+    if term._cur_n >= min_episodes:
+        if term._cur_ok / term._cur_n >= up_threshold and term.move_speed_max < term.cfg.move_speed_limit:
+            term.move_speed_max = min(term.move_speed_max + step, term.cfg.move_speed_limit)
+        term._cur_n, term._cur_ok = 0, 0
+    return term.move_speed_max

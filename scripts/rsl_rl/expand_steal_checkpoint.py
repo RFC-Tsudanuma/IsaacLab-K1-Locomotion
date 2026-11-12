@@ -15,11 +15,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--src", required=True)
 parser.add_argument("--dst", required=True)
 parser.add_argument("--extra", type=int, default=2)
+parser.add_argument("--nets", default="actor,critic", help="入力を足すネット (critic のみ観測を足すときは critic)")
 args = parser.parse_args()
 
 ck = torch.load(args.src, map_location="cpu", weights_only=False)
 sd = ck["model_state_dict"]
-for net in ("actor", "critic"):
+for net in args.nets.split(","):
     w = sd[f"{net}.0.weight"]
     sd[f"{net}.0.weight"] = torch.cat([w, w.new_zeros(w.shape[0], args.extra)], dim=1)
     for stat, fill in (("_mean", 0.0), ("_var", 1.0), ("_std", 1.0)):
@@ -34,6 +35,7 @@ from rsl_rl.networks import MLP, EmpiricalNormalization  # noqa: E402
 
 src = torch.load(args.src, map_location="cpu", weights_only=False)["model_state_dict"]
 n_in, n_out = src["actor.0.weight"].shape[1], src["actor.4.weight"].shape[0]
+n_new = n_in + (args.extra if "actor" in args.nets.split(",") else 0)
 def actor(sd, n):
     norm, mlp = EmpiricalNormalization([n]), MLP(n, n_out, [256, 128], "elu")
     norm.load_state_dict({k.split(".", 1)[1]: v for k, v in sd.items() if k.startswith("actor_obs_normalizer.")})
@@ -41,6 +43,6 @@ def actor(sd, n):
     return lambda x: mlp(norm.eval()(x))
 x = torch.randn(64, n_in)
 with torch.no_grad():
-    err = (actor(src, n_in)(x) - actor(sd, n_in + args.extra)(torch.cat([x, torch.randn(64, args.extra)], 1))).abs().max()
+    err = (actor(src, n_in)(x) - actor(sd, n_new)(torch.cat([x, torch.randn(64, n_new - n_in)], 1))).abs().max()
 assert err < 1e-5, err
-print(f"[expand] {args.src} -> {args.dst}: obs {n_in} -> {n_in + args.extra}, max |Δ| {err:.1e}")
+print(f"[expand] {args.src} -> {args.dst}: +{args.extra} inputs on {args.nets}, actor obs {n_in} -> {n_new}, actor max |Δ| {err:.1e}")

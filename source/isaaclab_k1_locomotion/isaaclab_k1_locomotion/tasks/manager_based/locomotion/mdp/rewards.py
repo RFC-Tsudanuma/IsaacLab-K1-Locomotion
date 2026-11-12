@@ -821,6 +821,26 @@ def base_ang_acc_l2(
     return torch.where(fresh, torch.zeros_like(penalty), penalty)
 
 
+def base_lin_acc_l2(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """base (Trunk) の並進加速度の L2 二乗 [(m/s²)²] (weight < 0 で使う)。
+
+    頭部カメラのブレ = Trunk の回転ジッタ (base_ang_acc_l2) + 並進の急な加減速 (この項)。
+    world 系の線速度の有限差分で計算し (body 系だと回転で見かけの差分が出る)、リセット直後は 0。
+    """
+    robot = env.scene[asset_cfg.name]
+    lin_vel = robot.data.root_lin_vel_w  # (N, 3)
+    if not hasattr(env, "_prev_root_lin_vel_w") or env._prev_root_lin_vel_w.shape != lin_vel.shape:
+        env._prev_root_lin_vel_w = lin_vel.clone()
+    acc = (lin_vel - env._prev_root_lin_vel_w) / max(env.step_dt, 1e-6)
+    env._prev_root_lin_vel_w = lin_vel.clone()
+    penalty = torch.sum(torch.square(acc), dim=1)
+    fresh = env.episode_length_buf < 2
+    return torch.where(fresh, torch.zeros_like(penalty), penalty)
+
+
 def com_jerk_l2(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),

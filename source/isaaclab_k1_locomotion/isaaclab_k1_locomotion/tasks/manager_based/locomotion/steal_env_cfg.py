@@ -41,6 +41,7 @@ from .block_env_cfg import K1BlockActionsCfg, K1BlockSceneCfg
 from .flat_env_cfg import K1FlatObservationsCfg, K1FlatStancePlanePolishCfg
 from .mdp.block import joint_residual_l2
 from .mdp.observations import ball_pos_rel, ball_vel
+from .mdp.rewards import base_ang_acc_l2, base_lin_acc_l2
 from .mdp.steal import (
     StealCommandCfg,
     ball_away_speed,
@@ -51,9 +52,12 @@ from .mdp.steal import (
     ball_wrong_dir,
     body_ball_progress,
     foot_near_ball,
+    steal_move_speed_curriculum,
+    steal_obstacle_vel,
     steal_target_dir,
     trunk_obstacle_contact,
 )
+from isaaclab.managers import CurriculumTermCfg as CurrTerm
 from .mdp.waypoint import ExternalVelocityCommandCfg, walk_command_rate_l2
 from .rough_env_cfg import K1CriticCfg, K1PolicyCfg
 
@@ -228,6 +232,8 @@ class K1StealDirPolicyCfg(K1StealPolicyCfg):
 @configclass
 class K1StealDirCriticCfg(K1StealCriticCfg):
     target_dir = ObsTerm(func=steal_target_dir)
+    # 動く敵 (2026-11-11): 敵の速度は critic のみ (方策の入力 69 次元と実機ノードの契約は変えない)
+    obstacle_vel = ObsTerm(func=steal_obstacle_vel)
 
 
 @configclass
@@ -252,6 +258,15 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-60.0, params={"term_keys": "ball_wrong_dir"})
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.2)
     walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.2, params={"action_name": "walk_command"})
+    # 上体の揺れ (2026-11-11 追加): 実機のボール検出 (頭部カメラ) を安定させるため、Trunk の傾き・ロール/ピッチ
+    # 角速度・角加速度・並進加速度を罰する。best_steal_dir model_38200 の学習値 (最初に入れた値の 8 倍)。
+    # 1 → 2 → 4 → 8 倍と段階的に上げ、奪取率を落とさず傾き 0.186 → 0.058 / 角速度 1.77 → 0.53 rad/s。
+    # 揺れの小さい方策から学習を続ける前提の値で、揺れの大きい方策にいきなり掛けると揺れ罰が奪取報酬を
+    # 大きく上回る (model_30700 の揺れでは 1 倍で合計 −0.6/s、時間罰則 −0.5/s と同程度)。
+    flat_orientation_l2 = RewTerm(func=mdp.flat_orientation_l2, weight=-40.0)
+    ang_vel_xy_l2 = RewTerm(func=mdp.ang_vel_xy_l2, weight=-0.8)
+    base_ang_acc_l2 = RewTerm(func=base_ang_acc_l2, weight=-4.0e-4)
+    base_lin_acc_l2 = RewTerm(func=base_lin_acc_l2, weight=-8.0e-3)
 
 
 @configclass
@@ -261,6 +276,8 @@ class K1StealDirEnvCfg(K1StealEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.commands.steal.directed = True
+        # 動く敵とボール (ドリブル対策, 2026-11-11): 速度上限 0 から奪取率 85% 以上で 0.1 m/s ずつ 1.0 m/s まで
+        self.curriculum.steal_move_speed = CurrTerm(func=steal_move_speed_curriculum)
         self.rewards = K1StealDirRewardsCfg()
         self.terminations.ball_wrong_dir = DoneTerm(func=ball_wrong_dir)
 
