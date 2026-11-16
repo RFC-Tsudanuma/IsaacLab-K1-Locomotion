@@ -1,10 +1,39 @@
 # best_gating — 歩行 ⇄ その場回転 ゲーティング融合モデル
 
 `Isaac-Velocity-Flat-Gating` (`K1FlatGatingCfg` + `GatingPPO`) の凍結成果物。
-凍結 expert 2 本 (`best_walk/model_52500.pt`, `best_turn/model_7999.pt`) とゲート MLP を
+凍結 expert 2 本 (現行は `best_walk/model_56444.pt`, `best_turn/model_9000.pt`) とゲート MLP を
 1 つの ONNX に融合してある (`scripts/rsl_rl/export_gating_policy.py`)。
 
-## 現行 (2026-11-06 採用)
+## 現行 (2026-11-16 採用、実機未検証)
+
+歩行 expert を横移動拡張版 (`best_walk/model_56444.pt`、y ±1.9 m/s) に差し替えたのに合わせ、ゲートをスクラッチで再学習した。
+
+| | |
+|---|---|
+| 融合 ONNX | `gating_2999_walk56444_turn9000.onnx` |
+| ゲート重み | `model_2999.pt` (`2026-11-16_04-54-41_gate_v7_walk56444`、2 GPU × 2048 env、3000 it、歩行コマンド y ±1.9) |
+| 凍結 expert | `best_walk/model_56444.pt` + `best_turn/model_9000.pt` (回転 expert は据え置き) |
+| 検証 | torch 等価性 `max|Δaction| = 3.8e-6` (64 乱数入力) / mode=0 vs `best_walk/policy.onnx` 差 0 (小振幅乱数入力、w=0)。mode=1 の expert 単体パリティは乱数入力では w が 1 に寄らず未実施 |
+| 旧ゲート | `old/model_5897.pt` (番号最大の自動解決で拾われないよう退避)、`gating_5897_turn9000.onnx` は旧歩行 52700 焼き込みのまま |
+
+**C++ 側の注意**: 歩容位相の周波数に横加算が増えた。
+`freq = 1.8 + max(||cmd_xy|| - 1.0, 0) * 0.25 + max(|vy| - 0.5, 0) * 0.75` (`best_walk/README.md` 参照)。
+`cmd_phase_freq` を合わせないと横移動で位相がずれる。
+
+pivot 計測 (`eval_pivot_overhead.py`、新歩行 56444 + 回転 9000、合計時間の中央値 / turn 中の転倒率):
+
+| 条件 | 旧ゲート 5897 | 新ゲート 2999 |
+|---|---|---|
+| 進入 0 m/s、180° (1024 env) | 1.16 s / 0 % | 1.12 s / 0 % |
+| 進入 1.0 m/s、120° (1024 env) | 0.92 s / 0.1 % | 0.98 s / 0 % |
+| 進入 1.5 m/s、120° (1024 env) | 1.00 s / 0.1 % | 1.04 s / 0 % |
+| 進入 2.0 m/s、120° (4096 env) | 1.16 s / 0.73 % | 1.20 s / 0.34 % |
+
+新ゲートは高速進入の転倒が半分、所要時間は進入ありで 0.04〜0.06 s 長い。途中の model_2000 は時間が旧と同等 (2.0 m/s で 1.14 s) だが転倒 0.61 % で旧と差が無い。
+横移動からの進入 (`--entry-vy`、120°、2048 env、旧 / 新): 横 1.0 m/s で 1.04 s / 0.15 % → 1.06 s / 0.05 %、
+横 1.9 m/s で 0.86 s / 2.93 % → 0.96 s / 2.05 %。横 1.9 からの進入は新旧とも 2 % 台で転ぶ (回転 expert は横進入を学習していない)。
+
+## 旧現行 (2026-11-06 採用)
 
 | | |
 |---|---|

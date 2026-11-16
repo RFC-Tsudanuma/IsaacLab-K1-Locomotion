@@ -30,6 +30,8 @@ def phase_obs(
     high_speed: float = 1.8,
     low_freq: float = 1.5,
     high_freq: float = 2.0,
+    lateral_low: float = 0.5,
+    lateral_gain: float = 0.0,
 ) -> torch.Tensor:
     """現在の歩行位相を sin/cos で返す (左足, 右足の計4次元)。
 
@@ -38,7 +40,7 @@ def phase_obs(
     コマンド速度が ``cmd_threshold`` 未満のときは位相をゼロで埋め、
     停止すべき状況であることをポリシーに明示する。
     """
-    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq, lateral_low, lateral_gain)
     phase_right = phase_left + math.pi
 
     phase = torch.stack([

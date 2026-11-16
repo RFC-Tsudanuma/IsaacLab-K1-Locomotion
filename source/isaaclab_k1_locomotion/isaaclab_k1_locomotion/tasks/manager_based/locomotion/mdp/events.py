@@ -88,8 +88,14 @@ def compute_cmd_phase_freq(
     high_speed: float = 1.8,
     low_freq: float = 1.5,
     high_freq: float = 2.0,
+    lateral_low: float = 0.5,
+    lateral_gain: float = 0.0,
 ) -> torch.Tensor:
     """速度コマンドに応じた per-env 歩行周波数 [Hz] を返す。
+
+    ``lateral_gain`` > 0 のとき、横速度指令 |vy| が ``lateral_low`` を超えた分に比例して
+    周波数を加算する (横移動は 1 周期の移動量が足の開き幅で頭打ちになるため、歩数で稼ぐ)。
+    既定 0.0 で無効。デプロイ側の cmd_phase_freq() も同じ式にすること。
 
     線速度コマンドのノルム ``s = ||cmd_xy||`` に対して:
       - ``s <= low_speed`` では ``low_freq`` で固定
@@ -101,6 +107,8 @@ def compute_cmd_phase_freq(
     speed = torch.norm(cmd[:, :2], dim=1)
     slope = (high_freq - low_freq) / (high_speed - low_speed)
     freq = low_freq + torch.clamp(speed - low_speed, min=0.0) * slope
+    if lateral_gain != 0.0:
+        freq = freq + torch.clamp(cmd[:, 1].abs() - lateral_low, min=0.0) * lateral_gain
     offset = getattr(env, _PHASE_FREQ_OFFSET_ATTR, None)
     if offset is not None:
         freq = freq + offset
@@ -114,6 +122,8 @@ def get_gait_phase(
     high_speed: float = 1.8,
     low_freq: float = 1.5,
     high_freq: float = 2.0,
+    lateral_low: float = 0.5,
+    lateral_gain: float = 0.0,
 ) -> torch.Tensor:
     """左足の歩行位相 [rad, 0..2π) を返す (右足は +π)。
 
@@ -135,7 +145,9 @@ def get_gait_phase(
         setattr(env, _GAIT_PHASE_STEP_ATTR, int(env.common_step_counter))
     step = int(env.common_step_counter)
     if getattr(env, _GAIT_PHASE_STEP_ATTR) != step:
-        freq = compute_cmd_phase_freq(env, command_name, low_speed, high_speed, low_freq, high_freq)
+        freq = compute_cmd_phase_freq(
+            env, command_name, low_speed, high_speed, low_freq, high_freq, lateral_low, lateral_gain
+        )
         phase.add_(2.0 * math.pi * freq * env.step_dt).remainder_(2.0 * math.pi)
         setattr(env, _GAIT_PHASE_STEP_ATTR, step)
     # リセット直後の env は位相 0 からエピソードを開始する
