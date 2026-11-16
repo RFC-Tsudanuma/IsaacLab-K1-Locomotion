@@ -52,9 +52,11 @@ from .mdp.block import (
     JOINT_DIM,
     BallLaunchCommandCfg,
     BallSpeedCurriculum,
+    BallTrapCommandCfg,
     DelayedBallObs,
     TouchVelocityKill,
     ball_conceded,
+    ball_escaped,
     ball_held_at_feet,
     ball_speed_after_touch,
     ball_resolved,
@@ -301,6 +303,57 @@ class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
         self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.08)
+
+
+# ---------------------------------------------------------------------------
+# トラップ (パスを足元に止める) タスク Isaac-Trap-K1 (2026-11-14)。カットとトラップは別タスク (2026-11-09 ユーザー方針)。
+# 環境・観測・方策は Block (FastRawPos) と同一で、射出分布 (1〜4 m/s、ほぼ正面)・判定 (BallTrapCommand)・報酬だけ違う。
+# 失点罰なし: Block で「止める」が出なかったのは失点罰との競合と 8 m/s の速い球だったので、ここで切り分ける。
+# ---------------------------------------------------------------------------
+@configclass
+class K1TrapRewardsCfg:
+    """JOGA 型: 足元ゾーン (毎 step) + 吸収 shaping + 弾き出し罰 + 接近中の足の進路合わせ。値は RewardManager が dt を掛ける。
+    既定値は best_trap (trap_v4c model_22799、2026-11-16) の学習設定。"""
+
+    trapped = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
+    fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
+    lost = RewTerm(func=mdp.is_terminated_term, weight=-300.0, params={"term_keys": "ball_conceded"})  # 後方 2 m に抜けた。−200 → −300 でロスト 4.9 → 4.1 % (成功 −1.7 pt)
+    escaped = RewTerm(func=mdp.is_terminated_term, weight=-100.0, params={"term_keys": "ball_escaped"})  # 触った後に前方 1.5 m 超へ逃がした (終了にして成功 +4〜5 pt)
+    # 足元ゾーン exp(−(d/0.3)² − (v/0.5)²): JOGA の trapped zone exp(−4v²) と同じ速度スケール
+    trap_zone = RewTerm(func=ball_held_at_feet, weight=3.0, params={"pos_std": 0.3, "vel_std": 0.5, "latched": False})
+    # 広いゾーン: 届かない所で止まった/遅いボールへ歩いて寄る勾配 (trap_zone は 0.6 m 程で消える)
+    trap_zone_wide = RewTerm(func=ball_held_at_feet, weight=1.0, params={"pos_std": 1.5, "vel_std": 0.5, "latched": False})
+    touch_velocity_kill = RewTerm(func=TouchVelocityKill, weight=0.0, params={"dist": 0.35})  # 硬い跳ね返しにも加点されるので不使用
+    ball_speed_after_touch = RewTerm(func=ball_speed_after_touch, weight=-0.5, params={"max_speed": 2.0})
+    # 接触中に足を引いて勢いを殺すと正、蹴ると負 (吸収 shaping: 成功 +2〜4 pt、弾き出し減)
+    foot_yield_on_contact = RewTerm(func=foot_yield_on_contact, weight=1.0, params={"dist": 0.3, "min_speed": 0.3})
+    foot_on_intercept = RewTerm(func=foot_on_intercept, weight=0.5, params={"std": 0.15})
+    body_on_intercept = RewTerm(func=body_on_intercept, weight=0.3, params={"std": 0.6})
+    joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
+    joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})
+    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
+
+
+@configclass
+class K1TrapEnvCfg(K1BlockFastRawPosEnvCfg):
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.ball_launch = BallTrapCommandCfg(asset_name="robot")
+        self.rewards = K1TrapRewardsCfg()
+        # 終了項の名前は Block と同じ (ball_conceded = ロスト、ball_resolved = トラップ成功) にして eval_block.py を流用する
+        # 到達 ≤ 3 s + トラップ + 保持 1 s。成功・ロスト・転倒で早期終了する。
+        self.episode_length_s = 8.0
+        self.terminations.ball_escaped = DoneTerm(func=ball_escaped)
+
+
+@configclass
+class K1TrapEnvCfg_PLAY(K1BlockFastRawPosEnvCfg_PLAY):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.commands.ball_launch = BallTrapCommandCfg(asset_name="robot")
+        self.rewards = K1TrapRewardsCfg()
+        self.episode_length_s = 8.0
+        self.terminations.ball_escaped = DoneTerm(func=ball_escaped)
 
 
 @configclass

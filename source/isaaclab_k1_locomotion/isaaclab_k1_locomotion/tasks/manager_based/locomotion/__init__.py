@@ -382,6 +382,17 @@ for _suffix, _cfg in (("", "K1BlockFastRawPosEnvCfg"), ("-Play", "K1BlockFastRaw
         },
     )
 
+for _suffix, _cfg in (("", "K1TrapEnvCfg"), ("-Play", "K1TrapEnvCfg_PLAY")):
+    gym.register(
+        id=f"Isaac-Trap-K1{_suffix}-v0",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.block_env_cfg:{_cfg}",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1TrapPPORunnerCfg",
+        },
+    )
+
 gym.register(
     id="Isaac-Block-K1-Curr-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",

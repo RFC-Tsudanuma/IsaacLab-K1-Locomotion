@@ -43,7 +43,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401, E402
 
-OUTCOMES = ("conceded", "resolved", "fell", "timeout")
+OUTCOMES = ("conceded", "resolved", "fell", "timeout", "escaped")  # escaped は Trap のみ (触った後に前方へ逃がした)
 REASONS = ("out_wide", "away", "stopped", "lost_after_touch")  # resolved の内訳 + 触った後に転倒/時間切れ (コマンド項の Metrics から)
 
 
@@ -105,6 +105,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             peak_after = torch.where(touched_foot, torch.maximum(peak_after, ball_v), peak_after)
             feet_d_xy = torch.norm(robot.data.body_link_pos_w[:, term._feet_idx, :2] - ball_w[:, :2].unsqueeze(1), dim=-1).min(dim=1).values
             touched_foot |= feet_d_xy < 0.35
+            ball_x, _, _, _ = term.ball_line_state()
             rebound = torch.where(touched_foot, peak_after, torch.full_like(peak_after, float("nan")))
             obs, _, dones, extras = env.step(policy(obs))
             for k in logged:
@@ -117,11 +118,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             outcome = torch.full_like(d, 3, dtype=torch.long)  # timeout
             outcome[tm.get_term("ball_resolved")] = 1
             outcome[tm.get_term("ball_conceded")] = 0
+            if "ball_escaped" in tm.active_terms:
+                outcome[tm.get_term("ball_escaped")] = 4
             outcome[fell] = 2  # 転倒は同時に失点していても転倒扱い
             for i in d.nonzero().flatten().tolist():
                 rows.append({"speed": speed[i].item(), "dist": dist[i].item(), "lateral": lateral[i].item(), "t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]],
                              "base_x": base_x[i].item(), "base_y": base_y[i].item(), "near": touched[i].item(),
-                             "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item(), "ball_v": ball_v[i].item(), "rebound": rebound[i].item()})
+                             "ball_z": ball_z[i].item(), "feet_d": feet_d[i].item(), "ball_v": ball_v[i].item(), "rebound": rebound[i].item(),
+                             "hit": touched_foot[i].item(), "ahead": (ball_x[i] > base_x[i]).item()})
             touched_foot[d] = False
             peak_after[d] = 0.0
             if step % 500 == 0:
@@ -137,6 +141,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  終了時の胴体のライン前方 x 平均: 全体 {sum(r['base_x'] for r in rows) / n:+.3f} m, 阻止 {sum(r['base_x'] for r in res) / max(len(res), 1):+.3f} m,"
           f" 0.5 m 以上前に出た割合 {100.0 * sum(r['base_x'] > 0.5 for r in rows) / n:5.1f}%")
     print(f"  阻止時 (終了 1 step 前): ボール高さ z 平均 {sum(r['ball_z'] for r in res) / max(len(res), 1):.3f} m, 最寄り足との距離 平均 {sum(r['feet_d'] for r in res) / max(len(res), 1):.3f} m, ボール速度 平均 {sum(r['ball_v'] for r in res) / max(len(res), 1):.3f} m/s, 1 m 以内で 0.3 m/s 未満 {100.0 * sum(r['feet_d'] < 1.0 and r['ball_v'] < 0.3 for r in res) / max(len(res), 1):5.1f}%")
+    to = [r for r in rows if r["outcome"] == "timeout"]
+    nt = max(len(to), 1)
+    print(f"  時間切れ時 (終了 1 step 前): 最寄り足との距離 平均 {sum(r['feet_d'] for r in to) / nt:.2f} m, ボール速度 平均 {sum(r['ball_v'] for r in to) / nt:.2f} m/s, 0.3 m/s 未満 {100.0 * sum(r['ball_v'] < 0.3 for r in to) / nt:5.1f}%, 止まって 1 m 以内 {100.0 * sum(r['ball_v'] < 0.3 and r['feet_d'] < 1.0 for r in to) / nt:5.1f}%, 止まって 2 m 超 {100.0 * sum(r['ball_v'] < 0.3 and r['feet_d'] > 2.0 for r in to) / nt:5.1f}%")
+    # トラップ方策の対象は動いている球。足に触れずに手前 (ロボットより前方) に残ったまま時間切れになった球は「届かなかった」= 対象外
+    na = [r for r in to if not r["hit"] and r["ahead"]]
+    live = [r for r in rows if r["outcome"] != "timeout" or r["hit"] or not r["ahead"]]
+    nl = max(len(live), 1)
+    print(f"  対象外 (未接触で前方に残った時間切れ): {100.0 * len(na) / n:5.1f}% (うち止まった 0.3 m/s 未満 {100.0 * sum(r['ball_v'] < 0.3 for r in na) / max(len(na), 1):5.1f}%)")
+    for label, sel in (("接触あり・前方", [r for r in to if r["hit"] and r["ahead"]]), ("接触あり・後方", [r for r in to if r["hit"] and not r["ahead"]]), ("接触なし・後方", [r for r in to if not r["hit"] and not r["ahead"]])):
+        m = max(len(sel), 1)
+        print(f"  時間切れ内訳 {label}: {100.0 * len(sel) / n:5.1f}%  (足との距離 平均 {sum(r['feet_d'] for r in sel) / m:.2f} m, 止まった {100.0 * sum(r['ball_v'] < 0.3 for r in sel) / m:5.1f}%)")
+    print(f"  動いている球のみ ({len(live)} 件): " + "  ".join(f"{o}: {100.0 * sum(r['outcome'] == o for r in live) / nl:5.1f}%" for o in OUTCOMES))
     reb = [r["rebound"] for r in res if r["rebound"] == r["rebound"]]
     print(f"  阻止のうち足に触れた割合 {100.0 * len(reb) / max(len(res), 1):5.1f}%, 接触後のボール最大速度 (弾き出し) 平均 {sum(reb) / max(len(reb), 1):.3f} m/s,"
           f" 1 m/s 未満 {100.0 * sum(v < 1.0 for v in reb) / max(len(reb), 1):5.1f}%")

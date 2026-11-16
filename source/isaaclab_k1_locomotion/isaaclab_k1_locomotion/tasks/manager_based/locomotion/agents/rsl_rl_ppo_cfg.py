@@ -353,6 +353,18 @@ class K1BlockFastLateralPPORunnerCfg(K1BlockPPORunnerCfg):
 
 
 @configclass
+class K1TrapPPORunnerCfg(K1BlockFastLateralPPORunnerCfg):
+    """トラップ方策 (Isaac-Trap-K1-v0): 方策・PPO は Block (Fast) と同一、ログだけ k1_trap に分ける。
+    Block の checkpoint (別 experiment) から resume するときは --checkpoint に絶対パスを渡す。"""
+
+    experiment_name = "k1_trap"
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.algorithm.latent_loss_coef = 0.0  # Block から resume するので latent 蒸留は切る (best_trap v4c の設定)
+
+
+@configclass
 class K1StealPPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """凍結歩行 expert を事前分布にしたボール奪取方策の学習 (Isaac-Steal-K1-v0)。
 

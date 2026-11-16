@@ -347,8 +347,81 @@ def ball_conceded(env: "ManagerBasedRLEnv", command_name: str = "ball_launch") -
     return env.command_manager.get_term(command_name).conceded()
 
 
+class BallTrapCommand(BallLaunchCommand):
+    """トラップ (パスを足元に止める) 用の判定 (2026-11-14、Isaac-Trap-K1)。射出・ライン座標・観測は BallLaunchCommand と同じ。
+
+    * 成功 (``resolved``): 最寄り足から trap_dist 以内かつ球速 trap_speed 未満 (内訳は常に 3 「止めた」) を resolve_hold_s 保持。
+    * ``conceded`` はロスト: ボールがライン後方 lost_x より奥へ抜けた (罰は付けず終了と評価指標だけに使う)。
+    阻止の内訳 (幅外 / 前へ弾く) は成功にしないので、eval_block.py の「阻止」= トラップ成功、「失点」= ロストと読む。
+    """
+
+    cfg: "BallTrapCommandCfg"
+
+    def __init__(self, cfg: "BallTrapCommandCfg", env: "ManagerBasedRLEnv"):
+        super().__init__(cfg, env)
+        self.touched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)  # 足が一度ボールに触れた
+        self.metrics["escaped"] = torch.zeros(self.num_envs, device=self.device)
+
+    def conceded(self) -> torch.Tensor:
+        x, _, _, _ = self.ball_line_state()
+        return x < -self.cfg.lost_x
+
+    def escaped(self) -> torch.Tensor:
+        """足に触れた後、ボールがロボット前方 escape_x より遠くで遠ざかっている = 弾いて逃がした (終了)。
+        止まった球・逃げた球を追うのは別方策の仕事 (2026-11-15 ユーザー基準) なので、追わせずに失敗で切る。"""
+        x, _, vx, _ = self.ball_line_state()
+        bx, _ = self.body_line_xy()
+        return self.touched & (x - bx > self.cfg.escape_x) & (vx > 0.1)
+
+    def _update_metrics(self):
+        super()._update_metrics()
+        self.metrics["escaped"] = self.escaped().float()
+
+    def _resample_command(self, env_ids: Sequence[int]):
+        super()._resample_command(env_ids)
+        self.touched[env_ids] = False
+
+    def _update_command(self):
+        super()._update_command()
+        self.touched |= _ball_feet_dist(self) < self.cfg.touch_dist
+
+    def resolve_parts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        speed = torch.norm(self.ball.data.root_lin_vel_w[:, :2], dim=1)
+        trapped = (_ball_feet_dist(self) < self.cfg.trap_dist) & (speed < self.cfg.trap_speed) & (self.elapsed() > 0.5)
+        never = torch.zeros_like(trapped)
+        return never, never, trapped
+
+
+@configclass
+class BallTrapCommandCfg(BallLaunchCommandCfg):
+    """トラップ用の射出分布と判定 (2026-11-14 ユーザー決定: まず 1〜4 m/s、狙いはほぼ正面)。"""
+
+    class_type: type = BallTrapCommand
+
+    speed_range: tuple[float, float] = (1.0, 4.0)
+    time_to_arrival_range: tuple[float, float] = (1.0, 3.0)
+    distance_range: tuple[float, float] = (1.5, 8.0)
+    approach_angle: float = math.pi / 4
+    target_lateral: float = 0.5
+    resolve_hold_s: float = 1.0
+    trap_dist: float = 0.4
+    """成功判定: 最寄り足からの xy 距離 [m]。"""
+    trap_speed: float = 0.3
+    """成功判定: 球速 [m/s] 未満。"""
+    lost_x: float = 2.0
+    """ライン後方 [m]: これより奥へ抜けたらロスト (終了)。"""
+    touch_dist: float = 0.35
+    """接触判定: 最寄り足とボールの xy 距離 [m] (eval_block.py の弾き出し判定と同じ)。"""
+    escape_x: float = 1.5
+    """接触後、ボールが胴体よりこれだけ前方 [m] で遠ざかっていたら「逃がした」(終了)。"""
+
+
 def ball_resolved(env: "ManagerBasedRLEnv", command_name: str = "ball_launch") -> torch.Tensor:
     return env.command_manager.get_term(command_name).resolved()
+
+
+def ball_escaped(env: "ManagerBasedRLEnv", command_name: str = "ball_launch") -> torch.Tensor:
+    return env.command_manager.get_term(command_name).escaped()
 
 
 # ---------------------------------------------------------------------------
@@ -384,17 +457,19 @@ def body_forward_l2(env: "ManagerBasedRLEnv", margin: float = 0.2, command_name:
 
 
 def ball_held_at_feet(
-    env: "ManagerBasedRLEnv", pos_std: float = 0.3, vel_std: float = 0.5, command_name: str = "ball_launch"
+    env: "ManagerBasedRLEnv", pos_std: float = 0.3, vel_std: float = 0.5, latched: bool = True, command_name: str = "ball_launch"
 ) -> torch.Tensor:
     """阻止後 (最初の阻止条件を満たしてから終了まで)、ボールが最寄り足の近くで遅いほど高い [0, 1]。
 
     阻止の 3 種 (幅外 / 前へ弾く / 止めた) はどれも同じ ``blocked`` 報酬なので、これで「弾き飛ばすより
     足元に止める」方向へ寄せる (2026-11-07 ユーザー指示)。阻止ラッチ後に限るのは、ラッチ前に遅い
     ボールを足元で転がし続けて稼ぐ抜け道を塞ぐため (ラッチ後は resolve_hold_s で必ず終了する)。
+    ``latched=False`` で毎 step 掛ける (Trap タスク: 足元で止めること自体が目的なので抜け道ではない。JOGA の trapped ゾーン)。
     """
     term: BallLaunchCommand = env.command_manager.get_term(command_name)
     speed = torch.norm(term.ball.data.root_lin_vel_w[:, :2], dim=1)
-    return (term.resolved_at >= 0.0).float() * torch.exp(-torch.square(_ball_feet_dist(term) / pos_std) - torch.square(speed / vel_std))
+    gate = (term.resolved_at >= 0.0).float() if latched else 1.0
+    return gate * torch.exp(-torch.square(_ball_feet_dist(term) / pos_std) - torch.square(speed / vel_std))
 
 
 def ball_speed_after_touch(env: "ManagerBasedRLEnv", max_speed: float = 2.0, command_name: str = "ball_launch") -> torch.Tensor:
