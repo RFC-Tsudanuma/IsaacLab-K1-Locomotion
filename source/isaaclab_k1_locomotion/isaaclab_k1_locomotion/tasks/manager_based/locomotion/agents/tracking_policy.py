@@ -49,8 +49,10 @@ class TrackingActorCritic(ActorCritic):
         num_actions,  # 環境のアクション次元 (12 + 5)。上位の出力次元ではない。
         gate_checkpoint: str = "",
         gate_policy: dict | None = None,
-        command_limits=(2.0, 0.9, 1.0),
+        command_limits=(2.0, 1.9, 1.0),
         command_deadzone: float = 0.1,
+        lateral_x_knee: float | None = 1.0,
+        lateral_x_min: float = 0.3,
         pivot_limit: float = 1.0,
         min_noise_std=(0.0, 0.0, 0.0, 0.0, 0.3),
         **kwargs,
@@ -75,6 +77,8 @@ class TrackingActorCritic(ActorCritic):
         self.register_buffer("command_limits", torch.tensor(command_limits, dtype=torch.float), persistent=False)
         self.register_buffer("min_noise_std", torch.tensor(min_noise_std, dtype=torch.float), persistent=False)
         self.command_deadzone = float(command_deadzone)
+        self.lateral_x_knee = None if lateral_x_knee is None else float(lateral_x_knee)
+        self.lateral_x_min = float(lateral_x_min)
         self.pivot_limit = float(pivot_limit)
 
     def update_distribution(self, obs):
@@ -88,6 +92,13 @@ class TrackingActorCritic(ActorCritic):
     def command(self, raw: torch.Tensor) -> torch.Tensor:
         """生出力 → env に渡す 5 次元 [vx, vy, ωz (クランプ + デッドゾーン), Δψ 残差 (±pivot_limit), mode (0/1)]。"""
         cmd = torch.maximum(torch.minimum(raw[:, :3], self.command_limits), -self.command_limits)
+        if self.lateral_x_knee is not None:
+            # 歩行 expert (best_walk 56444) の指令領域: |vy| > knee では |vx| 上限を knee で xmax → レンジ端で
+            # lateral_x_min へ線形に絞る (mdp/commands.py の lateral_x_knee と同じ台形)
+            xmax, ymax = float(self.command_limits[0]), float(self.command_limits[1])
+            a = ((cmd[:, 1:2].abs() - self.lateral_x_knee) / max(ymax - self.lateral_x_knee, 1e-6)).clamp(0.0, 1.0)
+            lim = xmax + a * (min(self.lateral_x_min, xmax) - xmax)
+            cmd = torch.cat([torch.maximum(torch.minimum(cmd[:, :1], lim), -lim), cmd[:, 1:]], dim=-1)
         stop = torch.norm(cmd, dim=-1, keepdim=True) < self.command_deadzone
         cmd = torch.where(stop, torch.zeros_like(cmd), cmd)
         dpsi = raw[:, 3:4].clamp(-self.pivot_limit, self.pivot_limit)
@@ -135,11 +146,18 @@ class RslRlTrackingActorCriticCfg(RslRlPpoActorCriticCfg):
     gate_policy: RslRlGatingActorCriticCfg = RslRlGatingActorCriticCfg()
     """ゲート (GatingActorCritic) のアーキテクチャと expert のパス。gate_v4 の学習設定と一致させること。"""
 
-    command_limits: tuple[float, float, float] = (2.0, 0.9, 1.0)
-    """歩行コマンドのクランプ (|vx|, |vy|, |ωz|) = 歩行 expert の学習レンジ。"""
+    command_limits: tuple[float, float, float] = (2.0, 1.9, 1.0)
+    """歩行コマンドのクランプ (|vx|, |vy|, |ωz|) = 歩行 expert の学習レンジ (best_walk 56444: x ±2.0 / y ±1.9)。
+    ωz は 1.0 のまま (waypoint v3 で 2.0 にしても到達時間は縮まず精度だけ落ちた)。"""
 
     command_deadzone: float = 0.1
     """||cmd|| がこれ未満なら 0 (停止指令)。"""
+
+    lateral_x_knee: float | None = 1.0
+    """|vy| がこれを超えたら |vx| 上限を絞り始める (歩行 expert の学習分布に合わせる)。None で矩形。"""
+
+    lateral_x_min: float = 0.3
+    """|vy| がレンジ端 (command_limits[1]) のときの |vx| 上限 [m/s]。"""
 
     pivot_limit: float = 1.0
     """Δψ 残差のクランプ [rad] (pivot 目標 = env の既定目標 + 残差)。"""

@@ -316,8 +316,10 @@ class TrackingGoalCommandCfg(WaypointCommandCfg):
     goal_pos_tolerance: float = 0.1
     goal_yaw_tolerance: float = 0.1
 
-    obs_delay_s: tuple[float, float] = (0.1, 0.3)
-    """自己位置推定の遅延 [s] (エピソードごとに一様乱数)。観測・通過判定・pivot 既定目標に掛かる。(0, 0) で無効。"""
+    obs_delay_s: tuple[float, float] = (0.0, 0.0)
+    """自己位置推定の遅延 [s] (エピソードごとに一様乱数)。観測・通過判定・pivot 既定目標に掛かる。
+    既定 0: 実機側 (booster_k1_locomotion) が header.stamp 時刻のオドメトリで遅延を補正するため。
+    補正できない構成なら (0.1, 0.3) で学習する (v9b、到達が約 0.8 s 遅くなる)。"""
 
 
 # ---------------------------------------------------------------------------

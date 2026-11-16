@@ -32,7 +32,6 @@ from .mdp.tracking import (
     TRACK_ACTION_DIM,
     ExternalTransitionCommandCfg,
     TrackingGoalCommandCfg,
-    heading_progress,
     look_at_penalty,
     lowlevel_state,
     mode_switch,
@@ -103,8 +102,7 @@ class K1TrackingRewardsCfg:
         func=track_goal_heading_exp, weight=2.0, params={"command_name": "tracking", "std_yaw": 0.15, "std_pos": 0.15}
     )
     look_at = RewTerm(func=look_at_penalty, weight=-1.0, params={"command_name": "tracking"})
-    # 向き誤差の減少 [rad] × 100 → 1 rad 早く向くごとに +2.0 (pivot の価値を見えやすくする, v4)
-    heading_progress = RewTerm(func=heading_progress, weight=100.0, params={"command_name": "tracking"})
+    # heading_progress (向き誤差ポテンシャル, v4) は pose を遅くし転倒を増やしたので外した (rl_traking.md)
     walk_command_rate_l2 = RewTerm(func=track_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
     mode_switch = RewTerm(func=mode_switch, weight=-0.5, params={"command_name": "base_velocity"})
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
@@ -125,7 +123,7 @@ class K1TrackingEnvCfg(K1FlatGatingCfg):
                 asset_name=gate_cmd.asset_name,
                 walk_cfg=gate_cmd.walk_cfg,
                 turn_cfg=gate_cmd.turn_cfg,
-                initial_turn_prob=0.35,  # turn 始まり (目標 = 既定目標) で pivot の価値を学ばせる (v3)
+                initial_turn_prob=0.2,  # turn 始まりのエピソード (v3 の 0.35 は効果なし → v5 以降 0.2)
                 zero_command_history_on_switch=True,
             )
         )

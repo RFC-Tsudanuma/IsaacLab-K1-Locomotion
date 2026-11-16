@@ -288,3 +288,9 @@ critic は同じ項をノイズ無しで。停滞したときだけ関節位置�
   推定の遅延中に動いた分はこれで戻るので、**遅延なし方策 v7b model_1200 (新 pivot expert 上で学習) に戻す**。
 - v9b (遅延込み学習) は stamp が使えない場合の代替として best_tracking に残す (model_v9b_1499.pt / tracking_v9b_1499.onnx)。
   遅延を観測に入れて方策に融合させる案は、決定論的な補正と同じ結果にしかならないので採らない。
+
+## 2026-11-16: 新歩行 (best_walk 56444, y ±1.9) + 新ゲート (gate_v7 2999) 向けの準備
+- 採用設定 (v7b) を既定値に焼き込み: heading_progress 報酬を削除、initial_turn_prob 0.2、obs_delay_s (0, 0) (遅延は実機側で補正)。
+- 上位方策のクランプを新歩行の指令領域に合わせた: (2.0, 1.9, 1.0) + |vy| > 1.0 で |vx| 上限を 0.3 (|vy|=1.9) まで線形に絞る台形
+  (`lateral_x_knee` / `lateral_x_min`、mdp/commands.py のサンプリングと同じ)。ONNX 書き出しにも同じ処理を入れた (旧 checkpoint は従来どおり)。
+- 新 expert / ゲートで 64 env × 3 iter の起動確認済み。別 PC 向けの手順は `scripts/rsl_rl/TRACKING_HANDOFF.md`。

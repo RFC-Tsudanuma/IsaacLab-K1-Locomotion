@@ -107,6 +107,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     # エピソード開始時の「最初の目標点への yaw 誤差」(pivot が有効な状況の抽出用)。reset 直後の step で記録
     init_yaw_err = torch.zeros(env.num_envs, device=raw_env.device)
     ep_switches = torch.zeros(env.num_envs, device=raw_env.device)
+    # 全経由点通過後に初めてゴールから r [m] 以内 (位置のみ、向きは無視) に入った時刻: 粗い到達の速さを見る
+    radii = (0.1, 0.3, 0.5)
+    t_first = {r: torch.full((env.num_envs,), -1.0, device=raw_env.device) for r in radii}
+    coarse = {name: {r: [0.0, 0] for r in radii} for name in ("pose", "look")}  # [時間の和, 件数]
     obs = env.get_observations()
     with torch.inference_mode():
         for step in range(args_cli.steps):
@@ -124,6 +128,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             turn_pre = low.is_turn.clone()
             viol_pre = look_pre & (goal.look_at_err().abs() > goal.cfg.look_at_limit)
             passed_pre, gdist_pre = goal.all_passed().clone(), goal.goal_dist().clone()
+            t_now = raw_env.episode_length_buf.float() * dt
+            for r in radii:
+                hit = passed_pre & (gdist_pre < r) & (t_first[r] < 0)
+                t_first[r][hit] = t_now[hit]
             obs, _, dones, _ = env.step(actions)
             ep_switches += low.switched.float()
             fall = tm.get_term("base_height") | tm.get_term("base_contact")
@@ -147,7 +155,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 st.big_yaw_done += int(big.sum())
                 st.big_yaw_reach += int((big & reached_pre).sum())
                 st.big_yaw_ttg += float(ttg_pre[big & reached_pre].sum())
+                for r in radii:
+                    sel = dm & (t_first[r] >= 0)
+                    coarse[name][r][0] += float(t_first[r][sel].sum())
+                    coarse[name][r][1] += int(sel.sum())
             ep_switches[d] = 0.0
+            for r in radii:
+                t_first[r][d] = -1.0
             if step % 500 == 0:
                 print(f"[step {step}] episodes={stats['pose'].done + stats['look'].done}")
 
@@ -159,6 +173,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  episodes {total}: reached {100.0 * reach / max(total, 1):.2f}%  falls {100.0 * falls / max(total, 1):.2f}%")
     for name, st in stats.items():
         print(st.line(name))
+        parts = [f"r<{r:.1f} m: {c[0] / max(c[1], 1):.3f} s ({100.0 * c[1] / max(st.done, 1):.1f}%)" for r, c in coarse[name].items()]
+        print(f"         time to goal position only (after all waypoints): " + "  ".join(parts))
     env.close()
 
 

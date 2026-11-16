@@ -14,8 +14,9 @@ C++ 側の契約 (mdp/tracking.py, tracking_env_cfg.py K1TrackingNavPolicyCfg):
       + [前 tick の上位出力 (vx, vy, ωz, Δψ, mode) (5)]
       + [gate mode one-hot (walk, turn) (2), 現モード滞在時間 clip 1 s (1), turn 中の残り角 (rad, walk では 0) (1)]
       + [base 線速度 body 系 (3)] + [base 角速度 (3)] + [projected gravity (3)]
-出力  command (1, 5) float32 = (vx, vy, ωz, Δψ 残差, mode)。クランプ (2.0, 0.9, 1.0) / ||cmd|| < 0.1 → 0 /
-      Δψ 残差 ∈ ±1.0 / mode ∈ {0, 1} を適用済み。上位出力は次 tick のコマンドとして使う (学習と同じ 1 step 遅れ)。
+出力  command (1, 5) float32 = (vx, vy, ωz, Δψ 残差, mode)。クランプ (command_limits、現行 (2.0, 1.9, 1.0)) /
+      |vy| > lateral_x_knee では |vx| 上限を lateral_x_min まで線形に絞る (歩行 expert の指令領域) /
+      ||cmd|| < 0.1 → 0 / Δψ 残差 ∈ ±1.0 / mode ∈ {0, 1} を適用済み。上位出力は次 tick のコマンドとして使う (学習と同じ 1 step 遅れ)。
       mode の切替は最小滞在 0.3 s を満たすときだけ受け付け、turn 突入時に Δψ をラッチする (C++ 側で実装)。
 
 使い方 (Isaac Sim 不要)::
@@ -46,17 +47,25 @@ args = parser.parse_args()
 class NavExporter(nn.Module):
     """nav_obs → command。TrackingActorCritic.act_inference + command() と同じ計算。"""
 
-    def __init__(self, policy: ActorCritic, limits, deadzone: float, pivot_limit: float):
+    def __init__(self, policy: ActorCritic, limits, deadzone: float, pivot_limit: float,
+                 lateral_x_knee: float | None = None, lateral_x_min: float = 0.3):
         super().__init__()
         self.norm = policy.actor_obs_normalizer
         self.actor = policy.actor
         self.register_buffer("lim", torch.tensor(limits, dtype=torch.float))
         self.deadzone = float(deadzone)
         self.pivot_limit = float(pivot_limit)
+        self.knee = None if lateral_x_knee is None else float(lateral_x_knee)
+        self.xmax, self.ymax = float(limits[0]), float(limits[1])
+        self.x_min = min(float(lateral_x_min), self.xmax)
 
     def forward(self, nav_obs: torch.Tensor) -> torch.Tensor:
         raw = self.actor(self.norm(nav_obs))
         cmd = torch.maximum(torch.minimum(raw[:, :3], self.lim), -self.lim)
+        if self.knee is not None:  # TrackingActorCritic.command() と同じ台形の指令領域
+            a = ((cmd[:, 1:2].abs() - self.knee) / max(self.ymax - self.knee, 1e-6)).clamp(0.0, 1.0)
+            lim = self.xmax + a * (self.x_min - self.xmax)
+            cmd = torch.cat([torch.maximum(torch.minimum(cmd[:, :1], lim), -lim), cmd[:, 1:]], dim=-1)
         stop = torch.norm(cmd, dim=-1, keepdim=True) < self.deadzone
         cmd = torch.where(stop, torch.zeros_like(cmd), cmd)
         dpsi = raw[:, 3:4].clamp(-self.pivot_limit, self.pivot_limit)
@@ -88,7 +97,8 @@ def main() -> None:
     policy.load_state_dict(sd, strict=True)
     policy.eval()
 
-    exporter = NavExporter(policy, pcfg["command_limits"], pcfg["command_deadzone"], pcfg["pivot_limit"]).eval()
+    exporter = NavExporter(policy, pcfg["command_limits"], pcfg["command_deadzone"], pcfg["pivot_limit"],
+                           pcfg.get("lateral_x_knee"), pcfg.get("lateral_x_min", 0.3)).eval()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     obs_dim = obs["nav_policy"].shape[1]
     torch.onnx.export(
@@ -106,7 +116,8 @@ def main() -> None:
         out = sess.run(None, {"nav_obs": x.numpy()})[0]
         max_err = max(max_err, float(np.abs(out - ref).max()))
     print(f"[export_tracking_policy] wrote {args.out} (nav_obs dim {obs_dim}, limits {pcfg['command_limits']}, "
-          f"deadzone {pcfg['command_deadzone']}, pivot_limit {pcfg['pivot_limit']})")
+          f"deadzone {pcfg['command_deadzone']}, pivot_limit {pcfg['pivot_limit']}, "
+          f"lateral_x_knee {pcfg.get('lateral_x_knee')}, lateral_x_min {pcfg.get('lateral_x_min', 0.3)})")
     print(f"[export_tracking_policy] parity torch vs onnxruntime over {args.num_checks} inputs: max |Δ| = {max_err:.3e}")
     assert max_err < 1e-5, "ONNX と torch の出力が一致しません"
 
