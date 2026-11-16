@@ -346,7 +346,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     sp = torch.tensor(speeds, device=dev)
     group = torch.arange(N, device=dev) % len(speeds)
     fixed = torch.zeros(N, 3, device=dev)
-    fixed[:, 0] = sp[group]
+    ax = int(os.environ.get("MEASURE_AXIS", "0"))  # 0: vx 指令, 1: vy 指令 (横移動)
+    fixed[:, ax] = sp[group]
+    fixed[:, 1 - ax] = float(os.environ.get("MEASURE_OTHER", "0"))  # もう一方の軸の固定指令 (斜め計測用)
     cmd_term = uenv.command_manager.get_term("base_velocity")
     robot = uenv.scene["robot"]
     sensor = uenv.scene.sensors["contact_forces"]
@@ -357,10 +359,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     z = lambda: torch.zeros(N, device=dev)
     stride_sum, stride_cnt, vel_sum, vel_cnt, gap_absmax, air_sum = z(), z(), z(), z(), z(), z()
     slide_sum, slide_cnt = z(), z()
+    fall_cnt = z()  # 計測中の終了回数 (計測は 12 s でタイムアウトより短いので ≒ 転倒)
+    tilt_sum, angv_sum, pow_sum = z(), z(), z()  # 上体の傾き |g_xy|・roll/pitch 角速度・関節パワー Σ|τω|
     fly_sum = z()  # 両足同時空中だったステップ数 (odometry 要件: 0 が理想)
     obs = env.get_observations()
+    # 地形 (既定 5x5 タイル x 8 m + 縁 5 m = 半幅 25 m) の端から歩いて落ちた終了は転倒に数えない
+    edge = float(os.environ.get("MEASURE_EDGE", "24.0"))
+    flip = int(os.environ.get("MEASURE_FLIP", "0"))
     for step in range(steps_total):
-        cmd_term.vel_command_b[:] = fixed
+        inside = robot.data.root_pos_w[:, :2].abs().max(dim=1)[0] < edge
+        # MEASURE_FLIP>0: このステップ数ごとに指令の符号を反転 (切り返し時の転倒確認用。速度列は無意味になる)
+        cmd_term.vel_command_b[:] = -fixed if flip and (step // flip) % 2 else fixed
         cmd_term.is_heading_env[:] = False
         cmd_term.is_standing_env[:] = False
         with torch.inference_mode():
@@ -369,11 +378,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             policy_nn.reset(dones)
         if step < warmup:
             continue
+        fall_cnt += (dones.to(inside.device) & inside).float()
         valid = uenv.episode_length_buf > 50
         base_pos = robot.data.root_pos_w[:, :3]
         qy = yaw_quat(robot.data.root_quat_w)
         rel = [quat_apply_inverse(qy, robot.data.body_pos_w[:, i, :3] - base_pos) for i in rid]
-        gap_x = rel[0][:, 0] - rel[1][:, 0]
+        gap_x = rel[0][:, ax] - rel[1][:, ax]
         gap_absmax = torch.maximum(gap_absmax, gap_x.abs() * valid)
         first = sensor.compute_first_contact(dt)[:, sid]
         first = first & (sensor.data.last_air_time[:, sid] > 0.1)
@@ -382,16 +392,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         stride_sum += torch.where(hit, stride, z())
         stride_cnt += hit.float()
         air_sum += torch.where(hit, sensor.data.last_air_time[:, sid].max(dim=1)[0], z())
-        vel_sum += robot.data.root_lin_vel_b[:, 0] * valid
+        vel_sum += robot.data.root_lin_vel_b[:, ax] * valid
         vel_cnt += valid.float()
         in_contact = sensor.data.net_forces_w_history[:, :, sid, :].norm(dim=-1).max(dim=1)[0] > 1.0
         foot_v = torch.stack([robot.data.body_lin_vel_w[:, i, :2].norm(dim=1) for i in rid], dim=1)
         slide_sum += (foot_v * in_contact).sum(dim=1) * valid
         slide_cnt += in_contact.sum(dim=1).float() * valid
         fly_sum += (~in_contact.any(dim=1)).float() * valid
+        tilt_sum += robot.data.projected_gravity_b[:, :2].norm(dim=1) * valid
+        angv_sum += robot.data.root_ang_vel_b[:, :2].norm(dim=1) * valid
+        pow_sum += (robot.data.applied_torque * robot.data.joint_vel).abs().sum(dim=1) * valid
     T = (steps_total - warmup) * dt
     print("\n=== stride measurement (per commanded vx) ===")
-    print("vx_cmd  vx_act  stride_td  gap_amp  cadence[Hz]  swing[s]  slide[m/s]  fly%  n_td")
+    print("vx_cmd  vx_act  stride_td  gap_amp  cadence[Hz]  swing[s]  slide[m/s]  fly%  n_td  falls/env  tilt  angv_xy[rad/s]  power[W]")
     for gi, s in enumerate(speeds):
         m = group == gi
         n_td = stride_cnt[m].sum().item()
@@ -402,7 +415,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sw = (air_sum[m].sum() / max(n_td, 1)).item()
         sl = (slide_sum[m].sum() / slide_cnt[m].sum().clamp(min=1)).item()
         fly = (fly_sum[m].sum() / vel_cnt[m].sum().clamp(min=1)).item() * 100.0
-        print(f"{s:6.2f}  {va:6.3f}  {st:8.3f}  {amp:7.3f}  {cad:10.2f}  {sw:7.3f}  {sl:9.3f}  {fly:4.1f}  {int(n_td)}")
+        print(f"{s:6.2f}  {va:6.3f}  {st:8.3f}  {amp:7.3f}  {cad:10.2f}  {sw:7.3f}  {sl:9.3f}  {fly:4.1f}  {int(n_td)}  {fall_cnt[m].mean().item():.2f}  " + "  ".join(f"{(q[m].sum() / vel_cnt[m].sum().clamp(min=1)).item():.3f}" for q in (tilt_sum, angv_sum, pow_sum)))
     env.close()
 
 

@@ -102,6 +102,11 @@ def feet_phase(
     gate_low_speed: float = 1.2,
     gate_high_speed: float = 1.6,
     gate_high_scale: float = 1.0,
+    lateral_low: float = 0.5,
+    lateral_gain: float = 0.0,
+    lateral_stance_ratio: float | None = None,
+    lateral_gate_low: float = 0.7,
+    lateral_gate_high: float = 1.0,
 ) -> torch.Tensor:
     """Reward based on matching foot contact pattern to a periodic phase oscillator.
 
@@ -142,12 +147,18 @@ def feet_phase(
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
     # Phase angle in [0, 2*pi) for the LEFT foot (コマンド依存周波数の積分位相; obs と共有)
-    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq)  # [N]
+    phase_left = get_gait_phase(env, command_name, low_speed, high_speed, low_freq, high_freq, lateral_low, lateral_gain)  # [N]
     # RIGHT foot is half-cycle offset (anti-phase alternating gait)
     phase_right = (phase_left + math.pi) % (2.0 * math.pi)             # [N]
 
     # Desired contact: True when phase < stance_ratio * 2*pi  (stance phase)
     stance_threshold = 2.0 * math.pi * stance_ratio
+    if lateral_stance_ratio is not None:
+        # 横指令 |vy| が gate_low→gate_high で stance 比を lateral_stance_ratio へ線形に寄せる
+        # (0.5 未満で飛行期を位相報酬が許す。横は 1 周期の移動量が開き幅で頭打ちのため)
+        vy = env.command_manager.get_command(command_name)[:, 1].abs()
+        a = torch.clamp((vy - lateral_gate_low) / (lateral_gate_high - lateral_gate_low), 0.0, 1.0)
+        stance_threshold = 2.0 * math.pi * (stance_ratio + a * (lateral_stance_ratio - stance_ratio))
     desired_stance_left = phase_left < stance_threshold    # [N]
     desired_stance_right = phase_right < stance_threshold  # [N]
     # Stack: shape [N, 2] — column 0 = left, column 1 = right
@@ -396,11 +407,21 @@ def feet_parallel_to_ground(env: ManagerBasedRLEnv,
 
     return shaped_reward
 
-def both_feet_not_in_contact(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg) -> torch.Tensor:
+def both_feet_not_in_contact(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    command_name: str | None = None,
+    lateral_gate_low: float = 0.7,
+    lateral_gate_high: float = 1.0,
+) -> torch.Tensor:
     """Penalize when both feet are not in contact with the ground.
 
     This function penalizes the agent when both feet are not in contact with the ground.
     The reward is computed based on the contact forces of the feet. If both feet have low contact force, a penalty is applied.
+
+    ``command_name`` を渡すと横移動ゲートが有効になる: 横速度指令 |vy| が
+    ``lateral_gate_low`` 以下では等倍、``lateral_gate_high`` 以上では 0 (フライト許可) へ
+    線形に減衰する。None (既定) では従来どおり常時ペナルティ。
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
@@ -409,7 +430,11 @@ def both_feet_not_in_contact(env: ManagerBasedRLEnv, sensor_cfg: SceneEntityCfg)
     foot_in_contact = foot_contact_forces > 1.0  # Consider in contact if force > 1 N
     both_feet_not_in_contact = ~(foot_in_contact[:, -1, 0] | foot_in_contact[:, -1, 1])  # Check last timestep for both feet
 
-    return both_feet_not_in_contact.float() * -1.0  # Penalty of -1 when both feet are not in contact
+    penalty = both_feet_not_in_contact.float() * -1.0  # Penalty of -1 when both feet are not in contact
+    if command_name is not None:
+        vy = env.command_manager.get_command(command_name)[:, 1].abs()
+        penalty = penalty * (1.0 - ((vy - lateral_gate_low) / (lateral_gate_high - lateral_gate_low)).clamp(0.0, 1.0))
+    return penalty
 
 def foot_clearance_ji(
     env: ManagerBasedRLEnv,

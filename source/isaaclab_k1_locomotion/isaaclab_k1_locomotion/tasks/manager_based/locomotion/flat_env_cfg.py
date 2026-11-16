@@ -1061,6 +1061,99 @@ class K1FlatStancePlanePolishCfg(K1FlatStancePlaneCfg):
 
 
 @configclass
+class K1FlatStancePlaneWideCfg(K1FlatStancePlanePolishCfg):
+    """model_52700 からの速度分布拡張: y ±0.9 → ±1.9 (2026-11-14〜16。x ±2.8 は未着手)。
+
+    参照動作ベースの歩行で同じ実機が x 2.8 / y 1.9 m/s 程度まで出せると判明したため、
+    学習分布をそこへ広げる (scripts/rsl_rl/WALK_HANDOFF.md 参照)。
+
+    K1FlatStancePlanePolishCfg との違い:
+
+    * 位相周波数: ノルム依存マッピングは model_52700 のまま。横移動時のみ
+      (|vy| - 0.5) × lateral_gain 0.75 Hz を加算 (3 箇所同時)。
+    * 速度追従の粗い項 (std 1.0) を追加: 届かない指令で「諦め歩行」に落ちるのを防ぐ。
+    * no_fly に横指令ゲート: |vy| > 1.0 の横移動時のみフライト許可 (ユーザー判断)。
+    * 指令領域: |vy| > 1.0 では |vx| 上限を絞る (高速の横移動はほぼ純横、x 2.0 / y 1.0 は含む)。
+    * 速度範囲 x ±2.0 / y ±1.9 (単段)、extreme corner 即時有効。
+    * 仕上げ: no_fly 12 / feet_slide -1.5 / ang_vel_xy -0.9 / flat_orientation -50。
+    * この既定値 = frozen_policies/best_walk/model_56444.pt の最終段の学習設定。
+
+    追加学習は best_walk を logs/rsl_rl/k1_flat/best_walk/ に置いて warm-start
+    (scripts/rsl_rl/probe_wide.sh 参照。--reset_noise_std 0.05 必須)。
+
+    NOTE: lateral_gain を有効にしたポリシーをデプロイするときは C++ 側
+    cmd_phase_freq() にも同じ横加算を入れること (k1_constants_isaaclab.hpp)。
+    """
+
+    def __post_init__(self):
+        super().__post_init__()
+
+        # --- 上体揺れ: model_52700 の finetune 値 (-0.65 / -40) から、範囲拡張で増えた揺れを
+        # 戻すために一段強める (2026-11-16 S2b: +300it で傾きは基準並み、前進 2.0 の
+        # roll/pitch 角速度 0.48 → 0.42 rad/s、速度は維持) ---
+        self.rewards.ang_vel_xy_l2.weight = -0.9
+        self.rewards.flat_orientation_l2.weight = -50.0
+        self.rewards.base_ang_acc_l2.weight = -2.0e-5
+
+        # --- フライト/滑りの仕上げ (2026-11-16 P4): 片方だけ強めると他方が増えるので同時に上げる。
+        # 前進 2.0 の fly% 2.0 → 1.2 (基準 1.4)、滑りも 1 割減、速度はほぼ維持 ---
+        self.rewards.no_fly.weight = 12.0
+        self.rewards.feet_slide.weight = -1.5
+        # 横に足を開けるよう股関節ロールの偏差罰を緩める (横速度は開き幅 × ケイデンス)
+        self.rewards.joint_deviation_hip.weight = -0.02
+
+        # --- 位相周波数: ノルム依存マッピングは best_walk のまま、横移動時のみ加算 (3 箇所同時) ---
+        # プローブ (2026-11-15): 高速側アンカーの引き上げ (2.8 Hz@2.0 / 3.0 Hz@2.8) は
+        # 再適応中に 2.0 m/s の追従ごと失ったため見送り。横は「開き幅 × ケイデンス」で
+        # 頭打ちになるので、|vy| > lateral_low の超過分 × lateral_gain [Hz/(m/s)] を加算する。
+        # 採用値 0.75: 純横 1.9 m/s で ~3.1 Hz (実機上限 ~3 Hz、2026-11-15 ユーザー情報)。
+        # 2.0 (4.8 Hz) は速いが非現実的、0.5 (2.7 Hz) は横 1.9 → 1.44 m/s 止まり。
+        lateral_phase_freq = {"lateral_low": 0.5, "lateral_gain": 0.75}
+        self.observations.policy.gait_phase.params.update(lateral_phase_freq)
+        self.observations.critic.gait_phase.params.update(lateral_phase_freq)
+        self.rewards.feet_phase.params.update(lateral_phase_freq)
+        self.rewards.feet_phase.params["lateral_stance_ratio"] = None  # プローブで override する用
+
+        # --- 速度追従の「さらに粗い」項 (std 1.0) ---
+        # プローブ (2026-11-15): 物理上限 (~1.95 m/s) を超える指令を学習分布に入れると、
+        # 誤差 >0.3 m/s で既存 2 項 (std 0.25/0.5) が飽和して「全力で走る」旨味が消え、
+        # 指令 2.2 → 実速度 1.07 の「諦め歩行」に落ちた (範囲 ±2.0 据え置きでは起きない)。
+        # 届かない指令でも速い方が得になる勾配を残す。
+        self.rewards.track_lin_vel_xy_vcoarse = RewTerm(
+            func=mdp.track_lin_vel_xy_yaw_frame_exp,
+            weight=2.4,
+            params={"command_name": "base_velocity", "std": 1.0},
+        )
+
+        # --- 横移動時のフライト許可 (2026-11-15 ユーザー判断) ---
+        # フライト禁止下の横速度は「足の開き幅 ~0.42 m × ケイデンス」で決まり、
+        # 基準ポリシーは ~0.86 m/s で頭打ち (実測)。横指令 |vy| 1.0→1.3 で no_fly を 0 へ減衰。
+        # 前進側はフライトさせたくない + 「x 2.0 / y 1.0」の斜めは必須 (同日ユーザー要件) なので、
+        # |vy| <= 1.0 は no_fly を全量かける。
+        self.rewards.no_fly.params.update(
+            {"command_name": "base_velocity", "lateral_gate_low": 1.0, "lateral_gate_high": 1.3}
+        )
+
+        # --- 指令領域: 高速の横移動はほぼ純横 (キーパーのセーブ用途、同日ユーザー要件) ---
+        # |vy| <= 1.0 は x 全域 (x 2.0 / y 1.0 の斜めを含む)、それより外は |vx| 上限を
+        # |vy| = ymax で 0.3 m/s まで線形に絞る。extreme corner も (xmax, 1.0) に置かれる。
+        self.commands.base_velocity.lateral_x_knee = 1.0
+        self.commands.base_velocity.lateral_x_min = 0.3
+
+        # --- 速度範囲: x ±2.0 据え置き / y ±1.9 (単段。warm-start では EMA 関門が機能しないため
+        # 段階拡張はプローブを手で刻んだ: ±1.2 → ±1.5 → ±1.9)。x ±2.8 への拡張は未着手 ---
+        self.curriculum.lin_vel_command = K1FlatCurriculumCfg().lin_vel_command
+        self.curriculum.lin_vel_command.params["stages_x"] = [(-2.0, 2.0)]
+        self.curriculum.lin_vel_command.params["stages_y"] = [(-1.9, 1.9)]
+        self.curriculum.lin_vel_command.params["error_threshold"] = [1.0]  # 単段なのでログ表示専用
+
+        # --- extreme corner: 即時有効 (角は (xmax, lateral_x_knee) に置かれる) ---
+        self.curriculum.extreme_commands.params["num_steps"] = 0
+        self.curriculum.extreme_commands.params["ramp_steps"] = 1
+        self.commands.base_velocity.resampling_time_range = (1.0, 7.0)
+
+
+@configclass
 class K1FlatTurnCfg(K1FlatStancePlaneCfg):
     """高速その場回転タスク (2026-09-12)。コマンド = 目標ヘディングまでの残り角 Δψ。
 
@@ -2000,8 +2093,13 @@ class K1FlatTransitionCfg(K1FlatStancePlaneCfg):
         super().__post_init__()
 
         # 参照 cfg (各 expert の最終学習設定)。純粋な Python 設定なので実体化は軽い。
-        walk_ref = K1FlatStancePlanePolishCfg()
+        # 2026-11-16: 歩行 expert が best_walk/model_56444 (横速度拡張) になったので参照も Wide に。
+        # 位相周波数の横加算 (lateral_gain) は観測側にも同じ params を入れる (報酬側は
+        # merge_expert_rewards が walk_ref から取り込む)。turn 中は cmd_xy = 0 なので影響しない。
+        walk_ref = K1FlatStancePlaneWideCfg()
         turn_ref = K1FlatTurnFinetuneCfg()
+        self.observations.policy.gait_phase.params.update(walk_ref.observations.policy.gait_phase.params)
+        self.observations.critic.gait_phase.params.update(walk_ref.observations.critic.gait_phase.params)
 
         # ------------------------------------------------------------------
         # カリキュラムを学習終了時点の状態に固定 (両参照 cfg と同じ回避)
@@ -2093,7 +2191,9 @@ class K1FlatGatingCfg(K1FlatTransitionCfg):
         # 遷移の密度も上げる (extreme = |v| が max の 0.7 倍以上を引く確率)。
         # 注意: best_walk 自体は y ±0.9 で学習しているので 1.2 は expert にとって分布外。
         # 横 1.2 の追従が悪い場合はゲートではなく best_walk 側の追加学習が必要。
-        cmd.walk_cfg.ranges.lin_vel_y = (-1.2, 1.2)
+        # 2026-11-16: best_walk/model_56444 で y ±1.9 が学習分布に入ったので歩行側と同じ領域にする
+        # (|vy| > 1.0 では |vx| 上限が絞られる。walk_cfg.lateral_x_knee は Wide から引き継ぐ)。
+        cmd.walk_cfg.ranges.lin_vel_y = (-1.9, 1.9)
         cmd.walk_cfg.extreme_prob = 0.6
         cmd.turn_early_exit_rad = 15.0 * math.pi / 180.0
         cmd.yaw_assist_gain = 4.0

@@ -39,6 +39,7 @@ parser.add_argument("--agent", type=str, default="rsl_rl_cfg_entry_point")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--warmup", type=float, default=1.5, help="turn へ入る前に歩かせる秒数")
 parser.add_argument("--entry-speed", type=float, default=0.0, help="turn 突入時の前進指令 [m/s]")
+parser.add_argument("--entry-vy", type=float, default=0.0, help="turn 突入時の横指令 [m/s]")
 parser.add_argument("--turn-deg", type=float, default=180.0, help="pivot の目標相対角 [deg]")
 parser.add_argument("--exit-deg", type=float, default=5.0, help="この残り角 [deg] で walk へ戻す")
 parser.add_argument("--resume-speed", type=float, default=0.5, help="再加速の判定速度 [m/s]")
@@ -142,13 +143,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg):
     target_rad = math.radians(args_cli.turn_deg)
     obs = env.get_observations()
 
-    def set_walk_cmd(ids, vx, wz=None):
+    def set_walk_cmd(ids, vx, wz=None, vy=0.0):
         cmd.walk.vel_command_b[ids, 0] = vx
-        cmd.walk.vel_command_b[ids, 1] = 0.0
+        cmd.walk.vel_command_b[ids, 1] = vy
         cmd.walk.vel_command_b[ids, 2] = 0.0 if wz is None else wz
         cmd.walk.time_left[ids] = 1.0e6
 
-    set_walk_cmd(slice(None), args_cli.entry_speed)
+    set_walk_cmd(slice(None), args_cli.entry_speed, vy=args_cli.entry_vy)
 
     steps = int((env_cfg.episode_length_s - 0.2) / dt)
     with torch.inference_mode():

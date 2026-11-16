@@ -142,6 +142,16 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-Velocity-Flat-Stance-Plane-Wide",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.flat_env_cfg:K1FlatStancePlaneWideCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1FlatFastPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Velocity-Flat-Stance-Fast",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

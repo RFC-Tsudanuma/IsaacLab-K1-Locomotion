@@ -170,6 +170,20 @@ class ExtremeVelocityCommand(UniformVelocityCommand):
         self.metrics["stride_touchdown_fast"] = self._stride_fast_sum / self._stride_fast_cnt.clamp(min=1.0)
 
     def _resample_command(self, env_ids: Sequence[int]):
+        self._resample_extreme(env_ids)
+        knee = self.cfg.lateral_x_knee
+        if knee is not None:
+            # 高速の横移動はほぼ純横 (キーパーのセーブ) という前提で、|vy| > knee では |vx| の上限を
+            # xmax (|vy|=knee) → lateral_x_min (|vy|=ymax) へ線形に絞る。|vy| <= knee は矩形のまま。
+            xmax = max(map(abs, self.cfg.ranges.lin_vel_x))
+            ymax = max(map(abs, self.cfg.ranges.lin_vel_y))
+            if ymax > knee:
+                v = self.vel_command_b[env_ids, :2]
+                a = ((v[:, 1].abs() - knee) / (ymax - knee)).clamp(0.0, 1.0)
+                lim = xmax + a * (min(self.cfg.lateral_x_min, xmax) - xmax)
+                self.vel_command_b[env_ids, 0] = torch.maximum(torch.minimum(v[:, 0], lim), -lim)
+
+    def _resample_extreme(self, env_ids: Sequence[int]):
         super()._resample_command(env_ids)
         prob = float(self.cfg.extreme_prob)
         if prob <= 0.0:
@@ -191,6 +205,9 @@ class ExtremeVelocityCommand(UniformVelocityCommand):
                 torch.full((m,), hi, device=self.device),
                 torch.full((m,), lo, device=self.device),
             )
+            if col == 1 and self.cfg.lateral_x_knee is not None:
+                # 角は (xmax, knee) に置く (それより外の |vy| は |vx| が絞られるので角にならない)
+                bound = bound.clamp(-self.cfg.lateral_x_knee, self.cfg.lateral_x_knee)
             u = torch.rand(m, device=self.device)
             self.vel_command_b[ids, col] = bound * (frac + (1.0 - frac) * u)
 
@@ -225,6 +242,12 @@ class ExtremeVelocityCommandCfg(UniformVelocityCommandCfg):
 
     extreme_frac: float = 0.7
     """extreme モードで引く線速度成分の大きさの下限 (レンジ端に対する割合)。"""
+
+    lateral_x_knee: float | None = None
+    """|vy| がこの値を超えたら |vx| の上限を絞り始める (None で無効 = 矩形サンプリング)。"""
+
+    lateral_x_min: float = 0.3
+    """|vy| がレンジ端のときの |vx| 上限 [m/s]。"""
 
     extreme_heading_err_range: tuple[float, float] = (2.0, math.pi)
     """extreme モードで heading target を現在 yaw から離す角度 [rad] の範囲。
