@@ -349,7 +349,7 @@ class K1BlockFastLateralPPORunnerCfg(K1BlockPPORunnerCfg):
     """横移動を速くした阻止方策 (Isaac-Block-K1-Fast-v0): コマンド上限 (1.5, 1.5, 2.0)。環境側は
     K1BlockFastLateralEnvCfg (1.5 m/s で 2.3 Hz)。v10 の checkpoint から resume して使う。"""
 
-    policy = RslRlBlockActorCriticCfg(command_limits=(1.5, 1.5, 2.0))
+    policy = RslRlBlockActorCriticCfg(command_limits=(2.0, 1.9, 2.0))  # 2026-11-16 best_walk model_56444 (y ±1.9) に合わせた
 
 
 @configclass

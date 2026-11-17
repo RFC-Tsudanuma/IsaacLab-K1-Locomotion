@@ -73,6 +73,10 @@ class BlockExporter(nn.Module):
         self.register_buffer("lim", torch.tensor(pcfg["command_limits"], dtype=torch.float), persistent=False)
         self.deadzone = float(pcfg["command_deadzone"])
         self.residual_scale = float(pcfg["residual_scale"])
+        # |vy| > knee で vx 上限を絞る (BlockActorCritic.command と同じ)。古い agent.yaml (膝なし) / vy 上限 ≤ knee なら無効
+        self.knee = float(pcfg.get("lateral_x_knee", 1.0))
+        self.x_min = float(pcfg.get("lateral_x_min", 0.3))
+        self.knee_active = "lateral_x_knee" in pcfg and float(pcfg["command_limits"][1]) > self.knee
 
     def forward(self, block_obs: torch.Tensor, ball_history: torch.Tensor):
         x = torch.cat([block_obs, ball_history.reshape(block_obs.shape[0], -1)], dim=-1)
@@ -80,6 +84,10 @@ class BlockExporter(nn.Module):
         cmd = torch.maximum(torch.minimum(raw[:, :3], self.lim), -self.lim)
         stop = torch.norm(cmd, dim=-1, keepdim=True) < self.deadzone
         cmd = torch.where(stop, torch.zeros_like(cmd), cmd)
+        if self.knee_active:
+            t = ((cmd[:, 1:2].abs() - self.knee) / (self.lim[1] - self.knee)).clamp(0.0, 1.0)
+            x_lim = self.lim[0] - t * (self.lim[0] - self.x_min)
+            cmd = torch.cat([torch.maximum(torch.minimum(cmd[:, :1], x_lim), -x_lim), cmd[:, 1:]], dim=-1)
         return cmd, self.residual_scale * raw[:, 3:]
 
 
@@ -123,7 +131,8 @@ def main() -> None:
         max_err = max(max_err, max(float(np.abs(o - r).max()) for o, r in zip(out, ref)))
     print(
         f"[export_block_policy] wrote {args.out} (block_obs {obs_dim}, ball_history {ball_history}x{BALL_DIM}, "
-        f"limits {pcfg['command_limits']}, deadzone {pcfg['command_deadzone']}, residual_scale {pcfg['residual_scale']})"
+        f"limits {pcfg['command_limits']}, deadzone {pcfg['command_deadzone']}, residual_scale {pcfg['residual_scale']}, "
+        f"knee {'on' if exporter.knee_active else 'off'})"
     )
     print(f"[export_block_policy] parity torch vs onnxruntime over {args.num_checks} inputs: max |Δ| = {max_err:.3e}")
     assert max_err < 1e-4, "ONNX と torch の出力が一致しません"

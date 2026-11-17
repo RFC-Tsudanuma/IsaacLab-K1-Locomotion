@@ -261,16 +261,17 @@ class K1BlockEnvCfg_PLAY(K1BlockEnvCfg):
 
 
 # ---------------------------------------------------------------------------
-# 横移動を速くした変種 (2026-11-04 ユーザー提案): 歩行 expert の学習範囲 (vy ±0.9, 1.8→2.0 Hz) の外だが、
-# expert に vy 1.5 m/s + 2.3 Hz を与えても転倒せず横速度が 0.70 → 0.92 m/s に伸びた (scratchpad の固定コマンド試験)。
-# 位相周波数は ||cmd_xy|| に対する線形で 1.0 m/s 以下 1.8 Hz、1.5 m/s で 2.3 Hz。コマンド上限は
-# K1BlockFastLateralPPORunnerCfg 側で (1.5, 1.5, 2.0) (vx も 1.5 に下げ、軸方向の飽和で 2.3 Hz 止まりにする)。
+# 横移動を速くした変種 (2026-11-04 ユーザー提案)。2026-11-16 まで: 旧 expert (vy ±0.9) に 2.3 Hz@1.5 m/s の
+# 位相を与えて横 0.92 m/s を引き出す hack (コマンド上限 (1.5, 1.5, 2.0))。
+# 2026-11-16 から: 横 ±1.9 m/s で学習した best_walk model_56444 に合わせ、位相周波数は expert と同じ
+# 1.8 → 2.0 Hz@1.8 m/s + 横加算 (|vy| − 0.5) × 0.75 Hz (frozen_policies/best_walk/README.md)。
+# コマンド上限は K1BlockFastLateralPPORunnerCfg 側で (2.0, 1.9, 2.0) + |vy| > 1.0 で vx を絞る膝 (BlockActorCritic.command)。
 # ---------------------------------------------------------------------------
 @configclass
 class K1BlockFastLateralEnvCfg(K1BlockEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        fast = {"low_speed": 1.0, "high_speed": 1.5, "low_freq": 1.8, "high_freq": 2.3}
+        fast = {"low_speed": 1.0, "high_speed": 1.8, "low_freq": 1.8, "high_freq": 2.0, "lateral_low": 0.5, "lateral_gain": 0.75}
         # 位相の積分は 1 step 内で最初に gait_phase を評価したグループの params で進む (policy が先頭) が、
         # 4 グループとも同じ値にして齟齬を無くす
         for group in (self.observations.policy, self.observations.critic, self.observations.block_policy, self.observations.block_critic):

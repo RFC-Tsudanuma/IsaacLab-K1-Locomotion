@@ -55,6 +55,8 @@ class BlockActorCritic(WaypointActorCritic):
         nhead: int = 4,
         num_layers: int = 2,
         residual_scale: float = 0.5,
+        lateral_x_knee: float = 1.0,
+        lateral_x_min: float = 0.3,
         actor_hidden_dims=(256, 128),
         critic_hidden_dims=(256, 128),
         activation: str = "elu",
@@ -79,6 +81,7 @@ class BlockActorCritic(WaypointActorCritic):
         )
         self.num_env_actions = int(num_actions)
         self.residual_scale = float(residual_scale)
+        self.lateral_x_knee, self.lateral_x_min = float(lateral_x_knee), float(lateral_x_min)
 
         heads, frame_dims = {}, {}
         for set_name in ("policy", "critic"):
@@ -106,6 +109,17 @@ class BlockActorCritic(WaypointActorCritic):
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(self.num_policy_actions)))
         print(f"Actor (block): {self.actor}")
         print(f"Critic (block): {self.critic}")
+
+    def command(self, raw: torch.Tensor) -> torch.Tensor:
+        """クランプ + デッドゾーン (基底) に加え、歩行 expert の指令領域に合わせて |vy| > lateral_x_knee では
+        |vx| の上限を |vy| = 上限で lateral_x_min まで線形に絞る (best_walk model_56444: 高速の横移動はほぼ純横)。
+        vy の上限が膝以下 (旧 expert の 0.9) なら何もしない。"""
+        cmd = super().command(raw)
+        if float(self.command_limits[1]) <= self.lateral_x_knee:
+            return cmd
+        t = ((cmd[:, 1:2].abs() - self.lateral_x_knee) / (self.command_limits[1] - self.lateral_x_knee)).clamp(0.0, 1.0)
+        x_lim = self.command_limits[0] - t * (self.command_limits[0] - self.lateral_x_min)
+        return torch.cat([torch.maximum(torch.minimum(cmd[:, :1], x_lim), -x_lim), cmd[:, 1:]], dim=-1)
 
     def env_actions(
         self, obs: TensorDict, raw: torch.Tensor, blend: torch.Tensor | None = None, cmd_ext: torch.Tensor | None = None
@@ -194,6 +208,10 @@ class RslRlBlockActorCriticCfg(RslRlWaypointActorCriticCfg):
     num_layers: int = 2
     residual_scale: float = 0.5
     """方策の残差出力 → 関節指令 (raw action 単位) の倍率。env 側 scale 0.5 と合わせて 1 単位 ≈ 0.25 rad。"""
+    lateral_x_knee: float = 1.0
+    lateral_x_min: float = 0.3
+    """|vy| > lateral_x_knee で |vx| 上限を |vy| = command_limits[1] のとき lateral_x_min まで線形に絞る
+    (歩行 expert の指令領域、flat_env_cfg の lateral_x_knee / lateral_x_min と同じ)。"""
 
 
 @configclass
