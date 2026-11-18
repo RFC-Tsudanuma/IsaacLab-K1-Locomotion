@@ -11,7 +11,9 @@ C++ 側の契約 (steal_env_cfg.py K1StealPolicyCfg, agents/steal_policy.py):
          joint_pos_rel 12, joint_vel_rel 12, last_action 12 (= expert + residual の合成), gait_phase 4]
       + [前 tick の residual (12)]
       + [ボール相対位置 x, y (2)] + [ボール速度 vx, vy (2)] + [障害物 (敵) 中心の相対位置 x, y (2)] … base yaw 系
-出力  command (1, 3) float32 = (vx, vy, ωz)。クランプ (2.0, 0.9, 2.0) と ||cmd|| < 0.1 → 0 を適用済み。
+出力  command (1, 3) float32 = (vx, vy, ωz)。クランプ (agent.yaml の command_limits、2026-11-18 以降 (2.0, 1.9, 2.0))、
+      ||cmd|| < 0.1 → 0、|vy| > 1.0 で |vx| 上限を |vy| = 1.9 のとき 0.3 まで絞る膝 (agent.yaml に lateral_x_knee が
+      ある checkpoint のみ) を適用済み。
       residual (1, 12) float32 = 歩行 ONNX の出力 (action 単位) に足す関節残差 (residual_scale 0.5 を掛け済み)。
       q_target = default + 0.5 × (walk_action + residual)。次 tick の last_action は walk_action + residual。
 
@@ -55,12 +57,20 @@ class StealExporter(nn.Module):
         self.register_buffer("lim", torch.tensor(pcfg["command_limits"], dtype=torch.float), persistent=False)
         self.deadzone = float(pcfg["command_deadzone"])
         self.residual_scale = float(pcfg["residual_scale"])
+        # |vy| > knee で vx 上限を絞る (StealActorCritic.command と同じ)。古い agent.yaml (膝なし) / vy 上限 ≤ knee なら無効
+        self.knee = float(pcfg.get("lateral_x_knee", 1.0))
+        self.x_min = float(pcfg.get("lateral_x_min", 0.3))
+        self.knee_active = "lateral_x_knee" in pcfg and float(pcfg["command_limits"][1]) > self.knee
 
     def forward(self, steal_obs: torch.Tensor):
         raw = self.actor(self.actor_obs_normalizer(steal_obs))
         cmd = torch.maximum(torch.minimum(raw[:, :3], self.lim), -self.lim)
         stop = torch.norm(cmd, dim=-1, keepdim=True) < self.deadzone
         cmd = torch.where(stop, torch.zeros_like(cmd), cmd)
+        if self.knee_active:
+            t = ((cmd[:, 1:2].abs() - self.knee) / (self.lim[1] - self.knee)).clamp(0.0, 1.0)
+            x_lim = self.lim[0] - t * (self.lim[0] - self.x_min)
+            cmd = torch.cat([torch.maximum(torch.minimum(cmd[:, :1], x_lim), -x_lim), cmd[:, 1:]], dim=-1)
         return cmd, self.residual_scale * raw[:, 3:]
 
 
@@ -101,7 +111,8 @@ def main() -> None:
         max_err = max(max_err, max(float(np.abs(o - r).max()) for o, r in zip(out, ref)))
     print(
         f"[export_steal_policy] wrote {args.out} (steal_obs {obs_dim}, limits {pcfg['command_limits']}, "
-        f"deadzone {pcfg['command_deadzone']}, residual_scale {pcfg['residual_scale']})"
+        f"deadzone {pcfg['command_deadzone']}, residual_scale {pcfg['residual_scale']}, "
+        f"knee {'on' if exporter.knee_active else 'off'})"
     )
     print(f"[export_steal_policy] parity torch vs onnxruntime over {args.num_checks} inputs: max |Δ| = {max_err:.3e}")
     assert max_err < 1e-4, "ONNX と torch の出力が一致しません"

@@ -188,6 +188,14 @@ class K1StealEnvCfg(K1FlatStancePlanePolishCfg):
         self.curriculum.command_resampling_time_range = None
         self.curriculum.push_robot_stage1 = None
 
+        # 歩容位相: 凍結 expert (best_walk model_56444, K1FlatStancePlaneWideCfg) と同じ写像にする。ノルム依存
+        # (1.8 → 2.0 Hz@1.8 m/s) は親のまま、横移動時のみ (|vy| − 0.5) × 0.75 Hz を加算 (2026-11-18)。
+        # 位相の積分は 1 step 内で最初に gait_phase を評価したグループの params で進むので 4 グループとも揃える
+        # (Block の K1BlockFastLateralEnvCfg と同じ対処)。
+        lateral_phase_freq = {"lateral_low": 0.5, "lateral_gain": 0.75}
+        for group in (self.observations.policy, self.observations.critic, self.observations.steal_policy, self.observations.steal_critic):
+            group.gait_phase.params.update(lateral_phase_freq)
+
         # 立位スタート (Block / waypoint と同じ)
         self.events.reset_robot_joints.params["position_range"] = (-math.radians(5.0), math.radians(5.0))
         self.events.reset_base.params["velocity_range"] = {k: (-0.1, 0.1) for k in ("x", "y", "z", "roll", "pitch", "yaw")}

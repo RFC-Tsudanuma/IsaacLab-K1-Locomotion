@@ -38,6 +38,8 @@ class StealActorCritic(WaypointActorCritic):
         obs_groups,
         num_actions,  # 環境のアクション次元 (12 + 3 + 12)。方策の出力次元ではない。
         residual_scale: float = 0.5,
+        lateral_x_knee: float = 1.0,
+        lateral_x_min: float = 0.3,
         actor_hidden_dims=(256, 128),
         critic_hidden_dims=(256, 128),
         activation: str = "elu",
@@ -61,6 +63,7 @@ class StealActorCritic(WaypointActorCritic):
         )
         self.num_env_actions = int(num_actions)
         self.residual_scale = float(residual_scale)
+        self.lateral_x_knee, self.lateral_x_min = float(lateral_x_knee), float(lateral_x_min)
         num_actor_obs = sum(obs[g].shape[-1] for g in obs_groups["policy"])
         num_critic_obs = sum(obs[g].shape[-1] for g in obs_groups["critic"])
         self.actor = MLP(num_actor_obs, self.num_policy_actions, list(actor_hidden_dims), activation)
@@ -71,6 +74,17 @@ class StealActorCritic(WaypointActorCritic):
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(self.num_policy_actions)))
         print(f"Actor (steal): {self.actor}")
         print(f"Critic (steal): {self.critic}")
+
+    def command(self, raw: torch.Tensor) -> torch.Tensor:
+        """クランプ + デッドゾーン (基底) に加え、歩行 expert の指令領域に合わせて |vy| > lateral_x_knee では
+        |vx| の上限を |vy| = 上限で lateral_x_min まで線形に絞る (best_walk model_56444: 高速の横移動はほぼ純横)。
+        BlockActorCritic.command と同じ。vy の上限が膝以下 (旧 expert の 0.9) なら何もしない。"""
+        cmd = super().command(raw)
+        if float(self.command_limits[1]) <= self.lateral_x_knee:
+            return cmd
+        t = ((cmd[:, 1:2].abs() - self.lateral_x_knee) / (self.command_limits[1] - self.lateral_x_knee)).clamp(0.0, 1.0)
+        x_lim = self.command_limits[0] - t * (self.command_limits[0] - self.lateral_x_min)
+        return torch.cat([torch.maximum(torch.minimum(cmd[:, :1], x_lim), -x_lim), cmd[:, 1:]], dim=-1)
 
     def env_actions(self, obs: TensorDict, raw: torch.Tensor) -> torch.Tensor:
         """環境に渡す 27 次元 ``[expert + 残差 (12), コマンド (3), 残差 (12)]``。"""
@@ -115,8 +129,13 @@ class RslRlStealActorCriticCfg(RslRlWaypointActorCriticCfg):
     residual_scale: float = 0.5
     """方策の残差出力 → 関節指令 (raw action 単位) の倍率。Block で 1.0 は転倒が増えて逆効果だった。"""
 
-    command_limits: tuple[float, float, float] = (2.0, 0.9, 2.0)
-    """waypoint 側の既定が変わっても Steal は固定 (Block と同じ上限)。"""
+    command_limits: tuple[float, float, float] = (2.0, 1.9, 2.0)
+    """歩行コマンドの上限 (vx, vy, ωz)。2026-11-18 に best_walk model_56444 (y ±1.9) に合わせて vy 0.9 → 1.9
+    (Block と同じ)。waypoint 側の既定が変わっても Steal はここで固定する。"""
+    lateral_x_knee: float = 1.0
+    lateral_x_min: float = 0.3
+    """|vy| > lateral_x_knee で |vx| 上限を |vy| = command_limits[1] のとき lateral_x_min まで線形に絞る
+    (歩行 expert の指令領域、flat_env_cfg の K1FlatStancePlaneWideCfg / Block と同じ)。"""
 
 
 @configclass
