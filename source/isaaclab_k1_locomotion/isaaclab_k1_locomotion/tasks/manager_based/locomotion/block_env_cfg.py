@@ -314,7 +314,7 @@ class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
 @configclass
 class K1TrapRewardsCfg:
     """JOGA 型: 足元ゾーン (毎 step) + 吸収 shaping + 弾き出し罰 + 接近中の足の進路合わせ。値は RewardManager が dt を掛ける。
-    既定値は best_trap (trap_v4c model_22799、2026-11-16) の学習設定。"""
+    既定値は best_trap (trap_t2 model_25798、2026-11-18、v4c@22799 を新歩行 expert model_56444 で再学習) の学習設定。"""
 
     trapped = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
