@@ -294,3 +294,34 @@ critic は同じ項をノイズ無しで。停滞したときだけ関節位置�
 - 上位方策のクランプを新歩行の指令領域に合わせた: (2.0, 1.9, 1.0) + |vy| > 1.0 で |vx| 上限を 0.3 (|vy|=1.9) まで線形に絞る台形
   (`lateral_x_knee` / `lateral_x_min`、mdp/commands.py のサンプリングと同じ)。ONNX 書き出しにも同じ処理を入れた (旧 checkpoint は従来どおり)。
 - 新 expert / ゲートで 64 env × 3 iter の起動確認済み。別 PC 向けの手順は `scripts/rsl_rl/TRACKING_HANDOFF.md`。
+
+## 2026-11-18〜19: v10 の停滞診断と v11〜v13 (報酬調整ループ、新歩行 56444 + gate_v7 2999 上)
+- **v10 model_1499 の未到達の診断** (`eval_tracking.py --dump_miss`、立位 8192 ep): look の時間切れ約 20 件のうち 13 件は
+  「開始 0.3 s で pivot に入り、完了 (残り角 ≈ 0) 後も mode=turn を出し続けて 20 s 動かない」。残りは経由点の 0.3〜0.5 m 手前
+  (通過半径のすぐ外) で微小指令のまま停滞。見つめる対象と経路の距離は無関係 (全件 1.1 m 以上)。
+- **turn 居座りガード** (`agent.policy.turn_exit_rad`、既定 0 = 無効): turn 中に |残り角| < 値 なら mode=walk を強制。
+  `TrackingActorCritic.env_actions` と `export_tracking_policy.py --turn_exit_rad` の両方に実装 (nav_obs[24], [26] だけで決まるので C++ 変更不要)。
+  v10 に評価時だけ 0.15 を掛けると look の時間切れ 20 → 4 件 (到達 99.17 → 99.58 %)。
+- **停滞ペナルティ** (`rewards.turn_overstay` / `rewards.walk_stall`、既定 weight 0 = 無効): turn に 1 s 超で居座る / walk で
+  ゴールから 0.5 m 以上離れて速度 0.3 m/s 未満、の step に 1。
+- 学習はすべて 1 GPU × 4096 env × 1500 iter。評価は立位・8192 ep × 5 seed (123, 7, 11, 21, 33) の平均、model_1499:
+  | run | 変更点 | pose 到達 / 時間 / 転倒 | look 到達 / 時間 / 転倒 | 時間切れ (pose / look, 件/8192ep) |
+  |---|---|---|---|---|
+  | v10 (採用中) | 既定 | 99.61 % / 4.55 s / 0.33 % | 99.20 % / 4.52 s / 0.30 % | 5.2 / 22.0 |
+  | v11a | 既定、seed 1 | 99.71 % / 4.68 s / 0.31 % | 99.74 % / 4.38 s / 0.29 % | 0 / 1.2 |
+  | v11b | 停滞ペナルティ 各 −2 (seed 123 のみ) | 99.69 % / 4.53 s / 0.39 % | 99.21 % / 4.56 s / 0.84 % | 0 / 3 |
+  | v12a | turn_exit_rad 0.15 で学習・評価 | 99.51 % / 4.53 s / 0.54 % | 99.69 % / 4.17 s / 0.34 % | 0.4 / 0.4 |
+  | v12b | termination −400 | 99.53 % / 4.51 s / 0.52 % | 99.56 % / 4.17 s / 0.45 % | 0 / 1.4 |
+  | v12b + ガード (評価時のみ) | 同上 | 99.57 % / 4.50 s / 0.48 % | 99.53 % / 4.15 s / 0.50 % | 0 / 1.0 |
+  | v13a | 停滞ペナルティ + termination −400 (seed 123 のみ) | 99.22 % / 4.65 s / 0.51 % | 99.11 % / 4.36 s / 0.37 % | 13 / 24 |
+  学習時リセット評価 (seed 7、到達 pose / look): v10 96.8 / 96.7 %、v11a 96.7 / 96.9 %、v12a 95.7 / 96.4 %、v12b+ガード 96.1 / 96.7 %。
+- わかったこと:
+  - v10 の turn 居座りは**シード依存の癖** (同設定の v11a ではほぼ出ない)。同一 checkpoint・同一 seed でも評価は到達 ±0.25 %pt、
+    時間 ±0.08 s 揺れるので、採否は複数 seed の平均で見る。
+  - 停滞ペナルティは効果なし (v11b は look の転倒増、v13a は逆に停滞増)。termination −400 でも転倒は減らない (0.3〜0.5 % は下位由来)。
+  - v12a / v12b は look が 4.17 s (v10 比 −0.35 s) と速いが、pose の転倒が 0.5 % (v10 / v11a は 0.3 %) とやや多い。v11a は転倒・到達が最良で pose が 0.13 s 遅い。
+  - 評価を学習と同じ GPU で並走させると両方が約 2 倍遅くなる (5 分 → 10 分)。
+- **採用 (2026-11-19 ユーザー決定): v11a model_1499** (`k1_tracking/2026-11-18_23-02-08_tracking_v11a_seed1`、既定設定・seed 1、ガードなし)。
+  `frozen_policies/best_tracking/{model_v11a_1499.pt,tracking_v11a_1499.onnx}` (torch–onnxruntime 差 1.6e-06)。実機リポジトリへの配備は未実施。
+  速さ優先の代替は `k1_tracking/2026-11-19_03-31-41_tracking_v12b_term400/model_1499.pt` (書き出し時に `--turn_exit_rad 0.15`)。評価ログは `scripts/rsl_rl/eval_tracking_v1*_s*.log`。
+  安全優先 = `2026-11-18_23-02-08_tracking_v11a_seed1/model_1499.pt`。評価ログは `scripts/rsl_rl/eval_tracking_v1*_s*.log`。

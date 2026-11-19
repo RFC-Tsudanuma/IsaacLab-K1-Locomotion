@@ -39,6 +39,8 @@ from rsl_rl.modules import ActorCritic
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--checkpoint", required=True, help="k1_tracking の model_*.pt")
+parser.add_argument("--turn_exit_rad", type=float, default=None,
+                    help="turn 中に |残り角| がこの値未満なら mode=0 を強制する。省略時は学習時の設定 (無ければ 0 = 無効)")
 parser.add_argument("--out", required=True, help="出力 ONNX パス")
 parser.add_argument("--num_checks", type=int, default=64)
 args = parser.parse_args()
@@ -48,7 +50,8 @@ class NavExporter(nn.Module):
     """nav_obs → command。TrackingActorCritic.act_inference + command() と同じ計算。"""
 
     def __init__(self, policy: ActorCritic, limits, deadzone: float, pivot_limit: float,
-                 lateral_x_knee: float | None = None, lateral_x_min: float = 0.3):
+                 lateral_x_knee: float | None = None, lateral_x_min: float = 0.3,
+                 turn_exit_rad: float = 0.0):
         super().__init__()
         self.norm = policy.actor_obs_normalizer
         self.actor = policy.actor
@@ -58,6 +61,7 @@ class NavExporter(nn.Module):
         self.knee = None if lateral_x_knee is None else float(lateral_x_knee)
         self.xmax, self.ymax = float(limits[0]), float(limits[1])
         self.x_min = min(float(lateral_x_min), self.xmax)
+        self.turn_exit_rad = float(turn_exit_rad)
 
     def forward(self, nav_obs: torch.Tensor) -> torch.Tensor:
         raw = self.actor(self.norm(nav_obs))
@@ -70,6 +74,9 @@ class NavExporter(nn.Module):
         cmd = torch.where(stop, torch.zeros_like(cmd), cmd)
         dpsi = raw[:, 3:4].clamp(-self.pivot_limit, self.pivot_limit)
         mode = (raw[:, 4:5] > 0.0).float()
+        if self.turn_exit_rad > 0.0:  # TrackingActorCritic.env_actions() と同じ (nav_obs[24] = turn, [26] = 残り角)
+            done = (nav_obs[:, 24:25] > 0.5) & (nav_obs[:, 26:27].abs() < self.turn_exit_rad)
+            mode = mode * (~done).float()
         return torch.cat([cmd, dpsi, mode], dim=-1)
 
 
@@ -98,7 +105,8 @@ def main() -> None:
     policy.eval()
 
     exporter = NavExporter(policy, pcfg["command_limits"], pcfg["command_deadzone"], pcfg["pivot_limit"],
-                           pcfg.get("lateral_x_knee"), pcfg.get("lateral_x_min", 0.3)).eval()
+                           pcfg.get("lateral_x_knee"), pcfg.get("lateral_x_min", 0.3),
+                           pcfg.get("turn_exit_rad", 0.0) if args.turn_exit_rad is None else args.turn_exit_rad).eval()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     obs_dim = obs["nav_policy"].shape[1]
     torch.onnx.export(
@@ -117,7 +125,7 @@ def main() -> None:
         max_err = max(max_err, float(np.abs(out - ref).max()))
     print(f"[export_tracking_policy] wrote {args.out} (nav_obs dim {obs_dim}, limits {pcfg['command_limits']}, "
           f"deadzone {pcfg['command_deadzone']}, pivot_limit {pcfg['pivot_limit']}, "
-          f"lateral_x_knee {pcfg.get('lateral_x_knee')}, lateral_x_min {pcfg.get('lateral_x_min', 0.3)})")
+          f"lateral_x_knee {pcfg.get('lateral_x_knee')}, lateral_x_min {pcfg.get('lateral_x_min', 0.3)}, turn_exit_rad {exporter.turn_exit_rad})")
     print(f"[export_tracking_policy] parity torch vs onnxruntime over {args.num_checks} inputs: max |Δ| = {max_err:.3e}")
     assert max_err < 1e-5, "ONNX と torch の出力が一致しません"
 

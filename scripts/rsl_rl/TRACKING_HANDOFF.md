@@ -84,7 +84,9 @@ cp /abs/path/logs/rsl_rl/k1_tracking/<run>/model_1200.pt ../../frozen_policies/b
   README の例を更新。融合モデル (歩行 + pivot + ゲート) の ONNX も新版 `best_gating/gating_2999_walk56444_turn9000.onnx` を
   `assets/k1_gating_walk_turn_*.onnx` として追加し launch 既定を切り替える。**新歩行は位相周波数に横加算があり、C++ の
   `cmd_phase_freq` を合わせないと位相がずれる** (`best_walk/README.md`)。これはゲート側の作業として依頼済みか確認すること。
-- 旧版は `frozen_policies/best_tracking/` に併置して良い (v7b: 採用中、v9b: 遅延込み学習の代替)。
+- 旧版は `frozen_policies/best_tracking/` に併置して良い (v9b: 遅延込み学習の代替)。
+- **2026-11-19 追記: 採用は v11a model_1499** (`best_tracking/tracking_v11a_1499.onnx`、新歩行 56444 + gate_v7 2999 上、既定設定・seed 1)。
+  経緯と比較は `rl_traking.md` 末尾の節。採否は複数 seed の評価平均で決める (同一 seed でも到達 ±0.25 %pt 揺れる)。
 
 ## 既知の結論 (やり直さなくて良いこと)
 

@@ -32,6 +32,9 @@ parser.add_argument("--standing", action="store_true", help="立位スタート 
 parser.add_argument("--no_push", action="store_true", help="押し外乱を無効化")
 parser.add_argument("--force_pivot_s", type=float, default=0.0,
                     help="診断用: 初期 |yaw 誤差| >= 120 deg の env で、エピソード開始からこの秒数だけ mode=turn (Δψ 残差 0) を強制する")
+parser.add_argument("--dump_miss", action="store_true", help="診断用: 転倒以外の未到達エピソードの終了時の状況を 1 行ずつ出す")
+parser.add_argument("--turn_exit_rad", type=float, default=0.0,
+                    help="診断用: turn 中に |残り角| がこの値未満になったら mode=walk を強制する (0 で無効)")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -111,6 +114,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     radii = (0.1, 0.3, 0.5)
     t_first = {r: torch.full((env.num_envs,), -1.0, device=raw_env.device) for r in radii}
     coarse = {name: {r: [0.0, 0] for r in radii} for name in ("pose", "look")}  # [時間の和, 件数]
+    goal._window_all = torch.arange(goal.cfg.max_waypoints, device=raw_env.device)  # --dump_miss 用
     obs = env.get_observations()
     with torch.inference_mode():
         for step in range(args_cli.steps):
@@ -123,6 +127,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 forced = (init_yaw_err >= math.radians(120.0)) & (raw_env.episode_length_buf.float() * dt < args_cli.force_pivot_s)
                 actions[forced, 15] = 0.0
                 actions[forced, 16] = 1.0
+            if args_cli.turn_exit_rad > 0.0:
+                actions[low.is_turn & (low.heading_error.abs() < args_cli.turn_exit_rad), 16] = 0.0
             reached_pre, ttg_pre = goal.reached_goal.clone(), goal.time_to_goal.clone()
             look_pre = goal.is_look().clone()
             turn_pre = low.is_turn.clone()
@@ -132,6 +138,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             for r in radii:
                 hit = passed_pre & (gdist_pre < r) & (t_first[r] < 0)
                 t_first[r][hit] = t_now[hit]
+            if args_cli.dump_miss:  # 終了時の状況 (step 前に控える。step 後は reset 済み)
+                pos_pre, tgt_pre = goal._pos().clone(), goal.points_w[goal._env_idx, goal.target_idx].clone()
+                # 見つめる対象と残り経路 (現在位置 → 次の点 → … → ゴール) の線分との最短距離
+                a = torch.cat([pos_pre.unsqueeze(1), goal.points_w[:, :-1]], dim=1)
+                b = torch.cat([tgt_pre.unsqueeze(1), goal.points_w[:, 1:]], dim=1)
+                ab, ap = b - a, goal.look_at_w.unsqueeze(1) - a
+                u = ((ap * ab).sum(-1) / (ab * ab).sum(-1).clamp(min=1e-9)).clamp(0.0, 1.0)
+                seg_d = torch.norm(ap - u.unsqueeze(-1) * ab, dim=-1)
+                seg_d[:, 1:][goal._window_all[None, :] < goal.target_idx[:, None]] = float("inf")  # 通過済み区間は除く
+                look_seg_pre = seg_d.min(dim=1).values
+                look_err_pre = goal.look_at_err().clone()
+                idx_pre, nwp_pre = goal.target_idx.clone(), goal.num_waypoints.clone()
+                look_d_pre = torch.norm(goal.look_at_w - pos_pre, dim=1)
+                tgt_b_pre = goal.cmd_buf[:, :2].clone()
+                rem_pre, dwell_pre = low.heading_error.clone(), low.dwell.clone()
+                vel_pre = torch.cat([raw_env.scene["robot"].data.root_lin_vel_b[:, :2], raw_env.scene["robot"].data.root_ang_vel_b[:, 2:]], dim=1)
             obs, _, dones, _ = env.step(actions)
             ep_switches += low.switched.float()
             fall = tm.get_term("base_height") | tm.get_term("base_contact")
@@ -147,6 +169,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 st.ttg += float(ttg_pre[dm & reached_pre].sum())
                 st.fall += int((dm & fall).sum())
                 miss = dm & ~reached_pre & ~fall
+                if args_cli.dump_miss:
+                    for i in miss.nonzero().flatten().tolist():
+                        print(f"MISS {name} wp {int(idx_pre[i])}/{int(nwp_pre[i])} target_b ({tgt_b_pre[i,0]:+.2f},{tgt_b_pre[i,1]:+.2f}) "
+                              f"goal_dist {gdist_pre[i]:.2f} look_err {math.degrees(look_err_pre[i]):+.0f} look_dist {look_d_pre[i]:.2f} "
+                              f"look_to_path {look_seg_pre[i]:.2f} cmd {[round(v, 2) for v in actions[i, 12:].tolist()]} turn {bool(turn_pre[i])} "
+                              f"turn_remaining {math.degrees(rem_pre[i]):+.0f} dwell {dwell_pre[i]:.1f} vel {[round(v, 2) for v in vel_pre[i].tolist()]}")
                 st.miss_wp += int((miss & ~passed_pre).sum())
                 st.miss_goal += int((miss & passed_pre).sum())
                 st.miss_dist += float(gdist_pre[miss].sum())

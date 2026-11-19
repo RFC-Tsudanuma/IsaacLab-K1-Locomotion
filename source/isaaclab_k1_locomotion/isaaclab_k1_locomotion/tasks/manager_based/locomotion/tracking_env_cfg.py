@@ -38,6 +38,8 @@ from .mdp.tracking import (
     track_command_rate_l2,
     track_goal_heading_exp,
     track_goal_position_exp,
+    turn_overstay,
+    walk_stall,
 )
 from .mdp.waypoint import WalkCommandActionCfg, path_progress
 from .velocity_env_cfg import ActionsCfg
@@ -106,6 +108,9 @@ class K1TrackingRewardsCfg:
     walk_command_rate_l2 = RewTerm(func=track_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
     mode_switch = RewTerm(func=mode_switch, weight=-0.5, params={"command_name": "base_velocity"})
     termination_penalty = RewTerm(func=mdp.is_terminated, weight=-200.0)
+    # 停滞対策 (2026-11-18 試行、既定は無効。`env.rewards.turn_overstay.weight=-2` などで有効化)
+    turn_overstay = RewTerm(func=turn_overstay, weight=0.0, params={"command_name": "base_velocity"})
+    walk_stall = RewTerm(func=walk_stall, weight=0.0, params={"command_name": "tracking"})
 
 
 @configclass

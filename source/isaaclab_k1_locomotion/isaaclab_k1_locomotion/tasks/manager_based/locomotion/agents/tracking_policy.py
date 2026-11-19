@@ -55,6 +55,7 @@ class TrackingActorCritic(ActorCritic):
         lateral_x_min: float = 0.3,
         pivot_limit: float = 1.0,
         min_noise_std=(0.0, 0.0, 0.0, 0.0, 0.3),
+        turn_exit_rad: float = 0.0,
         **kwargs,
     ):
         self.num_env_actions = int(num_actions)
@@ -80,6 +81,7 @@ class TrackingActorCritic(ActorCritic):
         self.lateral_x_knee = None if lateral_x_knee is None else float(lateral_x_knee)
         self.lateral_x_min = float(lateral_x_min)
         self.pivot_limit = float(pivot_limit)
+        self.turn_exit_rad = float(turn_exit_rad)
 
     def update_distribution(self, obs):
         # mode 次元の探索ノイズに下限を置く。v2/v3 では std が 0.1 まで潰れた後 mode の平均が walk 側に
@@ -108,7 +110,14 @@ class TrackingActorCritic(ActorCritic):
     @torch.no_grad()
     def env_actions(self, obs: TensorDict, raw: torch.Tensor) -> torch.Tensor:
         """環境に渡す 17 次元 ``[ゲート混合の関節指令 (12), command (5)]``。"""
-        return torch.cat([self.gate.act_inference_blended(obs), self.command(raw)], dim=-1)
+        cmd = self.command(raw)
+        if self.turn_exit_rad > 0.0:
+            # pivot 完了後の居座り防止: turn 中で残り角が小さければ mode=walk を強制する (ONNX にも同じ処理)。
+            # nav_policy の並び: [tracking 18, 前出力 5, mode one-hot (walk, turn), 滞在時間, turn 残り角, ...]
+            nav = obs["nav_policy"]
+            done = (nav[:, 24] > 0.5) & (nav[:, 26].abs() < self.turn_exit_rad)
+            cmd[:, 4] = torch.where(done, torch.zeros_like(cmd[:, 4]), cmd[:, 4])
+        return torch.cat([self.gate.act_inference_blended(obs), cmd], dim=-1)
 
     # ── 凍結ゲートは checkpoint に含めない (パスから読む) ───────────────────
     _GATE_PREFIX = "gate."
@@ -164,6 +173,10 @@ class RslRlTrackingActorCriticCfg(RslRlPpoActorCriticCfg):
 
     min_noise_std: tuple[float, float, float, float, float] = (0.0, 0.0, 0.0, 0.0, 0.3)
     """学習時の探索ノイズ std の下限 (次元ごと)。mode 次元だけ 0.3 を残して pivot を試し続けさせる。"""
+
+    turn_exit_rad: float = 0.0
+    """turn 中に |残り角| がこの値未満なら mode=walk を強制する (0 で無効)。v10 は pivot 完了後も mode=turn を
+    出し続けて動かなくなるエピソードが look の 0.3 % あった (2026-11-18)。観測の残り角だけで決まるので C++ は不要。"""
 
 
 # OnPolicyRunner は eval(class_name) を on_policy_runner モジュールの名前空間で評価する。

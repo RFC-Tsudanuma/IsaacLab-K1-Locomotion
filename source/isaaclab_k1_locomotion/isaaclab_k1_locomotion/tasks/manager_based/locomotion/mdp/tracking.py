@@ -378,3 +378,30 @@ def mode_switch(env: "ManagerBasedRLEnv", command_name: str = "base_velocity") -
     """この step で walk ⇄ turn を切り替えた env に 1。"""
     term: ExternalTransitionCommand = env.command_manager.get_term(command_name)
     return term.switched.float()
+
+
+def turn_overstay(env: "ManagerBasedRLEnv", max_s: float = 1.0, command_name: str = "base_velocity") -> torch.Tensor:
+    """turn モードに ``max_s`` 秒を超えて居座っている env に 1 (180° の pivot は 0.72 s で終わる)。
+
+    v10 の look 未到達 20 件中 13 件が「開始直後に pivot し、完了後も mode=turn を出し続けて
+    20 s 動かない」だった (2026-11-18 診断、eval_tracking.py --dump_miss)。"""
+    term: ExternalTransitionCommand = env.command_manager.get_term(command_name)
+    return (term.is_turn & (term.dwell > max_s)).float()
+
+
+def walk_stall(
+    env: "ManagerBasedRLEnv",
+    speed: float = 0.3,
+    min_goal_dist: float = 0.5,
+    grace_s: float = 1.0,
+    command_name: str = "tracking",
+    lowlevel_name: str = "base_velocity",
+) -> torch.Tensor:
+    """walk モードでゴールから ``min_goal_dist`` 以上離れているのに水平速度が ``speed`` 未満の env に 1。
+
+    v10 の未到達の残り (経由点の 0.3〜0.5 m 手前で微小指令のまま停滞) 向け。開始 ``grace_s`` 秒は対象外。"""
+    term: TrackingGoalCommand = env.command_manager.get_term(command_name)
+    low: ExternalTransitionCommand = env.command_manager.get_term(lowlevel_name)
+    slow = torch.norm(term.robot.data.root_lin_vel_b[:, :2], dim=1) < speed
+    started = env.episode_length_buf * env.step_dt > grace_s
+    return (low.is_walk & slow & started & (term.goal_dist() > min_goal_dist)).float()
