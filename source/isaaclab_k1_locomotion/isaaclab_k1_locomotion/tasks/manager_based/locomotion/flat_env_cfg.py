@@ -1131,7 +1131,8 @@ class K1FlatStancePlaneWideCfg(K1FlatStancePlanePolishCfg):
         # 前進側はフライトさせたくない + 「x 2.0 / y 1.0」の斜めは必須 (同日ユーザー要件) なので、
         # |vy| <= 1.0 は no_fly を全量かける。
         self.rewards.no_fly.params.update(
-            {"command_name": "base_velocity", "lateral_gate_low": 1.0, "lateral_gate_high": 1.3}
+            {"command_name": "base_velocity", "lateral_gate_low": 1.0, "lateral_gate_high": 1.3,
+             "forward_gate_low": None, "forward_gate_high": 2.4}
         )
 
         # --- 指令領域: 高速の横移動はほぼ純横 (キーパーのセーブ用途、同日ユーザー要件) ---

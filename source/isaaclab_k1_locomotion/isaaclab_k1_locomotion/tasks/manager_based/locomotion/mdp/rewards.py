@@ -413,6 +413,8 @@ def both_feet_not_in_contact(
     command_name: str | None = None,
     lateral_gate_low: float = 0.7,
     lateral_gate_high: float = 1.0,
+    forward_gate_low: float | None = None,
+    forward_gate_high: float = 2.4,
 ) -> torch.Tensor:
     """Penalize when both feet are not in contact with the ground.
 
@@ -422,6 +424,8 @@ def both_feet_not_in_contact(
     ``command_name`` を渡すと横移動ゲートが有効になる: 横速度指令 |vy| が
     ``lateral_gate_low`` 以下では等倍、``lateral_gate_high`` 以上では 0 (フライト許可) へ
     線形に減衰する。None (既定) では従来どおり常時ペナルティ。
+    ``forward_gate_low`` を渡すと前進ゲートも有効になる: 前進指令 vx が ``forward_gate_low`` 以下では
+    等倍、``forward_gate_high`` 以上では 0 へ線形に減衰する (後退側は対象外)。
     """
     contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
 
@@ -434,6 +438,9 @@ def both_feet_not_in_contact(
     if command_name is not None:
         vy = env.command_manager.get_command(command_name)[:, 1].abs()
         penalty = penalty * (1.0 - ((vy - lateral_gate_low) / (lateral_gate_high - lateral_gate_low)).clamp(0.0, 1.0))
+        if forward_gate_low is not None:
+            vx = env.command_manager.get_command(command_name)[:, 0]
+            penalty = penalty * (1.0 - ((vx - forward_gate_low) / (forward_gate_high - forward_gate_low)).clamp(0.0, 1.0))
     return penalty
 
 def foot_clearance_ji(

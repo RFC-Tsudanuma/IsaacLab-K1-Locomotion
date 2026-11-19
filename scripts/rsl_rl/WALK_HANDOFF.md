@@ -1,6 +1,11 @@
 # 歩行学習 引き継ぎ (2026-11-12)
 
 別 PC で歩行学習を続けるエージェント向けの前提知識。これ 1 ファイルを読めば開始できる。
+
+> **2026-11-19 追記あり。** 現状・採用モデル・次にやることは末尾の
+> 「追記 (2026-11-19)」が最新。以下の本文は 2026-11-12 時点の記述で、
+> 「次の目的」「現在の最良ポリシー」「推奨プラン」は追記の内容で置き換わっている
+> (学習の回し方・検証プロトコル・下流との契約は今も有効)。
 詳細な実験経緯は `scripts/rsl_rl/phase_freq_weight_tuning.md`、各設定クラスの docstring
 (`source/.../locomotion/flat_env_cfg.py`) にある。
 
@@ -145,3 +150,240 @@ bash export_policy.sh --checkpoint <full path の .pt>   # --checkpoint はフ�
    (c) no_fly の扱いをユーザーに確認 (高ケイデンスなら禁止のままで届く可能性あり)。
 3. model_52700 から warm-start、プローブ → 10000it 本学習 → 直接計測で膝選定 →
    export → best_walk 更新 → ゲート再学習依頼、の順。
+
+---
+
+# 追記 (2026-11-19): 横 ±1.9 拡張の完了、前進拡張の調査、摩擦 DR 拡張 (未完)
+
+2026-11-14〜19 に行った作業のまとめ。**次にやることは「A. 摩擦 DR の拡張」**。
+
+## 0. 現状の一覧
+
+| 項目 | 状態 |
+|---|---|
+| 採用歩行 | `frozen_policies/best_walk/model_56444.pt` (x ±2.0 / y ±1.9、コミット `66ce5e4`) |
+| 採用ゲート | `frozen_policies/best_gating/model_2999.pt` + `gating_2999_walk56444_turn9000.onnx` (同コミット) |
+| 学習タスク | `Isaac-Velocity-Flat-Stance-Plane-Wide` (`K1FlatStancePlaneWideCfg`、既定値 = model_56444 の最終段の設定) |
+| 実機 | **高速域で転倒が出た (2026-11-19 ユーザー報告)。摩擦 DR 不足の疑い → A 節** |
+| C++ 側 | `~/workspace/booster_k1_locomotion` ブランチ `feat/new_fast_side_walk` コミット `a7c6151` (未 push、**未コンパイル**) |
+| 調査用に足したコード | no_fly 前進ゲート (既定無効)・飽和診断など (D 節) |
+
+下流 (経路追従・ボール奪取・トラップ・パスカット) は別セッションが model_56444 を
+前提に再学習済み。**歩行を差し替えたら下流すべてが再学習対象になる** (ゲートは必須)。
+
+## A. 次にやること: 摩擦 DR を 0.3〜3.0 に広げて再学習 (ユーザー指示 2026-11-19)
+
+ユーザーの指示: 「横の速度コマンドを拡張した今の状態で、摩擦の DR を 0.3〜3.0 まで
+拡張して再学習。それで速度範囲が少し小さくなるのは許容する」。
+
+現状の摩擦 DR は `K1FlatStancePlaneCfg` の U(0.6, 1.0) (static/dynamic とも。
+`make_consistent=True` なので dynamic ≤ static)。地形側は 1.0 × multiply 結合なので、
+ロボット側の値がそのまま実効摩擦になる。経路追従タスクは同じ理由で既に U(0.2, 3.0) に
+広げてある (`tracking_env_cfg.py`、コミット `be3a61c`)。
+
+**着手済みで中断したもの** (ユーザーの中止指示で停止。結果は無い):
+
+- 上書き設定 `probe_wide_R1.json` (摩擦 0.3〜3.0 のみ変更) は作成済み。
+- 学習 R1 は 38 it で停止 (`logs/rsl_rl/k1_flat/2026-11-19_15-27-07_wideR1_friction0.3-3.0`、
+  checkpoint 無し、捨ててよい)。起動と上書きの反映 (`params/env.yaml`) は確認済み。
+- 現行モデルを摩擦固定で測る基準値計測は結果が出る前に停止。**基準値は未取得**。
+
+再開手順:
+
+```bash
+cd scripts/rsl_rl
+# 1) 学習 (単一 GPU、約 10 s/it。2000 it で 5〜6 時間)
+LOAD_RUN=2026-11-16_03-49-34_wideS2b_angvel-0.9_ori-50.0 CKPT=model_56444.pt \
+    nohup ./probe_wide.sh R1 <gpu> 2000 > probe_wide_R1.log 2>&1 &
+
+# 2) 摩擦を固定して計測 (hydra 上書き。基準 model_56444 と新モデルの両方で、mu = 0.3 / 0.5 / 3.0)
+MU=0.3; CUDA_VISIBLE_DEVICES=<gpu> MEASURE_AXIS=0 MEASURE_SPEEDS=1.0,1.5,2.0 MEASURE_OTHER=0 \
+  _labpython2 measure_stride.py --task Isaac-Velocity-Flat-Stance-Plane-Wide --headless \
+  --num_envs 512 --device cuda:0 --checkpoint <full path の .pt> \
+  "env.events.physics_material.params.static_friction_range=[$MU,$MU]" \
+  "env.events.physics_material.params.dynamic_friction_range=[$MU,$MU]"
+```
+
+- `LOAD_RUN` に S2b の run を指定するのは、`logs/rsl_rl/k1_flat/best_walk/` に model_56444 を
+  置いていないため。別 PC では `frozen_policies/best_walk/model_56444.pt` を
+  `logs/rsl_rl/k1_flat/<任意名>/` にコピーして `LOAD_RUN=<任意名>` とする。
+- 2) の hydra 上書きは**起動まで確認、結果は未確認** (途中で止めたため)。通らなければ
+  同じキーを `--override_json` 相当で渡すか、measure_stride.py に env 変数を足す。
+- 見るべき列: `vx_act` (実速度)、`falls/env` (転倒)、`slide` (滑り)、`fly%`。
+  採用基準はユーザーと未合意。たたき台: mu 0.3 と 3.0 の転倒が基準より明確に減り、
+  mu 0.6〜1.0 の実速度の低下が 1 割以内。
+- 予想される副作用: 低摩擦では横の高速 (開き幅 × ケイデンスで稼いでいる) と前進 2.0
+  (速度の 2 割強を接地足の滑りで稼いでいる) が落ちる。高摩擦では滑れなくなるので
+  斜め・切り返しの転倒を重点的に見る (`MEASURE_OTHER` で斜め、`MEASURE_FLIP=100` で切り返し)。
+- 一度に 0.3〜3.0 で崩れる場合は、0.4〜2.0 → 0.3〜3.0 の 2 段に刻む
+  (横の範囲拡張は ±1.2 → ±1.5 → ±1.9 と手で刻んで成功した)。
+- 採用したら: `K1FlatStancePlaneWideCfg` に摩擦範囲を既定値として書く → best_walk 更新
+  (E 節) → ゲート再学習 (F 節) → 下流の再学習を依頼。gating / tracking は
+  `K1FlatStancePlaneCfg` 系を別経路で継承しているので、Wide cfg を変えても影響しない。
+
+## B. 横 ±1.9 拡張でやったこと (完了、採用済み)
+
+model_52700 → model_56444。合計 +3750 it の warm-start 連鎖
+(Y4 → Y4b → Y12 → W2 → P4 → S2b)。設定はすべて `K1FlatStancePlaneWideCfg` の既定値に
+反映済みで、コメントに根拠がある。要点:
+
+1. **位相周波数に横加算** (policy obs / critic obs / feet_phase 報酬の 3 箇所同時):
+   ```
+   freq = 1.8 + max(||cmd_xy|| - 1.0, 0) * 0.25 + max(|vy| - 0.5, 0) * 0.75
+   ```
+   純横 1.9 m/s で約 3.1 Hz。横速度は「1 周期の移動量 0.35〜0.41 m × 周波数」で決まり、
+   移動量はどの設定でもほぼ一定だったので、周波数を足すのが唯一効いたレバー。
+   係数 0.5 は横 1.9 → 1.44 止まり、1.0 (3.4 Hz) は 1.73、2.0 (4.8 Hz) は実機非現実的。
+   実機の周波数上限は約 3 Hz (3.4 ならいけるかも) というユーザー情報から 0.75 を採用。
+2. **粗い追従項** `track_lin_vel_xy_vcoarse` (std 1.0、重み 2.4): 届かない指令を学習分布に
+   入れると既存の追従項 (std 0.25 / 0.5) が飽和して「諦め歩行」に落ちる
+   (x 上限を 2.2 にしただけで指令 2.2 → 実 1.07 m/s)。これを防ぐ。**範囲を広げる
+   プローブではこの項を外さないこと。**
+3. **no_fly の横ゲート**: |vy| 1.0 → 1.3 で罰を 0 へ。横の高速域のみフライト許可。
+4. **指令領域**: |vy| ≤ 1.0 は x 全域、それより外は |vx| 上限を |vy| = 1.9 で 0.3 まで絞る
+   (`lateral_x_knee` / `lateral_x_min`)。x 2.0 / y 1.0 の斜めは必須要件で含む。
+5. **仕上げ**: no_fly 12 + feet_slide -1.5 (片方だけ上げると他方が悪化するので同時)、
+   ang_vel_xy -0.9 + flat_orientation -50 (揺れ。+300 it まで。それ以上は 2.0 の追従を食う)。
+
+実測値は `frozen_policies/best_walk/README.md` の表を参照
+(横 1.9 → 1.60、斜め (2.0, 1.0) → (1.77, 0.79)、前進 2.0 → 1.81)。
+
+効かなかったもの: 同じ設定で長く回す、追従重みの倍増、横の接地比緩和
+(`lateral_stance_ratio` 0.45。効果小)、高速側アンカーの引き上げ (2.8 Hz@2.0 など。
+再適応中に 2.0 m/s の追従ごと失う)。
+
+## C. 前進 2.2 m/s への拡張 (調査のみ、未達)
+
+model_56444 から +500 it のプローブ 6 本。指令 2.2 → 実速度 (512 env):
+
+| プローブ | 変更 | 実速度 |
+|---|---|---|
+| 基準 56444 | — | 1.93 |
+| X1 | x 上限 2.2 | 1.94 |
+| X2 | X1 + high_freq 2.2 | 1.92 (歩幅が縮み滑り増) |
+| F1 | X1 + フライトゲート 2.0→2.4 | 1.96 |
+| F2 | X1 + フライトゲート 2.0→2.2 | 1.99 |
+| G1 | F2 + high_freq 2.2 | 2.01 (歩幅 0.34 → 0.30 m、滑り 0.50 → 0.58) |
+| G2 | F2 + 探索ノイズ 0.2 | 2.00 |
+
+- どれも 2.0 m/s で頭打ち。フライトは罰を 0 にしても使われない (fly% 1.4〜1.6 のまま)。
+- 前進 2.0 以下の fly% はどのプローブでも増えていない (2.0 で 1.0〜1.1 %)。
+- 接地時の歩幅は 2.0 以上で約 0.34 m に飽和。
+
+**原因の有力候補は関節速度上限**。`measure_stride.py` の末尾に出る飽和診断
+(`=== actuator saturation ...`) で、model_56444 は指令 2.0 以上で膝の最大角速度が
+12.5 rad/s (上限 12.57)、足首ピッチが 18.1 (上限 17.59) に張り付く。トルクが上限で
+切られるのは 1 % 未満。最大値どうしの比較で、歩行周期のどの瞬間に当たっているかは未確認。
+
+ユーザーへの未回答の確認事項: sim の速度上限 (膝 12.57 / 足首 17.59 / 股関節ピッチ 14.66 rad/s)
+は実機モーターの実上限か、余裕を見た値か。前者なら今の歩き方では 2.0 が限界に近く、
+膝をあまり曲げ伸ばししない歩き方へ寄せる報酬設計が要る。後者なら上限を実機値に上げる。
+
+ユーザー要件 (前進): フライト無しで行ける範囲 (2.0 以下) はフライト禁止を保つ。
+2.0 超から徐々にフライトを許可してよい。まず保守的に 2.2 から。
+
+## D. 調査用に足したコード (この文書と同じコミットに含む)
+
+- `mdp/rewards.py` `both_feet_not_in_contact` に前進ゲート
+  (`forward_gate_low` / `forward_gate_high`。vx 指令が low → high で罰を 0 へ)。
+  `flat_env_cfg.py` の Wide cfg では既定 `None` (無効)。
+- `probe_wide.sh`: 環境変数 `NOISE` で `--reset_noise_std` を変えられる (既定 0.05)。
+- `measure_stride.py`: 関節ごとの飽和診断 (トルクが切られた割合と最大角速度)。
+- `probe_wide_R1.json` (摩擦 DR 0.3〜3.0 の上書き設定)。
+- X1〜G2 の上書き設定とログは git 管理外 (内容は C 節の表の「変更」列のとおり)。
+- コミットは明示的に頼まれたときだけ行う運用。
+
+## E. 歩行を採用するときの手順
+
+1. `bash export_policy.sh --checkpoint <full path>` で ONNX / policy.pt を作る。
+2. `frozen_policies/best_walk/` に `model_<番号>.pt` / `policy.onnx` / `policy.pt` /
+   `env.yaml` (run の `params/env.yaml`) を置き、README の先頭に新しい節を足す。
+   **番号最大の model が下流から自動解決される**ので、旧モデルより番号が小さい場合は
+   旧モデルを `old/` に退避する。
+3. 位相の式を変えたら C++ 側も変える (G 節)。摩擦 DR だけなら C++ の変更は不要。
+
+## F. ゲート (歩行 ⇄ その場回転) の再学習手順
+
+歩行を差し替えたら毎回必要。スクラッチで 3000 it (2 GPU × 2048 env、約 6〜7 時間)。
+
+```bash
+cd scripts/rsl_rl
+./train_gating.sh --max_iterations 3000 --run_name gate_v8_walk<番号>   # expert は best_walk / best_turn の番号最大
+# 旧ゲートとの比較 (進入速度 / 回転角ごと。転倒率は 4096 env で見る)
+CUDA_VISIBLE_DEVICES=<gpu> _labpython2 eval_pivot_overhead.py --headless --device cuda:0 \
+    --num_envs 4096 --checkpoint <abs>/model_2999.pt --entry-speed 2.0 --turn-deg 120   # 横進入は --entry-vy 1.9
+PYTHONUNBUFFERED=1 _labpython2 export_gating_policy.py --headless \
+    --checkpoint <abs>/model_2999.pt --out <出力>.onnx   # PYTHONUNBUFFERED が無いと検証 print が出ない
+```
+
+- gating env の歩行位相 params は Wide cfg と揃えてある (lateral_gain 0.75)。
+  歩行の位相式を変えたら gating 側も合わせる。
+- 採用したら `frozen_policies/best_gating/` に `model_<番号>.pt` と融合 ONNX を置き、
+  旧 model は `old/` へ退避 (`tracking_policy.py` が番号最大を自動解決するため)。
+- 今回の結果 (model_2999 vs 旧 5897): 進入 2.0 m/s / 120° の転倒 0.34 % vs 0.73 %、
+  所要時間 +0.04〜0.06 s。途中の model_2000 は旧と差なし。詳細は `best_gating/README.md`。
+- **残課題**: 横 1.9 m/s からの pivot 進入は転倒 2.05 % (旧 2.93 %)。回転 expert
+  (`best_turn/model_9000.pt`) が横進入を学習していないため。下げるには回転 expert の
+  再学習が要る。要否はユーザー未回答。
+- 融合 ONNX の mode=1 (回転) の expert 単体パリティは未検証 (乱数入力ではゲート重みが
+  1 に寄らないため)。torch との等価性は 3.8e-6 で確認済み。
+
+## G. C++ 側 (`~/workspace/booster_k1_locomotion`)
+
+ブランチ `feat/new_fast_side_walk`、コミット `a7c6151` (未 push)。
+
+- `src/k1_constants_isaaclab.hpp`: `PHASE_LATERAL_LOW = 0.5`。
+- `src/rl_policy_isaaclab_node.cpp`: `cmd_phase_freq(lin_speed, vy)` に横加算、
+  ノードパラメータ `phase_freq_lateral_gain` (既定 0.0 = 従来動作)。
+- `launch/k1_isaaclab_sim.launch.py`: 既定モデルを
+  `k1_gating_walk_turn_2026-11-16_v7_2999_walk56444_turn9000.onnx` に、
+  `phase_freq_lateral_gain` 既定 0.75。
+- **未対応**: 実機用 `k1_isaaclab_deploy.launch.py` は旧ゲート (v4_5897) のまま。
+  kick の build_frame と `getup_walk_supervisor.hpp` の周波数計算は横加算なし。Python ノードは非対応。
+- **未検証**: この PC には ROS と third_party SDK が無く C++ ノードをビルドできなかった。
+  SDK のある PC でビルドと動作確認が要る。
+
+## H. この PC 固有の注意 (2× GPU: RTX 4000 Ada 20 GB + RTX A4000 16 GB)
+
+- python は `_labpython2` (`~/.bash_functions`、IsaacLab 2.3.2 の kit)。本文の `uv run` は
+  別 PC 向けの記述で、この PC では `_labpython2` に読み替える。
+- SSH の X 転送 (`DISPLAY`) が残っていると Isaac Sim が起動時に固まる → `unset DISPLAY`
+  (probe_wide.sh は対応済み)。
+- train.py は SIGTERM で終わらず GPU メモリを掴み続ける → `kill -9`。
+  `pkill -f` / `pgrep -f` は自分のシェルにもマッチするので `"[p]robe_wide_R1"` のように書く。
+- Isaac プロセスを同じ秒に 2 本起動すると `/tmp/IsaacLab/usd_*` が衝突して片方が落ちる
+  → 60 秒ずらす。
+- GPU 0 が他ジョブで埋まっていることがある (2026-11-19 は別プロジェクト FastBFM の学習が
+  15 GB 使用)。`nvidia-smi` で確認し、他人のジョブは止めない。
+- 単一 GPU プローブは 2048 env で約 10 s/it。
+
+## I. 計測の読み方 (追加分)
+
+- 学習ログの `Episode_Termination/base_height` は転倒率ではない (大半が 40 m 四方の
+  地形端からの落下で、速い指令ほど増える)。`measure_stride.py` の `falls/env`
+  (端付近を除外) で見る。
+- `measure_stride.py` の環境変数: `MEASURE_AXIS` (0 = 前進, 1 = 横)、`MEASURE_SPEEDS`、
+  `MEASURE_OTHER` (もう一方の軸の固定指令。斜め用)、`MEASURE_FLIP` (切り返しの周期 step)、
+  `MEASURE_EDGE`。出力列に tilt / angv_xy / power もある。
+- 速度カリキュラムの EMA 関門は warm-start では十数 it で素通りする。範囲は単段で固定し、
+  直接計測で判断する。
+- 位相の params を試すときは hydra 上書きを 3 箇所同時に付ける
+  (`env.observations.policy.gait_phase.params.X` / `env.observations.critic.gait_phase.params.X`
+  / `env.rewards.feet_phase.params.X`)。
+
+## J. ユーザー要件の一覧 (判断の根拠)
+
+- 上位は model-free RL なので指令への追従率は低くてよい (実速度が出ることが大事)。
+- 実機の歩行周波数の上限は約 3 Hz、3.4 Hz ならいけるかもしれない。
+- 横の高速域はキーパーのセーブ用途でほぼ純横。x 2.0 と y 1.9 の両立は不要、
+  **x 2.0 / y 1.0 の斜めは必須**。
+- 前進側はフライトしないのが望ましい。2.0 超のみ徐々に許可可。
+- 摩擦 DR 拡張で速度範囲が少し狭くなるのは許容。
+
+## K. ユーザーに未確認のまま残っていること
+
+1. 摩擦 DR 拡張の採用基準 (どの摩擦でどの程度の速度低下・転倒率なら可か)。
+2. sim の関節速度上限は実機の実上限か (C 節)。
+3. 回転 expert を横進入込みで再学習するか (F 節)。
+4. 実機用 launch の既定モデルを新ゲートに切り替えるか (G 節)。
+5. 後退 2.8 m/s は必要か。参照動作 (2.8 m/s) のケイデンスと接地時間。

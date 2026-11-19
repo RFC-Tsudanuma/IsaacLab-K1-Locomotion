@@ -361,6 +361,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     slide_sum, slide_cnt = z(), z()
     fall_cnt = z()  # 計測中の終了回数 (計測は 12 s でタイムアウトより短いので ≒ 転倒)
     tilt_sum, angv_sum, pow_sum = z(), z(), z()  # 上体の傾き |g_xy|・roll/pitch 角速度・関節パワー Σ|τω|
+    # 関節ごとの飽和診断: トルクがクリップされたステップ率と |関節速度| の最大値
+    sat_sum = torch.zeros(uenv.num_envs, robot.num_joints, device=dev)
+    qd_max = torch.zeros(uenv.num_envs, robot.num_joints, device=dev)
     fly_sum = z()  # 両足同時空中だったステップ数 (odometry 要件: 0 が理想)
     obs = env.get_observations()
     # 地形 (既定 5x5 タイル x 8 m + 縁 5 m = 半幅 25 m) の端から歩いて落ちた終了は転倒に数えない
@@ -402,6 +405,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         tilt_sum += robot.data.projected_gravity_b[:, :2].norm(dim=1) * valid
         angv_sum += robot.data.root_ang_vel_b[:, :2].norm(dim=1) * valid
         pow_sum += (robot.data.applied_torque * robot.data.joint_vel).abs().sum(dim=1) * valid
+        sat_sum += ((robot.data.computed_torque - robot.data.applied_torque).abs() > 1e-3).float() * valid[:, None]
+        qd_max = torch.maximum(qd_max, robot.data.joint_vel.abs() * valid[:, None])
     T = (steps_total - warmup) * dt
     print("\n=== stride measurement (per commanded vx) ===")
     print("vx_cmd  vx_act  stride_td  gap_amp  cadence[Hz]  swing[s]  slide[m/s]  fly%  n_td  falls/env  tilt  angv_xy[rad/s]  power[W]")
@@ -416,6 +421,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sl = (slide_sum[m].sum() / slide_cnt[m].sum().clamp(min=1)).item()
         fly = (fly_sum[m].sum() / vel_cnt[m].sum().clamp(min=1)).item() * 100.0
         print(f"{s:6.2f}  {va:6.3f}  {st:8.3f}  {amp:7.3f}  {cad:10.2f}  {sw:7.3f}  {sl:9.3f}  {fly:4.1f}  {int(n_td)}  {fall_cnt[m].mean().item():.2f}  " + "  ".join(f"{(q[m].sum() / vel_cnt[m].sum().clamp(min=1)).item():.3f}" for q in (tilt_sum, angv_sum, pow_sum)))
+    print("\n=== actuator saturation: torque-clipped step % / p99 over envs of max |joint vel| [rad/s] ===")
+    for gi, s in enumerate(speeds):
+        m = group == gi
+        sat = sat_sum[m].sum(dim=0) / vel_cnt[m].sum().clamp(min=1) * 100.0
+        qd = torch.quantile(qd_max[m], 0.99, dim=0)
+        top = torch.argsort(sat + qd, descending=True)[:6].tolist()
+        print(f"{s:6.2f}  " + "  ".join(f"{robot.joint_names[j]}: {sat[j].item():.1f}% {qd[j].item():.1f}" for j in top))
     env.close()
 
 
