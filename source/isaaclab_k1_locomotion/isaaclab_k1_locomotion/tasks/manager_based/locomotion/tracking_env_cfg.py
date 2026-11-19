@@ -139,6 +139,10 @@ class K1TrackingEnvCfg(K1FlatGatingCfg):
 
         self.rewards = K1TrackingRewardsCfg()
 
+        # 摩擦 DR を広げる (2026-11-19): 親の U(0.6, 1.0) では実機の滑る床で合成指令時に転倒が多かった
+        self.events.physics_material.params["static_friction_range"] = (0.2, 3.0)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.2, 3.0)
+
         # 経路は最長 5 セグメント × 2 m なので平面の縁を広げる
         self.scene.terrain.terrain_generator = PLANE_HEAVY_TERRAIN_CFG.replace(border_width=15.0)
         self.episode_length_s = 20.0
