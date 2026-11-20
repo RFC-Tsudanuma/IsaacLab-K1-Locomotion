@@ -181,7 +181,7 @@ class K1BlockCommandsCfg:
 class K1BlockRewardsCfg:
     """阻止タスクの報酬 (歩行用の報酬は継承しない)。値は RewardManager が dt (0.02) を掛ける。
 
-    既定値は best_block (b4 model_19399、2026-11-19、w2@17600 を観測ノイズ強化 + 滑らかさ罰則で再学習) の学習設定。
+    既定値は best_block (f1 model_23400、2026-11-20、b5@20800 を歩行 expert R9 model_64440 + 摩擦 U(0.3, 3.0) env ごとで再学習) の学習設定。
     """
 
     # 主目的: 阻止 (+2 実効) / 失点 (−4 実効)。転倒も失点と同程度に罰する。
@@ -237,13 +237,14 @@ class K1BlockEnvCfg(K1FlatStancePlanePolishCfg):
         # 止めてから 3 s 立ち続けて阻止 (2.5 → 3.0 s、2026-11-19 ユーザー指示: 止めた直後の転倒を減らす)
         self.commands.ball_launch.resolve_hold_s = 3.0
 
-        # 実機は床の摩擦変動が大きいので足の摩擦 DR を歩行 (0.3〜1.0) より両側に広げる (2026-11-19 ユーザー指示)。地形 1.0 × multiply なので実効値そのまま
-        self.events.physics_material.params["static_friction_range"] = (0.15, 3.0)
-        self.events.physics_material.params["dynamic_friction_range"] = (0.15, 3.0)
-        # 引き方は歩行 Wide cfg と同じ関数に差し替え (既定 per_env False = 標準版と同じ shape ごと)。新歩行 expert (R9) は
-        # per_env True (床ごとに 1 つ) で学習したので、その上で再学習するときは env.events.physics_material.params.per_env=true (2026-11-20)
+        # 足の摩擦 DR: 歩行 expert R9 (best_walk model_64440) の学習と同じ U(0.3, 3.0) を床 (env) ごとに 1 つ引く
+        # (2026-11-20 ユーザー指示。b5 までは U(0.15, 3.0) を shape ごと = 両足とも滑る床がほぼ出なかった)。
+        # 地形 1.0 × multiply なので実効値そのまま
         self.events.physics_material.func = randomize_floor_friction
-        self.events.physics_material.params.update({"per_env": False, "log_uniform": False})
+        self.events.physics_material.params.update(
+            {"static_friction_range": (0.3, 3.0), "dynamic_friction_range": (0.3, 3.0),
+             "per_env": True, "log_uniform": False}
+        )
 
         # 歩行コマンド系のカリキュラムは全て無効 (base_velocity は ExternalVelocityCommand)
         self.curriculum.lin_vel_command = None
