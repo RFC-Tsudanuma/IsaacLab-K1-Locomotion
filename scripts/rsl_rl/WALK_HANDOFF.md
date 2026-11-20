@@ -394,7 +394,7 @@ PYTHONUNBUFFERED=1 _labpython2 export_gating_policy.py --headless \
 
 **最終版 = R9 `model_64440.pt`** (run `2026-11-19_20-01-03_wideR9_perenv_clearance0.15_w-150`、
 設定 `probe_wide_R9.json`、model_56444 から合計 +7996 it)。`logs/` は git 管理外なので
-checkpoint は学習した PC と vast.ai にしか無い。**`frozen_policies/best_walk` は未更新 (採用判断待ち、実機未検証)**。
+checkpoint は学習した PC と vast.ai にしか無い。**2026-11-20 に採用: `frozen_policies/best_walk/model_64440.pt` (実機未検証)**。
 
 ### 変更点 (model_56444 比)
 
@@ -405,8 +405,7 @@ checkpoint は学習した PC と vast.ai にしか無い。**`frozen_policies/b
    目標の足リンク高さ 0.15 m)。高摩擦の転倒の約 9 割は凹凸タイル (地形の 3 割、1〜4 cm) での
    前のめりのつまずきで、平面のみではもともとほぼ転ばない。
 
-どちらも `K1FlatStancePlaneWideCfg` の既定値は従来挙動 (`per_env: False`、重み 0)。
-`--override_json probe_wide_R9.json` で有効になる。採用するなら既定値に書き写す。
+採用に伴い `K1FlatStancePlaneWideCfg` の既定値を R9 の設定にした (`probe_wide_R9.json` の上書きと同じ値)。
 
 ### 試した系列
 
@@ -459,7 +458,7 @@ checkpoint は学習した PC と vast.ai にしか無い。**`frozen_policies/b
 
 ### 残り
 
-- 採用判断。採用時は E 節の手順 (best_walk 更新 → ゲートと下流方策の再学習)。位相の式と入出力は不変なので C++ の変更は不要。
+- best_walk は更新済み。残りは E・F 節の手順のゲートと下流方策の再学習。位相の式と入出力は不変なので C++ の変更は不要。
 - 実機の床の種類が未確認。今回減らしたのは「高摩擦 + 凹凸でのつまずき」。硬く平らな床なら
   シミュレーション上は基準でもほぼ転ばないので、実機の転倒は別原因の可能性がある。
 - R9 の指令 2.2 / 2.4 (範囲外) での実速度は未計測。μ0.3 の斜めの転倒 (0.17 回/9 s) も未解決。

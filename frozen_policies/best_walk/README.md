@@ -1,6 +1,27 @@
 # best_walk — 歩行の最良ポリシー (平面特化 x ±2.0 / y ±1.9 m/s)
 
-## 現行: model_56444.pt (2026-11-16、横速度拡張。**実機未検証**)
+## 現行: model_64440.pt (2026-11-20、摩擦 DR 拡張 R9。**実機未検証**)
+
+`Isaac-Velocity-Flat-Stance-Plane-Wide` (`K1FlatStancePlaneWideCfg`、既定値 = この学習設定) の成果物。
+`policy.onnx` / `policy.pt` / `env.yaml` は model_64440 のもの。model_56444 / 52700 / 52500 は旧版として同梱。
+**番号最大が下流 (ゲート・tracking など) から自動で読まれる。** 融合ゲート `best_gating/model_2999.pt` は
+model_56444 上で学習したものなので、ゲートと下流方策は再学習が要る (WALK_HANDOFF.md E・F 節)。
+
+model_56444 からの変更 (+7996 it、run `2026-11-19_20-01-03_wideR9_perenv_clearance0.15_w-150`):
+
+* 摩擦 DR を U(0.6, 1.0) → U(0.3, 3.0) にし、床 (env) ごとに 1 つ引く (`randomize_floor_friction`, `per_env`)。
+* 振り出し足が低いことへの罰 `feet_swing_clearance` (重み -150、目標 0.15 m)。高摩擦 + 凹凸でのつまずき対策。
+* 位相の式・入出力は model_56444 と同じ (C++ の変更なし)。
+
+転倒 [回/台] (前進 2.0 / 横 1.9 / 斜め (2.0, 1.0)、4096 env・15 s): μ3.0 混合地形 0.22 / 0.17 / 0.19 → 0.03 / 0.02 / 0.04、
+μ0.8 混合地形 0.10 / 0.01 / 0.08 → 0.00 / 0.00 / 0.02。μ0.3 (512 env・9 s): 前進 2.0 の転倒 0.42 → 0.06、
+斜めは 0.28 → 0.17 (残る弱点)。μ0.8 の定常速度はほぼ不変、横・斜めの立ち上がりは 0.3〜0.4 s 遅くなった。
+μ0.3 では前進 2.0 指令の実速度 1.40 m/s・立ち上がり 2.4 s。詳細と生データは `scripts/rsl_rl/WALK_HANDOFF.md` L 節、
+`scripts/rsl_rl/friction_dr_eval/`。
+
+---
+
+## (旧) model_56444.pt (2026-11-16、横速度拡張。**実機未検証**)
 
 `Isaac-Velocity-Flat-Stance-Plane-Wide` (`K1FlatStancePlaneWideCfg`、既定値 = 最終段の学習設定) の成果物。
 `policy.onnx` / `policy.pt` / `env.yaml` は model_56444 のもの。model_52700 / 52500 は旧版として同梱。
