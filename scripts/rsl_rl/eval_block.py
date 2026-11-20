@@ -89,6 +89,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     # 弾き出し速度: 最初に足 (xy 0.35 m 以内) に触れた後のボール速さの最大値 (接触の次 step から)
     touched_foot = torch.zeros(env.num_envs, dtype=torch.bool, device=raw_env.device)
     peak_after = torch.zeros(env.num_envs, device=raw_env.device)
+    # 滑らかさ: 関節指令 (expert + 残差) の 1 step 変化 ||Δa||² と関節加速度² の平均 (全体 / ボールが足 0.6 m 以内)。リセット step は除く
+    smooth = torch.zeros(2, 3, device=raw_env.device)  # [全体, 近傍] × [Σ||Δa||², Σ||q̈||², step 数]
     with torch.inference_mode():
         for step in range(args_cli.steps):
             speed = term.metrics["launch_speed"].clone()
@@ -108,6 +110,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             ball_x, _, _, _ = term.ball_line_state()
             rebound = torch.where(touched_foot, peak_after, torch.full_like(peak_after, float("nan")))
             obs, _, dones, extras = env.step(policy(obs))
+            am = raw_env.action_manager
+            d_act = torch.sum(torch.square(am.action[:, :12] - am.prev_action[:, :12]), dim=1)
+            j_acc = torch.sum(torch.square(robot.data.joint_acc), dim=1)
+            for row, mask in ((0, ~dones.bool()), (1, ~dones.bool() & (feet_d_xy < 0.6))):
+                smooth[row] += torch.stack([d_act[mask].sum(), j_acc[mask].sum(), mask.sum().float()])
             for k in logged:
                 if f"Metrics/ball_launch/{k}" in extras.get("log", {}):
                     logged[k].append(extras["log"][f"Metrics/ball_launch/{k}"])
@@ -136,6 +143,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print("  " + "  ".join(f"{o}: {100.0 * sum(r['outcome'] == o for r in rows) / n:5.1f}%" for o in OUTCOMES))
     print("  logged Metrics/ (学習ログ方式, 阻止内訳はこちら): " + "  ".join(f"{k}: {100.0 * sum(v) / max(len(v), 1):5.1f}%" for k, v in logged.items()))
     res = [r for r in rows if r["outcome"] == "resolved"]
+    sm = (smooth[:, :2] / smooth[:, 2:3].clamp(min=1)).tolist()
+    print(f"  滑らかさ (1 step 平均): 関節指令変化 ||Δa||² 全体 {sm[0][0]:.4f} / ボール 0.6 m 以内 {sm[1][0]:.4f},  関節加速度² 全体 {sm[0][1]:.0f} / 0.6 m 以内 {sm[1][1]:.0f} (rad/s²)²")
     print(f"  終了直前に胴体がボール 0.45 m 以内 (阻止のみ): {100.0 * sum(r['near'] for r in res) / max(len(res), 1):5.1f}%")
     print(f"  終了時の胴体の横ずれ |y| 平均: 全体 {sum(r['base_y'] for r in rows) / n:.3f} m, 阻止 {sum(r['base_y'] for r in res) / max(len(res), 1):.3f} m")
     print(f"  終了時の胴体のライン前方 x 平均: 全体 {sum(r['base_x'] for r in rows) / n:+.3f} m, 阻止 {sum(r['base_x'] for r in res) / max(len(res), 1):+.3f} m,"

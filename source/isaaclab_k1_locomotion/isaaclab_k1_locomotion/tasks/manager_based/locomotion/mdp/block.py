@@ -12,7 +12,7 @@
 
 * **conceded** (失点): ボールがラインの後ろ (``behind_x``) かつゴール幅 (``goal_half_width``) 内に入った
 * **resolved** (阻止): 失点せずに、ボールが (a) ゴール幅の外に逸れた、(b) 前方へ弾き返された、
-  (c) 止まった、のいずれかになった後 ``resolve_hold_s`` 秒 (既定 2.5 s) 転倒も失点もせずに立ち続けた
+  (c) 止まった、のいずれかになった後 ``resolve_hold_s`` 秒 (既定 2.5 s、Block は 3.0 s) 転倒も失点もせずに立ち続けた
 
 を判定する。両方とも終了条件 (time_out=False) で、報酬は ``is_terminated_term`` で与える。
 阻止の瞬間に終わらせないのは、体勢を崩しながら触ればよい方策にしないため (2026-11-02 ユーザー指示):
@@ -21,7 +21,7 @@
 ボール観測は 2 系統:
 
 * 真値 (:func:`ball_state_rel`): base yaw 座標系の相対位置 xy + 速度 xy (critic 側 encoder 用)
-* ノイズ付き (:class:`DelayedBallObs`): カメラ 30 fps の離散更新 + 検出遅延 (既定 160〜240 ms, env ごと) +
+* ノイズ付き (:class:`DelayedBallObs`): カメラ 30 fps の離散更新 + 検出遅延 (既定 速度 160〜300 ms, env ごと) +
   検出欠け + 位置 ±10 cm / 速度 ±1.0 m/s の一様ノイズ (actor 側 encoder 用)
 
 いずれも ObservationGroupCfg の history_length (``BALL_HISTORY``) で履歴化し、方策側の
@@ -98,34 +98,34 @@ class DelayedBallObs(ManagerTermBase):
         self._acc[env_ids] = 0.0
         self._fresh[env_ids] = True
 
-    def _noise(self, x: torch.Tensor, pos_noise: float, vel_noise: float, vel_noise_rel: float) -> torch.Tensor:
-        """ガウスノイズ。速度の σ は速さに比例して増える (カルマンフィルタ推定の誤差を模す)。"""
-        speed = torch.norm(x[:, 2:4], dim=1, keepdim=True)
-        std = torch.cat([torch.full_like(speed, pos_noise).expand(-1, 2), (vel_noise + vel_noise_rel * speed).expand(-1, 2)], dim=1)
+    def _noise(self, x: torch.Tensor, pos_noise: tuple[float, float], vel_noise: tuple[float, float], noise_dist: float) -> torch.Tensor:
+        """ガウスノイズ。σ はボール距離 d の 2 乗で (近, 遠) を補間し、d ≥ noise_dist で遠側に飽和 (カメラの奥行き誤差 ∝ d²)。"""
+        w = (torch.norm(x[:, :2], dim=1, keepdim=True) / noise_dist).clamp(max=1.0) ** 2
+        std = torch.cat([(pos_noise[0] + (pos_noise[1] - pos_noise[0]) * w).expand(-1, 2), (vel_noise[0] + (vel_noise[1] - vel_noise[0]) * w).expand(-1, 2)], dim=1)
         return x + torch.randn_like(x) * std
 
     def __call__(
         self,
         env: "ManagerBasedRLEnv",
-        delay_range: tuple[float, float] = (0.16, 0.24),
+        delay_range: tuple[float, float] = (0.16, 0.30),
         camera_fps: float = 30.0,
-        pos_noise: float = 0.05,
-        vel_noise: float = 1.0,
-        vel_noise_rel: float = 0.3,
+        pos_noise: tuple[float, float] = (0.05, 0.25),
+        vel_noise: tuple[float, float] = (0.25, 1.5),
+        noise_dist: float = 10.0,
         drop_prob: float = 0.1,
         pos_only: bool = False,
         pos_delay_range: tuple[float, float] | None = None,
     ) -> torch.Tensor:
         """``pos_only`` で位置 xy だけを返す (実機の速度推定は遅延 ≈ 0.6 s で使えないため、速度は encoder に履歴から推定させる)。
 
-        ``pos_delay_range`` を与えると位置だけ別の遅延にする (実機: 位置は生の検出 0.03〜0.08 s、速度はフィルタ越し 0.16〜0.24 s)。
-        None なら位置も ``delay_range``。"""
+        ``pos_delay_range`` を与えると位置だけ別の遅延にする (実機: 位置は生の検出 0.03〜0.10 s、速度はフィルタ越し 0.16〜0.30 s)。
+        None なら位置も ``delay_range``。``pos_noise`` / ``vel_noise`` は σ の (近, 遠) で、距離 ``noise_dist`` [m] 以上で遠側に飽和する。"""
         true = ball_state_rel(env)
         fresh = self._fresh
         if fresh.any():
             # リセット直後: 履歴を現在値で埋める (「少し前から見えていた」扱い)
             self._buf[fresh] = true[fresh].unsqueeze(1)
-            self._out[fresh] = self._noise(true[fresh], pos_noise, vel_noise, vel_noise_rel)
+            self._out[fresh] = self._noise(true[fresh], pos_noise, vel_noise, noise_dist)
             self._fresh[:] = False
         self._buf[:, self._ptr] = true
         delayed = self._buf[self._env_idx, (self._ptr - self._delay) % self._len]
@@ -139,7 +139,7 @@ class DelayedBallObs(ManagerTermBase):
         new_frame = self._acc >= 1.0
         self._acc -= new_frame.float()
         new_frame &= torch.rand_like(self._acc) >= drop_prob
-        self._out = torch.where(new_frame.unsqueeze(1), self._noise(delayed, pos_noise, vel_noise, vel_noise_rel), self._out)
+        self._out = torch.where(new_frame.unsqueeze(1), self._noise(delayed, pos_noise, vel_noise, noise_dist), self._out)
         return self._out[:, :2].clone() if pos_only else self._out.clone()
 
 
@@ -470,6 +470,18 @@ def ball_held_at_feet(
     speed = torch.norm(term.ball.data.root_lin_vel_w[:, :2], dim=1)
     gate = (term.resolved_at >= 0.0).float() if latched else 1.0
     return gate * torch.exp(-torch.square(_ball_feet_dist(term) / pos_std) - torch.square(speed / vel_std))
+
+
+def fell_after_resolve(env: "ManagerBasedRLEnv", command_name: str = "ball_launch") -> torch.Tensor:
+    """阻止ラッチ後 (ボールを止めてから終了までの保持中) に転倒して終了した step で 1。
+
+    実機でシュートを止めた直後に転ぶ事例があったので (2026-11-19 ユーザー報告)、保持中の転倒を ``fell`` に上乗せして罰する。
+    ラッチは終了判定の後に更新されるので、ラッチと同じ step の転倒は ``fell`` だけになる。
+    """
+    term: BallLaunchCommand = env.command_manager.get_term(command_name)
+    tm = env.termination_manager
+    fell = tm.get_term("base_contact") | tm.get_term("base_height")
+    return (fell & (term.resolved_at >= 0.0)).float()
 
 
 def ball_speed_after_touch(env: "ManagerBasedRLEnv", max_speed: float = 2.0, command_name: str = "ball_launch") -> torch.Tensor:

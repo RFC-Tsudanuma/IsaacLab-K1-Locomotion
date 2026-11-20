@@ -22,7 +22,7 @@
     - ``block_critic``: 同上 + 線速度 (ノイズなし)
     - ``ball_noisy``:   遅延 + 30 fps + ノイズ付きボール観測の履歴 (actor の encoder 入力)
     - ``ball_true``:    真値ボール観測の履歴 (critic の encoder 入力 / latent 蒸留の教師)
-* reward: 阻止 (+) / 失点 (−) / 転倒 (−) / 足を予測到達点へ (shaping) / 残差・コマンドの大きさと変化率 (−)
+* reward: 阻止 (+) / 失点 (−) / 転倒 (−、止めた後の保持中はさらに −) / 足を予測到達点へ (shaping) / 残差・コマンドの大きさと変化率 (−)
 * termination: 失点・阻止で終了 (どちらも time_out=False)。
 * reset: 立位スタート (関節 ±5°, 初速 ±0.1)。
 
@@ -47,6 +47,7 @@ from .dribble_env_cfg import K1DribbleSceneCfg
 from .flat_env_cfg import PLANE_HEAVY_TERRAIN_CFG, K1FlatObservationsCfg, K1FlatStancePlanePolishCfg
 from .rough_env_cfg import K1CriticCfg, K1PolicyCfg
 from .velocity_env_cfg import ActionsCfg
+from .mdp.events import randomize_floor_friction
 from .mdp.block import (
     BALL_HISTORY,
     JOINT_DIM,
@@ -60,6 +61,7 @@ from .mdp.block import (
     ball_held_at_feet,
     ball_speed_after_touch,
     ball_resolved,
+    fell_after_resolve,
     ball_state_rel,
     ball_stopped,
     body_forward_l2,
@@ -143,11 +145,13 @@ class K1BallNoisyCfg(ObsGroup):
     ball = ObsTerm(
         func=DelayedBallObs,
         params={
-            "delay_range": (0.16, 0.24),  # 認識まで含めた遅延 ≈ 200 ms (env ごとに抽選)
+            "delay_range": (0.16, 0.30),  # 認識まで含めた遅延 (env ごとに抽選、速度側)
             "camera_fps": 30.0,
-            "pos_noise": 0.05,  # 位置 σ=5 cm (±10 cm ≈ 2σ)
-            "vel_noise": 1.0,  # 速度 σ = 1.0 + 0.3·|v| m/s (カルマンフィルタ推定: 速いほど誤差大)
-            "vel_noise_rel": 0.3,
+            # σ の (近, 遠): 距離の 2 乗で補間し 10 m 以上で遠側に飽和 (2026-11-18)。±最大 ≈ 2σ で
+            # 位置 ±10 cm → ±50 cm、速度 ±0.5 → ±3.0 m/s
+            "pos_noise": (0.05, 0.25),
+            "vel_noise": (0.25, 1.5),
+            "noise_dist": 10.0,
             "drop_prob": 0.1,  # 検出欠け
         },
     )
@@ -175,12 +179,17 @@ class K1BlockCommandsCfg:
 
 @configclass
 class K1BlockRewardsCfg:
-    """阻止タスクの報酬 (歩行用の報酬は継承しない)。値は RewardManager が dt (0.02) を掛ける。"""
+    """阻止タスクの報酬 (歩行用の報酬は継承しない)。値は RewardManager が dt (0.02) を掛ける。
+
+    既定値は best_block (b4 model_19399、2026-11-19、w2@17600 を観測ノイズ強化 + 滑らかさ罰則で再学習) の学習設定。
+    """
 
     # 主目的: 阻止 (+2 実効) / 失点 (−4 実効)。転倒も失点と同程度に罰する。
     blocked = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     conceded = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": "ball_conceded"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
+    # 止めた後の保持 (3 s) 中の転倒は fell に上乗せして計 −600 (実機で止めた直後に転ぶ事例への対策、2026-11-19)
+    fell_after_resolve = RewTerm(func=fell_after_resolve, weight=-400.0)
     # 阻止終了時にボールが足元にあるほど blocked に上乗せ (v19d/e で 100〜200: 足元保持 +1pt、失点 +2〜3pt で不採用 → 0)
     stopped_bonus = RewTerm(func=ball_stopped, weight=0.0, params={"std": 0.5})
     # shaping: ボール接近中、予測到達点 (ライン上の y) に足を置く / 胴体を横に合わせる
@@ -198,8 +207,11 @@ class K1BlockRewardsCfg:
     foot_yield_on_contact = RewTerm(func=foot_yield_on_contact, weight=0.0, params={"dist": 0.3, "min_speed": 0.3})
     # 事前分布 (歩行 expert) からのずれと、その変化率・コマンド変化率は軽く抑える
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
-    joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})
-    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
+    joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-1.0, params={"action_name": "joint_residual"})
+    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.5, params={"action_name": "walk_command"})
+    # 関節加速度 (expert + 残差の合算が実際に関節を揺らした分)。歩行環境と同じ量。実機の足首振動対策 (2026-11-18): 変化率 2 項と合わせ
+    # ||Δa||² を w2 比 −49%、関節加速度² を −47% にし、失点は悪化しなかった (b4)。弱い −0.3/−0.2/−1e-6 (b3) は失点が 0.6 pt 低く滑らかさは 16% 劣る
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-3.0e-6)
 
 
 @configclass
@@ -222,6 +234,16 @@ class K1BlockEnvCfg(K1FlatStancePlanePolishCfg):
 
         self.terminations.ball_conceded = DoneTerm(func=ball_conceded)
         self.terminations.ball_resolved = DoneTerm(func=ball_resolved)
+        # 止めてから 3 s 立ち続けて阻止 (2.5 → 3.0 s、2026-11-19 ユーザー指示: 止めた直後の転倒を減らす)
+        self.commands.ball_launch.resolve_hold_s = 3.0
+
+        # 実機は床の摩擦変動が大きいので足の摩擦 DR を歩行 (0.3〜1.0) より両側に広げる (2026-11-19 ユーザー指示)。地形 1.0 × multiply なので実効値そのまま
+        self.events.physics_material.params["static_friction_range"] = (0.15, 3.0)
+        self.events.physics_material.params["dynamic_friction_range"] = (0.15, 3.0)
+        # 引き方は歩行 Wide cfg と同じ関数に差し替え (既定 per_env False = 標準版と同じ shape ごと)。新歩行 expert (R9) は
+        # per_env True (床ごとに 1 つ) で学習したので、その上で再学習するときは env.events.physics_material.params.per_env=true (2026-11-20)
+        self.events.physics_material.func = randomize_floor_friction
+        self.events.physics_material.params.update({"per_env": False, "log_uniform": False})
 
         # 歩行コマンド系のカリキュラムは全て無効 (base_velocity は ExternalVelocityCommand)
         self.curriculum.lin_vel_command = None
@@ -243,8 +265,8 @@ class K1BlockEnvCfg(K1FlatStancePlanePolishCfg):
         # ボールは最長 12 m 先から来て弾かれて飛ぶので平面の縁を広げる (env 間の衝突は filter_collisions で切れている)
         self.scene.terrain.terrain_generator = PLANE_HEAVY_TERRAIN_CFG.replace(border_width=15.0)
 
-        # 到達 (12 m を 4 m/s、減衰 0.1 で ≈ 3.6 s) + 阻止保持 2.5 s + 余裕。阻止・失点で早期終了するので大半はこれより短い。
-        self.episode_length_s = 10.0
+        # 到達 (12 m を 4 m/s、減衰 0.1 で ≈ 3.6 s) + 阻止保持 3 s + 余裕。阻止・失点で早期終了するので大半はこれより短い。
+        self.episode_length_s = 10.5
 
 
 @configclass
@@ -292,18 +314,18 @@ class K1BlockFastLateralEnvCfg_PLAY(K1BlockFastLateralEnvCfg):
 
 @configclass
 class K1BlockFastRawPosEnvCfg(K1BlockFastLateralEnvCfg):
-    """実機の入力に合わせ、actor のボール位置は生の検出 (遅延 0.03〜0.08 s)、速度はフィルタ越し (0.16〜0.24 s) にする (2026-11-10)。"""
+    """実機の入力に合わせ、actor のボール位置は生の検出 (遅延 0.03〜0.10 s)、速度はフィルタ越し (0.16〜0.30 s) にする (2026-11-10、幅は 2026-11-18 に拡大)。"""
 
     def __post_init__(self):
         super().__post_init__()
-        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.08)
+        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.10)
 
 
 @configclass
 class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.08)
+        self.observations.ball_noisy.ball.params["pos_delay_range"] = (0.03, 0.10)
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +355,8 @@ class K1TrapRewardsCfg:
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
     joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})
     walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
+    # 関節加速度 (expert + 残差の合算が実際に関節を揺らした分)。歩行環境と同じ量。実機の足首振動対策の候補 (2026-11-18)、0 で無効
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
 
 
 @configclass
