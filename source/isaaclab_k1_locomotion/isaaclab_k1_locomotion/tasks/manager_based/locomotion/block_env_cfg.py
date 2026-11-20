@@ -336,10 +336,13 @@ class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
 @configclass
 class K1TrapRewardsCfg:
     """JOGA 型: 足元ゾーン (毎 step) + 吸収 shaping + 弾き出し罰 + 接近中の足の進路合わせ。値は RewardManager が dt を掛ける。
-    既定値は best_trap (trap_t2 model_25798、2026-11-18、v4c@22799 を新歩行 expert model_56444 で再学習) の学習設定。"""
+    既定値は best_trap (trap_t2 model_25798、2026-11-18、v4c@22799 を新歩行 expert model_56444 で再学習) の学習設定に、
+    実機で止めた直後に転んだ対策 (2026-11-19 ユーザー指示、未学習) を足したもの: 保持中転倒罰 fell_after_resolve。
+    保持 3 s と摩擦 DR 0.3〜3.0 は _configure_trap (t2 は保持 1 s・摩擦 0.3〜1.0 で学習)。手順は scripts/rsl_rl/TRAP_HANDOFF.md。"""
 
     trapped = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
+    fell_after_resolve = RewTerm(func=fell_after_resolve, weight=-400.0)  # 止めた後の保持中の転倒に上乗せ (fell と合わせ −600)。Block と同じ
     lost = RewTerm(func=mdp.is_terminated_term, weight=-300.0, params={"term_keys": "ball_conceded"})  # 後方 2 m に抜けた。−200 → −300 でロスト 4.9 → 4.1 % (成功 −1.7 pt)
     escaped = RewTerm(func=mdp.is_terminated_term, weight=-100.0, params={"term_keys": "ball_escaped"})  # 触った後に前方 1.5 m 超へ逃がした (終了にして成功 +4〜5 pt)
     # 足元ゾーン exp(−(d/0.3)² − (v/0.5)²): JOGA の trapped zone exp(−4v²) と同じ速度スケール
@@ -359,26 +362,33 @@ class K1TrapRewardsCfg:
     dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
 
 
+def _configure_trap(cfg) -> None:
+    """Block cfg (学習 / Play 共通) をトラップ用に差し替える。終了項の名前は Block と同じ
+    (ball_conceded = ロスト、ball_resolved = トラップ成功) にして eval_block.py を流用する。"""
+    cfg.commands.ball_launch = BallTrapCommandCfg(asset_name="robot")
+    cfg.rewards = K1TrapRewardsCfg()
+    cfg.terminations.ball_escaped = DoneTerm(func=ball_escaped)
+    # 止めてから 3 s 立ち続けて成功 (1.0 → 3.0 s、2026-11-19 ユーザー指示: 実機で止めた直後の転倒を減らす)。保持中の転倒は fell_after_resolve
+    cfg.commands.ball_launch.resolve_hold_s = 3.0
+    # 到達 ≤ 3 s + トラップ + 保持 3 s。成功・ロスト・escaped・転倒で早期終了する
+    cfg.episode_length_s = 10.0
+    # 実機の床の摩擦変動対策 (2026-11-19 ユーザー指示: 0.3〜3.0。Block は 0.15〜3.0、歩行 expert R9 は 0.3〜3.0 per_env)
+    cfg.events.physics_material.params["static_friction_range"] = (0.3, 3.0)
+    cfg.events.physics_material.params["dynamic_friction_range"] = (0.3, 3.0)
+
+
 @configclass
 class K1TrapEnvCfg(K1BlockFastRawPosEnvCfg):
     def __post_init__(self):
         super().__post_init__()
-        self.commands.ball_launch = BallTrapCommandCfg(asset_name="robot")
-        self.rewards = K1TrapRewardsCfg()
-        # 終了項の名前は Block と同じ (ball_conceded = ロスト、ball_resolved = トラップ成功) にして eval_block.py を流用する
-        # 到達 ≤ 3 s + トラップ + 保持 1 s。成功・ロスト・転倒で早期終了する。
-        self.episode_length_s = 8.0
-        self.terminations.ball_escaped = DoneTerm(func=ball_escaped)
+        _configure_trap(self)
 
 
 @configclass
 class K1TrapEnvCfg_PLAY(K1BlockFastRawPosEnvCfg_PLAY):
     def __post_init__(self) -> None:
         super().__post_init__()
-        self.commands.ball_launch = BallTrapCommandCfg(asset_name="robot")
-        self.rewards = K1TrapRewardsCfg()
-        self.episode_length_s = 8.0
-        self.terminations.ball_escaped = DoneTerm(func=ball_escaped)
+        _configure_trap(self)
 
 
 @configclass
