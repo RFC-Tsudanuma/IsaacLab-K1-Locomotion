@@ -324,11 +324,17 @@ PYTHONUNBUFFERED=1 _labpython2 export_gating_policy.py --headless \
   旧 model は `old/` へ退避 (`tracking_policy.py` が番号最大を自動解決するため)。
 - 今回の結果 (model_2999 vs 旧 5897): 進入 2.0 m/s / 120° の転倒 0.34 % vs 0.73 %、
   所要時間 +0.04〜0.06 s。途中の model_2000 は旧と差なし。詳細は `best_gating/README.md`。
-- **残課題**: 横 1.9 m/s からの pivot 進入は転倒 2.05 % (旧 2.93 %)。回転 expert
-  (`best_turn/model_9000.pt`) が横進入を学習していないため。下げるには回転 expert の
-  再学習が要る。要否はユーザー未回答。
-- 融合 ONNX の mode=1 (回転) の expert 単体パリティは未検証 (乱数入力ではゲート重みが
-  1 に寄らないため)。torch との等価性は 3.8e-6 で確認済み。
+- ~~**残課題**: 横 1.9 m/s からの pivot 進入は転倒 2.05 % (旧 2.93 %)~~
+  → **2026-11-21 解消** (コミット 963f2e0、ゲート担当セッション)。R9 (model_64440) を凍結して
+  回転 expert を +1000 it 追加学習 (`best_turn/model_10000.pt`) し、横 1.9 m/s 180° の転倒が
+  **2.73 → 0.39 %**、120° が **1.86 → 0.20 %**。ゲートもスクラッチ再学習して
+  `best_gating/model_2999.pt` / `gating_2999_walk64440_turn10000.onnx` に差し替え済み。
+  ゲート/pivot の学習環境の摩擦 DR も R9 と同じ U(0.3, 3.0) per_env に揃えた (896cec3)。
+  退行は前進しながらの 180° 全反転の転倒のみ (0.10 → 0.54 %)。詳細は
+  `best_gating/README.md` と `best_gating/PIVOT_FIXED_COST_MEMO.md` §9。
+- ~~融合 ONNX の mode=1 (回転) の expert 単体パリティは未検証~~
+  → 2026-11-21 実施。歩容位相入りの履歴なら w ≈ 0.9999 まで寄るので測れる
+  (`max|Δ| ≤ 9.2e-5`)。静止プライム履歴だと w = 0.97 で歩行が 3 % 残り `≤ 1.2e-2`。
 
 ## G. C++ 側 (`~/workspace/booster_k1_locomotion`)
 
