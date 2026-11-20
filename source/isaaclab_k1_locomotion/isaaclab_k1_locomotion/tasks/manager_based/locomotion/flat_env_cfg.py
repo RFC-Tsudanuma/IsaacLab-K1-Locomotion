@@ -2218,6 +2218,23 @@ class K1FlatGatingCfg(K1FlatTransitionCfg):
         cmd.yaw_assist_max = 3.0
         cmd.yaw_assist_s = 0.6
 
+        # --- 摩擦 DR: 歩行 expert と同じ引き方に揃える (2026-11-20 ユーザー指示) ---
+        # 凍結する歩行 expert が U(0.3, 3.0)・床ごとに 1 つ (per_env) で学習しているので、
+        # ゲートと回転 expert の追加学習も同じ分布で回す。K1FlatStancePlaneCfg 由来の
+        # U(0.6, 1.0)・shape ごとのままだと、低摩擦/高摩擦でのゲートの振る舞いも
+        # 「両足とも滑る床」も学習に出てこない (mdp.randomize_floor_friction の docstring 参照)。
+        # 歩行側 (K1FlatStancePlaneWideCfg) は既定を従来挙動にして probe_wide_R9.json で
+        # 上書きする運用だが、こちらは下流が固定なので既定値にする。
+        self.events.physics_material.func = randomize_floor_friction
+        self.events.physics_material.params.update(
+            {
+                "static_friction_range": (0.3, 3.0),
+                "dynamic_friction_range": (0.3, 3.0),
+                "per_env": True,
+                "log_uniform": False,
+            }
+        )
+
 
 @configclass
 class K1FlatGatingCfg_PLAY(K1FlatGatingCfg):
