@@ -337,6 +337,67 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # Metrics/base_velocity/stride_touchdown の妥当性と歩容の実態 (歩幅/ケイデンス/滑り)
     # を確認する。--speeds で与えた vx を env に巡回割り当てする。
     # ------------------------------------------------------------------
+    if os.environ.get("MEASURE_GRID"):
+        # 指令応答の計測 (2026-11-20): MEASURE_GRID="vx,vy,wz;vx,vy,wz;..." を env に巡回割り当てし、
+        # 静止 2 s → 指令 8 s → 指令 0 で 3 s。定常速度・立ち上がり時間・停止時間/距離・転倒率を出す。
+        # 上位方策 (歩行 expert を使う側) が見る「指令 → 実際の動き」の対応を新旧で比べるためのもの。
+        uenv = env.unwrapped
+        dev, N = uenv.device, uenv.num_envs
+        cmds = torch.tensor([[float(v) for v in c.split(",")] for c in os.environ["MEASURE_GRID"].split(";")], device=dev)
+        G = len(cmds)
+        group = torch.arange(N, device=dev) % G
+        cmd_term = uenv.command_manager.get_term("base_velocity")
+        robot = uenv.scene["robot"]
+        n_pre, n_on, n_off = int(2.0 / dt), int(8.0 / dt), int(3.0 / dt)
+        alive = torch.ones(N, dtype=torch.bool, device=dev)
+        fell_on, fell_off = torch.zeros(N, device=dev), torch.zeros(N, device=dev)
+        onehot = torch.nn.functional.one_hot(group, G).float()  # (N, G)
+        trace = torch.zeros(n_on + n_off, G, 3, device=dev)  # 生存 env の平均 (vx, vy, wz)
+        steady_sum, steady_cnt = torch.zeros(N, 3, device=dev), torch.zeros(N, device=dev)
+        obs = env.get_observations()
+        for step in range(n_pre + n_on + n_off):
+            k = step - n_pre
+            cmd_term.vel_command_b[:] = cmds[group] if 0 <= k < n_on else 0.0
+            inside = robot.data.root_pos_w[:, :2].abs().max(dim=1)[0] < 24.0  # 地形端からの落下は転倒に数えない
+            cmd_term.is_heading_env[:] = False
+            cmd_term.is_standing_env[:] = False
+            with torch.inference_mode():
+                actions = policy(obs)
+                obs, _, dones, _ = env.step(actions)
+                policy_nn.reset(dones)
+            if k < 0:
+                continue
+            d = dones.to(dev).bool()
+            (fell_on if k < n_on else fell_off).add_((d & alive & inside).float())
+            alive &= ~d
+            v = torch.cat([robot.data.root_lin_vel_b[:, :2], robot.data.root_ang_vel_b[:, 2:3]], dim=1)
+            w = onehot * alive[:, None]
+            trace[k] = (w.T @ v) / w.sum(dim=0).clamp(min=1)[:, None]
+            if n_on // 2 <= k < n_on:
+                steady_sum += v * alive[:, None]
+                steady_cnt += alive.float()
+        print("\n=== command response (alive envs; rise = 90 % of steady, stop = |v| < 0.15 m/s & |wz| < 0.2 rad/s) ===")
+        print("cmd(vx,vy,wz) | steady(vx,vy,wz) | env-std(vx,vy,wz) | rise[s] | stop[s] | stop_dist[m] | stop_yaw[rad] | fall%(on/off)")
+        for g in range(G):
+            m = (group == g) & (steady_cnt > 0)
+            per_env = steady_sum[m] / steady_cnt[m][:, None]
+            st, sd = per_env.mean(dim=0), per_env.std(dim=0)
+            c = cmds[g]
+            use_lin = c[:2].norm() > 0.1
+            ref = st[:2] if use_lin else st[2:3]
+            proj = (trace[:n_on, g, :2] @ ref / ref.norm().clamp(min=1e-6)) if use_lin else trace[:n_on, g, 2] * torch.sign(ref[0])
+            hit = (proj >= 0.9 * ref.norm()).nonzero()
+            rise = hit[0].item() * dt if len(hit) else float("nan")
+            off = trace[n_on:, g]
+            moving = ((off[:, :2].norm(dim=1) >= 0.15) | (off[:, 2].abs() >= 0.2)).nonzero()
+            stop = (moving[-1].item() + 1) * dt if len(moving) else 0.0
+            n_g = (group == g).sum().item()
+            print(f"({c[0]:+.1f},{c[1]:+.1f},{c[2]:+.1f}) | ({st[0]:+.2f},{st[1]:+.2f},{st[2]:+.2f}) | ({sd[0]:.2f},{sd[1]:.2f},{sd[2]:.2f}) | {rise:.2f} | {stop:.2f} | "
+                  f"{(off[:, :2].norm(dim=1).sum() * dt).item():.2f} | {(off[:, 2].sum() * dt).item():+.2f} | "
+                  f"{fell_on[group == g].sum().item() / n_g * 100:.1f}/{fell_off[group == g].sum().item() / n_g * 100:.1f}")
+        env.close()
+        return
+
     uenv = env.unwrapped
     dev = uenv.device
     N = uenv.num_envs
@@ -365,6 +426,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     sat_sum = torch.zeros(uenv.num_envs, robot.num_joints, device=dev)
     qd_max = torch.zeros(uenv.num_envs, robot.num_joints, device=dev)
     fly_sum = z()  # 両足同時空中だったステップ数 (odometry 要件: 0 が理想)
+    age, fall_early = z(), z()  # リセットからの経過ステップ / 経過 2 s 未満 (加速中) の転倒数
+    fz_st_sum, fz_st_cnt, fz_sw_sum, fz_sw_cnt = z(), z(), z(), z()  # 足リンク高さ: 接地中 / 空中かつ水平速度が速い瞬間 (振り出し中)
+    fall_g = torch.zeros(N, 2, device=dev)  # 転倒直前の重力射影 xy の和 (x>0 前のめり, y>0 左へ)
+    fall_dir = torch.zeros(N, 4, device=dev)  # 転倒方向の内訳: 前 / 後 / 左 / 右
+    tm = uenv.termination_manager
+    fall_term = {n: z() for n in tm.active_terms if n != "time_out"}
     obs = env.get_observations()
     # 地形 (既定 5x5 タイル x 8 m + 縁 5 m = 半幅 25 m) の端から歩いて落ちた終了は転倒に数えない
     edge = float(os.environ.get("MEASURE_EDGE", "24.0"))
@@ -375,13 +442,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         cmd_term.vel_command_b[:] = -fixed if flip and (step // flip) % 2 else fixed
         cmd_term.is_heading_env[:] = False
         cmd_term.is_standing_env[:] = False
+        g_prev = robot.data.projected_gravity_b[:, :2].clone()
         with torch.inference_mode():
             actions = policy(obs)
             obs, _, dones, _ = env.step(actions)
             policy_nn.reset(dones)
+        fell = dones.to(inside.device).bool() & inside
+        early = fell & (age < 2.0 / dt)
+        age = torch.where(dones.to(age.device).bool(), z(), age + 1)
         if step < warmup:
             continue
-        fall_cnt += (dones.to(inside.device) & inside).float()
+        fall_cnt += fell.float()
+        fall_g += g_prev * fell[:, None]
+        fwd_back = g_prev[:, 0].abs() > g_prev[:, 1].abs()
+        for k, cond in enumerate((fwd_back & (g_prev[:, 0] > 0), fwd_back & (g_prev[:, 0] <= 0), ~fwd_back & (g_prev[:, 1] > 0), ~fwd_back & (g_prev[:, 1] <= 0))):
+            fall_dir[:, k] += (fell & cond).float()
+        for n in fall_term:
+            fall_term[n] += (fell & tm.get_term(n).to(fell.device)).float()
+        fall_early += early.float()
         valid = uenv.episode_length_buf > 50
         base_pos = robot.data.root_pos_w[:, :3]
         qy = yaw_quat(robot.data.root_quat_w)
@@ -402,6 +480,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         slide_sum += (foot_v * in_contact).sum(dim=1) * valid
         slide_cnt += in_contact.sum(dim=1).float() * valid
         fly_sum += (~in_contact.any(dim=1)).float() * valid
+        foot_z = torch.stack([robot.data.body_pos_w[:, i, 2] for i in rid], dim=1) - uenv.scene.env_origins[:, 2:3]
+        mid_swing = (~in_contact) & (foot_v > 1.0)
+        fz_st_sum += (foot_z * in_contact).sum(dim=1) * valid
+        fz_st_cnt += in_contact.sum(dim=1).float() * valid
+        fz_sw_sum += (foot_z * mid_swing).sum(dim=1) * valid
+        fz_sw_cnt += mid_swing.sum(dim=1).float() * valid
         tilt_sum += robot.data.projected_gravity_b[:, :2].norm(dim=1) * valid
         angv_sum += robot.data.root_ang_vel_b[:, :2].norm(dim=1) * valid
         pow_sum += (robot.data.applied_torque * robot.data.joint_vel).abs().sum(dim=1) * valid
@@ -421,6 +505,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         sl = (slide_sum[m].sum() / slide_cnt[m].sum().clamp(min=1)).item()
         fly = (fly_sum[m].sum() / vel_cnt[m].sum().clamp(min=1)).item() * 100.0
         print(f"{s:6.2f}  {va:6.3f}  {st:8.3f}  {amp:7.3f}  {cad:10.2f}  {sw:7.3f}  {sl:9.3f}  {fly:4.1f}  {int(n_td)}  {fall_cnt[m].mean().item():.2f}  " + "  ".join(f"{(q[m].sum() / vel_cnt[m].sum().clamp(min=1)).item():.3f}" for q in (tilt_sum, angv_sum, pow_sum)))
+    print("\n=== falls/env within 2 s of reset (accelerating) vs later (steady) ===")
+    for gi, s in enumerate(speeds):
+        m = group == gi
+        print(f"{s:6.2f}  early {fall_early[m].mean().item():.2f}  late {(fall_cnt[m] - fall_early[m]).mean().item():.2f}")
+    print("\n=== foot link height [m]: in contact / mid-swing (airborne & foot speed > 1 m/s) / clearance ===")
+    for gi, s in enumerate(speeds):
+        m = group == gi
+        st = (fz_st_sum[m].sum() / fz_st_cnt[m].sum().clamp(min=1)).item()
+        sw = (fz_sw_sum[m].sum() / fz_sw_cnt[m].sum().clamp(min=1)).item()
+        print(f"{s:6.2f}  stance {st:.3f}  swing {sw:.3f}  clearance {sw - st:.3f}")
+    print("\n=== fall direction (count: forward / backward / left / right), mean tilt before fall, termination terms ===")
+    for gi, s in enumerate(speeds):
+        m = group == gi
+        nf = max(fall_cnt[m].sum().item(), 1)
+        print(f"{s:6.2f}  n={int(fall_cnt[m].sum().item())}  dir " + " / ".join(str(int(x)) for x in fall_dir[m].sum(dim=0).tolist())
+              + f"  g_xy ({fall_g[m, 0].sum().item() / nf:+.2f}, {fall_g[m, 1].sum().item() / nf:+.2f})  "
+              + "  ".join(f"{n}: {int(v[m].sum().item())}" for n, v in fall_term.items()))
     print("\n=== actuator saturation: torque-clipped step % / p99 over envs of max |joint vel| [rad/s] ===")
     for gi, s in enumerate(speeds):
         m = group == gi

@@ -1,0 +1,80 @@
+== base mu=0.3 (cmd act slide fly% falls tilt angv power)
+-- base_mu0.3_x
+awk: run time error: negative field index $-3
+	FILENAME="-" FNR=6 NR=6
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.751 0.354 5.1 0.99 0.075 0.704 171.495
+1.50 0.990 0.432 5.9 0.68 0.077 0.763 218.193
+2.00 1.195 0.483 6.6 0.42 0.080 0.787 272.282
+-- base_mu0.3_y
+awk: run time error: negative field index $-3
+	FILENAME="-" FNR=6 NR=6
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.482 0.315 2.3 0.18 0.055 0.612 141.753
+1.50 0.950 0.352 3.2 0.05 0.044 0.532 197.467
+1.90 1.281 0.377 6.8 0.03 0.044 0.586 268.560
+-- base_mu0.3_diag
+awk: run time error: negative field index $-3
+	FILENAME="-" FNR=4 NR=4
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.255 0.525 9.4 0.28 0.077 0.784 337.768
+== base mu=0.5 (cmd act slide fly% falls tilt angv power)
+-- base_mu0.5_x
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.952 0.228 0.3 0.01 0.036 0.357 118.621
+1.50 1.388 0.358 0.6 0.04 0.037 0.392 183.625
+2.00 1.777 0.490 1.3 0.06 0.040 0.422 270.357
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Right_Ankle_Pitch: 13.0 Left_Knee_Pitch: 8.2 Left_Hip_Yaw: 0.0% 8.2
+-- base_mu0.5_y
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.809 0.189 0.3 0.01 0.032 0.347 141.360
+1.50 1.227 0.318 3.2 0.01 0.037 0.404 229.291
+1.90 1.554 0.351 8.6 0.00 0.038 0.480 295.462
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Left_Knee_Pitch: 11.6 Left_Ankle_Pitch: 9.9 Left_Hip_Yaw: 0.0% 9.3
+-- base_mu0.5_diag
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.726 0.584 3.4 0.04 0.042 0.447 363.949
+=== actuator / p99 |joint vel| [rad/s] ===
+2.00 Right_Ankle_Pitch: 18.1 Left_Knee_Pitch: 11.8 Left_Hip_Yaw: 0.1% 11.6
+== base mu=0.8 (cmd act slide fly% falls tilt angv power)
+-- base_mu0.8_x
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.953 0.198 0.2 0.02 0.038 0.351 119.575
+1.50 1.394 0.315 0.4 0.01 0.037 0.389 185.199
+2.00 1.800 0.432 0.9 0.05 0.040 0.419 273.076
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Left_Ankle_Pitch: 14.0 Left_Knee_Pitch: 7.5 Left_Ankle_Roll: 0.0% 7.5
+-- base_mu0.8_y
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.819 0.170 0.4 0.00 0.030 0.342 145.233
+1.50 1.275 0.308 3.5 0.00 0.035 0.400 243.571
+1.90 1.606 0.354 9.4 0.01 0.037 0.475 307.638
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Left_Knee_Pitch: 11.1 Right_Ankle_Roll: 9.5 Right_Ankle_Pitch: 0.0% 9.5
+-- base_mu0.8_diag
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.766 0.564 1.9 0.04 0.039 0.457 360.932
+=== actuator / p99 |joint vel| [rad/s] ===
+2.00 Right_Ankle_Pitch: 18.1 Left_Knee_Pitch: 12.0 Left_Hip_Yaw: 0.0% 11.5
+== base mu=3.0 (cmd act slide fly% falls tilt angv power)
+-- base_mu3.0_x
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.942 0.172 0.3 0.02 0.040 0.363 123.427
+1.50 1.393 0.269 0.5 0.02 0.040 0.418 193.378
+2.00 1.792 0.360 1.2 0.14 0.047 0.503 293.130
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Right_Ankle_Pitch: 13.0 Right_Knee_Pitch: 11.8 Right_Hip_Roll: 0.0% 10.8
+-- base_mu3.0_y
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.796 0.129 0.6 0.02 0.031 0.355 146.677
+1.50 1.240 0.226 5.8 0.06 0.037 0.440 249.738
+1.90 1.595 0.287 12.1 0.09 0.038 0.486 315.609
+=== actuator / p99 |joint vel| [rad/s] ===
+1.00 Left_Knee_Pitch: 11.6 Left_Ankle_Roll: 10.7 Right_Hip_Yaw: 0.0% 9.5
+-- base_mu3.0_diag
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.725 0.438 2.5 0.09 0.052 0.623 380.694
+=== actuator / p99 |joint vel| [rad/s] ===
+2.00 Right_Ankle_Pitch: 18.1 Left_Hip_Yaw: 12.5 Left_Knee_Pitch: 0.0% 12.5

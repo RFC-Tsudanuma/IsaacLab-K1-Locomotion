@@ -1,0 +1,82 @@
+== R9f mu=3.0 (cmd act slide fly% falls/15s)
+-- R9f_mu3.0_x
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.00 0.941 0.167 0.2 0.01
+2.00 1.835 0.348 1.1 0.03
+  1.00  early 0.00  late 0.01
+  2.00  early 0.00  late 0.02
+  1.00  n=29  dir 9 / 5 / 5 / 10  g_xy (+0.26, -0.17)  base_contact: 1  base_height: 28
+  2.00  n=53  dir 22 / 2 / 6 / 23  g_xy (+0.29, -0.19)  base_contact: 7  base_height: 46
+-- R9f_mu3.0_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.649 0.322 18.6 0.02
+  1.90  early 0.00  late 0.02
+
+  1.90  n=100  dir 11 / 9 / 78 / 2  g_xy (-0.02, +0.32)  base_contact: 3  base_height: 100
+
+-- R9f_mu3.0_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.704 0.403 1.4 0.04
+  2.00  early 0.00  late 0.04
+
+  2.00  n=179  dir 137 / 12 / 14 / 16  g_xy (+0.36, +0.03)  base_contact: 11  base_height: 170
+
+== R9f mu=0.8 (cmd act slide fly% falls/15s)
+-- R9f_mu0.8_x
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.00 0.936 0.174 0.2 0.00
+2.00 1.791 0.375 0.9 0.00
+  1.00  early 0.00  late 0.00
+  2.00  early 0.00  late 0.00
+  1.00  n=3  dir 1 / 0 / 0 / 2  g_xy (+0.04, -0.25)  base_contact: 0  base_height: 3
+  2.00  n=7  dir 6 / 0 / 0 / 1  g_xy (+0.28, -0.10)  base_contact: 0  base_height: 7
+-- R9f_mu0.8_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.655 0.366 16.7 0.00
+  1.90  early 0.00  late 0.00
+
+  1.90  n=14  dir 6 / 1 / 7 / 0  g_xy (+0.09, +0.20)  base_contact: 0  base_height: 14
+
+-- R9f_mu0.8_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.688 0.482 1.3 0.02
+  2.00  early 0.00  late 0.02
+
+  2.00  n=77  dir 51 / 1 / 19 / 6  g_xy (+0.27, +0.10)  base_contact: 0  base_height: 77
+
+== R9f mu=0.8 (cmd act slide fly% falls tilt angv power)
+-- R9f_mu0.8_x
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.940 0.176 0.2 0.01 0.034 0.359 137.253
+1.50 1.386 0.266 0.3 0.00 0.037 0.381 210.142
+2.00 1.787 0.370 0.8 0.00 0.042 0.431 304.575
+=== falls/env reset (accelerating) vs later (steady) ===
+-- R9f_mu0.8_y
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.785 0.156 0.3 0.00 0.032 0.331 176.249
+1.50 1.285 0.306 7.3 0.00 0.042 0.388 278.504
+1.90 1.654 0.368 16.5 0.00 0.047 0.446 352.768
+=== falls/env reset (accelerating) vs later (steady) ===
+-- R9f_mu0.8_diag
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.693 0.481 1.2 0.01 0.050 0.439 394.122
+=== falls/env reset (accelerating) vs later (steady) ===
+=== foot contact / m/s) / clearance ===
+== R9f mu=0.3 (cmd act slide fly% falls tilt angv power)
+-- R9f_mu0.3_x
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.888 0.254 0.8 0.04 0.043 0.417 142.948
+1.50 1.223 0.351 1.5 0.09 0.050 0.459 202.177
+2.00 1.387 0.406 2.5 0.06 0.069 0.500 250.552
+=== falls/env reset (accelerating) vs later (steady) ===
+-- R9f_mu0.3_y
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+1.00 0.632 0.216 0.5 0.00 0.039 0.383 158.305
+1.50 1.050 0.327 6.7 0.01 0.049 0.490 247.175
+1.90 1.380 0.380 14.1 0.05 0.056 0.565 322.791
+=== falls/env reset (accelerating) vs later (steady) ===
+-- R9f_mu0.3_diag
+vx_cmd vx_act slide[m/s] fly% falls/env tilt angv_xy[rad/s] power[W]
+2.00 1.223 0.455 3.8 0.17 0.068 0.545 302.858
+=== falls/env reset (accelerating) vs later (steady) ===
+=== foot contact / m/s) / clearance ===

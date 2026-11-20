@@ -618,6 +618,28 @@ def feet_slide_deadband(
     return torch.sum(excess * contacts, dim=1)
 
 
+def feet_swing_clearance(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_height: float = 0.13,
+) -> torch.Tensor:
+    """振り出し中の足が低いことへの罰 (2026-11-20、つまずき対策)。
+
+    空中の足について (target_height - 足リンク高さ) の不足分の 2 乗 × 足の水平速度。
+    速く動いている足ほど強く効くので、離地直後・着地直前の低い足は罰しない。
+    足リンク高さはワールド z (平面基準)。接地中は約 0.05 m、model_61442 の振り出し中は約 0.11 m。
+    """
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    in_air = (
+        contact_sensor.data.net_forces_w_history[:, :, sensor_cfg.body_ids, :].norm(dim=-1).max(dim=1)[0] < 1.0
+    )
+    asset = env.scene[asset_cfg.name]
+    lack = (target_height - asset.data.body_pos_w[:, asset_cfg.body_ids, 2]).clamp(min=0.0)
+    speed = asset.data.body_lin_vel_w[:, asset_cfg.body_ids, :2].norm(dim=-1)
+    return torch.sum(lack.square() * speed * in_air, dim=1)
+
+
 def feet_stride_length(
     env: ManagerBasedRLEnv,
     command_name: str,

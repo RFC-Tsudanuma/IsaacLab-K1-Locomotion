@@ -1,0 +1,10 @@
+{
+ "agent": {"run_name": "wideR10_perenv_clearance0.17_w-150"},
+ "env": {
+  "events.physics_material.params.static_friction_range": [0.3, 3.0],
+  "events.physics_material.params.dynamic_friction_range": [0.3, 3.0],
+  "events.physics_material.params.per_env": true,
+  "rewards.feet_swing_clearance.weight": -150.0,
+  "rewards.feet_swing_clearance.params.target_height": 0.17
+ }
+}

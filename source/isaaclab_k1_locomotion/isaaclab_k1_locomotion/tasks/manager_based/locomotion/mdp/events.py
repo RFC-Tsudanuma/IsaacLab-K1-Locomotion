@@ -218,3 +218,47 @@ __all__ = [
     "randomize_rigid_body_inertia",
     "reset_prev_high_action",
 ]
+
+
+from isaaclab.envs.mdp.events import randomize_rigid_body_material as _randomize_rigid_body_material
+
+
+class randomize_floor_friction(_randomize_rigid_body_material):
+    """摩擦 DR の床寄り版 (2026-11-19)。標準の randomize_rigid_body_material との違い:
+
+    * ``per_env``: 摩擦を shape ごとでなく env ごとに 1 つ引く。標準版は足ごと・shape ごとに
+      独立に引くので「両足とも滑る床」がほとんど出ない (U(0.3, 3.0) で両足 μ<0.4 は 0.1 %)。
+    * ``log_uniform``: 一様でなく対数一様に引く。低摩擦側が厚くなる
+      (0.3〜3.0 で μ<0.5 が 7 % → 22 %)。
+
+    どちらも False なら標準版と同じ挙動。
+    """
+
+    def __init__(self, cfg, env):
+        super().__init__(cfg, env)
+        if cfg.params.get("log_uniform", False):
+            for i, key in enumerate(("static_friction_range", "dynamic_friction_range")):
+                lo, hi = cfg.params[key]
+                t = (self.material_buckets[:, i] - lo) / max(hi - lo, 1e-9)
+                self.material_buckets[:, i] = lo * (hi / lo) ** t
+            if cfg.params.get("make_consistent", False):
+                self.material_buckets[:, 1] = torch.min(self.material_buckets[:, 0], self.material_buckets[:, 1])
+
+        q = torch.quantile(self.material_buckets[:, 0], torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0]))
+        print(f"[randomize_floor_friction] per_env={cfg.params.get('per_env', False)} static μ quantiles 0/25/50/75/100 %: {[round(x, 2) for x in q.tolist()]}")
+
+    def __call__(self, env, env_ids, static_friction_range, dynamic_friction_range, restitution_range,
+                 num_buckets, asset_cfg, make_consistent=False, per_env=False, log_uniform=False):
+        if not per_env:
+            return super().__call__(env, env_ids, static_friction_range, dynamic_friction_range,
+                                    restitution_range, num_buckets, asset_cfg, make_consistent)
+        env_ids = torch.arange(env.scene.num_envs, device="cpu") if env_ids is None else env_ids.cpu()
+        materials = self.asset.root_physx_view.get_material_properties()
+        sample = self.material_buckets[torch.randint(0, num_buckets, (len(env_ids),))][:, None, :]
+        if self.num_shapes_per_body is None:
+            materials[env_ids] = sample
+        else:
+            for body_id in self.asset_cfg.body_ids:
+                start = sum(self.num_shapes_per_body[:body_id])
+                materials[env_ids, start : start + self.num_shapes_per_body[body_id]] = sample
+        self.asset.root_physx_view.set_material_properties(materials, env_ids)

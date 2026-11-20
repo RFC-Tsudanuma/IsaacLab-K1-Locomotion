@@ -1,0 +1,9 @@
+{
+ "agent": {"run_name": "wideR5_perenv_log_cont"},
+ "env": {
+  "events.physics_material.params.static_friction_range": [0.3, 3.0],
+  "events.physics_material.params.dynamic_friction_range": [0.3, 3.0],
+  "events.physics_material.params.per_env": true,
+  "events.physics_material.params.log_uniform": true
+ }
+}

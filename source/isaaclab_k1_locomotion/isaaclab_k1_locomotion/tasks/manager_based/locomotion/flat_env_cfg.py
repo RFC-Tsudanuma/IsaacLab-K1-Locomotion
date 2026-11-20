@@ -31,7 +31,7 @@ _K1_TORSIONAL_USD_PATH = os.path.join(
     "../../../../../../assets_soccer/booster_robotics_robots/K1/usd_torsional/K1_locomotion.usd",
 )
 import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
-from .mdp.events import randomize_phase_freq_offset, randomize_rigid_body_inertia
+from .mdp.events import randomize_floor_friction, randomize_phase_freq_offset, randomize_rigid_body_inertia
 from .mdp.commands import (
     MODE_TURN,
     MODE_WALK,
@@ -50,6 +50,7 @@ from .mdp.rewards import (
     joint_power_l2,
     feet_stride_length,
     feet_slide_deadband,
+    feet_swing_clearance,
     both_feet_not_in_contact,
     track_heading_exp,
     heading_progress,
@@ -1134,6 +1135,22 @@ class K1FlatStancePlaneWideCfg(K1FlatStancePlanePolishCfg):
             {"command_name": "base_velocity", "lateral_gate_low": 1.0, "lateral_gate_high": 1.3,
              "forward_gate_low": None, "forward_gate_high": 2.4}
         )
+
+        # --- 振り出し足の高さ (2026-11-20、つまずき対策): 既定は重み 0 = 無効。プローブで重みを負にする ---
+        self.rewards.feet_swing_clearance = RewTerm(
+            func=feet_swing_clearance,
+            weight=0.0,
+            params={
+                "sensor_cfg": SceneEntityCfg("contact_forces", body_names=".*_foot_link"),
+                "asset_cfg": SceneEntityCfg("robot", body_names=".*_foot_link"),
+                "target_height": 0.13,
+            },
+        )
+
+        # --- 摩擦 DR の引き方 (2026-11-19): 既定は標準版と同じ挙動。プローブで per_env / log_uniform を
+        # True にすると「床ごとに 1 つ・低摩擦を厚く」引く (mdp.randomize_floor_friction 参照) ---
+        self.events.physics_material.func = randomize_floor_friction
+        self.events.physics_material.params.update({"per_env": False, "log_uniform": False})
 
         # --- 指令領域: 高速の横移動はほぼ純横 (キーパーのセーブ用途、同日ユーザー要件) ---
         # |vy| <= 1.0 は x 全域 (x 2.0 / y 1.0 の斜めを含む)、それより外は |vx| 上限を

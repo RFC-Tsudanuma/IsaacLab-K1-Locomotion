@@ -1,0 +1,89 @@
+== R6fP mu=3.0 (cmd act slide fly% falls/15s)
+-- R6fP_mu3.0_x
+-- R6fP_mu3.0_y
+-- R6fP_mu3.0_diag
+== R6fP mu=0.8 (cmd act slide fly% falls/15s)
+-- R6fP_mu0.8_x
+-- R6fP_mu0.8_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.593 0.294 17.5 0.00
+  1.90  early 0.00  late 0.00
+
+  1.90  n=3  dir 1 / 0 / 2 / 0  g_xy (-0.00, +0.14)  base_contact: 0  base_height: 3
+
+-- R6fP_mu0.8_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.713 0.476 1.4 0.00
+  2.00  early 0.00  late 0.00
+
+  2.00  n=18  dir 17 / 0 / 1 / 0  g_xy (+0.41, +0.05)  base_contact: 0  base_height: 18
+
+== baseP mu=3.0 (cmd act slide fly% falls/15s)
+-- baseP_mu3.0_x
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.00 0.949 0.169 0.2 0.00
+2.00 1.817 0.360 0.8 0.02
+  1.00  early 0.00  late 0.00
+  2.00  early 0.00  late 0.02
+  1.00  n=4  dir 2 / 1 / 0 / 1  g_xy (+0.33, -0.32)  base_contact: 1  base_height: 3
+  2.00  n=37  dir 31 / 2 / 4 / 0  g_xy (+0.53, +0.07)  base_contact: 1  base_height: 36
+-- baseP_mu3.0_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.623 0.283 11.8 0.00
+  1.90  early 0.00  late 0.00
+
+  1.90  n=12  dir 6 / 1 / 5 / 0  g_xy (+0.37, +0.34)  base_contact: 0  base_height: 12
+
+-- baseP_mu3.0_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.744 0.444 2.0 0.04
+  2.00  early 0.00  late 0.04
+
+  2.00  n=180  dir 148 / 19 / 9 / 4  g_xy (+0.46, +0.16)  base_contact: 0  base_height: 180
+
+== base mu=3.0 (cmd act slide fly% falls/15s)
+-- base_mu3.0_x
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.00 0.939 0.170 0.3 0.02
+2.00 1.796 0.362 1.3 0.22
+  1.00  early 0.00  late 0.02
+  2.00  early 0.01  late 0.21
+  1.00  n=46  dir 19 / 6 / 9 / 12  g_xy (+0.36, -0.02)  base_contact: 2  base_height: 46
+  2.00  n=452  dir 414 / 7 / 11 / 20  g_xy (+0.57, +0.01)  base_contact: 4  base_height: 451
+-- base_mu3.0_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.598 0.290 11.9 0.17
+  1.90  early 0.01  late 0.16
+
+  1.90  n=709  dir 54 / 10 / 641 / 4  g_xy (+0.04, +0.47)  base_contact: 76  base_height: 700
+
+-- base_mu3.0_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.717 0.438 2.6 0.19
+  2.00  early 0.00  late 0.19
+
+  2.00  n=786  dir 669 / 53 / 19 / 45  g_xy (+0.52, +0.07)  base_contact: 1  base_height: 785
+
+== baseP mu=0.8 (cmd act slide fly% falls/15s)
+-- baseP_mu0.8_x
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.00 0.958 0.197 0.2 0.00
+2.00 1.817 0.433 0.6 0.00
+  1.00  early 0.00  late 0.00
+  2.00  early 0.00  late 0.00
+  1.00  n=0  dir 0 / 0 / 0 / 0  g_xy (+0.00, +0.00)  base_contact: 0  base_height: 0
+  2.00  n=2  dir 2 / 0 / 0 / 0  g_xy (+0.57, +0.06)  base_contact: 0  base_height: 2
+-- baseP_mu0.8_y
+vx_cmd vx_act slide[m/s] fly% falls/env
+1.90 1.629 0.347 9.3 0.00
+  1.90  early 0.00  late 0.00
+
+  1.90  n=3  dir 3 / 0 / 0 / 0  g_xy (+0.58, +0.20)  base_contact: 0  base_height: 3
+
+-- baseP_mu0.8_diag
+vx_cmd vx_act slide[m/s] fly% falls/env
+2.00 1.782 0.570 1.4 0.00
+  2.00  early 0.00  late 0.00
+
+  2.00  n=12  dir 12 / 0 / 0 / 0  g_xy (+0.54, +0.15)  base_contact: 0  base_height: 12
+
