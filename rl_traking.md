@@ -325,3 +325,35 @@ critic は同じ項をノイズ無しで。停滞したときだけ関節位置�
   `frozen_policies/best_tracking/{model_v11a_1499.pt,tracking_v11a_1499.onnx}` (torch–onnxruntime 差 1.6e-06)。実機リポジトリへの配備は未実施。
   速さ優先の代替は `k1_tracking/2026-11-19_03-31-41_tracking_v12b_term400/model_1499.pt` (書き出し時に `--turn_exit_rad 0.15`)。評価ログは `scripts/rsl_rl/eval_tracking_v1*_s*.log`。
   安全優先 = `2026-11-18_23-02-08_tracking_v11a_seed1/model_1499.pt`。評価ログは `scripts/rsl_rl/eval_tracking_v1*_s*.log`。
+
+## 2026-11-21: v14 — 新歩行 R9 (best_walk 64440, 摩擦 DR U(0.3, 3.0) per_env) + pivot 10000 + gate_v8 2999 上で再学習
+- 別 PC で歩行 expert を摩擦 DR 拡張版 R9 (`model_64440`, 摩擦 U(0.3, 3.0) を床ごとに 1 つ) に差し替え、pivot (`best_turn/model_10000`) と
+  ゲート (`best_gating/model_2999`, gate_v8, `gating_2999_walk64440_turn10000.onnx`) も同じ摩擦分布で再学習済み (commit 963f2e0)。
+  ユーザー指示: 「同じ摩擦 DR の範囲の環境で経路追従を再学習」。
+- tracking 環境の摩擦: 親 `K1FlatGatingCfg` が `randomize_floor_friction` per_env U(0.3, 3.0) になった (896cec3) のに、
+  `K1TrackingEnvCfg.__post_init__` が 11-19 の上書き (0.2, 3.0) (be3a61c) を残していたので撤去し、親をそのまま継承させた。
+  起動ログ `[randomize_floor_friction] per_env=True static μ quantiles: [0.38, 0.98, 1.76, 2.36, 3.0]`。他の設定は v11a と同じ既定値。
+- 学習: 1 GPU × 4096 env × 1500 iter を 2 seed 並走 (v14a seed 1 / GPU0、v14b seed 7 / GPU1、約 8 s/iter、3.4 h)。
+  `k1_tracking/2026-11-21_03-23-49_tracking_v14a_walk64440_seed1`、`2026-11-21_03-23-57_tracking_v14b_walk64440_seed7`。発散なし。
+- 評価 (立位、2048 env × 4000 step ≈ 8192 ep / seed、摩擦 U(0.3, 3.0) 環境、下位は新スタック)。
+  v14a/v14b model_1499 は 5 seed (123, 7, 11, 21, 33)、他は 2 seed (123, 7) の平均:
+  | checkpoint | pose 到達 / 時間 / 転倒 | look 到達 / 時間 / 転倒 | 時間切れ (件 / 2 seed) |
+  |---|---|---|---|
+  | v11a model_1499 (旧上位方策を新スタックに載せたもの) | 99.58 % / 4.72 s / 0.58 % | 99.66 % / 4.44 s / 0.40 % | 2 |
+  | **v14a model_1000 (採用)** | 99.54 % / 4.55 s / 0.48 % | 99.69 % / 4.38 s / 0.45 % | 13 |
+  | v14a model_1200 | 99.49 % / 4.56 s / 0.62 % | 99.66 % / 4.36 s / 0.52 % | 5 |
+  | v14a model_1499 (5 seed) | 99.50 % / 4.55 s / 0.63 % | 99.68 % / 4.35 s / 0.42 % | 18 / 5 seed |
+  | v14b model_1499 (5 seed) | 99.21 % / 4.54 s / 0.78 % | 99.55 % / 4.17 s / 0.58 % | 23 / 5 seed |
+  (v14a 1499 の 2 seed だけなら 99.42 / 4.54 / 0.73 %、99.63 / 4.33 / 0.42 %)
+- わかったこと:
+  - 転倒 0.4〜0.6 % は新しい評価環境 (μ 0.3 の床を含む) の床値。旧上位 v11a も同環境では pose 0.58 % 転ぶ (旧環境では 0.31 %)。
+    v14 固有の悪化ではない。μ 0.3 では歩行 expert 単体でも前進 2.0 で転倒が残る (`best_walk/README.md`)。
+  - 再学習の効果は到達時間: pose −0.17 s (4.72 → 4.55 s)、look −0.06〜−0.1 s。到達率・転倒は v11a と同等。
+    v11a をそのまま新スタックに載せても大きくは壊れない (到達 99.6 %)。
+  - v14a の checkpoint 間の差 (到達 ±0.1 %pt、転倒 ±0.15 %pt) は seed ノイズ (±0.25 %pt) の範囲。model_1000 は転倒と到達が最良で
+    速度は 1499 と同じなので採用。経由点手前での時間切れが 2 seed で 13 件とやや多い (1499 は 5 seed で 18 件) が到達率に含めて評価済み。
+  - v14b (seed 7) は look が 0.2 s 速いが pose の到達 99.2 %・転倒 0.8〜0.9 % で劣る。v11a 時代と同じく seed 依存が大きい。
+  - 切替回数 pose 0.74 / ep (v11a 0.45)、pivot 時間 1.0〜1.5 % (v11a 0.6〜1.2 %)。新 pivot expert で少し使うようになったが依然 1 % 台。
+- **採用: v14a model_1000** → `frozen_policies/best_tracking/{model_v14a_1000.pt, tracking_v14a_1000.onnx}` (torch–onnxruntime 差 3.4e-06)。
+  実機リポジトリへの配備は未実施。実機側は融合 ONNX も `gating_2999_walk64440_turn10000.onnx` に差し替える必要がある (位相の式は 56444 と同じで C++ 変更なし)。
+  評価ログ `scripts/rsl_rl/eval_tracking_v14*_s*.log`, `eval_tracking_v11a_1499_newenv_s*.log`。

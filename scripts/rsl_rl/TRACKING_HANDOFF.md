@@ -6,9 +6,11 @@
 
 ## 今回の目的
 
-歩行 expert が `best_walk/model_56444.pt` (横 ±1.9 m/s、2026-11-16) に、融合ゲートが
+(初版 2026-11-16) 歩行 expert が `best_walk/model_56444.pt` (横 ±1.9 m/s) に、融合ゲートが
 `best_gating/model_2999.pt` (gate_v7) に更新された。この上で tracking 上位方策を再学習し、
 現行 `best_tracking/tracking_v7b_1200.onnx` (旧歩行 52700 + ゲート 5897 上で学習) を置き換える。
+→ v11a で実施。その後 2026-11-21 に歩行 R9 (`model_64440`, 摩擦 DR 拡張) + pivot 10000 + gate_v8 で v14a を再学習 (末尾の追記)。
+下位 expert が更新されたら、このファイルの手順どおり再学習 → 2 seed 以上で評価 → best_tracking 更新、を繰り返す。
 
 ## 構成 (コードはすべてコミット済み、既定値 = 採用設定)
 
@@ -85,7 +87,11 @@ cp /abs/path/logs/rsl_rl/k1_tracking/<run>/model_1200.pt ../../frozen_policies/b
   `assets/k1_gating_walk_turn_*.onnx` として追加し launch 既定を切り替える。**新歩行は位相周波数に横加算があり、C++ の
   `cmd_phase_freq` を合わせないと位相がずれる** (`best_walk/README.md`)。これはゲート側の作業として依頼済みか確認すること。
 - 旧版は `frozen_policies/best_tracking/` に併置して良い (v9b: 遅延込み学習の代替)。
-- **2026-11-19 追記: 採用は v11a model_1499** (`best_tracking/tracking_v11a_1499.onnx`、新歩行 56444 + gate_v7 2999 上、既定設定・seed 1)。
+- **2026-11-21 追記: 採用は v14a model_1000** (`best_tracking/tracking_v14a_1000.onnx`、歩行 R9 64440 (摩擦 U(0.3, 3.0) per_env) +
+  pivot 10000 + gate_v8 2999 上、既定設定・seed 1)。tracking 環境の摩擦 DR は親 `K1FlatGatingCfg` の U(0.3, 3.0) per_env を継承
+  (歩行 expert と同じ分布。tracking 側で上書きしないこと)。この環境での評価は μ 0.3 の床を含むため転倒の床値が 0.4〜0.6 % になる
+  (旧環境の基準 0.2 % とは比べられない。同環境で旧 v11a も 0.58 %)。経緯は `rl_traking.md` 末尾。
+- 2026-11-19 追記: 採用は v11a model_1499 (`best_tracking/tracking_v11a_1499.onnx`、新歩行 56444 + gate_v7 2999 上、既定設定・seed 1)。
   経緯と比較は `rl_traking.md` 末尾の節。採否は複数 seed の評価平均で決める (同一 seed でも到達 ±0.25 %pt 揺れる)。
 
 ## 既知の結論 (やり直さなくて良いこと)
