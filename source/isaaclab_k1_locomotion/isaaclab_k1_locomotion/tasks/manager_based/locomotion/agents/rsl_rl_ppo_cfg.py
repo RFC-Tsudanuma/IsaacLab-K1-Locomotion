@@ -24,6 +24,7 @@ from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgori
 from .tracking_policy import RslRlTrackingActorCriticCfg
 from .block_policy import RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
 from .steal_policy import RslRlStealActorCriticCfg, RslRlStealPpoAlgorithmCfg
+from .neck_policy import RslRlNeckActorCriticCfg
 
 
 @configclass
@@ -309,6 +310,21 @@ class K1TrackingPPORunnerCfg(K1WaypointPPORunnerCfg):
 
     experiment_name = "k1_tracking"
     policy = RslRlTrackingActorCriticCfg()
+
+
+@configclass
+class K1NeckPPORunnerCfg(K1WaypointPPORunnerCfg):
+    """凍結歩行 expert の上で首 2 軸の残差を学習する (Isaac-Neck-K1-v0、設計は scripts/rsl_rl/neck_compensate.md)。
+    環境は `K1NeckEnvCfg`、方策は NeckActorCritic、PPO は WaypointPPO を流用。
+    行動の効果は 0.2 s 以内に出尽くすので、rollout を短く (16 step) して更新回数を稼ぎ、γ / λ も短くする。
+    entropy_coef は探索ノイズの潰れ防止 (0 だと std が 0.02 まで縮んで学習が止まった)。"""
+
+    num_steps_per_env = 16
+    max_iterations = 1500
+    experiment_name = "k1_neck"
+    obs_groups = {"policy": ["neck_policy"], "critic": ["neck_critic"]}
+    policy = RslRlNeckActorCriticCfg()
+    algorithm = K1WaypointPPORunnerCfg().algorithm.replace(gamma=0.95, lam=0.9, entropy_coef=0.003)
 
 
 @configclass
