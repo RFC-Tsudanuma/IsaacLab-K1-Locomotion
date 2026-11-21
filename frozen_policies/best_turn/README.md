@@ -6,12 +6,38 @@
 
 | | |
 |---|---|
-| **現行 checkpoint** | **`model_9000.pt`** (`policy.onnx` / `policy.pt` はこれの書き出し) |
-| 現行の学習 run | `scripts/rsl_rl/logs/rsl_rl/k1_transition/2026-11-05_19-39-03_turnfast_v1` |
-| 現行の学習ログ | `scripts/rsl_rl/turnfast_v1_nohup.log` |
-| 旧 checkpoint | `model_7999.pt` (2026-09-18 まではこちらが現行) |
+| **現行 checkpoint** | **`model_10000.pt`** (`policy.onnx` / `policy.pt` はこれの書き出し) |
+| 現行の学習 run | `scripts/rsl_rl/logs/rsl_rl/k1_transition/2026-11-20_15-34-37_turnfast_v2_walk64440` |
+| 現行の学習ログ | `scripts/rsl_rl/turnfast_v2_nohup.log` |
+| 旧 checkpoint | `model_9000.pt` (2026-11-21 まではこちらが現行) / `model_7999.pt` (2026-09-18 まで) |
 | 旧 run | `scripts/rsl_rl/logs/rsl_rl/k1_turn/2026-09-16_03-56-13` (`turn_v11_nohup.log`) |
-| エクスポート日 | 2026-11-05 (model_9000) / 2026-09-18 (model_7999) |
+| エクスポート日 | 2026-11-21 (model_10000) / 2026-11-05 (model_9000) / 2026-09-18 (model_7999) |
+
+### model_10000 (2026-11-21): 新歩行 expert (摩擦 DR 拡張 R9) 上での追加学習
+
+歩行 expert が `best_walk/model_64440.pt` (摩擦 U(0.3, 3.0) per_env + 遊脚クリアランス罰) に
+差し替わったので、同じ `Isaac-Velocity-Flat-Transition-TurnFast` + `MultiExpertPPO`
+(learner=turn、歩行 expert を凍結) で `model_9000` から 1000 iteration 追加学習した。
+**ゲート/回転側の学習環境の摩擦 DR も歩行と同じ U(0.3, 3.0) per_env に揃えた**
+(`K1FlatGatingCfg.__post_init__`、commit 896cec3)。従来は `K1FlatStancePlaneCfg` 由来の
+U(0.6, 1.0)・shape ごとで、「両足とも滑る床」が学習に出てこなかった。
+
+狙いは `WALK_HANDOFF.md` F 節の残課題「横 1.9 m/s からの進入で転倒 2 %、回転 expert が
+横進入を学習していない」。結果 (`eval_pivot_overhead.py`、ゲートは旧 `model_2999` で固定、
+1024 env・中央値・exit 5°):
+
+| 進入条件 | model_9000 | model_10000 |
+|---|---|---|
+| 横 1.9 m/s 180° | 合計 1.16 s / 転倒 **2.73 %** | 1.10 s / 転倒 **0.59 %** |
+| 横 1.9 m/s 120° | 0.96 s / **1.86 %** | 0.90 s / **0.39 %** |
+| 停止 180° | 1.08 s / 0.39 % | 1.08 s / 0.20 % |
+| 前進 1.0 m/s 180° | 1.28 s / 0.29 % | 1.18 s / 0.00 % |
+| 前進 2.0 m/s 180° | 1.48 s / 0.20 % | 1.38 s / 0.20 % |
+| 前進 2.0 m/s 120° | 1.20 s / 0.29 % | 1.14 s / 0.20 % |
+
+横進入の転倒が 1/5 に落ち、他条件は同等以上。再加速も全条件で 0.02-0.08 s 短縮。
+学習は 10046 it でプラトー判定して停止 (`turn_success_rate` は 100 it で 0.91 に到達後横ばい、
+転倒終了率 0.124 → 0.109、`base_contact` は通して 0)。
 
 ### model_9000 (2026-11-05): 歩行中からの進入の追加学習
 

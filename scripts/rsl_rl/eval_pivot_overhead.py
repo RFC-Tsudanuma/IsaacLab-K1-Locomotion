@@ -137,6 +137,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg):
     turn_time = torch.full((n,), float("nan"), device=dev)
     resume_time = torch.full((n,), float("nan"), device=dev)
     fell_turn = torch.zeros(n, dtype=torch.bool, device=dev)
+    turn_xy0 = torch.zeros(n, 2, device=dev)   # turn 突入時の水平位置 (回転中の移動量用)
+    turn_disp = torch.full((n,), float("nan"), device=dev)
     fell_resume = torch.zeros(n, dtype=torch.bool, device=dev)
 
     exit_rad = math.radians(args_cli.exit_deg)
@@ -180,6 +182,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg):
                     robot.data.heading_w[ids] + sign[ids] * target_rad)
                 if cmd.cfg.zero_command_history_on_switch:
                     cmd._zero_command_history(ids)   # compute() の switched 経路を通らないので明示的に
+                turn_xy0[ids] = robot.data.root_pos_w[ids, :2]
                 phase[ids] = PHASE_TURN
                 timer[ids] = 0.0
 
@@ -188,6 +191,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg):
             if to_walk.any():
                 ids = to_walk.nonzero(as_tuple=False).flatten()
                 turn_time[ids] = timer[ids]
+                turn_disp[ids] = (robot.data.root_pos_w[ids, :2] - turn_xy0[ids]).norm(dim=-1)
                 cmd._enter_walk(ids, count_switch=True, resample_walk=False)
                 if cmd.cfg.zero_command_history_on_switch:
                     cmd._zero_command_history(ids)
@@ -225,6 +229,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg):
     print(f"  再加速時間    median {_median(resume_time[ok_resume]):.3f} s  "
           f"(>= {args_cli.resume_speed} m/s に到達: {float(ok_resume.float().mean()):.3f})", flush=True)
     print(f"  合計          median {_median(total[ok_turn & ok_resume]):.3f} s", flush=True)
+    print(f"  回転中の移動  median {_median(turn_disp[ok_turn]):.3f} m", flush=True)
     print(f"  転倒 (turn中)   {float(fell_turn.float().mean()):.4f}", flush=True)
     print(f"  転倒 (resume中) {float(fell_resume.float().mean()):.4f}", flush=True)
     w_mean = w_turn_sum / w_turn_cnt.clamp(min=1.0)
