@@ -40,6 +40,7 @@ import isaaclab_tasks.manager_based.locomotion.velocity.mdp as mdp
 from .block_env_cfg import K1BlockActionsCfg, K1BlockSceneCfg
 from .flat_env_cfg import K1FlatObservationsCfg, K1FlatStancePlanePolishCfg
 from .mdp.block import joint_residual_l2
+from .mdp.events import randomize_floor_friction
 from .mdp.observations import ball_pos_rel, ball_vel
 from .mdp.rewards import base_ang_acc_l2, base_lin_acc_l2
 from .mdp.steal import (
@@ -206,6 +207,18 @@ class K1StealEnvCfg(K1FlatStancePlanePolishCfg):
             "roll": (-0.02, 0.02),
             "pitch": (-0.02, 0.02),
         }
+
+        # 足の摩擦 DR: 歩行 expert R9 (best_walk model_64440) の学習と同じ U(0.3, 3.0) を床 (env) ごとに 1 つ引く
+        # (2026-11-21 ユーザー指示。model_38200 までは親の U(0.6, 1.0)・shape ごと)。
+        # 歩行 / Block と違い、掛けるのは足だけ: 全 body (.*) に掛けると μ > 1 の env で物理が発散し
+        # (角速度が桁外れ → value loss 1e8 → 120 iter で方策が崩壊)、足だけなら発散しない (80 iter のプローブで確認。
+        # 敵の円柱を無摩擦にしても発散は残ったので、足以外の body 同士か対ボールの接触が原因)。足と床の摩擦の分布は歩行と同じ
+        self.events.physics_material.params["asset_cfg"].body_names = ".*_foot_link"
+        self.events.physics_material.func = randomize_floor_friction
+        self.events.physics_material.params.update(
+            {"static_friction_range": (0.3, 3.0), "dynamic_friction_range": (0.3, 3.0),
+             "per_env": True, "log_uniform": False}
+        )
 
         # 平面地形 (サッカー場)。親の 30% 凹凸地形 (1〜4 cm) だと静置したボールが勝手に転がり、
         # ロボットが触れずに lost / stolen が 8% 程度出る (2026-11-03 ゼロ方策診断)。
