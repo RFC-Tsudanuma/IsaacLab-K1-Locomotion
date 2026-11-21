@@ -178,6 +178,10 @@ cp $PWD/logs/rsl_rl/k1_trap/<run>/model_N.pt ../../frozen_policies/best_trap/mod
   - トラップは C++ の `LinePolicy` / `line_policy_step` (block と共用) で動く。有効化は `/trap_cmd` (std_msgs/Bool)、自動判定なし、
     優先順は奪取 > 阻止 > トラップ。**C++ の変更は不要**。ただし**実機の歩行 ONNX とゲート (gating) も R9 版に差し替わっていること**が前提
     (`WALK_HANDOFF.md` E / F / G 節)。
+  - 2026-11-21 時点で booster 側の gating 既定は R9 ベースの v8 (`k1_gating_walk_turn_2026-11-21_v8_2999_walk64440_turn10000.onnx`、b1c5cea)。
+    **現行 t2 を v8 の上で動かすと上の表どおり転倒 16.6 %** なので、再学習版が出るまで trap を使う運用は v7 一式
+    (`model_path:=<pkg>/assets/k1_gating_walk_turn_2026-11-16_v7_2999_walk56444_turn9000.onnx`) で動かす。再学習版を配備するときは
+    gating が v8 であることを確認してから `default_trap_model` を差し替える。
 - 旧版 (t2 / v4c) は `best_trap/` に併置したままでよい。
 
 ## 既知の結論 (やり直さなくて良いこと)
