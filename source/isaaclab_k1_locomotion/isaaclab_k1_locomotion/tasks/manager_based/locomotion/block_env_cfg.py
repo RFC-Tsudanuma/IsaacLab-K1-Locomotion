@@ -337,9 +337,9 @@ class K1BlockFastRawPosEnvCfg_PLAY(K1BlockFastLateralEnvCfg_PLAY):
 @configclass
 class K1TrapRewardsCfg:
     """JOGA 型: 足元ゾーン (毎 step) + 吸収 shaping + 弾き出し罰 + 接近中の足の進路合わせ。値は RewardManager が dt を掛ける。
-    既定値は best_trap (trap_t2 model_25798、2026-11-18、v4c@22799 を新歩行 expert model_56444 で再学習) の学習設定に、
-    実機で止めた直後に転んだ対策 (2026-11-19 ユーザー指示、未学習) を足したもの: 保持中転倒罰 fell_after_resolve。
-    保持 3 s と摩擦 DR 0.3〜3.0 は _configure_trap (t2 は保持 1 s・摩擦 0.3〜1.0 で学習)。手順は scripts/rsl_rl/TRAP_HANDOFF.md。"""
+    既定値は best_trap (trap_t3 model_26900、2026-11-21、t2@25798 を歩行 expert R9 model_64440 の上で再学習) の学習設定。
+    t2 からの差分は実機で止めた直後に転んだ対策 (2026-11-19 ユーザー指示): 保持中転倒罰 fell_after_resolve、
+    保持 3 s と摩擦 DR 0.3〜3.0 (_configure_trap)、Block b4 と同じ滑らかさ罰則 3 項。手順と結果は scripts/rsl_rl/TRAP_HANDOFF.md。"""
 
     trapped = RewTerm(func=mdp.is_terminated_term, weight=100.0, params={"term_keys": "ball_resolved"})
     fell = RewTerm(func=mdp.is_terminated_term, weight=-200.0, params={"term_keys": ["base_contact", "base_height"]})
@@ -357,10 +357,11 @@ class K1TrapRewardsCfg:
     foot_on_intercept = RewTerm(func=foot_on_intercept, weight=0.5, params={"std": 0.15})
     body_on_intercept = RewTerm(func=body_on_intercept, weight=0.3, params={"std": 0.6})
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.05)
-    joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.02, params={"action_name": "joint_residual"})
-    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.05, params={"action_name": "walk_command"})
-    # 関節加速度 (expert + 残差の合算が実際に関節を揺らした分)。歩行環境と同じ量。実機の足首振動対策の候補 (2026-11-18)、0 で無効
-    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=0.0)
+    # 滑らかさ 3 項は Block b4 と同じ値 (t3)。t2 までの弱い値 (−0.02 / −0.05 / 0) だとロスト −1.4 pt・成功 +2.8 pt だが ‖Δa‖² が 1.7 倍 (t4)
+    joint_residual_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-1.0, params={"action_name": "joint_residual"})
+    walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.5, params={"action_name": "walk_command"})
+    # 関節加速度 (expert + 残差の合算が実際に関節を揺らした分)。歩行環境と同じ量。実機の足首振動対策、0 で無効
+    dof_acc_l2 = RewTerm(func=mdp.joint_acc_l2, weight=-3.0e-6)
 
 
 def _configure_trap(cfg) -> None:
