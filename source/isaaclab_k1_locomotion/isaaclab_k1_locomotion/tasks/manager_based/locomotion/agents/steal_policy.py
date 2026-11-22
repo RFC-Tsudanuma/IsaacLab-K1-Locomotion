@@ -26,6 +26,7 @@ from rsl_rl.networks import MLP
 from rsl_rl.storage import RolloutStorage
 
 from ..mdp.block import JOINT_DIM
+from .block_policy import BlockActorCritic, RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
 from .waypoint_policy import RslRlWaypointActorCriticCfg, WaypointActorCritic, WaypointPPO
 
 
@@ -87,9 +88,17 @@ class StealActorCritic(WaypointActorCritic):
         return torch.cat([torch.maximum(torch.minimum(cmd[:, :1], x_lim), -x_lim), cmd[:, 1:]], dim=-1)
 
     def env_actions(self, obs: TensorDict, raw: torch.Tensor) -> torch.Tensor:
-        """環境に渡す 27 次元 ``[expert + 残差 (12), コマンド (3), 残差 (12)]``。"""
+        """環境に渡す 27 次元 ``[expert + 残差 (12), コマンド (3), 残差 (12)]``。
+
+        観測に ``steal_ctrl`` = [w, 歩行コマンド (3)] があれば、ノードの steal_step と同じく歩行と混合する:
+        コマンド = (1 − w) × 歩行コマンド + w × 方策、残差 = w × 方策 (試合条件の歩行中開始・途中解除)。"""
         cmd = self.command(raw[:, :3])
         res = self.residual_scale * raw[:, 3:]
+        if "steal_ctrl" in obs.keys():
+            ctrl = obs["steal_ctrl"]
+            w = ctrl[:, :1]
+            cmd = (1.0 - w) * ctrl[:, 1:4] + w * cmd
+            res = w * res
         return torch.cat([self.expert_actions(obs, cmd) + res, cmd, res], dim=-1)
 
     # 凍結 expert は checkpoint に含めない (block_policy.py / gating_policy.py と同じ対処)
@@ -105,6 +114,19 @@ class StealActorCritic(WaypointActorCritic):
         if missing:
             raise KeyError(f"checkpoint に方策側のキーが無い: {missing[:4]} ...")
         return super().load_state_dict(filtered, strict=False)
+
+
+class StealHistActorCritic(BlockActorCritic):
+    """Block 型の奪取方策 (Isaac-StealHist-K1, 2026-11-22)。BlockActorCritic と同じ構造で、
+    actor は ``[steal_policy (69), 観測履歴 (T × 8)]``、critic は ``[steal_critic (79), 真値履歴 (T × 6)]``。
+    履歴は causal transformer encoder で latent にし、BlockPPO が actor 側 encoder を真値側へ蒸留する。
+    歩行との混合は StealActorCritic と同じく観測 ``steal_ctrl`` から。"""
+
+    def env_actions(self, obs: TensorDict, raw: torch.Tensor) -> torch.Tensor:
+        if "steal_ctrl" in obs.keys():
+            ctrl = obs["steal_ctrl"]
+            return super().env_actions(obs, raw, blend=ctrl[:, 0], cmd_ext=ctrl[:, 1:4])
+        return super().env_actions(obs, raw)
 
 
 class StealPPO(WaypointPPO):
@@ -143,8 +165,17 @@ class RslRlStealPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     class_name: str = "StealPPO"
 
 
+@configclass
+class RslRlStealHistActorCriticCfg(RslRlBlockActorCriticCfg):
+    class_name: str = "StealHistActorCritic"
+    ball_history: int = 30
+    """環境側 StealCommandCfg.obs_history と一致させる。"""
+    command_limits: tuple[float, float, float] = (2.0, 1.9, 2.0)
+
+
 # OnPolicyRunner は eval(class_name) を on_policy_runner モジュールの名前空間で評価する。
 import rsl_rl.runners.on_policy_runner as _rsl_rl_on_policy_runner  # noqa: E402
 
 _rsl_rl_on_policy_runner.StealActorCritic = StealActorCritic
 _rsl_rl_on_policy_runner.StealPPO = StealPPO
+_rsl_rl_on_policy_runner.StealHistActorCritic = StealHistActorCritic

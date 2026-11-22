@@ -23,7 +23,7 @@ from .gating_policy import RslRlGatingActorCriticCfg, RslRlGatingPpoAlgorithmCfg
 from .waypoint_policy import RslRlWaypointActorCriticCfg, RslRlWaypointPpoAlgorithmCfg
 from .tracking_policy import RslRlTrackingActorCriticCfg
 from .block_policy import RslRlBlockActorCriticCfg, RslRlBlockPpoAlgorithmCfg
-from .steal_policy import RslRlStealActorCriticCfg, RslRlStealPpoAlgorithmCfg
+from .steal_policy import RslRlStealActorCriticCfg, RslRlStealHistActorCriticCfg, RslRlStealPpoAlgorithmCfg
 from .neck_policy import RslRlNeckActorCriticCfg
 
 
@@ -416,3 +416,29 @@ class K1StealDirPPORunnerCfg(K1StealPPORunnerCfg):
     """方向指定版 (Isaac-StealDir-K1-v0)。観測が target_dir (2) 分増える以外は K1StealPPORunnerCfg と同じ。"""
 
     experiment_name = "k1_steal_dir"
+
+
+@configclass
+class K1StealHistPPORunnerCfg(K1StealDirPPORunnerCfg):
+    """Block 型の奪取方策 (Isaac-StealHist-K1-v0, 2026-11-22): 観測履歴の causal transformer encoder ×2 + latent 蒸留
+    (StealHistActorCritic + BlockPPO)。obs_groups の末尾が履歴グループ。初期値は convert_steal_to_hist.py で
+    StealDir の checkpoint から作る (latent 入力の重み 0 で元の方策と同じ出力)。"""
+
+    experiment_name = "k1_steal_hist"
+    obs_groups = {"policy": ["steal_policy", "steal_hist"], "critic": ["steal_critic", "steal_hist_true"]}
+    policy = RslRlStealHistActorCriticCfg()
+    algorithm = RslRlBlockPpoAlgorithmCfg(
+        value_loss_coef=1.0,
+        use_clipped_value_loss=True,
+        clip_param=0.2,
+        entropy_coef=0.0,
+        num_learning_epochs=5,
+        num_mini_batches=8,  # transformer encoder ×2 で 4 だと 2048 env でも OOM (Block と同じ)
+        learning_rate=5.0e-4,
+        schedule="adaptive",
+        gamma=0.99,
+        lam=0.95,
+        desired_kl=0.01,
+        max_grad_norm=1.0,
+        latent_loss_coef=1.0,
+    )

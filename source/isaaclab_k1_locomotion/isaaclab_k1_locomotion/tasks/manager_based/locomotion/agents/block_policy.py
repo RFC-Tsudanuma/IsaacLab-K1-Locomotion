@@ -87,10 +87,10 @@ class BlockActorCritic(WaypointActorCritic):
         for set_name in ("policy", "critic"):
             groups = obs_groups[set_name]
             ball_dim = obs[groups[-1]].shape[-1]
-            # 1 フレームの次元は観測から決める: 真値は BALL_DIM (位置 + 速度)、ノイズ側は pos_only なら 2
-            if ball_dim % ball_history != 0 or ball_dim // ball_history not in (2, BALL_DIM):
+            # 1 フレームの次元は観測から決める (Block: 真値は BALL_DIM、ノイズ側 pos_only は 2。Steal の履歴は 8 / 6)
+            if ball_dim % ball_history != 0:
                 raise ValueError(
-                    f"obs_groups['{set_name}'] の末尾グループ '{groups[-1]}' はボール履歴 ({ball_history} × 2 or {BALL_DIM})"
+                    f"obs_groups['{set_name}'] の末尾グループ '{groups[-1]}' は履歴 ({ball_history} × フレーム)"
                     f" のはずですが {ball_dim} 次元です。"
                 )
             frame_dims[set_name] = ball_dim // ball_history

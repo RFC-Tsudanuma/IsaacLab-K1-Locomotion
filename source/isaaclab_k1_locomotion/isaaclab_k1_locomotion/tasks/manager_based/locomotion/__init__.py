@@ -464,6 +464,26 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-StealHist-K1-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.steal_env_cfg:K1StealHistEnvCfg",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StealHistPPORunnerCfg",
+    },
+)
+
+gym.register(
+    id="Isaac-StealHist-K1-Play-v0",
+    entry_point="isaaclab.envs:ManagerBasedRLEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.steal_env_cfg:K1StealHistEnvCfg_PLAY",
+        "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:K1StealHistPPORunnerCfg",
+    },
+)
+
+gym.register(
     id="Isaac-Tracking-K1-v0",
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     disable_env_checker=True,

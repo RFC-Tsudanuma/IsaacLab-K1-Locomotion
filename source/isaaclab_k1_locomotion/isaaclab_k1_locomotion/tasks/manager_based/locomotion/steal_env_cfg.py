@@ -28,6 +28,7 @@ import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.assets import RigidObjectCfg
+from isaaclab.managers import ObservationGroupCfg as ObsGroup
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
@@ -53,8 +54,16 @@ from .mdp.steal import (
     ball_wrong_dir,
     body_ball_progress,
     foot_near_ball,
+    steal_ctrl,
+    steal_hist_obs,
+    steal_hist_true,
     steal_move_speed_curriculum,
+    steal_neutral_end,
+    steal_obs_ball_pos,
+    steal_obs_ball_vel,
+    steal_obs_opponent,
     steal_obstacle_vel,
+    steal_phase_obs,
     steal_target_dir,
     trunk_obstacle_contact,
 )
@@ -247,6 +256,11 @@ class K1StealEnvCfg_PLAY(K1StealEnvCfg):
 # ---------------------------------------------------------------------------
 @configclass
 class K1StealDirPolicyCfg(K1StealPolicyCfg):
+    # ボール・敵は StealCommand が作る「方策が見る値」(試合条件ではノードの代替則 + 劣化、それ以外は真値)。
+    # 並び (69 次元) と一様ノイズは従来と同じ
+    ball_pos = ObsTerm(func=steal_obs_ball_pos, noise=Unoise(n_min=-0.05, n_max=0.05))
+    ball_vel = ObsTerm(func=steal_obs_ball_vel, noise=Unoise(n_min=-0.1, n_max=0.1))
+    obstacle_pos = ObsTerm(func=steal_obs_opponent, noise=Unoise(n_min=-0.05, n_max=0.05))
     target_dir = ObsTerm(func=steal_target_dir)
 
 
@@ -255,12 +269,26 @@ class K1StealDirCriticCfg(K1StealCriticCfg):
     target_dir = ObsTerm(func=steal_target_dir)
     # 動く敵 (2026-11-11): 敵の速度は critic のみ (方策の入力 69 次元と実機ノードの契約は変えない)
     obstacle_vel = ObsTerm(func=steal_obstacle_vel)
+    # 試合条件 (2026-11-22): 混合重み w・起動前・解除中/後 (critic 76 → 79)
+    steal_phase = ObsTerm(func=steal_phase_obs)
+
+
+@configclass
+class K1StealCtrlCfg(ObsGroup):
+    """方策の外の制御量 [w, 歩行コマンド (3)]。StealActorCritic.env_actions が歩行との混合に使う。actor / critic には入れない。"""
+
+    ctrl = ObsTerm(func=steal_ctrl)
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
 
 
 @configclass
 class K1StealDirObservationsCfg(K1FlatObservationsCfg):
     steal_policy: K1StealDirPolicyCfg = K1StealDirPolicyCfg()
     steal_critic: K1StealDirCriticCfg = K1StealDirCriticCfg()
+    steal_ctrl: K1StealCtrlCfg = K1StealCtrlCfg()
 
 
 @configclass
@@ -297,6 +325,10 @@ class K1StealDirEnvCfg(K1StealEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.commands.steal.directed = True
+        # 試合条件 (2026-11-22, STEAL_HANDOFF.md「次の再学習」の 1〜6): 歩行中からの開始・途中解除、敵が寄ってくる配置と
+        # 蹴られるボール、ボール / 敵の観測の劣化とノードの代替則。eval_steal.py は --match のときだけ有効にする
+        self.commands.steal.match_enable = True
+        self.terminations.steal_neutral = DoneTerm(func=steal_neutral_end, time_out=True)
         # 動く敵とボール (ドリブル対策, 2026-11-11): 速度上限 0 から奪取率 85% 以上で 0.1 m/s ずつ 1.0 m/s まで
         self.curriculum.steal_move_speed = CurrTerm(func=steal_move_speed_curriculum)
         self.rewards = K1StealDirRewardsCfg()
@@ -308,6 +340,59 @@ class K1StealDirEnvCfg_PLAY(K1StealDirEnvCfg):
     def __post_init__(self) -> None:
         super().__post_init__()
 
+        self.scene.num_envs = 32
+        self.scene.env_spacing = 2.5
+        self.observations.policy.enable_corruption = False
+        self.observations.steal_policy.enable_corruption = False
+        self.events.base_external_force_torque = None
+        self.events.push_robot = None
+
+
+@configclass
+class K1StealHistObsCfg(ObsGroup):
+    """actor 用の観測履歴 (T × 8, 現在の base yaw 系)。劣化は StealCommand が作る (一様ノイズは足さない)。"""
+
+    hist = ObsTerm(func=steal_hist_obs)
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class K1StealHistTrueCfg(ObsGroup):
+    """critic 用の真値履歴 (T × 6)。"""
+
+    hist = ObsTerm(func=steal_hist_true)
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class K1StealHistObservationsCfg(K1StealDirObservationsCfg):
+    steal_hist: K1StealHistObsCfg = K1StealHistObsCfg()
+    steal_hist_true: K1StealHistTrueCfg = K1StealHistTrueCfg()
+
+
+@configclass
+class K1StealHistEnvCfg(K1StealDirEnvCfg):
+    """Block 型 encoder 版 (Isaac-StealHist-K1-v0, 2026-11-22)。試合条件は StealDir と同じ。
+    動く敵・ボールの速さの上限を 1.6 m/s に広げる (寄ってくる敵の速さの上限も連動)。"""
+
+    observations: K1StealHistObservationsCfg = K1StealHistObservationsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.commands.steal.move_speed_limit = 1.6
+        self.commands.steal.move_speed_max = 1.6
+
+
+@configclass
+class K1StealHistEnvCfg_PLAY(K1StealHistEnvCfg):
+    def __post_init__(self) -> None:
+        super().__post_init__()
         self.scene.num_envs = 32
         self.scene.env_spacing = 2.5
         self.observations.policy.enable_corruption = False

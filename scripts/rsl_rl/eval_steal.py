@@ -26,6 +26,7 @@ parser.add_argument("--seed", type=int, default=None)
 parser.add_argument("--steps", type=int, default=1500, help="評価 step 数 (50 Hz)")
 parser.add_argument("--zero_policy", action="store_true", help="診断用: 残差 0・コマンド 0 (歩行 expert の立位) で評価")
 parser.add_argument("--stochastic", action="store_true", help="平均ではなくサンプルした行動で評価 (学習時と同条件)")
+parser.add_argument("--match", action="store_true", help="試合条件 (歩行中開始・寄ってくる敵・蹴られるボール・観測劣化・途中解除) で評価。既定は無効 (従来の評価)")
 parser.add_argument("--move_speed", type=float, default=None, help="敵・ボールの速度上限 [m/s] を固定 (カリキュラム無効)。既定は cfg の初期値")
 parser.add_argument("--diag_back", action="store_true", help="診断: 敵が背後 (|方位|>135°) の開始 1 s の方策出力 (コマンド・残差) を集計")
 cli_args.add_rsl_rl_args(parser)
@@ -46,7 +47,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config  # noqa: E402
 
 import isaaclab_k1_locomotion.tasks  # noqa: F401, E402
 
-OUTCOMES = ("stolen", "lost", "fell", "timeout", "no_foot", "wrong_dir")
+OUTCOMES = ("stolen", "lost", "fell", "timeout", "no_foot", "wrong_dir", "neutral")
 DIRS = ("front", "left", "back", "right")
 
 
@@ -72,6 +73,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         env_cfg.sim.device = args_cli.device
         agent_cfg.device = args_cli.device
 
+    if hasattr(env_cfg.commands.steal, "match_enable"):
+        env_cfg.commands.steal.match_enable = bool(args_cli.match)
     if hasattr(env_cfg.curriculum, "steal_move_speed"):
         env_cfg.curriculum.steal_move_speed = None  # 評価中に上限が変わらないように
     if args_cli.move_speed is not None:
@@ -101,6 +104,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     dt = raw_env.step_dt
 
     rows = []
+    active = {"steps": 0, "falls": 0, "falls_pre": 0}
     diag = []
     sensors = [raw_env.scene[n] for n in ("contact_balls_right", "contact_balls_left")]
     foot_touch = torch.zeros(env.num_envs, dtype=torch.bool, device=agent_cfg.device)  # 足がボールに触れた (接触センサ)
@@ -123,6 +127,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             ospeed = torch.norm(term.obstacle_vel, dim=1)
             t_ep = (raw_env.episode_length_buf + 1).float() * dt
             t_steal = term.stolen_at.clone()
+            # 試合条件: 奪取の作動時間 (w > 0 か解除後) と、その間の転倒 (試合 sim の「作動 1 分あたりの転倒」と同じ数え方)
+            steal_on = (term.w > 0.0) | (term.phase == 4)
+            active["steps"] += int(steal_on.sum())
             act = policy(obs)
             if args_cli.diag_back:
                 early = (raw_env.episode_length_buf < 50) & (term.bearing0.abs() > 2.356)
@@ -157,7 +164,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             outcome[tm.get_term("ball_no_foot")] = 4
             if "ball_wrong_dir" in tm.active_terms:
                 outcome[tm.get_term("ball_wrong_dir")] = 5
+            if "steal_neutral" in tm.active_terms:
+                outcome[tm.get_term("steal_neutral")] = 6
             outcome[fell] = 2  # 転倒は同時に失敗していても転倒扱い
+            active["falls"] += int((fell & steal_on).sum())
+            active["falls_pre"] += int((fell & ~steal_on).sum())
             for i in d.nonzero().flatten().tolist():
                 rows.append({"t": t_ep[i].item(), "outcome": OUTCOMES[outcome[i]], "t_steal": t_steal[i].item(),
                              "dist0": dist0[i].item(), "ball_r": ball_r[i].item(), "touched": t_steal[i].item() >= 0.0,
@@ -181,6 +192,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     print(f"  胴体が障害物に 0.25 m 以内まで接近: 全体 {100.0 * sum(r['bumped'] for r in rows) / n:5.1f}%")
     print(f"  胴体が障害物に接触 (センサ): 全体 {100.0 * sum(r['trunk'] for r in rows) / n:5.1f}%, 奪取のみ {100.0 * sum(r['trunk'] for r in stolen) / max(len(stolen), 1):5.1f}%")
     table("終了時の robot-obstacle 距離 [m] (≈ 初期距離の目安)", "dist0", [1.0, 1.5, 2.0, 2.5], rows)
+    if args_cli.match:
+        mins = active["steps"] * dt / 60.0
+        print(f"  [match] 奪取の作動 (w > 0 か解除後) {mins:.1f} 分 (延べ) で転倒 {active['falls']} 回 = "
+              f"{active['falls'] / max(mins, 1e-9):.2f} 回/分、起動前 (歩行 expert のみ) の転倒 {active['falls_pre']} 回")
     m = max(sway["n"], 1)
     print(f"  上体の揺れ (平均): 傾き |g_xy| {sway['tilt'] / m:.4f} / ロール・ピッチ角速度 {sway['ang_vel_xy'] / m:.3f} rad/s / "
           f"ロール・ピッチ角加速度 {sway['ang_acc'] / m:.2f} rad/s² / 並進加速度 {sway['lin_acc'] / m:.2f} m/s²")
