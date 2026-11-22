@@ -281,3 +281,121 @@ MuJoCo の 3v3 試合 sim (`3v3_vision_game.sh --bhuman --mcl`、25 分 × 15 �
 
 - 上の数値は MuJoCo の試合 sim の値で、実機ではない。ただし、vision 機と真値検出 (ノイズ・遅延付き) 機で、観測の質も転倒率もほぼ同じだった。
 - strategy の起動・終了の閾値を変えたら、ここの分布 (2・3・6) も合わせる。
+
+## 再学習 (2026-11-22): 試合条件 + Block 型の履歴 encoder (Isaac-StealHist-K1-v0)
+
+コミット 90bf0a9。上の「次の再学習」の 1〜6 は `StealCommand` (mdp/steal.py) に実装済み。
+StealDir でも既定で有効 (`match_enable`)。
+
+### 分かっていること (このサーバーで測定、決定的評価 1024 env × 1500 step)
+
+| 方策 | 静止: 奪取 | 静止: 転倒 | 動く敵 1.0: 奪取 | 試合条件: 作動 1 分あたりの転倒 |
+|---|---|---|---|---|
+| 現行 w64440_42199 | 90.6% | 1.6% | 76.0% | **1.35** (MuJoCo 試合 sim の 1.1〜1.8 を再現) |
+| MLP のまま試合条件で +1000 iter (A@45200) | 81.3% | 1.4% | | 0.34 |
+| MLP のまま試合条件で +2000 iter (A@46198) | 78.0% | 1.7% | | 0.42 |
+
+* 試合条件で学習すると、転倒は 1/4 に減る。一方で静止の奪取率が 90% → 80% に落ち、戻らない。
+* ユーザーの判断: 落ちる原因は観測劣化 (1 フレームの観測では見失い・遅延と真値を区別できない)。
+  そこで Block と同じ履歴 encoder を入れる。原因の切り分け run は不要。
+* コマンド変化の罰を強めても (−0.2 → −0.5) 効果は無かった。
+
+### 構成
+
+* actor = `steal_policy` (69、従来と同じ並び) + `steal_hist`。
+  * `steal_hist` は 30 step × 8 の履歴: 方策が見たボール位置・速度、敵位置、ボールが見えているか、敵が仮想か。
+  * world 系で持ち、毎 step 現在の base yaw 系に直す。
+* critic = `steal_critic` (79) + `steal_hist_true` (30 × 6 の真値)。
+* 履歴は causal transformer encoder で latent にする。`BlockPPO` が actor 側の encoder を真値側へ latent 蒸留する。
+  方策クラスは `StealHistActorCritic` (BlockActorCritic を継承)。
+* 敵・ボールの速度上限は 1.6 m/s (`move_speed_max` = `move_speed_limit`)。
+  試合条件では学習中の奪取率が昇格条件 0.75 に届かず、カリキュラムが上がらないため固定にしている。
+* `num_mini_batches` は 8 にしている。4 だと 2048 env でも 20 GB の GPU で OOM になる。
+* 速度: 1 iter 約 17 s (RTX 20 GB 級、2048 env、収集 4.2 s + 学習 12.5 s)。MLP 版は 3.6 s。
+
+### 開始点を作る
+
+変換済みの開始点を `frozen_policies/steal_hist_init/` に置いてある。encoder の乱数初期化も含め、このサーバーの run と同じもの:
+
+| ファイル | 元 | 備考 |
+|---|---|---|
+| `model_hist_42199.pt` | 現行 w64440_42199 | 静止 90.6%、試合条件 1.35 回/分 |
+| `model_hist_A45200.pt` | MLP 版を試合条件で +1000 iter した A@45200 | 静止 81.3%、試合条件 0.34 回/分 |
+
+logs に置いて resume する (`--checkpoint` はファイル名、`--load_run` はディレクトリ名):
+
+```bash
+cd scripts/rsl_rl
+mkdir -p logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-00_init42199
+cp ../../frozen_policies/steal_hist_init/model_hist_42199.pt logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-00_init42199/model_42199.pt
+mkdir -p logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-01_initA45200
+cp ../../frozen_policies/steal_hist_init/model_hist_A45200.pt logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-01_initA45200/model_45200.pt
+```
+
+A@45200 起点なら `--load_run 2026-11-22_00-00-01_initA45200 --checkpoint model_45200.pt` にする。
+このサーバーでは両方を回している (下の「このサーバーの run」)。
+
+自分で作り直す場合は、`frozen_policies/best_steal_dir/model_w64440_42199.pt` から次の手順で作る:
+`frozen_policies/best_steal_dir/model_w64440_42199.pt` から作る:
+1. critic を +3 拡張 (79 次元化)。
+2. 履歴版に変換。latent 入力の重みは 0 なので、変換直後の出力は元と同一。自己チェック付き。
+
+```bash
+cd scripts/rsl_rl
+uv run python expand_steal_checkpoint.py --src ../../frozen_policies/best_steal_dir/model_w64440_42199.pt \
+    --dst logs/rsl_rl/k1_steal_dir/2026-11-22_00-00-00_c79/model_42199.pt --extra 3 --nets critic
+uv run python convert_steal_to_hist.py --src logs/rsl_rl/k1_steal_dir/2026-11-22_00-00-00_c79/model_42199.pt \
+    --dst logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-00_init42199/model_42199.pt
+```
+
+### 学習
+
+```bash
+# 1 GPU
+CUDA_VISIBLE_DEVICES=0 uv run train.py --task Isaac-StealHist-K1-v0 --headless --num_envs 2048 \
+    --run_name hist_from42199 --max_iterations 3000 \
+    --resume --load_run 2026-11-22_00-00-00_init42199 --checkpoint model_42199.pt --reset_noise_std 0.2
+# 複数 GPU (BlockPPO は multi-GPU 対応、num_envs は GPU あたり)
+uv run torchrun --standalone --nproc_per_node=<N> train.py --task Isaac-StealHist-K1-v0 --headless --distributed \
+    --num_envs 2048 --run_name hist_from42199 --max_iterations 3000 \
+    --resume --load_run 2026-11-22_00-00-00_init42199 --checkpoint model_42199.pt --reset_noise_std 0.2
+```
+
+* `--reset_noise_std` は必須。変換で optimizer を捨てているため。
+* `--max_iterations` は追加分。
+* 開始点のディレクトリ名は、run 名で終わらせないこと。`rm -rf *_<run名>` で一緒に消える (一度やった)。
+* 学習中に見る値: `Mean latent loss` (初期 0.4 → 0.16 程度に下がる)、`Episode_Termination/base_height`。
+
+### 評価 (500 iter ごと、4 条件)
+
+```bash
+E="uv run python eval_steal.py --headless --task Isaac-StealHist-K1-Play-v0 --num_envs 1024 --steps 1500 --device cuda:0 --checkpoint <ckpt>"
+$E --move_speed 0.0            # 静止 (観測は真値)
+$E --move_speed 1.0            # 動く敵 (観測は真値)
+$E --match --move_speed 1.0    # 試合条件。最後の [match] 行の「回/分」が作動 1 分あたりの転倒
+$E --match --move_speed 1.6    # 試合条件・速い敵
+```
+
+* 試合条件の奪取率は 20% 前後と低い。35% 前後が罰なし打ち切り (neutral: 途中解除・遠くへ蹴られた) になる設計のため。
+  見るのは転倒の回/分。
+* 評価は学習と同じ GPU でも動く。ただしその間、学習が 1.3 倍ほど遅くなる。
+
+### 採用基準
+
+* 静止 93% 以上・転倒 1% 以下 (少なくとも 42199 の 90.6% / 1.6% を下回らない)。
+* 動く敵 1.0 で 75% 以上。
+* 試合条件の転倒が 42199 (1.35 回/分) より大きく下がる (MLP 版 A@45200 の 0.34 が目安)。
+
+### 未対応
+
+* ONNX 書き出し (`export_steal_policy.py` は MLP 版のみ)。
+* booster ノード: 履歴 30 step を odom で現在系に直して入れる。見えている・仮想のフラグも要る。
+  採用が決まってから行う。
+
+### このサーバーの run (2026-11-22 18 時〜)
+
+* `hist_fromA45200` (GPU1)
+* `hist_from42199` (GPU0)
+
+どちらも 3000 iter、`--reset_noise_std 0.2`。別サーバーで回すなら、同じ 2 本を速く進めるか、
+GPU 数を増やして env 数を増やした版にする。同じ設定を重複して回す必要は無い。
