@@ -399,3 +399,63 @@ $E --match --move_speed 1.6    # 試合条件・速い敵
 
 どちらも 3000 iter、`--reset_noise_std 0.2`。別サーバーで回すなら、同じ 2 本を速く進めるか、
 GPU 数を増やして env 数を増やした版にする。同じ設定を重複して回す必要は無い。
+
+## 結果 (2026-11-23): 教師-生徒で観測劣化に対応した s5 を採用、実機で転倒がほぼ無くなった
+
+成果物は `frozen_policies/best_steal_hist/` にある。booster_k1_locomotion の既定は `k1_steal_hist_2026-11-23_s5_1000.onnx`
+(= `steal_hist_s5_1000.onnx`)。ユーザーの実機確認では、転倒はほぼ無くなった。
+
+| 方策 | 静止: 奪取 / 転倒 | 動く敵 1.0 | 劣化ありの試合条件: 奪取 / 作動 1 分あたりの転倒 |
+|---|---|---|---|
+| 旧既定 w64440_42199 | 90.6% / 1.6% | 76.0% | 21.3% / 1.35 |
+| 教師 t1 model_44700 (劣化なしで学習) | 88.6% / 1.3% | 71.1% | 22.4% / 0.70 (劣化なしなら 0.50) |
+| **生徒 s5 model_1000 (採用)** | **86.1% / 1.9%** | **69.8%** | **31.1% / 0.50** |
+
+静止・動く敵の奪取率は旧既定より下がった。増えた失敗はボールに届いた後の扱いで、敵に当てる・体で押し出すの 2 つ。
+「近づかずに止まる」失敗 (時間切れ) は増えていない。
+
+### 分かったこと (やり直さなくて良いこと)
+
+* 観測劣化を入れて PPO で直接学習すると、方策全体が慎重になり、真値の観測でも成績が落ちる
+  (静止 −5 pt、動く敵は時間切れが増えて 76 → 46〜55%)。以下はどれも効かなかった。
+  * 履歴 encoder を入れる
+  * 劣化の割合を 0.5 に下げる
+  * 時間切れに罰を足す (報酬の `timeout` 項、既定 0)
+  * 長く回す
+  * 遅延を外す / 短くする
+* 1 条件ずつの切り分け (+400 iter): 能力を落とすのは観測劣化だけ。歩行中開始・寄ってくる敵・キック・途中解除・
+  速度 1.6 m/s・構造の変更は無害。劣化を要素ごとに入れると単独では小さく (遅延が最大で動く敵 −9 pt)、
+  全部入れると足し算以上に落ちる。
+* 対策: 劣化なしの試合条件で PPO の教師を作り、劣化ありの試合条件で生徒を DAgger 蒸留する。
+  教師の行動を教師あり学習で真似るので、RL で慎重になる問題が起きない。
+* 蒸留の改善は頭打ち。劣化なしの step の損失の重み 10 (`--clean_weight 10`) が少し効いた (静止 +1.5 pt)。
+  30 倍、学習率 1e-4、劣化 0.5 は差なし。
+
+### 再現手順
+
+```bash
+cd scripts/rsl_rl
+# 1. 教師: 42199 起点の履歴版 (frozen_policies/steal_hist_init/model_hist_42199.pt を
+#    logs/rsl_rl/k1_steal_hist/2026-11-22_00-00-00_init42199/model_42199.pt に置く) から、劣化なしで 3000 iter
+uv run train.py --task Isaac-StealHist-K1-v0 --headless --num_envs 2048 --run_name t1_teacher --max_iterations 3000 \
+    --resume --load_run 2026-11-22_00-00-00_init42199 --checkpoint model_42199.pt --reset_noise_std 0.2 \
+    env.commands.steal.obs_degrade_prob=0.0
+# 2. 生徒: DAgger 蒸留。1500 iter で頭打ち。s5 は s1 の 1200 から --clean_weight 10 で 1000 iter 追加したもの
+uv run python distill_steal.py --headless --teacher <t1>/model_44700.pt --run_name s1 --num_envs 2048 --iterations 1500
+uv run python distill_steal.py --headless --teacher <t1>/model_44700.pt --init <s1>/model_1200.pt \
+    --run_name s5_cw10 --num_envs 2048 --iterations 1000 --clean_weight 10
+# 3. ONNX。蒸留 run には params が無いので、--run_dir に教師の run (または frozen_policies/best_steal_hist) を渡す
+uv run python export_steal_hist_policy.py --checkpoint <s5>/model_1000.pt --run_dir ../../frozen_policies/best_steal_hist \
+    --out <out>.onnx
+# 評価 (生徒・教師とも StealHist の Play で読める)
+uv run python eval_steal.py --headless --task Isaac-StealHist-K1-Play-v0 --num_envs 1024 --steps 1500 --device cuda:0 \
+    --checkpoint <ckpt> [--move_speed 0.0 | --move_speed 1.0 | --match --move_speed 1.0]
+```
+
+* 1 iter の時間 (RTX 5090): 教師 5 s、蒸留 1.8 s。
+* `--match` 評価で教師を劣化なしで測るときは `env.commands.steal.obs_degrade_prob=0.0` を足す。
+
+### 未解決
+
+* 静止・動く敵の奪取率を旧既定の水準 (90.6% / 76.0%) に戻すこと。教師自体が 88.6% / 71.1% なので、まず教師の改善が要る。
+* ノードは奪取の起動 tick に履歴を今の値で埋める。学習では起動前の歩行中から履歴が積まれているので、ここは学習とずれる。

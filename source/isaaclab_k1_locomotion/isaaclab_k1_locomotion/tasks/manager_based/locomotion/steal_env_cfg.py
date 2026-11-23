@@ -56,6 +56,7 @@ from .mdp.steal import (
     foot_near_ball,
     steal_ctrl,
     steal_hist_obs,
+    steal_hist_teacher,
     steal_hist_true,
     steal_move_speed_curriculum,
     steal_neutral_end,
@@ -65,6 +66,7 @@ from .mdp.steal import (
     steal_obstacle_vel,
     steal_phase_obs,
     steal_target_dir,
+    steal_timeout,
     trunk_obstacle_contact,
 )
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -305,6 +307,9 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     fell = RewTerm(func=mdp.is_terminated_term, weight=-1600.0, params={"term_keys": "base_height"})
     no_foot = RewTerm(func=mdp.is_terminated_term, weight=-60.0, params={"term_keys": "ball_no_foot"})
     wrong_dir = RewTerm(func=mdp.is_terminated_term, weight=-60.0, params={"term_keys": "ball_wrong_dir"})
+    # 時間切れの罰 (2026-11-22): 試合条件で学習すると「挑まずに時間切れ」が失敗 (−60〜−1600) より得になり、
+    # 動く敵で時間切れが 10 → 50% に増えた。0 で従来どおり
+    timeout = RewTerm(func=steal_timeout, weight=0.0)
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.2)
     walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.2, params={"action_name": "walk_command"})
     # 上体の揺れ (2026-11-11 追加): 実機のボール検出 (頭部カメラ) を安定させるため、Trunk の傾き・ロール/ピッチ
@@ -399,3 +404,33 @@ class K1StealHistEnvCfg_PLAY(K1StealHistEnvCfg):
         self.observations.steal_policy.enable_corruption = False
         self.events.base_external_force_torque = None
         self.events.push_robot = None
+
+
+@configclass
+class K1StealTeacherPolicyCfg(K1StealPolicyCfg):
+    """教師の actor 入力 (69): StealDir の方策観測と同じ並び・ノイズで、ボール・敵は真値 (劣化なし)。"""
+
+    target_dir = ObsTerm(func=steal_target_dir)
+
+
+@configclass
+class K1StealTeacherHistCfg(ObsGroup):
+    hist = ObsTerm(func=steal_hist_teacher)
+
+    def __post_init__(self):
+        self.enable_corruption = False
+        self.concatenate_terms = True
+
+
+@configclass
+class K1StealStudentObservationsCfg(K1StealHistObservationsCfg):
+    teacher_policy: K1StealTeacherPolicyCfg = K1StealTeacherPolicyCfg()
+    teacher_hist: K1StealTeacherHistCfg = K1StealTeacherHistCfg()
+
+
+@configclass
+class K1StealStudentEnvCfg(K1StealHistEnvCfg):
+    """教師-生徒の蒸留 (Isaac-StealStudent-K1-v0, 2026-11-23、scripts/rsl_rl/distill_steal.py)。試合条件・観測劣化は
+    StealHist と同じ。教師 (劣化なしで学習した StealHist) 用に真値の観測グループ teacher_policy / teacher_hist を足す。"""
+
+    observations: K1StealStudentObservationsCfg = K1StealStudentObservationsCfg()

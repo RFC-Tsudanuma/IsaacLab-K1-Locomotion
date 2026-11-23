@@ -121,6 +121,7 @@ class StealCommand(CommandTerm):
         self._oh_len, self._oh_ptr = T, 0
         self.oh_obs = torch.zeros(T, n, 8, device=self.device)  # [ボール位置 2, 速度 2, 敵位置 2, ボールが見えている, 敵が仮想]
         self.oh_true = torch.zeros(T, n, 6, device=self.device)  # [ボール位置 2, 速度 2, 敵位置 2] (真値)
+        self.oh_teach = torch.zeros(T, n, 8, device=self.device)  # 教師 (劣化なしで学習) が見る履歴 = 劣化なしエピソードの oh_obs と同じ作り
         for name in ("stolen", "lost", "lost_no_foot", "lost_after_touch", "time_to_steal", "wrong_dir"):
             self.metrics[name] = torch.zeros(n, device=self.device)
 
@@ -344,6 +345,7 @@ class StealCommand(CommandTerm):
         f_true = torch.cat([ball_xy, torch.zeros(n, 2, device=dev), obs_xy], dim=1)
         self.oh_true[:, ids] = f_true.unsqueeze(0)
         self.oh_obs[:, ids] = torch.cat([f_true, torch.ones(n, 1, device=dev), torch.zeros(n, 1, device=dev)], dim=1).unsqueeze(0)
+        self.oh_teach[:, ids] = self.oh_obs[:, ids]
         for buf in (self.jump_left, self.veldrop_left, self.miss_left, self.fake_left):
             buf[ids] = 0.0
 
@@ -543,15 +545,21 @@ class StealCommand(CommandTerm):
              visible.float().unsqueeze(1), self.opp_virtual.float().unsqueeze(1)], dim=1
         )
         self.oh_true[self._oh_ptr] = torch.cat([ball_true, self.obstacle_xy()], dim=1)
+        ones = torch.ones(self.num_envs, 1, device=self.device)
+        self.oh_teach[self._oh_ptr] = torch.cat(
+            [rn(ball_true[:, :2], cfg.hist_pos_noise), rn(ball_true[:, 2:], cfg.hist_vel_noise),
+             rn(self.obstacle_xy(), cfg.hist_pos_noise), ones, torch.zeros_like(ones)], dim=1
+        )
 
     def _to_world(self, v_b: torch.Tensor) -> torch.Tensor:
         h = self.robot.data.heading_w
         c, s = torch.cos(h), torch.sin(h)
         return torch.stack([c * v_b[:, 0] - s * v_b[:, 1], s * v_b[:, 0] + c * v_b[:, 1]], dim=1)
 
-    def history_b(self, true: bool) -> torch.Tensor:
-        """観測履歴を現在の base yaw 系で (N, T × dim)、古い順。位置は現在のロボット位置からの相対、速度は回転のみ。"""
-        buf = self.oh_true if true else self.oh_obs
+    def history_b(self, true: bool, teacher: bool = False) -> torch.Tensor:
+        """観測履歴を現在の base yaw 系で (N, T × dim)、古い順。位置は現在のロボット位置からの相対、速度は回転のみ。
+        teacher=True は教師 (劣化なしで学習) 用の劣化なし履歴。"""
+        buf = self.oh_teach if teacher else (self.oh_true if true else self.oh_obs)
         T = self._oh_len
         idx = (self._oh_ptr + 1 + torch.arange(T, device=self.device)) % T
         h = buf[idx].clone()  # (T, N, dim)
@@ -724,6 +732,12 @@ def ball_wrong_dir(env: "ManagerBasedRLEnv", command_name: str = "steal") -> tor
     return env.command_manager.get_term(command_name).wrong_dir()
 
 
+def steal_timeout(env: "ManagerBasedRLEnv") -> torch.Tensor:
+    """エピソード長の時間切れ (time_out 項) で 1。is_terminated_term は time_out の項を 0 にするので別に作る。
+    罰なしの打ち切り (steal_neutral) は含めない。"""
+    return env.termination_manager.get_term("time_out").float()
+
+
 def steal_neutral_end(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
     return env.command_manager.get_term(command_name).neutral_end()
 
@@ -746,6 +760,11 @@ def steal_obs_opponent(env: "ManagerBasedRLEnv", command_name: str = "steal") ->
 def steal_hist_obs(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
     """actor 用の観測履歴 (N, T × 8): 方策が見たボール位置・速度・敵位置・ボールが見えているか・敵が仮想か。"""
     return env.command_manager.get_term(command_name).history_b(true=False)
+
+
+def steal_hist_teacher(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:
+    """教師-生徒の蒸留用: 教師が見る劣化なしの観測履歴 (N, T × 8)。"""
+    return env.command_manager.get_term(command_name).history_b(true=False, teacher=True)
 
 
 def steal_hist_true(env: "ManagerBasedRLEnv", command_name: str = "steal") -> torch.Tensor:

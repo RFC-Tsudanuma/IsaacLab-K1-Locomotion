@@ -1,0 +1,96 @@
+seed: 42
+device: cuda:0
+num_steps_per_env: 48
+max_iterations: 3000
+empirical_normalization: null
+obs_groups:
+  policy:
+  - steal_policy
+  - steal_hist
+  critic:
+  - steal_critic
+  - steal_hist_true
+clip_actions: null
+save_interval: 100
+experiment_name: k1_steal_hist
+run_name: t1_teacher
+logger: tensorboard
+neptune_project: isaaclab
+wandb_project: isaaclab
+resume: true
+load_run: 2026-11-22_00-00-00_init42199
+load_checkpoint: model_42199.pt
+class_name: OnPolicyRunner
+policy:
+  class_name: StealHistActorCritic
+  init_noise_std: 0.5
+  noise_std_type: scalar
+  state_dependent_std: false
+  actor_obs_normalization: true
+  critic_obs_normalization: true
+  actor_hidden_dims:
+  - 256
+  - 128
+  critic_hidden_dims:
+  - 256
+  - 128
+  activation: elu
+  expert_checkpoint: /workspace/steal_hist/frozen_policies/best_walk/model_64440.pt
+  expert_policy:
+    class_name: HistoryActorCritic
+    init_noise_std: 0.7207805082202461
+    noise_std_type: scalar
+    state_dependent_std: false
+    actor_obs_normalization: true
+    critic_obs_normalization: true
+    actor_hidden_dims:
+    - 512
+    - 256
+    - 128
+    critic_hidden_dims:
+    - 512
+    - 256
+    - 128
+    activation: elu
+    history_length: 100
+    mlp_history_steps: 4
+    cnn_kernel_sizes: !!python/tuple
+    - 8
+    - 4
+    cnn_filter_sizes: !!python/tuple
+    - 32
+    - 16
+    cnn_stride_sizes: !!python/tuple
+    - 4
+    - 2
+  command_limits: !!python/tuple
+  - 2.0
+  - 1.9
+  - 2.0
+  command_deadzone: 0.1
+  ball_history: 30
+  latent_dim: 32
+  d_model: 64
+  nhead: 4
+  num_layers: 2
+  residual_scale: 0.5
+  lateral_x_knee: 1.0
+  lateral_x_min: 0.3
+algorithm:
+  class_name: BlockPPO
+  num_learning_epochs: 5
+  num_mini_batches: 8
+  learning_rate: 0.0005
+  schedule: adaptive
+  gamma: 0.99
+  lam: 0.95
+  entropy_coef: 0.0
+  desired_kl: 0.01
+  max_grad_norm: 1.0
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  clip_param: 0.2
+  normalize_advantage_per_mini_batch: false
+  rnd_cfg: null
+  symmetry_cfg: null
+  latent_loss_coef: 1.0
