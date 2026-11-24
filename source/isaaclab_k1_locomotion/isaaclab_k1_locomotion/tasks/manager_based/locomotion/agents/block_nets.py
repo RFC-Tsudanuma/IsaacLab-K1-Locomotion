@@ -52,3 +52,45 @@ class BlockHead(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.mlp(torch.cat([x[..., : self.direct_dim], self.latents(x)[:, -1]], dim=-1))
+
+
+def steal_mirror(hist: int = 30) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """奪取方策 (StealHist) の左右反転 (2026-11-24)。actor 入力 (69 + hist × 8) と出力 (コマンド 3 + 残差 12) について
+    ``mirror(v) = v[..., idx] * sign`` となる (入力の idx, sign, 出力の idx, sign) を返す。規約は mdp/symmetry.py と同じ。"""
+    jp, js = [6, 7, 8, 9, 10, 11, 0, 1, 2, 3, 4, 5], [1.0, -1.0, -1.0, 1.0, 1.0, -1.0] * 2
+    idx, sign = [], []
+
+    def add(perm, sg):
+        base = len(idx)
+        idx.extend(base + p for p in perm)
+        sign.extend(sg)
+
+    add(range(3), [-1.0, 1.0, -1.0])  # base_ang_vel
+    add(range(3), [1.0, -1.0, 1.0])  # projected_gravity
+    add(range(3), [1.0, -1.0, -1.0])  # 歩行コマンド
+    for _ in range(3):  # joint_pos, joint_vel, 前回の関節指令
+        add(jp, js)
+    add([2, 3, 0, 1], [1.0] * 4)  # 歩行位相 [sin L, cos L, sin R, cos R]
+    add(jp, js)  # 前回の残差
+    for _ in range(4):  # ボール位置, ボール速度, 敵位置, 目標方向
+        add(range(2), [1.0, -1.0])
+    for _ in range(hist):  # [ボール位置, ボール速度, 敵位置, 見えている, 仮想]
+        add(range(8), [1.0, -1.0, 1.0, -1.0, 1.0, -1.0, 1.0, 1.0])
+    m = torch.tensor(idx), torch.tensor(sign), torch.tensor([0, 1, 2] + [3 + p for p in jp]), torch.tensor([1.0, -1.0, -1.0] + js)
+    for i, s in (m[:2], m[2:]):  # 2 回反転すると元に戻る
+        assert torch.equal(i[i], torch.arange(len(i))) and torch.all(s[i] * s == 1.0)
+    return m
+
+
+def steal_target_left(x: torch.Tensor) -> torch.Tensor:
+    """目標方向がロボット→ボールの線の左にあるか (N,) (actor 入力のボール相対位置 × 目標方向)。"""
+    return x[:, 61] * x[:, 68] - x[:, 62] * x[:, 67] > 0.0
+
+
+def steal_symmetric(actor, x: torch.Tensor, m, left: torch.Tensor | None = None) -> torch.Tensor:
+    """左右対称にした奪取方策の出力 (N, 15)。学習した方策は「左足で右へ払う」蹴りしか持たず、目標方向が左のときは
+    ボールの向こう側へ回り込む。目標方向がロボット→ボールの線の左にあるときは、観測を左右反転して方策に通し、
+    出力を反転して戻す (右足で左へ払う)。``actor`` は正規化込みの関数、``m`` は `steal_mirror` の戻り値 (x と同じ device)。``left`` を渡すとその判定を使う (起動時に固定する場合)。"""
+    idx, sign, oidx, osign = m
+    left = steal_target_left(x) if left is None else left
+    return torch.where(left.unsqueeze(1), actor(x[:, idx] * sign)[:, oidx] * osign, actor(x))

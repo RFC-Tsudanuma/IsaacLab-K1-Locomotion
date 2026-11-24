@@ -50,6 +50,7 @@ from .mdp.steal import (
     ball_lost,
     ball_no_foot,
     ball_stolen,
+    ball_circling,
     ball_target_speed,
     ball_wrong_dir,
     body_ball_progress,
@@ -310,6 +311,8 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     # 時間切れの罰 (2026-11-22): 試合条件で学習すると「挑まずに時間切れ」が失敗 (−60〜−1600) より得になり、
     # 動く敵で時間切れが 10 → 50% に増えた。0 で従来どおり
     timeout = RewTerm(func=steal_timeout, weight=0.0)
+    # 回り込みの罰 (2026-11-24): ボールのまわりを回った角度 [rad] × weight × dt。0 で従来どおり
+    ball_circling = RewTerm(func=ball_circling, weight=0.0)
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.2)
     walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.2, params={"action_name": "walk_command"})
     # 上体の揺れ (2026-11-11 追加): 実機のボール検出 (頭部カメラ) を安定させるため、Trunk の傾き・ロール/ピッチ

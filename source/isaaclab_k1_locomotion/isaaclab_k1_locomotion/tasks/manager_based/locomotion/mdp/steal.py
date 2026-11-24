@@ -68,6 +68,7 @@ class StealCommand(CommandTerm):
         self.cmd_buf = torch.zeros(n, 2, device=self.device)
         self.stolen_at = torch.full((n,), -1.0, device=self.device)  # 最初に圏外へ出た時刻 [s] (未達 −1)
         self.prev_body_dist = torch.zeros(n, device=self.device)  # 胴体→ボール距離 (接近ポテンシャル用)
+        self.prev_circ_ang = torch.zeros(n, device=self.device)  # ボールから見たロボットの方位 (回り込み量の罰用)
         self.target_dir_w = torch.zeros(n, 2, device=self.device)  # 目標方向 (world 単位ベクトル)
         self.target_idx = torch.zeros(n, dtype=torch.long, device=self.device)  # 0 前 / 1 左 / 2 後 / 3 右 (初期進行方向基準)
         self.ball_start_xy = torch.zeros(n, 2, device=self.device)
@@ -288,6 +289,8 @@ class StealCommand(CommandTerm):
         idx = torch.multinomial(allowed.float(), 1).squeeze(1)
         self.target_idx[env_ids] = idx
         self.target_dir_w[env_ids] = cand[torch.arange(n, device=dev), idx]
+        if cfg.target_mode == "robot_lr":
+            self._target_lr(ids, pos, ball_xy, obs_xy)
         self.ball_start_xy[env_ids] = ball_xy
 
         # 動き: 敵は速さ U(0, move_speed_max)・向き一様で直進。ボールは敵の速度 + 最大 ball_rel_speed_max の差
@@ -352,6 +355,24 @@ class StealCommand(CommandTerm):
         self.stolen_at[env_ids] = -1.0
         self.foot_touched[env_ids] = False
         self.prev_body_dist[env_ids] = torch.norm(pose[:, :2] - pos, dim=1)
+        self.prev_circ_ang[env_ids] = torch.atan2(pos[:, 1] - pose[:, 1], pos[:, 0] - pose[:, 0])
+
+    def _target_lr(self, ids: torch.Tensor, pos: torch.Tensor, ball_xy: torch.Tensor, obs_xy: torch.Tensor):
+        """目標方向 "robot_lr" (2026-11-24): ロボット→ボールの線から左右どちらかへ target_lateral_range の角度
+        (近づいた向きのまま左右へ出す)。ボール→敵から target_min_angle 以内の側は除く。リセット時と、
+        歩行中開始では起動時 (ノードが方向を固定する tick) に引く。"""
+        cfg, dev, n = self.cfg, self.device, len(ids)
+        ref = ball_xy - pos
+        off = torch.empty(n, device=dev).uniform_(*cfg.target_lateral_range)
+        a = torch.atan2(ref[:, 1], ref[:, 0]).unsqueeze(1) + off.unsqueeze(1) * torch.tensor([1.0, -1.0], device=dev)  # 左, 右
+        cand = torch.stack([torch.cos(a), torch.sin(a)], dim=2)  # (n, 2, 2)
+        to_obs = obs_xy - ball_xy
+        to_obs = to_obs / torch.norm(to_obs, dim=1, keepdim=True).clamp(min=1e-6)
+        ok = torch.sum(cand * to_obs.unsqueeze(1), dim=2) < math.cos(cfg.target_min_angle)
+        ok[~ok.any(dim=1)] = True
+        pick = torch.multinomial(ok.float(), 1).squeeze(1)
+        self.target_dir_w[ids] = cand[torch.arange(n, device=dev), pick]
+        self.target_idx[ids] = torch.where(pick == 0, 1, 3).to(self.target_idx.dtype)  # 評価表の左 / 右
 
     def _write_ball_vel(self, ids: torch.Tensor, vel_xy: torch.Tensor):
         """ボールに水平速度を与える (z 速度は保持、角速度は転がり条件 ω = z × v / r)。"""
@@ -440,6 +461,9 @@ class StealCommand(CommandTerm):
         start = pre & ((t >= self.pre_until) | (self.body_ball_dist() <= self.act_dist))
         self.phase[start] = PH_ON
         self.t_act[start] = t[start]
+        if cfg.target_mode == "robot_lr" and start.any():
+            i = start.nonzero().squeeze(1)
+            self._target_lr(i, self.robot.data.root_pos_w[i, :2], self.ball_xy()[i], self.obstacle_xy()[i])
         on = self.phase == PH_ON
         self.w[on] = (self.w[on] + dt / cfg.blend_s).clamp(max=1.0)
         self.phase[on & (self.w >= 1.0)] = PH_ACTIVE
@@ -704,6 +728,12 @@ class StealCommandCfg(CommandTermCfg):
     opp_fake_prob: float = 0.005
     opp_fake_dur: tuple[float, float] = (0.2, 1.0)
 
+    target_mode: str = "robot4"
+    """目標方向の抽選。"robot4" = 開始時のロボット向き基準の前後左右から敵方向に近いものを除く (従来)、
+    "robot_lr" = ロボット→ボールの線から左右どちらかへ target_lateral_range (敵方向に近い側は除く、2026-11-24)。
+    ボール→敵の線の横 ("lateral"、2026-11-23) は敵側へ入る立ち位置が 12 → 28% に増えたので不採用・削除。"""
+    target_lateral_range: tuple[float, float] = (math.radians(60.0), math.radians(120.0))
+
     directed: bool = False
     """True: 目標方向 (前/左/後/右) を抽選し、方向が合ったときだけ奪取とみなす (Isaac-StealDir-K1)。"""
     target_min_angle: float = math.radians(60.0)
@@ -804,6 +834,17 @@ def body_ball_progress(env: "ManagerBasedRLEnv", command_name: str = "steal") ->
     delta = term.prev_body_dist - dist
     term.prev_body_dist = dist
     return delta
+
+
+def ball_circling(env: "ManagerBasedRLEnv", min_dist: float = 0.25, command_name: str = "steal") -> torch.Tensor:
+    """ボールのまわりを回り込んだ角度 [rad/step] (ボールから見たロボットの方位の変化量)。奪取方策が作動中で、
+    足で触れる前だけ数える。ボールの真上付近 (min_dist 未満) は方位が定まらないので数えない。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    rel = term.robot.data.root_pos_w[:, :2] - term.ball_xy()
+    ang = torch.atan2(rel[:, 1], rel[:, 0])
+    delta = torch.remainder(ang - term.prev_circ_ang + math.pi, 2 * math.pi) - math.pi
+    term.prev_circ_ang = ang
+    return delta.abs() * ((term.w > 0.0) & ~term.foot_touched & (torch.norm(rel, dim=1) > min_dist)).float()
 
 
 def foot_near_ball(env: "ManagerBasedRLEnv", std: float = 0.2, command_name: str = "steal") -> torch.Tensor:
