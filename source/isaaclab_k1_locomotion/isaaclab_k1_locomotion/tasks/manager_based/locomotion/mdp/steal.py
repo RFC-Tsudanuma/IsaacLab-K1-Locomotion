@@ -197,7 +197,7 @@ class StealCommand(CommandTerm):
         return self.ball_out() & ~self.foot_touched & ~self.kicked
 
     def lost(self) -> torch.Tensor:
-        return self.lost_obstacle()
+        return self.lost_obstacle() & self.cfg.opp_touch_lost
 
     def wrong_dir(self) -> torch.Tensor:
         """足で触れた後、目標方向から外れて圏外へ出た (directed のときだけ終了条件に使う)。"""
@@ -609,7 +609,7 @@ class StealCommand(CommandTerm):
         new_touch = self.foot_contact_now() & ~self.foot_touched
         self.ball_touch_xy[new_touch] = self.ball_xy()[new_touch]
         self.foot_touched |= new_touch
-        first = (self.stolen_at < 0.0) & ~self.lost_obstacle() & self.foot_touched & self.ball_out()
+        first = (self.stolen_at < 0.0) & ~self.lost() & self.foot_touched & self.ball_out()
         if self.cfg.directed:
             first &= self.dir_ok()
         self.stolen_at[first] = self.elapsed()[first]
@@ -646,6 +646,9 @@ class StealCommandCfg(CommandTermCfg):
 
     touch_margin: float = 0.02
     """ボール中心と障害物中心の距離がこの余裕以内なら「敵に触れた」= 失敗。"""
+    opp_touch_lost: bool = True
+    """False: ボールが敵に触れても失敗にしない (2026-11-24、敵側の目標方向の学習用)。敵に当たって弾かれても、
+    目標方向へ出れば奪取。target_min_angle=0 (敵側の方向も抽選する) と組で使う。"""
     foot_sensor_names: tuple[str, ...] = ("contact_balls_right", "contact_balls_left")
     feet_body_names: str = ".*_foot_link"
     """足とボールの接触センサ (dribble シーン由来)。"""

@@ -771,7 +771,7 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
         state = "touched"
     else:
         state = "approach"
-    if "st_left" in gui and bool(gui["st_left"][env_idx]):
+    if "st_mirror" in gui and bool(gui["st_mirror"].left[env_idx]):
         state += " [mirrored]"  # --steal_mirror: 左右反転して動かしている (右足で左へ払う)
     server.scene.add_label(
         "/steal/label",
@@ -837,6 +837,8 @@ def override_command_from_viser(env, gui):
                 h = float(env.unwrapped.scene["robot"].data.heading_w[i]) + k * math.pi / 2
                 st.target_idx[i] = k
                 st.target_dir_w[i] = torch.tensor([math.cos(h), math.sin(h)], device=env.unwrapped.device)
+            if "st_mirror" in gui:
+                gui["st_mirror"].age[i] = 0  # 置き直したら左右反転の判定をやり直す (ノードの起動 tick に相当)
             gui["st_trail"].clear()
             gui["st_ball_trail"].clear()
         return
@@ -1060,7 +1062,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         urdf_path = args_cli.viser_urdf or DEFAULT_VISER_URDF
         viser_state = setup_viser(env, urdf_path, args_cli.viser_port)
         if args_cli.steal_mirror:
-            viser_state[4]["st_left"] = policy.left
+            viser_state[4]["st_mirror"] = policy
 
     # reset environment
     obs = env.get_observations()

@@ -29,14 +29,16 @@ parser.add_argument("--zero_policy", action="store_true", help="診断用: 残�
 parser.add_argument("--stochastic", action="store_true", help="平均ではなくサンプルした行動で評価 (学習時と同条件)")
 parser.add_argument("--match", action="store_true", help="試合条件 (歩行中開始・寄ってくる敵・蹴られるボール・観測劣化・途中解除) で評価。既定は無効 (従来の評価)")
 parser.add_argument("--move_speed", type=float, default=None, help="敵・ボールの速度上限 [m/s] を固定 (カリキュラム無効)。既定は cfg の初期値")
-parser.add_argument("--node_dir", choices=["away", "lr", "right"], default=None,
+parser.add_argument("--node_dir", choices=["away", "lr", "right", "opp_near", "opp_far"], default=None,
                     help="実機ノードの方向の決め方を再現 (起動 tick の観測から決めて固定)。away = 観測している敵 (仮想を含む) → ボール、"
                          "lr = ロボット→ボールの線の真横 (観測している敵のいない側)、right = ロボット→ボールの線から右へ --node_dir_deg "
-                         "(敵の方向と 60° 以内なら真後ろ、それも駄目なら away。今の方策は左足で右へ払う蹴りしか持たないため)")
+                         "(敵の方向と 60° 以内なら真後ろ、それも駄目なら away。今の方策は左足で右へ払う蹴りしか持たないため)、"
+                         "opp_near / opp_far = 敵→ボールの線の真横 (near = ロボットがいる側 = 回り込みが少ない側、far = その反対側)")
+parser.add_argument("--node_track", type=float, default=0.0, help="--node_dir opp_*: > 0 なら起動 tick で固定せず、ボールがロボットからこの距離 [m] に入るまで、敵が見えている tick ごとに向きを更新する (左右の側は起動 tick のまま。ノードの steal_dir_track_m と同じ)")
 parser.add_argument("--node_dir_deg", type=float, default=110.0, help="--node_dir right の角度 [deg] (ロボット→ボールの向きから右回り)")
 parser.add_argument("--expert_sym", action="store_true", help="診断: 歩行 expert を左右対称にして評価 (E(o) と 反転 E(反転 o) の平均)。--mirror の検算用")
 parser.add_argument("--dump_rows", type=str, default=None, help="エピソードごとの集計行を JSON で書き出す (立ち位置などの解析用)")
-parser.add_argument("--mirror", choices=["step", "latch", "full"], default=None,
+parser.add_argument("--mirror", choices=["step", "latch", "full", "full_opp"], default=None,
                     help="方策を左右対称にして評価する (目標方向が左のときは観測と出力を左右反転)。step = 毎 tick 判定、latch = 作動直後の判定を保つ、full = latch + 歩行 expert も反転 (制御全体を鏡像にする)")
 parser.add_argument("--dump_traj", type=str, default=None, help="先頭 256 env の毎 step の軌跡 (T, 256, 15) を torch.save する (解析用)")
 parser.add_argument("--diag_back", action="store_true", help="診断: 敵が背後 (|方位|>135°) の開始 1 s の方策出力 (コマンド・残差) を集計")
@@ -147,12 +149,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     bumped = torch.zeros_like(foot_touch)
     between = torch.zeros_like(foot_touch)  # ボールと敵の間に入った  # 胴体が障害物に接近しすぎた (敵にぶつかった目安)
     trunk_hit = torch.zeros_like(foot_touch)  # 胴体と障害物の接触センサが反応した
+    opp_hit = torch.zeros_like(foot_touch)  # ボールが敵に触れた (opp_touch_lost=false では終了しないので別に数える)
     # 足が最初にボールへ触れた瞬間の立ち位置: ボールから見た「ロボットの方向」と「敵の方向」の角度 [deg]
     # (0 = ボールと敵の間に立っている, 90 = 真横, 180 = 敵の反対側)。触れなかったエピソードは NaN
     touch_th = torch.full((env.num_envs,), float("nan"), device=agent_cfg.device)
     # 解析用 (--dump_rows): 符号付きの立ち位置 (ボール→敵を 0°、目標方向のある側を +) の開始時 / 最初に触れたとき、同じ系での目標方向
     start_sg, touch_sg, touch_tg = touch_th.clone(), touch_th.clone(), touch_th.clone()
     dir_latched = torch.zeros_like(foot_touch)  # --node_dir: このエピソードで目標方向を固定済み
+    trk_close = torch.zeros_like(foot_touch)  # --node_track: ボールが近づいたので目標方向の更新をやめた
+    opp_sign = torch.ones(env.num_envs, device=agent_cfg.device)  # --node_dir opp_*: ボール→敵の線の左 (+1) / 右 (−1)、起動 tick に決める
     # 回り込み量: 奪取の作動中 (w > 0)、足で触れるまでにボールのまわりを回った角度の累計 [deg] (ボールから見たロボットの方位の変化)
     circ = torch.zeros(env.num_envs, device=agent_cfg.device)
     prev_ang = torch.full_like(circ, float("nan"))
@@ -197,6 +202,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                     side = torch.stack([fwd[:, 0] * math.cos(a) - fwd[:, 1] * math.sin(a), fwd[:, 0] * math.sin(a) + fwd[:, 1] * math.cos(a)], dim=1)
                     free = lambda d: ((d * to_opp).sum(1) < 0.5).unsqueeze(1)  # 敵の方向から 60° より離れている
                     away = term._to_world(torch.where(free(side), side, torch.where(free(-fwd), -fwd, -to_opp)))
+                elif args_cli.node_dir in ("opp_near", "opp_far"):
+                    # ボール→敵の線の真横。側 = ロボットがいる側 (near) かその反対 (far)。線上・仮想の敵は右 (lr と同じ)
+                    e = opp_b - ball_b
+                    robot_left = ball_b[:, 0] * e[:, 1] - ball_b[:, 1] * e[:, 0] > 0.0  # ロボットはボール→敵の線の左にいる
+                    opp_sign = torch.where(new, torch.where(robot_left == (args_cli.node_dir == "opp_near"), 1.0, -1.0), opp_sign)
+                    away = term._to_world(torch.stack([-e[:, 1], e[:, 0]], dim=1) * opp_sign.unsqueeze(1))
+                    if args_cli.node_track > 0.0:
+                        trk_close |= (term.phase != 0) & (ball_b.norm(dim=1) < args_cli.node_track)
+                        new = new | ((term.phase != 0) & ~trk_close & ~term.opp_virtual)
                 else:
                     away = term._to_world(ball_b - opp_b)
                 away = away / away.norm(dim=1, keepdim=True).clamp(min=1e-6)
@@ -239,6 +253,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             lat = (rel[:, 0] * u[:, 1] - rel[:, 1] * u[:, 0]).abs()
             # 足で触れる前だけ数える: 蹴った後はボールが動いて線分がロボットの上を掃くので、追っているだけで「間」に数えてしまう
             between |= (along > 0.1) & (along < L - 0.1) & (lat < 0.25) & ~term.foot_touched
+            opp_hit |= term.lost_obstacle()
             bumped |= torch.norm(term.obstacle_xy() - raw_env.scene["robot"].data.root_pos_w[:, :2], dim=1) < term.cfg.obstacle_radius + 0.25
             if trunk_sensor is not None:
                 trunk_hit |= torch.norm(trunk_sensor.data.force_matrix_w, dim=-1).amax(dim=(1, 2)) > 1.0
@@ -274,11 +289,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                              "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(tdir[i]),
                              "side0": side0[i].item(), "trunk": trunk_hit[i].item(), "bear0": bear0[i].item(),
                              "ospeed": ospeed[i].item(), "between": between[i].item(), "tgt_opp": tgt_opp[i].item(), "kind": kind[i].item(), "touch_th": touch_th[i].item(),
-                             "start_sg": start_sg[i].item(), "touch_sg": touch_sg[i].item(), "touch_tg": touch_tg[i].item(), "circ": circ[i].item()})
+                             "start_sg": start_sg[i].item(), "touch_sg": touch_sg[i].item(), "touch_tg": touch_tg[i].item(), "circ": circ[i].item(), "opp_hit": opp_hit[i].item()})
             foot_touch[d] = False
             bumped[d] = False
             between[d] = False
+            opp_hit[d] = False
             dir_latched[d] = False
+            trk_close[d] = False
             for buf in (touch_th, start_sg, touch_sg, touch_tg, prev_ang):
                 buf[d] = float("nan")
             circ[d] = 0.0
@@ -326,8 +343,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         table("敵の動き (bins = 敵がボールを保持, 寄ってきてドリブル, 寄ってきて蹴る)", "kind", [0.5, 1.5], rows)
     if term.cfg.directed:
         table(f"target direction (bins = {', '.join(DIRS)})", "dir", [0.5, 1.5, 2.5], rows)
-        table("目標方向とボール→敵の角度 [deg] (180 = 敵から真っすぐ離す)", "tgt_opp", [90.0, 120.0, 150.0], rows)
-        for lo, hi in ((60.0, 90.0), (90.0, 120.0), (120.0, 150.0), (150.0, 181.0)):
+        table("目標方向とボール→敵の角度 [deg] (0 = 敵へ向けて, 180 = 敵から真っすぐ離す)", "tgt_opp", [30.0, 60.0, 90.0, 120.0, 150.0], rows)
+        print("  ボールが敵に触れた: " + ", ".join(
+            f"{name} {100.0 * sum(r['opp_hit'] for r in sel) / max(len(sel), 1):5.1f}%"
+            for name, sel in (("全体", rows), ("奪取のみ", stolen), ("目標が敵側 (<60°)", [r for r in rows if r["tgt_opp"] < 60.0]),
+                              ("目標が敵側の奪取", [r for r in stolen if r["tgt_opp"] < 60.0]))))
+        for lo, hi in ((0.0, 30.0), (30.0, 60.0), (60.0, 90.0), (90.0, 120.0), (120.0, 150.0), (150.0, 181.0)):
             sel = [r for r in rows if lo <= r["tgt_opp"] < hi]
             th = [r["touch_th"] for r in sel if r["touch_th"] == r["touch_th"]]
             print(f"    角度 [{lo:.0f},{hi:.0f}): ボールと敵の間に入った {100.0 * sum(r['between'] for r in sel) / max(len(sel), 1):5.1f}% (n={len(sel)})"

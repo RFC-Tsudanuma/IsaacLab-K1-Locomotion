@@ -133,7 +133,8 @@ def steal_mirror_policy(pol: StealHistActorCritic, raw_env, mode: str = "full", 
     """目標方向がロボット→ボールの線の左にあるとき左右反転して動かす推論関数 (obs → env action) を返す (eval_steal.py / play.py)。
     step = 毎 tick 判定、latch = 作動直後の判定を作動が切れるまで保つ (ノードが目標方向を固定するのと同じ)、
     full = latch に加えて歩行 expert も反転する (制御全体を鏡像にする。expert は左右対称でないため。ノードの steal_mirror と同じ)。
-    戻り値の ``.left`` は今反転している env (N,)。"""
+    full_opp = full と同じだが、判定を「目標方向がボール→敵の線の左にあるとき」に変える (立ち位置が必ず敵の反対側になる。評価用)。
+    戻り値の ``.left`` は今反転している env (N,)、``.age`` は作動してからの tick 数 (0 にすると判定をやり直す)。"""
     from ..history_layout import POLICY_TERM_SPECS
     from ..mdp.symmetry import _mirror_history_group, _mirror_joints
     from .block_nets import steal_mirror, steal_symmetric, steal_target_left
@@ -149,8 +150,10 @@ def steal_mirror_policy(pol: StealHistActorCritic, raw_env, mode: str = "full", 
         am = _mirror_joints(expert_actions(TensorDict(om, batch_size=o.batch_size), cmd * torch.tensor([1.0, -1.0, -1.0], device=cmd.device)))
         return torch.where(mir_left.unsqueeze(1), am, expert_actions(o, cmd))
 
-    if mode == "full":
+    if mode in ("full", "full_opp"):
         pol.expert_actions = expert_mirrored
+    opp_left = lambda x: (x[:, 65] - x[:, 61]) * x[:, 68] - (x[:, 66] - x[:, 62]) * x[:, 67] > 0.0  # 目標がボール→敵の線の左
+    target_left = opp_left if mode == "full_opp" else steal_target_left
 
     def policy(o):
         x = pol.get_actor_obs(o)
@@ -158,10 +161,10 @@ def steal_mirror_policy(pol: StealHistActorCritic, raw_env, mode: str = "full", 
         # 作動していない間は反転しない。--node_dir の目標方向は 1 tick 遅れて観測に入るので、作動 2 tick 目までは判定を更新する
         mir_age[:] = torch.where(w_on & (raw_env.episode_length_buf > 0), mir_age + 1, 0)
         hold = (mir_age > 2) & (mode != "step")
-        mir_left[:] = torch.where(hold, mir_left, steal_target_left(x) & w_on)
+        mir_left[:] = torch.where(hold, mir_left, target_left(x) & w_on)
         return pol.env_actions(o, steal_symmetric(lambda v: pol.actor(pol.actor_obs_normalizer(v)), x, mir, mir_left))
 
-    policy.left = mir_left
+    policy.left, policy.age = mir_left, mir_age
     return policy
 
 
