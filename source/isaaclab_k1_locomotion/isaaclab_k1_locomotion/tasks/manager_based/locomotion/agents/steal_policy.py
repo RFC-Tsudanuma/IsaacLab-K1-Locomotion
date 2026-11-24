@@ -129,6 +129,42 @@ class StealHistActorCritic(BlockActorCritic):
         return super().env_actions(obs, raw)
 
 
+def steal_mirror_policy(pol: StealHistActorCritic, raw_env, mode: str = "full", hist: int = 30):
+    """目標方向がロボット→ボールの線の左にあるとき左右反転して動かす推論関数 (obs → env action) を返す (eval_steal.py / play.py)。
+    step = 毎 tick 判定、latch = 作動直後の判定を作動が切れるまで保つ (ノードが目標方向を固定するのと同じ)、
+    full = latch に加えて歩行 expert も反転する (制御全体を鏡像にする。expert は左右対称でないため。ノードの steal_mirror と同じ)。
+    戻り値の ``.left`` は今反転している env (N,)。"""
+    from ..history_layout import POLICY_TERM_SPECS
+    from ..mdp.symmetry import _mirror_history_group, _mirror_joints
+    from .block_nets import steal_mirror, steal_symmetric, steal_target_left
+
+    mir = [t.to(raw_env.device) for t in steal_mirror(hist)]
+    mir_left = torch.zeros(raw_env.num_envs, dtype=torch.bool, device=raw_env.device)
+    mir_age = torch.zeros(raw_env.num_envs, dtype=torch.long, device=raw_env.device)  # 奪取が作動してからの tick 数
+    expert_actions = pol.expert_actions
+
+    def expert_mirrored(o, cmd):
+        om = {k: v for k, v in o.items()}
+        om["policy"] = _mirror_history_group(o["policy"], "policy", POLICY_TERM_SPECS)
+        am = _mirror_joints(expert_actions(TensorDict(om, batch_size=o.batch_size), cmd * torch.tensor([1.0, -1.0, -1.0], device=cmd.device)))
+        return torch.where(mir_left.unsqueeze(1), am, expert_actions(o, cmd))
+
+    if mode == "full":
+        pol.expert_actions = expert_mirrored
+
+    def policy(o):
+        x = pol.get_actor_obs(o)
+        w_on = o["steal_ctrl"][:, 0] > 0.0
+        # 作動していない間は反転しない。--node_dir の目標方向は 1 tick 遅れて観測に入るので、作動 2 tick 目までは判定を更新する
+        mir_age[:] = torch.where(w_on & (raw_env.episode_length_buf > 0), mir_age + 1, 0)
+        hold = (mir_age > 2) & (mode != "step")
+        mir_left[:] = torch.where(hold, mir_left, steal_target_left(x) & w_on)
+        return pol.env_actions(o, steal_symmetric(lambda v: pol.actor(pol.actor_obs_normalizer(v)), x, mir, mir_left))
+
+    policy.left = mir_left
+    return policy
+
+
 class StealPPO(WaypointPPO):
     """15 次元 (コマンド + 残差) を PPO で学習する (storage の action 次元だけ WaypointPPO と異なる)。"""
 

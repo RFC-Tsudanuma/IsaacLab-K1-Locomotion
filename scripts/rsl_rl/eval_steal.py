@@ -108,38 +108,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     pol = runner.alg.policy
     policy = (lambda o: pol.env_actions(o, pol.act(o))) if args_cli.stochastic else runner.alg.act_inference
     if args_cli.mirror:
+        from isaaclab_k1_locomotion.tasks.manager_based.locomotion.agents.steal_policy import steal_mirror_policy
+
+        policy = steal_mirror_policy(pol, env.unwrapped, args_cli.mirror, agent_cfg.policy.ball_history)
+    esym = {"d": 0.0, "a": 0.0, "n": 0}
+    if args_cli.expert_sym:
         from tensordict import TensorDict
 
-        from isaaclab_k1_locomotion.tasks.manager_based.locomotion.agents.block_nets import steal_mirror, steal_symmetric, steal_target_left
         from isaaclab_k1_locomotion.tasks.manager_based.locomotion.history_layout import POLICY_TERM_SPECS
         from isaaclab_k1_locomotion.tasks.manager_based.locomotion.mdp.symmetry import _mirror_history_group, _mirror_joints
 
-        mir = [t.to(agent_cfg.device) for t in steal_mirror(agent_cfg.policy.ball_history)]
-        mir_left = torch.zeros(env.num_envs, dtype=torch.bool, device=agent_cfg.device)
-        mir_age = torch.zeros(env.num_envs, dtype=torch.long, device=agent_cfg.device)  # 奪取が作動してからの tick 数
-        expert_actions = pol.expert_actions
-
-        def expert_mirrored(o, cmd):
-            """full: 反転中の env は歩行 expert も左右反転して使う (制御全体を鏡像にする。expert は左右対称でないため)。"""
-            om = {k: v for k, v in o.items()}
-            om["policy"] = _mirror_history_group(o["policy"], "policy", POLICY_TERM_SPECS)
-            am = _mirror_joints(expert_actions(TensorDict(om, batch_size=o.batch_size), cmd * torch.tensor([1.0, -1.0, -1.0], device=cmd.device)))
-            return torch.where(mir_left.unsqueeze(1), am, expert_actions(o, cmd))
-
-        if args_cli.mirror == "full":
-            pol.expert_actions = expert_mirrored
-
-        def policy(o):
-            x = pol.get_actor_obs(o)
-            w_on = o["steal_ctrl"][:, 0] > 0.0
-            # latch / full: 作動直後の判定を、作動が切れるまで保つ (ノードが目標方向を固定するのと同じ)。作動していない間は反転しない。
-            # --node_dir の目標方向は 1 tick 遅れて観測に入るので、作動 2 tick 目までは判定を更新する
-            mir_age[:] = torch.where(w_on & (raw_env.episode_length_buf > 0), mir_age + 1, 0)
-            hold = (mir_age > 2) & (args_cli.mirror != "step")
-            mir_left[:] = torch.where(hold, mir_left, steal_target_left(x) & w_on)
-            return pol.env_actions(o, steal_symmetric(lambda v: pol.actor(pol.actor_obs_normalizer(v)), x, mir, mir_left))
-    esym = {"d": 0.0, "a": 0.0, "n": 0}
-    if args_cli.expert_sym:
         expert_actions = pol.expert_actions
 
         def expert_sym(o, cmd):

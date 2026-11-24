@@ -45,6 +45,8 @@ parser.add_argument(
 parser.add_argument(
     "--viser_env_idx", type=int, default=0, help="Index of the environment to visualize in viser."
 )
+parser.add_argument("--steal_mirror", action="store_true", default=False,
+                    help="StealHist: 目標がロボット→ボールの線の左なら制御全体を左右反転する (ノードの steal_mirror と同じ)。")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -769,6 +771,8 @@ def _update_steal_viser(env, server, gui, env_idx: int = 0):
         state = "touched"
     else:
         state = "approach"
+    if "st_left" in gui and bool(gui["st_left"][env_idx]):
+        state += " [mirrored]"  # --steal_mirror: 左右反転して動かしている (右足で左へ払う)
     server.scene.add_label(
         "/steal/label",
         f"{dir_name}{state} | ball-obstacle {float(st.ball_obstacle_dist()[env_idx]):.2f} m | last: {gui['st_last'].value}",
@@ -985,7 +989,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
     else:
         raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+    runner.load(resume_path, load_optimizer=False)  # 再生に optimizer は要らない (蒸留した生徒の checkpoint には入っていない)
 
     # `runner.load` can silently no-op for some checkpoints, leaving the live policy at
     # initialization values. Re-load the state_dict directly into the policy as a safeguard.
@@ -1009,6 +1013,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             for expert in frozen.values():
                 expert.to(env.unwrapped.device)
         policy = runner.alg.act_inference
+    if args_cli.steal_mirror:
+        from isaaclab_k1_locomotion.tasks.manager_based.locomotion.agents.steal_policy import steal_mirror_policy
+
+        policy = steal_mirror_policy(runner.alg.policy, env.unwrapped, hist=agent_cfg.policy.ball_history)
 
     # extract the neural network module
     # we do this in a try-except to maintain backwards compatibility.
@@ -1051,6 +1059,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if args_cli.viser:
         urdf_path = args_cli.viser_urdf or DEFAULT_VISER_URDF
         viser_state = setup_viser(env, urdf_path, args_cli.viser_port)
+        if args_cli.steal_mirror:
+            viser_state[4]["st_left"] = policy.left
 
     # reset environment
     obs = env.get_observations()

@@ -499,7 +499,18 @@ s5、決定的評価 1024 env × 1500 step、目標 = ロボット→ボール�
   左右差は無い (5.2 / 4.8%)。原因は未特定。
 - 「常に右へ」(`--node_dir right`) は、右に敵がいるときの逃げ先 (真後ろ・敵の反対) が苦手で静止の方向違いが 13.5% に増える。不採用。
 
-### ノード (booster_k1_locomotion、未コミット)
+- 目視 (viser、ユーザー確認済み 2026-11-24): `play.py --steal_mirror`。反転中はラベルと state に `[mirrored]`。
+  「Steal Task」の `target dir` を `left` にして `new placement` で右足の蹴りが出る。反転の処理は
+  `agents/steal_policy.py` の `steal_mirror_policy` (eval_steal.py と共通)。
+
+```bash
+cd scripts/rsl_rl
+uv run play.py --task Isaac-StealHist-K1-Play-v0 --num_envs 1 --viser --real-time --steal_mirror \
+  --checkpoint ../../frozen_policies/best_steal_hist/student_s5_1000.pt \
+  env.commands.steal.match_enable=false env.commands.steal.move_speed_max=0.0 env.curriculum.steal_move_speed=null
+```
+
+### ノード (booster_k1_locomotion 34c0c9c)
 
 - `src/k1_steal_mirror.hpp` (反転の写像、`k1_walk_kick_mirror.hpp` の関節反転を再利用)、`test/test_k1_steal_mirror.cpp`
   (Python の `steal_mirror` と同じ並びになること、2 回で元に戻ること)。
