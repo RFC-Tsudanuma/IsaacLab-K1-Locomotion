@@ -341,6 +341,8 @@ class StealCommand(CommandTerm):
         # 観測の劣化と履歴 (遅延用) の初期化
         self.obs_degrade[ids] = (torch.rand(n, device=dev) < cfg.obs_degrade_prob) if m else torch.zeros(n, dtype=torch.bool, device=dev)
         self.delay[ids] = torch.randint(int(cfg.obs_delay_steps[0]), int(cfg.obs_delay_steps[1]) + 1, (n,), device=dev)
+        if cfg.target_mode == "opp_line":
+            self._target_opp_line(ids, ball_xy - pos, obs_xy - pos)
         b4 = torch.cat([ball_xy, torch.zeros(n, 2, device=dev)], dim=1)
         self.hist_ball[:, ids] = b4.unsqueeze(0)
         self.hist_opp[:, ids] = obs_xy.unsqueeze(0)
@@ -356,6 +358,16 @@ class StealCommand(CommandTerm):
         self.foot_touched[env_ids] = False
         self.prev_body_dist[env_ids] = torch.norm(pose[:, :2] - pos, dim=1)
         self.prev_circ_ang[env_ids] = torch.atan2(pos[:, 1] - pose[:, 1], pos[:, 0] - pose[:, 0])
+
+    def _target_opp_line(self, ids: torch.Tensor, ball: torch.Tensor, opp: torch.Tensor):
+        """目標方向 "opp_line" (2026-11-24): ボール→敵の線の真横 (右)。ノードの steal_opp_line を、反転後の系で見たもの
+        (ノードは左へ出すとき制御全体を左右反転する)。左右は上位が自陣ゴールから離れる側を選ぶので、ロボットは線のどちら側にもいる。
+        ball / opp はロボットから見た相対位置 (world 系)。リセット時と、歩行中開始では起動時に方策の観測から決める。
+        劣化ありで敵がボールから opponent_max_dist より遠いときは、ノードと同じく仮想の敵 (ロボット→ボールの延長上)。"""
+        virt = self.obs_degrade[ids] & (torch.norm(opp - ball, dim=1) > self.cfg.opponent_max_dist)
+        e = torch.where(virt.unsqueeze(1), ball, opp - ball)
+        self.target_dir_w[ids] = torch.stack([e[:, 1], -e[:, 0]], dim=1) / torch.norm(e, dim=1, keepdim=True).clamp(min=1e-6)
+        self.target_idx[ids] = 3  # 評価表の右
 
     def _target_lr(self, ids: torch.Tensor, pos: torch.Tensor, ball_xy: torch.Tensor, obs_xy: torch.Tensor):
         """目標方向 "robot_lr" (2026-11-24): ロボット→ボールの線から左右どちらかへ target_lateral_range の角度
@@ -464,6 +476,9 @@ class StealCommand(CommandTerm):
         if cfg.target_mode == "robot_lr" and start.any():
             i = start.nonzero().squeeze(1)
             self._target_lr(i, self.robot.data.root_pos_w[i, :2], self.ball_xy()[i], self.obstacle_xy()[i])
+        if cfg.target_mode == "opp_line" and start.any():
+            i = start.nonzero().squeeze(1)
+            self._target_opp_line(i, self._to_world(self.obs_ball_b[:, :2])[i], self._to_world(self.obs_opp_b)[i])
         on = self.phase == PH_ON
         self.w[on] = (self.w[on] + dt / cfg.blend_s).clamp(max=1.0)
         self.phase[on & (self.w >= 1.0)] = PH_ACTIVE
@@ -734,6 +749,7 @@ class StealCommandCfg(CommandTermCfg):
     target_mode: str = "robot4"
     """目標方向の抽選。"robot4" = 開始時のロボット向き基準の前後左右から敵方向に近いものを除く (従来)、
     "robot_lr" = ロボット→ボールの線から左右どちらかへ target_lateral_range (敵方向に近い側は除く、2026-11-24)。
+    "opp_line" = ボール→敵の線の真横 (右)。ノードの steal_opp_line + 左右反転を、反転後の系で見たもの (2026-11-24)。
     ボール→敵の線の横 ("lateral"、2026-11-23) は敵側へ入る立ち位置が 12 → 28% に増えたので不採用・削除。"""
     target_lateral_range: tuple[float, float] = (math.radians(60.0), math.radians(120.0))
 

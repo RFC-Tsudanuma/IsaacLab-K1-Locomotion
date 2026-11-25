@@ -527,3 +527,38 @@ uv run play.py --task Isaac-StealHist-K1-Play-v0 --num_envs 1 --viser --real-tim
 
 - 両足で蹴れる方策を学習で作るなら、対称な歩行 expert が前提 (今の expert の上では反転した蹴りが成立しない)。
 - 試合条件での転倒の微増 (0.1 回/分) の原因。
+
+## 敵の線ルールで再学習 (2026-11-25): 教師 t7 → 生徒 s9
+
+目標方向を「ボール→敵の線の真横」(ノードの `steal_opp_line`、左右は上位が `/steal_dir` で自陣ゴールから離れる側を選ぶ。
+booster_k1_locomotion fe8d90a) にして学習し直した。左へ出すときはノードが制御全体を左右反転するので、学習は常に
+「線の右へ出す」(`env.commands.steal.target_mode=opp_line`)、ロボットは線のどちら側にもいる。
+
+奪取率 静止 / 動く敵 1.0 m/s / 試合条件 [試合条件の転倒 回/分]。`eval_steal.py --node_dir opp_near|opp_far --mirror full_opp`、
+1024 env × 1500 step。near = 出す側にロボットがいる、far = 反対側にいる。
+
+| 方策 | near | far |
+|---|---|---|
+| 教師 t1@44700 (再学習前) | 70.8 / 63.9 / 45.9 [0.51] | 75.6 / 65.4 / 44.8 [0.69] |
+| 教師 t5 (opp_line のみ) @47699 | 75.1 / 70.3 / 51.2 [0.59] | 79.7 / 71.9 / 54.4 [0.76] |
+| **教師 t7 (+ 時間切れ −60) @46200** | 77.5 / 71.0 / 52.2 [0.54] | 77.9 / 71.0 / 51.4 [0.64] |
+| 生徒 s5@1000 (従来) | 65.3 / 61.4 / 31.9 [0.62] | 73.1 / 60.5 / 33.0 [0.66] |
+| **生徒 s9@1000 (採用候補)** | 76.1 / 69.3 / 37.7 [0.61] | 76.0 / 68.4 / 38.1 [0.64] |
+
+- 成果物: `frozen_policies/best_steal_hist/` の `teacher_t7_46200.pt` / `student_s9_1000.pt` / `steal_hist_s9_1000.onnx`。
+  booster の既定 ONNX は s5 のまま (s9 は `steal_opp_line:=true` で使う前提。`steal_model_path:=` で差し替えて試す)。
+- 奪取までの時間 (成功のみ、エピソード開始から圏外まで): 静止 2.7〜2.8 s / 動く敵 3.0〜3.2 s / 試合条件 3.5〜3.6 s。s5 と同じ。
+- far でも奪取率は落ちない → 左右を自陣ゴールで決めても損は無い。
+- 教師の checkpoint 間のばらつきは ±2〜5pt。t5 最終と t7@46200 は誤差内 (転倒の少ない t7 を採用)。
+- `env.commands.steal.opp_touch_lost=false` で学習した教師 (t6) は、どちらの判定基準でも t5 より下。不採用。
+- 教師→生徒の差は試合条件で 14pt 前後 (観測劣化で lost と timeout が増える)。今回は縮まっていない。
+
+```bash
+# 教師 (t1@44700 から 3000 iter、46200 を採用)
+uv run train.py --task Isaac-StealHist-K1-v0 --num_envs 2048 --headless --resume --load_run <t1 の run> --checkpoint model_44700.pt \
+  --max_iterations 3000 --reset_noise_std 0.05 env.commands.steal.obs_degrade_prob=0.0 \
+  env.commands.steal.target_mode=opp_line env.rewards.timeout.weight=-60.0
+# 生徒 (s5 を初期値に 1000 iter)
+uv run distill_steal.py --task Isaac-StealStudent-K1-v0 --teacher <teacher_t7_46200.pt> --init <student_s5_1000.pt> \
+  --run_name s9_t7 --iterations 1000 --clean_weight 10.0 env.commands.steal.target_mode=opp_line
+```
