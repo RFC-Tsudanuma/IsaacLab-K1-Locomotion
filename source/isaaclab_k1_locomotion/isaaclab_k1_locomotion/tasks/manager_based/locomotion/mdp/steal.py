@@ -67,6 +67,7 @@ class StealCommand(CommandTerm):
         self.foot_touched = torch.zeros(n, dtype=torch.bool, device=self.device)  # このエピソードで足がボールに触れた
         self.cmd_buf = torch.zeros(n, 2, device=self.device)
         self.stolen_at = torch.full((n,), -1.0, device=self.device)  # 最初に圏外へ出た時刻 [s] (未達 −1)
+        self.touch_bx = torch.zeros(n, device=self.device)  # 最初に触れた瞬間のボールの前方距離 (胴体座標) [m]
         self.prev_body_dist = torch.zeros(n, device=self.device)  # 胴体→ボール距離 (接近ポテンシャル用)
         self.prev_circ_ang = torch.zeros(n, device=self.device)  # ボールから見たロボットの方位 (回り込み量の罰用)
         self.target_dir_w = torch.zeros(n, 2, device=self.device)  # 目標方向 (world 単位ベクトル)
@@ -623,6 +624,7 @@ class StealCommand(CommandTerm):
         # 足接触の記録と成功のラッチ (毎 step、終了判定の後に呼ばれる → 次 step の終了判定が見る)
         new_touch = self.foot_contact_now() & ~self.foot_touched
         self.ball_touch_xy[new_touch] = self.ball_xy()[new_touch]
+        self.touch_bx[new_touch] = self.body_ball_b()[new_touch, 0]
         self.foot_touched |= new_touch
         first = (self.stolen_at < 0.0) & ~self.lost() & self.foot_touched & self.ball_out()
         if self.cfg.directed:
@@ -870,6 +872,39 @@ def foot_near_ball(env: "ManagerBasedRLEnv", std: float = 0.2, command_name: str
     """足がボールに近いほど高い [0, 1]。足で触れるまでだけ有効 (触れた後に足元に留まる動機を作らない)。"""
     term: StealCommand = env.command_manager.get_term(command_name)
     return (~term.foot_touched).float() * torch.exp(-torch.square(term.foot_ball_dist() / std))
+
+
+def ball_wait(env: "ManagerBasedRLEnv", near: float = 0.5, command_name: str = "steal") -> torch.Tensor:
+    """ボールが胴体から near 以内にあるのに、まだ足で触れていない間 1 (奪取方策の作動中)。足元にボールを置いて
+    立ってから蹴る「間」を罰する (2026-11-25)。foot_near_ball はこの間ずっと正なので、打ち消す重みが要る。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    return ((term.w > 0.0) & ~term.foot_touched & (term.body_ball_dist() < near)).float()
+
+
+def touch_speed(env: "ManagerBasedRLEnv", max_speed: float = 1.0, command_name: str = "steal") -> torch.Tensor:
+    """足が最初にボールへ触れた step だけ、胴体の水平の速さ [m/s] (上限 max_speed) ÷ dt。歩いてきた勢いのまま蹴るほど高い
+    (2026-11-25)。÷ dt で、重み = 1 m/s で触れたときの報酬 (報酬は weight × dt が掛かる)。
+    foot_touched は報酬の後 (コマンド更新) で立つので、「いま触れていて、まだ立っていない」がちょうど 1 step。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    first = term.foot_contact_now() & ~term.foot_touched & (term.w > 0.0)
+    v = torch.norm(term.robot.data.root_lin_vel_w[:, :2], dim=1).clamp(max=max_speed)
+    return first.float() * v / env.step_dt
+
+
+def touch_forward(env: "ManagerBasedRLEnv", max_x: float = 0.35, command_name: str = "steal") -> torch.Tensor:
+    """足が最初にボールへ触れた step だけ、ボールが胴体のどれだけ前にあるか (0〜max_x を 0〜1 に) ÷ dt。
+    従来は両足のあいだ (胴体の前 0.11 m) にボールを入れてから片足を振る。前へ出した足でそのまま蹴らせる (2026-11-25)。
+    重み = max_x 以上前で触れたときの報酬。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    first = term.foot_contact_now() & ~term.foot_touched & (term.w > 0.0)
+    return first.float() * (term.body_ball_b()[:, 0] / max_x).clamp(0.0, 1.0) / env.step_dt
+
+
+def steal_forward(env: "ManagerBasedRLEnv", max_x: float = 0.35, command_name: str = "steal") -> torch.Tensor:
+    """touch_forward の「成功時だけ」版: 奪取が成立した step に、最初に触れた瞬間のボールの前方距離 (0〜max_x を 0〜1 に) ÷ dt。
+    触れた瞬間に払うと歩き出しを急いで転倒が増えた (2026-11-25) → 成立まで払わない。"""
+    term: StealCommand = env.command_manager.get_term(command_name)
+    return env.termination_manager.get_term("ball_stolen").float() * (term.touch_bx / max_x).clamp(0.0, 1.0) / env.step_dt
 
 
 def ball_away_speed(env: "ManagerBasedRLEnv", max_speed: float = 3.0, command_name: str = "steal") -> torch.Tensor:

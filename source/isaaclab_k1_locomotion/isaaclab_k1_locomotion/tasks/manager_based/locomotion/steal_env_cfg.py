@@ -51,6 +51,7 @@ from .mdp.steal import (
     ball_no_foot,
     ball_stolen,
     ball_circling,
+    ball_wait,
     ball_target_speed,
     ball_wrong_dir,
     body_ball_progress,
@@ -68,6 +69,9 @@ from .mdp.steal import (
     steal_phase_obs,
     steal_target_dir,
     steal_timeout,
+    steal_forward,
+    touch_forward,
+    touch_speed,
     trunk_obstacle_contact,
 )
 from isaaclab.managers import CurriculumTermCfg as CurrTerm
@@ -313,6 +317,12 @@ class K1StealDirRewardsCfg(K1StealRewardsCfg):
     timeout = RewTerm(func=steal_timeout, weight=0.0)
     # 回り込みの罰 (2026-11-24): ボールのまわりを回った角度 [rad] × weight × dt。0 で従来どおり
     ball_circling = RewTerm(func=ball_circling, weight=0.0)
+    # 歩いてきた勢いのまま蹴らせる実験 (2026-11-25、STEAL_HANDOFF)。0 で従来どおり。
+    # ball_wait: ボールが 0.5 m 以内で未接触の間 weight /s、touch_speed: 最初に触れた瞬間の胴体の速さ × weight (1 回だけ)
+    ball_wait = RewTerm(func=ball_wait, weight=0.0)
+    touch_speed = RewTerm(func=touch_speed, weight=0.0)
+    touch_forward = RewTerm(func=touch_forward, weight=0.0)  # 最初に触れた瞬間、ボールが胴体の 0.35 m 以上前なら weight (1 回だけ)
+    steal_forward = RewTerm(func=steal_forward, weight=0.0)  # 同じ量を、奪取が成立した step に払う (成功時だけ)
     joint_residual_l2 = RewTerm(func=joint_residual_l2, weight=-0.2)
     walk_command_rate_l2 = RewTerm(func=walk_command_rate_l2, weight=-0.2, params={"action_name": "walk_command"})
     # 上体の揺れ (2026-11-11 追加): 実機のボール検出 (頭部カメラ) を安定させるため、Trunk の傾き・ロール/ピッチ

@@ -40,7 +40,7 @@ parser.add_argument("--expert_sym", action="store_true", help="診断: 歩行 ex
 parser.add_argument("--dump_rows", type=str, default=None, help="エピソードごとの集計行を JSON で書き出す (立ち位置などの解析用)")
 parser.add_argument("--mirror", choices=["step", "latch", "full", "full_opp"], default=None,
                     help="方策を左右対称にして評価する (目標方向が左のときは観測と出力を左右反転)。step = 毎 tick 判定、latch = 作動直後の判定を保つ、full = latch + 歩行 expert も反転 (制御全体を鏡像にする)")
-parser.add_argument("--dump_traj", type=str, default=None, help="先頭 256 env の毎 step の軌跡 (T, 256, 15) を torch.save する (解析用)")
+parser.add_argument("--dump_traj", type=str, default=None, help="先頭 256 env の毎 step の軌跡 (T, 256, 21) を torch.save する (解析用)")
 parser.add_argument("--diag_back", action="store_true", help="診断: 敵が背後 (|方位|>135°) の開始 1 s の方策出力 (コマンド・残差) を集計")
 cli_args.add_rsl_rl_args(parser)
 AppLauncher.add_app_launcher_args(parser)
@@ -161,6 +161,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     # 回り込み量: 奪取の作動中 (w > 0)、足で触れるまでにボールのまわりを回った角度の累計 [deg] (ボールから見たロボットの方位の変化)
     circ = torch.zeros(env.num_envs, device=agent_cfg.device)
     prev_ang = torch.full_like(circ, float("nan"))
+    # 蹴りまでの間 (2026-11-25): ボールが胴体から 0.5 m 以内に入った時刻 (奪取の作動中) / 最初に足で触れた時刻 / そのときの胴体の速さ
+    # (水平、時定数 0.2 s の平均)。足元にボールを置いて立ってから蹴るほど near → touch が長く、速さが小さい
+    near_t, touch_t, touch_v, near_vmin, touch_bx = (touch_th.clone() for _ in range(5))
+    v_avg = torch.zeros_like(circ)
     # 上体の揺れ (全 env・全 step の平均)。角加速度・並進加速度は有限差分、リセット直後の step は除く
     robot = raw_env.scene["robot"]
     sway = {"tilt": 0.0, "ang_vel_xy": 0.0, "ang_acc": 0.0, "lin_acc": 0.0, "n": 0}
@@ -189,7 +193,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             active["steps"] += int(steal_on.sum())
             if args_cli.node_dir:
                 # ノードの steal_update_dir (指令なし): 起動 tick の観測での「敵→ボール」。反映は次 tick の観測から
-                new = (term.phase != 0) & ~dir_latched
+                # step 0 は obs_ball_b / obs_opp_b がまだ零 (コマンド更新前) → 零ベクトルを固定してしまうので 1 tick 待つ (2026-11-26 修正)
+                new = (term.phase != 0) & ~dir_latched & (step > 0)
                 ball_b, opp_b = term.obs_ball_b[:, :2], term.obs_opp_b
                 if args_cli.node_dir == "lr":
                     opp_left = ball_b[:, 0] * (opp_b[:, 1] - ball_b[:, 1]) - ball_b[:, 1] * (opp_b[:, 0] - ball_b[:, 0]) > 0.0
@@ -217,6 +222,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                 term.target_dir_w[new] = away[new]
                 dir_latched |= new
             act = policy(obs)
+            t_now = term.elapsed()
+            near_t = torch.where(near_t.isnan() & (term.w > 0.0) & (term.body_ball_dist() < 0.5), t_now, near_t)
+            v_avg = 0.9 * v_avg + 0.1 * robot.data.root_lin_vel_w[:, :2].norm(dim=1)
+            near_vmin = torch.where(~near_t.isnan() & touch_t.isnan(), torch.fmin(near_vmin, v_avg), near_vmin)  # 近づいてから触れるまでの最小の速さ
             rb, ob = robot.data.root_pos_w[:, :2] - term.ball_xy(), term.obstacle_xy() - term.ball_xy()
             cross = lambda a, b: a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
             tg_now = torch.rad2deg(torch.atan2(cross(ob, term.target_dir_w), (ob * term.target_dir_w).sum(1)))
@@ -233,9 +242,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                     cmd = act[early, 12:15]
                     res = act[early, 15:27]
                     diag.append(torch.cat([cmd.abs().mean(0), cmd.mean(0), res.abs().amax(1).mean().view(1)]).cpu())
-            if args_cli.dump_traj:  # [ロボット xy, yaw, ボール xy, 目標方向 xy, 敵 xy, 触れた, w, コマンド 3, 経過 step]
+            if args_cli.dump_traj:  # [ロボット xy, yaw, ボール xy, 目標方向 xy, 敵 xy, 触れた, w, コマンド 3, 経過 step, 両足 xyz 6]
                 traj.append(torch.cat([robot.data.root_pos_w[:, :2], robot.data.heading_w.unsqueeze(1), term.ball_xy(), term.target_dir_w, term.obstacle_xy(),
-                                       term.foot_touched.float().unsqueeze(1), term.w.reshape(-1, 1), act[:, 12:15], raw_env.episode_length_buf.float().unsqueeze(1)], dim=1)[:256].cpu())
+                                       term.foot_touched.float().unsqueeze(1), term.w.reshape(-1, 1), act[:, 12:15], raw_env.episode_length_buf.float().unsqueeze(1),
+                                       robot.data.body_link_pos_w[:, term._feet_idx, :].flatten(1)], dim=1)[:256].cpu())
             obs, _, dones, _ = env.step(act)
             for sen in sensors:
                 foot_touch |= torch.norm(sen.data.force_matrix_w, dim=-1).amax(dim=(1, 2)) > 1.0
@@ -243,6 +253,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
             touch_th = torch.where(new_touch, th_now, touch_th)
             touch_sg = torch.where(new_touch, sg_now, touch_sg)
             touch_tg = torch.where(new_touch, tg_now.abs(), touch_tg)
+            touch_t = torch.where(new_touch, t_now + dt, touch_t)
+            touch_v = torch.where(new_touch, v_avg, touch_v)
+            touch_bx = torch.where(new_touch, term.body_ball_b()[:, 0], touch_bx)
             # ボールと敵の間に入った: ロボット中心をボール→敵の線分に射影して内側 (端から 0.1 m 以上) かつ横 0.25 m 以内
             rp = raw_env.scene["robot"].data.root_pos_w[:, :2]
             seg = term.obstacle_xy() - term.ball_xy()
@@ -289,14 +302,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
                              "foot": foot_touch[i].item(), "bumped": bumped[i].item(), "dir": int(tdir[i]),
                              "side0": side0[i].item(), "trunk": trunk_hit[i].item(), "bear0": bear0[i].item(),
                              "ospeed": ospeed[i].item(), "between": between[i].item(), "tgt_opp": tgt_opp[i].item(), "kind": kind[i].item(), "touch_th": touch_th[i].item(),
-                             "start_sg": start_sg[i].item(), "touch_sg": touch_sg[i].item(), "touch_tg": touch_tg[i].item(), "circ": circ[i].item(), "opp_hit": opp_hit[i].item()})
+                             "start_sg": start_sg[i].item(), "touch_sg": touch_sg[i].item(), "touch_tg": touch_tg[i].item(), "circ": circ[i].item(), "opp_hit": opp_hit[i].item(),
+                             "near_t": near_t[i].item(), "touch_t": touch_t[i].item(), "touch_v": touch_v[i].item(), "near_vmin": near_vmin[i].item(), "touch_bx": touch_bx[i].item()})
             foot_touch[d] = False
             bumped[d] = False
             between[d] = False
             opp_hit[d] = False
             dir_latched[d] = False
             trk_close[d] = False
-            for buf in (touch_th, start_sg, touch_sg, touch_tg, prev_ang):
+            for buf in (touch_th, start_sg, touch_sg, touch_tg, prev_ang, near_t, touch_t, touch_v, near_vmin, touch_bx):
                 buf[d] = float("nan")
             circ[d] = 0.0
             trunk_hit[d] = False
@@ -326,6 +340,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
         c = [r["circ"] for r in sel]
         m = max(len(c), 1)
         print(f"  回り込み量 (触れるまでにボールのまわりを回った角度) {name}: 平均 {sum(c) / m:5.1f}°, >45° {100.0 * sum(x > 45 for x in c) / m:5.1f}%, >90° {100.0 * sum(x > 90 for x in c) / m:5.1f}%")
+    k = [r for r in stolen if r["near_vmin"] == r["near_vmin"] and r["touch_t"] == r["touch_t"]]  # 近づいてから触れた回
+    m, med = max(len(k), 1), lambda x: sorted(x)[len(x) // 2] if x else float("nan")
+    dw, ko = [r["touch_t"] - r["near_t"] for r in k], [r["t_steal"] - r["touch_t"] for r in k]
+    print(f"  蹴りまでの間 (奪取のみ): ボール 0.5 m 以内 → 足で触れる 平均 {sum(dw) / m:.2f} s (中央 {med(dw):.2f} s, >1 s {100.0 * sum(x > 1.0 for x in dw) / m:.1f}%) / "
+          f"触れる → 圏外 平均 {sum(ko) / m:.2f} s (中央 {med(ko):.2f} s) / 触れた瞬間の胴体の速さ 平均 {sum(r['touch_v'] for r in k) / m:.2f} m/s"
+          f" / その間の最小の速さ 平均 {sum(r['near_vmin'] for r in k) / m:.2f} m/s (0.3 m/s 未満 {100 * sum(r['near_vmin'] < 0.3 for r in k) / m:.1f}%)"
+          f" / 触れた瞬間のボールの前方距離 (胴体座標) 平均 {sum(r['touch_bx'] for r in k) / m:.2f} m")
     table("終了時の robot-obstacle 距離 [m] (≈ 初期距離の目安)", "dist0", [1.0, 1.5, 2.0, 2.5], rows)
     if args_cli.match:
         mins = active["steps"] * dt / 60.0
